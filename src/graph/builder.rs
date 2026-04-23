@@ -1,11 +1,9 @@
 use crate::graph::{CodeGraph, Edge, Node, ProcedureId, SourceLocation};
-use crate::parser::{
-    load_ibatis_files, load_java_files, AllParsedFiles, CallEdge, CallExtractor, ParsedFile,
-};
+use crate::parser::{AllParsedFiles, CallEdge, CallExtractor, ParsedFile};
 use ogsql_parser::ast::Statement;
 use ogsql_parser::walk_statement;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 
 pub struct GraphBuilder;
 
@@ -25,7 +23,7 @@ impl GraphBuilder {
         graph
     }
 
-    pub fn build_all(&self, all: &AllParsedFiles, input: &Path) -> CodeGraph {
+    pub fn build_all(&self, all: &AllParsedFiles) -> CodeGraph {
         let mut graph = CodeGraph::new();
         let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
         let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
@@ -34,9 +32,24 @@ impl GraphBuilder {
         let edges = Self::collect_call_edges(&all.sql_files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
 
-        Self::add_ibatis_nodes(input, &mut graph, &mut proc_index, &mut mapper_index);
-        Self::add_java_nodes(input, &mut graph, &mut proc_index, &mapper_index);
-        Self::add_java_method_nodes(input, &mut graph, &mut proc_index, &mapper_index);
+        Self::add_ibatis_nodes_from_parsed(
+            &all.ibatis_files,
+            &mut graph,
+            &mut proc_index,
+            &mut mapper_index,
+        );
+        Self::add_java_nodes_from_parsed(
+            &all.java_files,
+            &mut graph,
+            &mut proc_index,
+            &mapper_index,
+        );
+        Self::add_java_method_nodes_from_parsed(
+            &all.java_method_results,
+            &mut graph,
+            &mut proc_index,
+            &mapper_index,
+        );
 
         graph
     }
@@ -150,15 +163,13 @@ impl GraphBuilder {
         }
     }
 
-    fn add_ibatis_nodes(
-        input: &Path,
+    fn add_ibatis_nodes_from_parsed(
+        ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let ibatis_files = load_ibatis_files(input);
-
-        for ibatis_file in &ibatis_files {
+        for ibatis_file in ibatis_files {
             let xml_path =
                 PathBuf::from(ibatis_file.result.file_path.as_deref().unwrap_or_default());
             let namespace = &ibatis_file.result.namespace;
@@ -204,15 +215,13 @@ impl GraphBuilder {
         }
     }
 
-    fn add_java_nodes(
-        input: &Path,
+    fn add_java_nodes_from_parsed(
+        java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let java_files = load_java_files(input);
-
-        for java_file in &java_files {
+        for java_file in java_files {
             let java_path = PathBuf::from(&java_file.result.file_path);
 
             for extraction in &java_file.result.extractions {
@@ -293,20 +302,18 @@ impl GraphBuilder {
         calls
     }
 
-    fn add_java_method_nodes(
-        input: &Path,
+    fn add_java_method_nodes_from_parsed(
+        java_results: &[crate::parser::java_method::JavaParseResult],
         graph: &mut CodeGraph,
         _proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let java_results = crate::parser::java_method::parse_java_directory(input);
-
         let mut class_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut method_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut simple_name_to_fqn: HashMap<String, String> = HashMap::new();
         let mut import_map: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
 
-        for result in &java_results {
+        for result in java_results {
             let mut file_imports = HashMap::new();
             for import in &result.imports {
                 if let Some(simple) = import.rsplit('.').next() {
@@ -319,7 +326,7 @@ impl GraphBuilder {
             }
         }
 
-        for result in &java_results {
+        for result in java_results {
             for class in &result.classes {
                 let node = Node::JavaClass {
                     fqn: class.fqn.clone(),
@@ -337,7 +344,7 @@ impl GraphBuilder {
             }
         }
 
-        for result in &java_results {
+        for result in java_results {
             for class in &result.classes {
                 let class_idx = class_index[&class.fqn];
                 if let Some(extends_name) = &class.extends {
@@ -383,7 +390,7 @@ impl GraphBuilder {
             }
         }
 
-        for result in &java_results {
+        for result in java_results {
             for method in &result.methods {
                 let method_fqn = format!("{}.{}", method.class_fqn, method.name);
                 let node = Node::JavaMethod {
@@ -403,7 +410,7 @@ impl GraphBuilder {
             }
         }
 
-        for result in &java_results {
+        for result in java_results {
             for method in &result.methods {
                 let method_fqn = format!("{}.{}", method.class_fqn, method.name);
                 let method_idx = method_index[&method_fqn];
@@ -516,8 +523,6 @@ impl GraphBuilder {
         }
     }
 }
-
-use std::path::PathBuf;
 
 fn resolve_fqn(
     simple_name: &str,

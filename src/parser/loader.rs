@@ -1,7 +1,6 @@
 use crate::error::{CodeWebError, Result};
 use ogsql_parser::{StatementInfo, Tokenizer};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 pub struct ParsedFile {
     pub path: PathBuf,
@@ -10,47 +9,52 @@ pub struct ParsedFile {
 
 pub struct AllParsedFiles {
     pub sql_files: Vec<ParsedFile>,
-    pub java_count: usize,
-    pub ibatis_count: usize,
+    pub java_files: Vec<crate::parser::java_loader::JavaParsedFile>,
+    pub ibatis_files: Vec<crate::parser::ibatis_loader::IbatisParsedFile>,
+    pub java_method_results: Vec<crate::parser::java_method::JavaParseResult>,
 }
 
 pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
-    let sql_files = load_sql_files_inner(input);
-    let java_files = crate::parser::java_loader::load_java_files(input);
-    let ibatis_files = crate::parser::ibatis_loader::load_ibatis_files(input);
+    let scanned = crate::parser::scanner::scan_directory(input);
 
-    let total = sql_files.len() + java_files.len() + ibatis_files.len();
-    if total == 0 {
+    if scanned.sql_files.is_empty() && scanned.java_files.is_empty() && scanned.xml_files.is_empty()
+    {
         return Err(CodeWebError::NoFilesFound {
             path: input.to_path_buf(),
         });
     }
 
+    let sql_files = parse_sql_files(&scanned.sql_files);
+    let java_files = crate::parser::java_loader::load_java_files_from_paths(&scanned.java_files);
+    let ibatis_files =
+        crate::parser::ibatis_loader::load_ibatis_files_from_paths(&scanned.xml_files);
+    let java_method_results =
+        crate::parser::java_method::parse_java_files_from_paths(&scanned.java_files);
+
     Ok(AllParsedFiles {
         sql_files,
-        java_count: java_files.len(),
-        ibatis_count: ibatis_files.len(),
+        java_files,
+        ibatis_files,
+        java_method_results,
     })
 }
 
 pub fn load_sql_files(input: &Path) -> Result<Vec<ParsedFile>> {
-    let files = load_sql_files_inner(input);
-    if files.is_empty() {
+    let scanned = crate::parser::scanner::scan_directory(input);
+    if scanned.sql_files.is_empty() {
         return Err(CodeWebError::NoFilesFound {
             path: input.to_path_buf(),
         });
     }
-    Ok(files)
+    Ok(parse_sql_files(&scanned.sql_files))
 }
 
-fn load_sql_files_inner(input: &Path) -> Vec<ParsedFile> {
-    let sql_files = collect_files_by_ext(input, "sql");
+fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
     let mut parsed = Vec::new();
-
-    for path in sql_files {
-        match parse_file(&path) {
+    for path in paths {
+        match parse_file(path) {
             Ok(stmts) => parsed.push(ParsedFile {
-                path,
+                path: path.clone(),
                 statements: stmts,
             }),
             Err(e) => {
@@ -58,25 +62,7 @@ fn load_sql_files_inner(input: &Path) -> Vec<ParsedFile> {
             }
         }
     }
-
     parsed
-}
-
-fn collect_files_by_ext(input: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if input.is_file() {
-        if input.extension().is_some_and(|e| e == ext) {
-            files.push(input.to_path_buf());
-        }
-    } else {
-        for entry in WalkDir::new(input).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.into_path();
-            if path.extension().is_some_and(|e| e == ext) {
-                files.push(path);
-            }
-        }
-    }
-    files
 }
 
 fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {

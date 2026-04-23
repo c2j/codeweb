@@ -3,13 +3,18 @@ pub mod ibatis_loader;
 pub mod java_loader;
 pub mod java_method;
 mod loader;
+pub mod scanner;
 
 pub use extractor::{CallEdge, CallExtractor};
-pub use ibatis_loader::load_ibatis_files;
-pub use java_loader::load_java_files;
+#[allow(unused_imports)]
+pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
+#[allow(unused_imports)]
+pub use java_loader::{load_java_files_from_paths, JavaParsedFile};
 #[allow(unused_imports)]
 pub use java_method::{
-    parse_java_directory, parse_java_file, JavaClassInfo, JavaMethodInfo, JavaParseResult,
+    parse_java_file, parse_java_files_from_paths, JavaClassInfo, JavaMethodInfo, JavaParseResult,
     MethodCallInfo,
 };
 pub use loader::{load_all_files, load_sql_files, AllParsedFiles, ParsedFile};
+#[allow(unused_imports)]
+pub use scanner::{scan_directory, ScannedFiles};

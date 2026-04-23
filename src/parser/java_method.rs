@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use tree_sitter::Parser;
 
@@ -356,37 +355,17 @@ pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
     })
 }
 
-pub fn parse_java_directory(input: &Path) -> Vec<JavaParseResult> {
-    let java_files = collect_java_files(input);
+pub fn parse_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParseResult> {
     let mut results = Vec::new();
-
-    for path in java_files {
-        match parse_java_file(&path) {
+    for path in paths {
+        match parse_java_file(path) {
             Ok(result) => results.push(result),
             Err(e) => {
-                eprintln!("warning: skipping {}: {}", path.display(), e);
+                eprintln!("warning: java method parse {}: {}", path.display(), e);
             }
         }
     }
-
     results
-}
-
-fn collect_java_files(input: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if input.is_file() {
-        if input.extension().is_some_and(|ext| ext == "java") {
-            files.push(input.to_path_buf());
-        }
-    } else {
-        for entry in WalkDir::new(input).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.into_path();
-            if path.extension().is_some_and(|ext| ext == "java") {
-                files.push(path);
-            }
-        }
-    }
-    files
 }
 
 // Tests

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use ogsql_parser::java::{
     extract_sql_from_java, ExtractionMethod, JavaExtractConfig, JavaExtractResult,
@@ -9,37 +8,17 @@ pub struct JavaParsedFile {
     pub result: JavaExtractResult,
 }
 
-pub fn load_java_files(input: &Path) -> Vec<JavaParsedFile> {
-    let java_files = collect_java_files(input);
+pub fn load_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParsedFile> {
     let mut parsed = Vec::new();
-
-    for path in java_files {
-        match load_java_file(&path) {
+    for path in paths {
+        match load_java_file(path) {
             Ok(result) => parsed.push(JavaParsedFile { result }),
             Err(e) => {
                 eprintln!("warning: skipping {}: {}", path.display(), e);
             }
         }
     }
-
     parsed
-}
-
-fn collect_java_files(input: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if input.is_file() {
-        if input.extension().is_some_and(|ext| ext == "java") {
-            files.push(input.to_path_buf());
-        }
-    } else {
-        for entry in WalkDir::new(input).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.into_path();
-            if path.extension().is_some_and(|ext| ext == "java") {
-                files.push(path);
-            }
-        }
-    }
-    files
 }
 
 fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {

@@ -58,11 +58,11 @@ fn run() -> Result<()> {
         eprintln!(
             "loaded {} SQL, {} Java, {} XML file(s)",
             all.sql_files.len(),
-            all.java_count,
-            all.ibatis_count
+            all.java_files.len(),
+            all.ibatis_files.len()
         );
         let builder = GraphBuilder::new();
-        builder.build_all(&all, &cli.input)
+        builder.build_all(&all)
     };
 
     print_stats(&graph, cli.include_unresolved);
