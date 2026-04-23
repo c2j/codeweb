@@ -9,16 +9,16 @@ pub struct JavaParsedFile {
 }
 
 pub fn load_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParsedFile> {
-    let mut parsed = Vec::new();
-    for path in paths {
-        match load_java_file(path) {
-            Ok(result) => parsed.push(JavaParsedFile { result }),
-            Err(e) => {
-                eprintln!("warning: skipping {}: {}", path.display(), e);
-            }
-        }
-    }
-    parsed
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            load_java_file(path)
+                .ok()
+                .map(|result| JavaParsedFile { result })
+        })
+        .collect()
 }
 
 fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {

@@ -1,8 +1,18 @@
 #![allow(dead_code)]
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tree_sitter::Parser;
+
+thread_local! {
+    static JAVA_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_java::LANGUAGE.into());
+        p.set_timeout_micros(5_000_000);
+        p
+    });
+}
 
 // Public data structures
 // ---------------------------------------------------------------------------
@@ -334,14 +344,9 @@ pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
     let source = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
     let source_bytes = source.as_bytes();
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .map_err(|e| format!("language error: {}", e))?;
-
-    let tree = parser
-        .parse(source_bytes, None)
-        .ok_or_else(|| "parse returned None".to_string())?;
+    let tree = JAVA_PARSER
+        .with(|p| p.borrow_mut().parse(source_bytes, None))
+        .ok_or_else(|| format!("parse timeout or failure: {}", path.display()))?;
 
     let mut walker = JavaTreeWalker::new(source_bytes, path);
     walker.walk_with_methods(tree.root_node());
@@ -356,16 +361,12 @@ pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
 }
 
 pub fn parse_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParseResult> {
-    let mut results = Vec::new();
-    for path in paths {
-        match parse_java_file(path) {
-            Ok(result) => results.push(result),
-            Err(e) => {
-                eprintln!("warning: java method parse {}: {}", path.display(), e);
-            }
-        }
-    }
-    results
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| parse_java_file(path).ok())
+        .collect()
 }
 
 // Tests

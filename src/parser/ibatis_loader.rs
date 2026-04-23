@@ -7,16 +7,16 @@ pub struct IbatisParsedFile {
 }
 
 pub fn load_ibatis_files_from_paths(paths: &[PathBuf]) -> Vec<IbatisParsedFile> {
-    let mut parsed = Vec::new();
-    for path in paths {
-        match load_ibatis_file(path) {
-            Ok(result) => parsed.push(IbatisParsedFile { result }),
-            Err(e) => {
-                eprintln!("warning: skipping {}: {}", path.display(), e);
-            }
-        }
-    }
-    parsed
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            load_ibatis_file(path)
+                .ok()
+                .map(|result| IbatisParsedFile { result })
+        })
+        .collect()
 }
 
 fn load_ibatis_file(path: &Path) -> Result<ParsedMapper, String> {

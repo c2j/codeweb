@@ -326,6 +326,18 @@ impl GraphBuilder {
             }
         }
 
+        // Reverse index: method_name → [(mapper_key, node_idx)] for O(1) lookup
+        let mut method_to_mappers: HashMap<String, Vec<(String, petgraph::graph::NodeIndex)>> =
+            HashMap::new();
+        for (key, &idx) in mapper_index.iter() {
+            if let Some((_, method)) = key.rsplit_once('.') {
+                method_to_mappers
+                    .entry(method.to_string())
+                    .or_default()
+                    .push((key.clone(), idx));
+            }
+        }
+
         for result in java_results {
             for class in &result.classes {
                 let node = Node::JavaClass {
@@ -449,14 +461,14 @@ impl GraphBuilder {
                             }
 
                             let mut found_mapper = false;
-                            for (key, &mapper_idx) in mapper_index.iter() {
-                                if key.ends_with(&format!(".{}", call.method)) {
+                            if let Some(candidates) = method_to_mappers.get(&call.method) {
+                                for (key, mapper_idx) in candidates {
                                     if let Some((ns, _)) = key.rsplit_once('.') {
                                         let ns_simple = ns.rsplit('.').next().unwrap_or(ns);
                                         if names_match(obj, ns_simple) {
                                             graph.add_edge(
                                                 method_idx,
-                                                mapper_idx,
+                                                *mapper_idx,
                                                 Edge::InvokesMapper {
                                                     location: location.clone(),
                                                 },
@@ -481,16 +493,15 @@ impl GraphBuilder {
                                 continue;
                             }
                         } else {
-                            // resolve_fqn failed — try heuristic mapper matching against namespace suffix
                             let mut found_mapper = false;
-                            for (key, &mapper_idx) in mapper_index.iter() {
-                                if key.ends_with(&format!(".{}", call.method)) {
+                            if let Some(candidates) = method_to_mappers.get(&call.method) {
+                                for (key, mapper_idx) in candidates {
                                     if let Some((ns, _)) = key.rsplit_once('.') {
                                         let ns_simple = ns.rsplit('.').next().unwrap_or(ns);
                                         if names_match(obj, ns_simple) {
                                             graph.add_edge(
                                                 method_idx,
-                                                mapper_idx,
+                                                *mapper_idx,
                                                 Edge::InvokesMapper {
                                                     location: location.clone(),
                                                 },

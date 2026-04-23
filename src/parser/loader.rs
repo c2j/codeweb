@@ -50,19 +50,17 @@ pub fn load_sql_files(input: &Path) -> Result<Vec<ParsedFile>> {
 }
 
 fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
-    let mut parsed = Vec::new();
-    for path in paths {
-        match parse_file(path) {
-            Ok(stmts) => parsed.push(ParsedFile {
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            parse_file(path).ok().map(|statements| ParsedFile {
                 path: path.clone(),
-                statements: stmts,
-            }),
-            Err(e) => {
-                eprintln!("warning: skipping {}: {}", path.display(), e);
-            }
-        }
-    }
-    parsed
+                statements,
+            })
+        })
+        .collect()
 }
 
 fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {
