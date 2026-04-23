@@ -370,3 +370,173 @@ fn test_java_extends_implements() {
     assert!(has_extends, "Expected extends edge");
     assert!(has_implements, "Expected implements edge");
 }
+
+#[test]
+fn test_e2e_full_chain() {
+    let demo_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("lib")
+        .join("codeweb-e2e-demo");
+
+    let output = run_codeweb(&[demo_dir.to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let node_types: std::collections::HashSet<&str> =
+        nodes.iter().filter_map(|n| n["type"].as_str()).collect();
+    let edge_types: std::collections::HashSet<&str> =
+        edges.iter().filter_map(|e| e["type"].as_str()).collect();
+
+    assert!(
+        node_types.contains("procedure"),
+        "Expected procedure nodes (SQL stored procs/functions)"
+    );
+    assert!(
+        node_types.contains("mapped_statement"),
+        "Expected mapped_statement nodes (MyBatis XML)"
+    );
+    assert!(
+        node_types.contains("java_class"),
+        "Expected java_class nodes"
+    );
+    assert!(
+        node_types.contains("java_method"),
+        "Expected java_method nodes"
+    );
+    assert!(
+        node_types.contains("table"),
+        "Expected table nodes (from SQL DML references)"
+    );
+
+    assert!(
+        edge_types.contains("calls_procedure"),
+        "Expected calls_procedure edges: mapper → stored proc"
+    );
+    assert!(
+        edge_types.contains("invokes_mapper"),
+        "Expected invokes_mapper edges: Java method → mapper"
+    );
+    assert!(
+        edge_types.contains("calls_java"),
+        "Expected calls_java edges: Java method → Java method"
+    );
+    assert!(
+        edge_types.contains("extends"),
+        "Expected extends edge: ReportService → BaseService"
+    );
+    assert!(
+        edge_types.contains("contains_method"),
+        "Expected contains_method edges: class → method"
+    );
+    assert!(
+        edge_types.contains("references_table"),
+        "Expected references_table edges: procedure/mapper → table"
+    );
+
+    let proc_names: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["type"] == "procedure")
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert!(
+        proc_names.contains(&"create_user"),
+        "Expected pkg_user_mgmt.create_user procedure"
+    );
+    assert!(
+        proc_names.contains(&"deactivate_user"),
+        "Expected pkg_user_mgmt.deactivate_user procedure"
+    );
+    assert!(
+        proc_names.contains(&"send_event"),
+        "Expected pkg_notify.send_event function"
+    );
+
+    let table_names: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["type"] == "table")
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert!(
+        table_names.contains(&"t_users"),
+        "Expected t_users table node"
+    );
+    assert!(
+        table_names.contains(&"t_orders"),
+        "Expected t_orders table node"
+    );
+
+    let refs_table_edges: Vec<&serde_json::Value> = edges
+        .iter()
+        .filter(|e| e["type"] == "references_table")
+        .collect();
+    assert!(
+        refs_table_edges.len() >= 5,
+        "Expected >= 5 references_table edges, got {}",
+        refs_table_edges.len()
+    );
+
+    let calls_proc_edges: Vec<&serde_json::Value> = edges
+        .iter()
+        .filter(|e| e["type"] == "calls_procedure")
+        .collect();
+    assert!(
+        calls_proc_edges.len() >= 3,
+        "Expected >= 3 calls_procedure edges, got {}",
+        calls_proc_edges.len()
+    );
+
+    let mapper_to_proc: Vec<(usize, usize)> = calls_proc_edges
+        .iter()
+        .filter_map(|e| {
+            let src = e["source"].as_u64()? as usize;
+            let tgt = e["target"].as_u64()? as usize;
+            let src_type = nodes.get(src)?["type"].as_str()?;
+            let tgt_type = nodes.get(tgt)?["type"].as_str()?;
+            if src_type == "mapped_statement" && tgt_type == "procedure" {
+                Some((src, tgt))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !mapper_to_proc.is_empty(),
+        "Expected at least one mapped_statement → procedure chain"
+    );
+
+    let invokes_mapper_edges: Vec<&serde_json::Value> = edges
+        .iter()
+        .filter(|e| e["type"] == "invokes_mapper")
+        .collect();
+    assert!(
+        invokes_mapper_edges.len() >= 5,
+        "Expected >= 5 invokes_mapper edges, got {}",
+        invokes_mapper_edges.len()
+    );
+
+    let java_to_mapper: Vec<(usize, usize)> = invokes_mapper_edges
+        .iter()
+        .filter_map(|e| {
+            let src = e["source"].as_u64()? as usize;
+            let tgt = e["target"].as_u64()? as usize;
+            let src_type = nodes.get(src)?["type"].as_str()?;
+            let tgt_type = nodes.get(tgt)?["type"].as_str()?;
+            if src_type == "java_method" && tgt_type == "mapped_statement" {
+                Some((src, tgt))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !java_to_mapper.is_empty(),
+        "Expected at least one java_method → mapped_statement chain"
+    );
+}

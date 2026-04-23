@@ -15,10 +15,12 @@ impl GraphBuilder {
     pub fn build(&self, files: &[ParsedFile]) -> CodeGraph {
         let mut graph = CodeGraph::new();
         let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
         Self::create_procedure_nodes(files, &mut graph, &mut proc_index);
         let edges = Self::collect_call_edges(files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
+        Self::add_table_refs_from_sql(files, &mut graph, &proc_index, &mut table_index);
 
         graph
     }
@@ -27,22 +29,26 @@ impl GraphBuilder {
         let mut graph = CodeGraph::new();
         let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
         let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
         Self::create_procedure_nodes(&all.sql_files, &mut graph, &mut proc_index);
         let edges = Self::collect_call_edges(&all.sql_files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
+        Self::add_table_refs_from_sql(&all.sql_files, &mut graph, &proc_index, &mut table_index);
 
         Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
             &mut graph,
             &mut proc_index,
             &mut mapper_index,
+            &mut table_index,
         );
         Self::add_java_nodes_from_parsed(
             &all.java_files,
             &mut graph,
             &mut proc_index,
             &mapper_index,
+            &mut table_index,
         );
         Self::add_java_method_nodes_from_parsed(
             &all.java_method_results,
@@ -168,6 +174,7 @@ impl GraphBuilder {
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for ibatis_file in ibatis_files {
             let xml_path =
@@ -210,6 +217,14 @@ impl GraphBuilder {
                             },
                         );
                     }
+
+                    Self::extract_and_add_table_refs(
+                        statements,
+                        &xml_path,
+                        node_idx,
+                        graph,
+                        table_index,
+                    );
                 }
             }
         }
@@ -220,6 +235,7 @@ impl GraphBuilder {
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for java_file in java_files {
             let java_path = PathBuf::from(&java_file.result.file_path);
@@ -263,6 +279,14 @@ impl GraphBuilder {
                             },
                         );
                     }
+
+                    Self::extract_and_add_table_refs(
+                        &parse_result.statements,
+                        &java_path,
+                        node_idx,
+                        graph,
+                        table_index,
+                    );
                 }
 
                 if let (Some(class), Some(method)) = (
@@ -300,6 +324,70 @@ impl GraphBuilder {
             }
         }
         calls
+    }
+
+    fn add_table_refs_from_sql(
+        files: &[ParsedFile],
+        graph: &mut CodeGraph,
+        proc_index: &HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        for file in files {
+            for info in &file.statements {
+                let proc_id = match &info.statement {
+                    Statement::CreateProcedure(p) => Some(ProcedureId::from_object_name(&p.name)),
+                    Statement::CreateFunction(f) => Some(ProcedureId::from_object_name(&f.name)),
+                    _ => None,
+                };
+                let proc_idx = match proc_id.as_ref().and_then(|id| proc_index.get(id)) {
+                    Some(&idx) => idx,
+                    None => continue,
+                };
+                Self::extract_and_add_table_refs(
+                    std::slice::from_ref(info),
+                    &file.path,
+                    proc_idx,
+                    graph,
+                    table_index,
+                );
+            }
+        }
+    }
+
+    fn extract_and_add_table_refs(
+        statements: &[ogsql_parser::StatementInfo],
+        file_path: &std::path::Path,
+        source_idx: petgraph::graph::NodeIndex,
+        graph: &mut CodeGraph,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        for info in statements {
+            let mut extractor = crate::parser::TableRefExtractor::new();
+            walk_statement(&mut extractor, &info.statement);
+            for tref in &extractor.tables {
+                let key = match &tref.schema {
+                    Some(s) => format!("{}.{}", s, tref.name),
+                    None => tref.name.clone(),
+                };
+                let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
+                    let node = Node::Table {
+                        schema: tref.schema.clone(),
+                        name: tref.name.clone(),
+                    };
+                    graph.add_node(node)
+                });
+                graph.add_edge(
+                    source_idx,
+                    table_idx,
+                    Edge::ReferencesTable {
+                        location: SourceLocation {
+                            file: file_path.to_path_buf(),
+                            line: info.start_line,
+                        },
+                    },
+                );
+            }
+        }
     }
 
     fn add_java_method_nodes_from_parsed(

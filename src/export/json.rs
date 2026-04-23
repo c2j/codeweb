@@ -57,6 +57,14 @@ enum NodeKindJson {
         file: String,
         line: usize,
     },
+    Table {
+        schema: Option<String>,
+        name: String,
+    },
+    View {
+        schema: Option<String>,
+        name: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -90,6 +98,8 @@ enum EdgeKindJson {
     Extends { file: String, line: usize },
     #[serde(rename = "implements")]
     Implements { file: String, line: usize },
+    #[serde(rename = "references_table")]
+    ReferencesTable { file: String, line: usize },
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
@@ -178,6 +188,20 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: *line,
                 },
             },
+            Node::Table { schema, name } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Table {
+                    schema: schema.clone(),
+                    name: name.clone(),
+                },
+            },
+            Node::View { schema, name } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::View {
+                    schema: schema.clone(),
+                    name: name.clone(),
+                },
+            },
         };
         nodes.push(node_json);
     }
@@ -246,6 +270,14 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::Implements {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::ReferencesTable { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::ReferencesTable {
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },

@@ -100,6 +100,8 @@ fn print_stats(graph: &CodeGraph, include_unresolved: bool) {
     let mut java_sql = 0usize;
     let mut java_methods = 0usize;
     let mut java_classes = 0usize;
+    let mut tables = 0usize;
+    let mut views = 0usize;
 
     for idx in graph.node_indices() {
         match &graph[idx] {
@@ -109,6 +111,8 @@ fn print_stats(graph: &CodeGraph, include_unresolved: bool) {
             Node::JavaSql { .. } => java_sql += 1,
             Node::JavaMethod { .. } => java_methods += 1,
             Node::JavaClass { .. } => java_classes += 1,
+            Node::Table { .. } => tables += 1,
+            Node::View { .. } => views += 1,
         }
     }
 
@@ -116,13 +120,13 @@ fn print_stats(graph: &CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} unresolved, {} edges",
-            procedures, mappers, java_sql, java_methods, java_classes, unresolved, edges
+            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} unresolved, {} edges",
+            procedures, mappers, java_sql, java_methods, java_classes, tables, views, unresolved, edges
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} edges",
-            procedures, mappers, java_sql, java_methods, java_classes, edges
+            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} edges",
+            procedures, mappers, java_sql, java_methods, java_classes, tables, views, edges
         );
     }
 }

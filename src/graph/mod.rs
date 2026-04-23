@@ -108,6 +108,16 @@ pub enum Node {
         file: PathBuf,
         line: usize,
     },
+    /// A database table.
+    Table {
+        schema: Option<String>,
+        name: String,
+    },
+    #[allow(dead_code)]
+    View {
+        schema: Option<String>,
+        name: String,
+    },
 }
 
 /// An edge in the call graph.
@@ -134,6 +144,8 @@ pub enum Edge {
     Extends { location: SourceLocation },
     /// A Java class implements an interface.
     Implements { location: SourceLocation },
+    /// A statement references a table or view.
+    ReferencesTable { location: SourceLocation },
 }
 
 /// The call graph itself.
@@ -149,6 +161,8 @@ impl Node {
             Node::JavaSql { java_file, .. } => java_file,
             Node::JavaMethod { file, .. } => file,
             Node::JavaClass { file, .. } => file,
+            Node::Table { .. } => Path::new(""),
+            Node::View { .. } => Path::new(""),
         }
     }
 }

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.OrderDao">
+    <select id="findByUserId" resultType="map">
+        SELECT * FROM t_orders WHERE user_id = #{userId} AND status = 'OPEN'
+    </select>
+
+    <update id="cancelOrder">
+        UPDATE t_orders SET status = 'CANCELLED' WHERE id = #{orderId}
+    </update>
+
+    <select id="computeScore" resultType="int">
+        SELECT pkg_user_mgmt.compute_level(#{score})
+    </select>
+
+    <update id="cancelByUserId">
+        CALL pkg_user_mgmt.deactivate_user(#{userId})
+    </update>
+</mapper>

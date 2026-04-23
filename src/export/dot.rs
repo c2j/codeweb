@@ -35,6 +35,20 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 name, class_fqn, ..
             } => (format!("{}.{}", class_fqn, name), "diamond", ""),
             Node::JavaClass { fqn, .. } => (fqn.clone(), "folder", ""),
+            Node::Table { schema, name } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, "cylinder", ", style=filled, fillcolor=lightyellow")
+            }
+            Node::View { schema, name } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, "cylinder", ", style=filled, fillcolor=lightcyan")
+            }
         };
         let escaped = dot_escape(&label);
         out.push_str(&format!(
@@ -62,6 +76,7 @@ pub fn to_dot(graph: &CodeGraph) -> String {
             Edge::Extends { .. } => ("label=\"extends\"".to_string(), "style=bold,"),
             Edge::Implements { .. } => ("label=\"implements\"".to_string(), "style=dashed,"),
             Edge::DirectCall { .. } => (String::new(), ""),
+            Edge::ReferencesTable { .. } => (String::new(), "color=purple,"),
         };
         out.push_str(&format!(
             "    {} -> {} [{}{}];\n",

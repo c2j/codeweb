@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.UserDao">
+    <select id="findById" resultType="map">
+        SELECT * FROM t_users WHERE id = #{id}
+    </select>
+
+    <select id="findAll" resultType="map">
+        SELECT * FROM t_users WHERE status = 'ACTIVE'
+    </select>
+
+    <insert id="insertUser">
+        CALL pkg_user_mgmt.create_user(#{name}, #{email})
+    </insert>
+
+    <update id="deactivateUser">
+        CALL pkg_user_mgmt.deactivate_user(#{userId})
+    </update>
+</mapper>

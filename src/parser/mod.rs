@@ -5,7 +5,8 @@ pub mod java_method;
 mod loader;
 pub mod scanner;
 
-pub use extractor::{CallEdge, CallExtractor};
+#[allow(unused_imports)]
+pub use extractor::{CallEdge, CallExtractor, TableRef, TableRefExtractor};
 #[allow(unused_imports)]
 pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
 #[allow(unused_imports)]
