@@ -64,7 +64,9 @@ fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
 }
 
 fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {
-    let sql = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let sql = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
 
     let tokens = Tokenizer::new(&sql)
         .tokenize()

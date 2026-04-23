@@ -22,7 +22,9 @@ pub fn load_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParsedFile> {
 }
 
 fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {
-    let source = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let source = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     let file_path = path.to_string_lossy();
     let config = JavaExtractConfig::default();
     let result = extract_sql_from_java(&source, &file_path, &config);

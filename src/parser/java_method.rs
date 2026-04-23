@@ -341,14 +341,13 @@ impl<'a> JavaTreeWalker<'a> {
 // ---------------------------------------------------------------------------
 
 pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
-    let source = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
-    let source_bytes = source.as_bytes();
+    let source_bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
 
     let tree = JAVA_PARSER
-        .with(|p| p.borrow_mut().parse(source_bytes, None))
+        .with(|p| p.borrow_mut().parse(&source_bytes, None))
         .ok_or_else(|| format!("parse timeout or failure: {}", path.display()))?;
 
-    let mut walker = JavaTreeWalker::new(source_bytes, path);
+    let mut walker = JavaTreeWalker::new(&source_bytes, path);
     walker.walk_with_methods(tree.root_node());
 
     Ok(JavaParseResult {
