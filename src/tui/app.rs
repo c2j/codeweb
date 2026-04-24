@@ -3,6 +3,7 @@ use crate::graph::traverse;
 use crate::graph::Node;
 use crate::project::Project;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -473,7 +474,12 @@ impl App {
         if let Some(store) = self.project.store() {
             let graph = store.graph();
 
-            if self.filter_low_degree {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(area);
+
+            let selected_node_idx = if self.filter_low_degree {
                 let filtered = traverse::low_degree_nodes(graph, self.filter_threshold);
                 let items: Vec<ListItem> = filtered
                     .iter()
@@ -496,12 +502,17 @@ impl App {
                         filtered.len()
                     )))
                     .highlight_style(Style::default().bg(Color::DarkGray));
-                f.render_stateful_widget(list, area, &mut self.list_state.clone());
+                f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
+
+                self.list_state
+                    .selected()
+                    .and_then(|s| filtered.into_iter().nth(s).map(|d| d.idx))
             } else {
-                let items: Vec<ListItem> = graph
-                    .node_indices()
+                let indices: Vec<_> = graph.node_indices().collect();
+                let items: Vec<ListItem> = indices
+                    .iter()
                     .map(|idx| {
-                        let node = &graph[idx];
+                        let node = &graph[*idx];
                         let (tag, color) = node_tag(node);
                         let key = NodeKey::from_node(node);
                         ListItem::new(Line::from(vec![
@@ -518,7 +529,83 @@ impl App {
                             .title(format!(" Graph Nodes ({}) ", graph.node_count())),
                     )
                     .highlight_style(Style::default().bg(Color::DarkGray));
-                f.render_stateful_widget(list, area, &mut self.list_state.clone());
+                f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
+
+                self.list_state
+                    .selected()
+                    .and_then(|s| indices.into_iter().nth(s))
+            };
+
+            if let Some(node_idx) = selected_node_idx {
+                let node = &graph[node_idx];
+                let key = NodeKey::from_node(node);
+                let (tag, color) = node_tag(node);
+
+                let mut lines: Vec<Line> = vec![
+                    Line::from(vec![
+                        Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
+                        Span::styled(
+                            key.to_string(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                ];
+
+                let incoming: Vec<_> = graph
+                    .edges_directed(node_idx, petgraph::Direction::Incoming)
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!("── INCOMING ({}) ──", incoming.len()),
+                    Style::default().fg(Color::Cyan),
+                )));
+                for edge in &incoming {
+                    let src_idx = edge.source();
+                    let src_key = NodeKey::from_node(&graph[src_idx]);
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(src_key.to_string(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!(" → [{}]", edge_tag(edge.weight())),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
+
+                lines.push(Line::from(""));
+                let outgoing: Vec<_> = graph
+                    .edges_directed(node_idx, petgraph::Direction::Outgoing)
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!("── OUTGOING ({}) ──", outgoing.len()),
+                    Style::default().fg(Color::Green),
+                )));
+                for edge in &outgoing {
+                    let dst_idx = edge.target();
+                    let dst_key = NodeKey::from_node(&graph[dst_idx]);
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(dst_key.to_string(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!(" → [{}]", edge_tag(edge.weight())),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
+
+                let para = Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Node Detail "),
+                );
+                f.render_widget(para, chunks[1]);
+            } else {
+                let para = Paragraph::new("Select a node to view details").block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Node Detail "),
+                );
+                f.render_widget(para, chunks[1]);
             }
         }
     }
@@ -587,5 +674,19 @@ fn node_tag(node: &Node) -> (&'static str, Color) {
         Node::JavaClass { .. } => ("class", Color::Yellow),
         Node::Table { .. } => ("table", Color::Yellow),
         Node::View { .. } => ("view", Color::Blue),
+    }
+}
+
+fn edge_tag(edge: &crate::graph::Edge) -> &'static str {
+    match edge {
+        crate::graph::Edge::DirectCall { .. } => "direct",
+        crate::graph::Edge::DynamicCall { .. } => "dynamic",
+        crate::graph::Edge::CallsProcedure { .. } => "calls_proc",
+        crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
+        crate::graph::Edge::CallsJava { .. } => "calls_java",
+        crate::graph::Edge::ContainsMethod => "contains",
+        crate::graph::Edge::Extends { .. } => "extends",
+        crate::graph::Edge::Implements { .. } => "implements",
+        crate::graph::Edge::ReferencesTable { .. } => "refs_table",
     }
 }
