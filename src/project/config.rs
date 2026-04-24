@@ -65,18 +65,27 @@ impl ProjectConfig {
     }
 
     pub fn default_template(name: &str) -> String {
+        Self::template_with_paths(name, &[".".to_string()])
+    }
+
+    pub fn template_with_paths(name: &str, paths: &[String]) -> String {
+        let paths_toml = paths
+            .iter()
+            .map(|p| format!("\"{}\"", p))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             r#"[project]
 name = "{}"
 
 [analysis]
-paths = ["."]
+paths = [{}]
 
 [store]
 path = ".codeweb/store.bincode"
 format = "bincode"
 "#,
-            name
+            name, paths_toml
         )
     }
 }

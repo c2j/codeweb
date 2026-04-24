@@ -55,25 +55,37 @@ impl Project {
         })
     }
 
-    pub fn init(dir: &Path, name: &str) -> Result<Self> {
-        let dir = if dir.is_absolute() {
-            dir.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_default().join(dir)
-        };
+    pub fn init(source_dirs: &[PathBuf], name: &str) -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_default();
 
-        let toml_path = dir.join(CODEWEB_TOML);
+        let toml_path = cwd.join(CODEWEB_TOML);
         if toml_path.exists() {
             return Err(CodeWebError::ProjectAlreadyExists { path: toml_path });
         }
 
-        let content = ProjectConfig::default_template(name);
+        let paths: Vec<String> = if source_dirs.is_empty() {
+            vec![".".to_string()]
+        } else {
+            source_dirs
+                .iter()
+                .map(|d| {
+                    if d.is_absolute() {
+                        d.to_string_lossy().to_string()
+                    } else {
+                        let relative = pathdiff::diff_paths(d, &cwd).unwrap_or_else(|| d.clone());
+                        relative.to_string_lossy().to_string()
+                    }
+                })
+                .collect()
+        };
+
+        let content = ProjectConfig::template_with_paths(name, &paths);
         std::fs::write(&toml_path, &content).map_err(|e| CodeWebError::FileRead {
             path: toml_path.clone(),
             source: e,
         })?;
 
-        let codeweb_dir = dir.join(".codeweb");
+        let codeweb_dir = cwd.join(".codeweb");
         std::fs::create_dir_all(&codeweb_dir).map_err(|e| CodeWebError::FileRead {
             path: codeweb_dir,
             source: e,

@@ -52,9 +52,9 @@ enum Commands {
         /// Project name
         name: String,
 
-        /// Directory to initialize (default: current directory)
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
+        /// Source directories to analyze (can specify multiple)
+        #[arg(short, long, num_args = 1..)]
+        dir: Vec<PathBuf>,
     },
 
     /// Analyze project (full or incremental)
@@ -150,8 +150,8 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_init(name: &str, dir: &Path) -> Result<()> {
-    let mut proj = project::Project::init(dir, name)?;
+fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {
+    let mut proj = project::Project::init(dirs, name)?;
     eprintln!(
         "Initialized project '{}' in {}",
         proj.name(),
