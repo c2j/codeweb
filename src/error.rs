@@ -13,6 +13,15 @@ pub enum CodeWebError {
 
     #[error("export error: {message}")]
     ExportError { message: String },
+
+    #[error("project not found (searched from {search_from})")]
+    ProjectNotFound { search_from: PathBuf },
+
+    #[error("project already exists at {path}")]
+    ProjectAlreadyExists { path: PathBuf },
+
+    #[error("config error: {message}")]
+    ConfigError { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, CodeWebError>;

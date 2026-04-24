@@ -1,4 +1,5 @@
 mod extractor;
+pub mod fingerprint;
 pub mod ibatis_loader;
 pub mod java_loader;
 pub mod java_method;

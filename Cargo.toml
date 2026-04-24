@@ -6,7 +6,7 @@ description = "Semantic code graph analyzer — call graphs for SQL stored proce
 
 [dependencies]
 ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", features = ["ibatis", "java"] }
-petgraph = "0.7"
+petgraph = { version = "0.7", features = ["serde-1"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +15,10 @@ rayon = "1.10"
 walkdir = "2"
 tree-sitter = "0.24"
 tree-sitter-java = "0.23"
+blake3 = "1"
+globset = "0.4"
+toml = "0.8"
+bincode = "1"
 
 [dev-dependencies]
 tempfile = "3"

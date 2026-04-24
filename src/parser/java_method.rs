@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tree_sitter::Parser;
 
 thread_local! {
@@ -17,7 +18,7 @@ thread_local! {
 // Public data structures
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaClassInfo {
     pub fqn: String,
     pub name: String,
@@ -28,7 +29,7 @@ pub struct JavaClassInfo {
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodCallInfo {
     pub object: Option<String>,
     pub method: String,
@@ -36,7 +37,7 @@ pub struct MethodCallInfo {
     pub line: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaMethodInfo {
     pub name: String,
     pub class_fqn: String,
@@ -46,7 +47,7 @@ pub struct JavaMethodInfo {
     pub calls: Vec<MethodCallInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaParseResult {
     pub file: PathBuf,
     pub package: String,

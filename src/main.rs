@@ -2,6 +2,8 @@ mod error;
 mod export;
 mod graph;
 mod parser;
+#[allow(dead_code)]
+mod project;
 
 use std::io::Write;
 use std::path::PathBuf;

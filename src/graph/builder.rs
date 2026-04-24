@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::graph::key::NodeKey;
+use crate::graph::store::GraphStore;
 use crate::graph::{CodeGraph, Edge, Node, ProcedureId, SourceLocation};
 use crate::parser::{AllParsedFiles, CallEdge, CallExtractor, ParsedFile};
 use ogsql_parser::ast::Statement;
@@ -58,6 +61,42 @@ impl GraphBuilder {
         );
 
         graph
+    }
+
+    #[allow(dead_code)]
+    pub fn build_store(&self, all: &AllParsedFiles, project_name: &str) -> GraphStore {
+        let mut graph = CodeGraph::new();
+        let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+
+        Self::create_procedure_nodes(&all.sql_files, &mut graph, &mut proc_index);
+        let edges = Self::collect_call_edges(&all.sql_files);
+        Self::create_edges(&edges, &mut graph, &mut proc_index);
+        Self::add_table_refs_from_sql(&all.sql_files, &mut graph, &proc_index, &mut table_index);
+
+        Self::add_ibatis_nodes_from_parsed(
+            &all.ibatis_files,
+            &mut graph,
+            &mut proc_index,
+            &mut mapper_index,
+            &mut table_index,
+        );
+        Self::add_java_nodes_from_parsed(
+            &all.java_files,
+            &mut graph,
+            &mut proc_index,
+            &mapper_index,
+            &mut table_index,
+        );
+        Self::add_java_method_nodes_from_parsed(
+            &all.java_method_results,
+            &mut graph,
+            &mut proc_index,
+            &mapper_index,
+        );
+
+        GraphStore::from_graph(project_name, graph)
     }
 
     fn create_procedure_nodes(

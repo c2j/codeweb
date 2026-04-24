@@ -1,11 +1,13 @@
 pub mod builder;
+pub mod key;
+pub mod store;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Unique identifier for a stored procedure or function.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcedureId {
     pub schema: Option<String>,
     pub name: String,
@@ -56,14 +58,14 @@ impl fmt::Display for ProcedureId {
 }
 
 /// Source location within a file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub file: PathBuf,
     pub line: usize,
 }
 
 /// A node in the call graph.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
     /// A resolved procedure or function.
     Procedure {
@@ -121,7 +123,7 @@ pub enum Node {
 }
 
 /// An edge in the call graph.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Edge {
     /// Direct static call to a known procedure.
     DirectCall { location: SourceLocation },
