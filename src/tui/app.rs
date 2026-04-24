@@ -555,42 +555,90 @@ impl App {
                 let incoming: Vec<_> = graph
                     .edges_directed(node_idx, petgraph::Direction::Incoming)
                     .collect();
-                lines.push(Line::from(Span::styled(
-                    format!("── INCOMING ({}) ──", incoming.len()),
-                    Style::default().fg(Color::Cyan),
-                )));
-                for edge in &incoming {
-                    let src_idx = edge.source();
-                    let src_key = NodeKey::from_node(&graph[src_idx]);
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default()),
-                        Span::styled(src_key.to_string(), Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!(" → [{}]", edge_tag(edge.weight())),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
-                }
-
-                lines.push(Line::from(""));
                 let outgoing: Vec<_> = graph
                     .edges_directed(node_idx, petgraph::Direction::Outgoing)
                     .collect();
-                lines.push(Line::from(Span::styled(
-                    format!("── OUTGOING ({}) ──", outgoing.len()),
-                    Style::default().fg(Color::Green),
-                )));
-                for edge in &outgoing {
-                    let dst_idx = edge.target();
-                    let dst_key = NodeKey::from_node(&graph[dst_idx]);
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default()),
-                        Span::styled(dst_key.to_string(), Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!(" → [{}]", edge_tag(edge.weight())),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
+
+                if incoming.is_empty() && outgoing.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  (orphaned — no links)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else if incoming.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("── LINKS ({}) ──", outgoing.len()),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    for edge in &outgoing {
+                        let dst_key = NodeKey::from_node(&graph[edge.target()]);
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default()),
+                            Span::styled(
+                                key.to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!(" ─[{}]─▶ ", edge_tag(edge.weight())),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::styled(dst_key.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                } else if outgoing.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("── LINKS ({}) ──", incoming.len()),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    for edge in &incoming {
+                        let src_key = NodeKey::from_node(&graph[edge.source()]);
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default()),
+                            Span::styled(src_key.to_string(), Style::default().fg(Color::White)),
+                            Span::styled(
+                                format!(" ─[{}]─▶ ", edge_tag(edge.weight())),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::styled(
+                                key.to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                } else {
+                    let total = incoming.len() * outgoing.len();
+                    lines.push(Line::from(Span::styled(
+                        format!("── CHAINS ({}) ──", total),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    for in_edge in &incoming {
+                        let src_key = NodeKey::from_node(&graph[in_edge.source()]);
+                        for out_edge in &outgoing {
+                            let dst_key = NodeKey::from_node(&graph[out_edge.target()]);
+                            lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(
+                                    src_key.to_string(),
+                                    Style::default().fg(Color::White),
+                                ),
+                                Span::styled(
+                                    format!(" ─[{}]─▶ ", edge_tag(in_edge.weight())),
+                                    Style::default().fg(Color::Yellow),
+                                ),
+                                Span::styled(
+                                    key.to_string(),
+                                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    format!(" ─[{}]─▶ ", edge_tag(out_edge.weight())),
+                                    Style::default().fg(Color::Yellow),
+                                ),
+                                Span::styled(
+                                    dst_key.to_string(),
+                                    Style::default().fg(Color::Green),
+                                ),
+                            ]));
+                        }
+                    }
                 }
 
                 let para = Paragraph::new(lines).block(
