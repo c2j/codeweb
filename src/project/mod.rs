@@ -1,10 +1,12 @@
 pub mod config;
 
-use config::ProjectConfig;
 use crate::error::{CodeWebError, Result};
 use crate::graph::builder::GraphBuilder;
 use crate::graph::store::GraphStore;
 use crate::parser;
+use crate::parser::fingerprint::{compute_changes, FileChangeSet, FileRecord, FileType};
+use config::ProjectConfig;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const CODEWEB_TOML: &str = "codeweb.toml";
@@ -18,9 +20,14 @@ pub struct Project {
 #[derive(Debug)]
 pub struct AnalyzeReport {
     pub files_scanned: usize,
+    pub files_unchanged: usize,
+    pub files_changed: usize,
+    pub files_added: usize,
+    pub files_deleted: usize,
     pub nodes: usize,
     pub edges: usize,
     pub is_full_build: bool,
+    pub is_up_to_date: bool,
     pub elapsed_ms: u64,
 }
 
@@ -57,9 +64,7 @@ impl Project {
 
         let toml_path = dir.join(CODEWEB_TOML);
         if toml_path.exists() {
-            return Err(CodeWebError::ProjectAlreadyExists {
-                path: toml_path,
-            });
+            return Err(CodeWebError::ProjectAlreadyExists { path: toml_path });
         }
 
         let content = ProjectConfig::default_template(name);
@@ -78,15 +83,11 @@ impl Project {
     }
 
     fn load_from(toml_path: &Path) -> Result<Self> {
-        let root = toml_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let content =
-            std::fs::read_to_string(toml_path).map_err(|e| CodeWebError::FileRead {
-                path: toml_path.to_path_buf(),
-                source: e,
-            })?;
+        let root = toml_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let content = std::fs::read_to_string(toml_path).map_err(|e| CodeWebError::FileRead {
+            path: toml_path.to_path_buf(),
+            source: e,
+        })?;
         let config = ProjectConfig::load(&content).map_err(|e| CodeWebError::ConfigError {
             message: e.to_string(),
         })?;
@@ -112,6 +113,45 @@ impl Project {
                 .collect()
         };
 
+        // Phase 1: Scan files and compute fingerprints
+        let current_files = scan_with_fingerprints(&input_paths);
+        let files_scanned = current_files.len();
+
+        // Phase 2: Load existing store and diff against manifest
+        let existing_manifest: HashMap<PathBuf, FileRecord> = self
+            .try_load_store()
+            .map(|s| s.manifest().clone())
+            .unwrap_or_default();
+
+        let changes = compute_changes(&current_files, &existing_manifest);
+
+        let is_up_to_date = changes.is_empty();
+        let is_full_build = existing_manifest.is_empty();
+
+        if is_up_to_date && !is_full_build {
+            return Ok(AnalyzeReport {
+                files_scanned,
+                files_unchanged: changes.unchanged.len(),
+                files_changed: 0,
+                files_added: 0,
+                files_deleted: 0,
+                nodes: self
+                    .store
+                    .as_ref()
+                    .map(|s| s.graph().node_count())
+                    .unwrap_or(0),
+                edges: self
+                    .store
+                    .as_ref()
+                    .map(|s| s.graph().edge_count())
+                    .unwrap_or(0),
+                is_full_build: false,
+                is_up_to_date: true,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Phase 3: Rebuild (full rebuild for now; surgical incremental later)
         let mut all_files = parser::AllParsedFiles {
             sql_files: Vec::new(),
             java_files: Vec::new(),
@@ -124,15 +164,18 @@ impl Project {
             all_files.sql_files.extend(loaded.sql_files);
             all_files.java_files.extend(loaded.java_files);
             all_files.ibatis_files.extend(loaded.ibatis_files);
-            all_files.java_method_results.extend(loaded.java_method_results);
+            all_files
+                .java_method_results
+                .extend(loaded.java_method_results);
         }
 
-        let files_scanned = all_files.sql_files.len()
-            + all_files.java_files.len()
-            + all_files.ibatis_files.len();
-
         let builder = GraphBuilder::new();
-        let new_store = builder.build_store(&all_files, &self.config.project.name);
+        let mut new_store = builder.build_store(&all_files, &self.config.project.name);
+
+        // Phase 4: Update manifest with new fingerprints
+        let new_records = compute_all_records(&current_files);
+        new_store.update_manifest(new_records);
+        new_store.remove_manifest_entries(&changes.deleted);
 
         let nodes = new_store.graph().node_count();
         let edges = new_store.graph().edge_count();
@@ -144,11 +187,37 @@ impl Project {
 
         Ok(AnalyzeReport {
             files_scanned,
+            files_unchanged: changes.unchanged.len(),
+            files_changed: changes.modified.len(),
+            files_added: changes.added.len(),
+            files_deleted: changes.deleted.len(),
             nodes,
             edges,
-            is_full_build: true,
+            is_full_build,
+            is_up_to_date: false,
             elapsed_ms,
         })
+    }
+
+    pub fn diff(&mut self) -> Result<FileChangeSet> {
+        let input_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
+            vec![self.root.clone()]
+        } else {
+            self.config
+                .analysis
+                .paths
+                .iter()
+                .map(|p| self.root.join(p))
+                .collect()
+        };
+
+        let current_files = scan_with_fingerprints(&input_paths);
+        let existing_manifest: HashMap<PathBuf, FileRecord> = self
+            .try_load_store()
+            .map(|s| s.manifest().clone())
+            .unwrap_or_default();
+
+        Ok(compute_changes(&current_files, &existing_manifest))
     }
 
     pub fn store(&self) -> Option<&GraphStore> {
@@ -175,4 +244,42 @@ impl Project {
         }
         Ok(())
     }
+
+    fn try_load_store(&mut self) -> Option<&GraphStore> {
+        if self.store.is_none() {
+            let store_path = self.store_path();
+            if store_path.exists() {
+                let loaded = match self.config.store.format {
+                    config::StoreFormat::Bincode => GraphStore::load_bincode(&store_path).ok(),
+                    config::StoreFormat::Json => GraphStore::load_json(&store_path).ok(),
+                };
+                self.store = loaded;
+            }
+        }
+        self.store.as_ref()
+    }
+}
+
+fn scan_with_fingerprints(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
+    let mut files = Vec::new();
+    for path in paths {
+        let scanned = parser::scan_directory(path);
+        for p in &scanned.sql_files {
+            files.push((p.clone(), FileType::Sql));
+        }
+        for p in &scanned.java_files {
+            files.push((p.clone(), FileType::Java));
+        }
+        for p in &scanned.xml_files {
+            files.push((p.clone(), FileType::Xml));
+        }
+    }
+    files
+}
+
+fn compute_all_records(files: &[(PathBuf, FileType)]) -> Vec<FileRecord> {
+    files
+        .iter()
+        .filter_map(|(path, ft)| FileRecord::compute(path, *ft))
+        .collect()
 }

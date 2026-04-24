@@ -1,6 +1,6 @@
 use crate::graph::key::NodeKey;
-use crate::graph::Node;
 use crate::graph::CodeGraph;
+use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
@@ -43,10 +43,7 @@ impl GraphStore {
         }
     }
 
-    pub fn from_graph(
-        project_name: &str,
-        graph: CodeGraph,
-    ) -> Self {
+    pub fn from_graph(project_name: &str, graph: CodeGraph) -> Self {
         let now = timestamp_ms();
 
         let node_key_index: HashMap<NodeKey, NodeIndex> = graph
@@ -71,7 +68,10 @@ impl GraphStore {
             let dst_key = NodeKey::from_node(&graph[dst]);
 
             if let Some(src_file) = node_source_file(&graph[src]) {
-                file_edges.entry(src_file.clone()).or_default().push((src_key.clone(), dst_key.clone()));
+                file_edges
+                    .entry(src_file.clone())
+                    .or_default()
+                    .push((src_key.clone(), dst_key.clone()));
 
                 if let Some(dst_file) = node_source_file(&graph[dst]) {
                     if dst_file != src_file {
@@ -187,10 +187,11 @@ impl GraphStore {
                 source: e,
             })?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| crate::error::CodeWebError::ExportError {
+        let json = serde_json::to_string_pretty(self).map_err(|e| {
+            crate::error::CodeWebError::ExportError {
                 message: format!("json serialize: {}", e),
-            })?;
+            }
+        })?;
         std::fs::write(path, json).map_err(|e| crate::error::CodeWebError::FileRead {
             path: path.to_path_buf(),
             source: e,
@@ -212,9 +213,93 @@ impl GraphStore {
     fn touch(&mut self) {
         self.updated_at = timestamp_ms();
     }
+
+    /// Merge multiple stores into one, deduplicating shared nodes by NodeKey.
+    /// Edges pointing to the same semantic entity are consolidated.
+    pub fn merge(stores: Vec<Self>, merged_name: &str) -> Self {
+        let mut merged = GraphStore::new(merged_name);
+
+        for store in &stores {
+            let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+            for old_idx in store.graph.node_indices() {
+                let key = NodeKey::from_node(&store.graph[old_idx]);
+                let new_idx = merged
+                    .node_key_index
+                    .entry(key.clone())
+                    .or_insert_with(|| merged.graph.add_node(store.graph[old_idx].clone()));
+                idx_map.insert(old_idx, *new_idx);
+            }
+
+            let mut seen_edges: HashSet<(NodeKey, NodeKey, String)> = HashSet::new();
+            for old_edge_idx in store.graph.edge_indices() {
+                let (src, dst) = store.graph.edge_endpoints(old_edge_idx).unwrap();
+                let src_key = NodeKey::from_node(&store.graph[src]);
+                let dst_key = NodeKey::from_node(&store.graph[dst]);
+                let edge_type = edge_type_tag(&store.graph[old_edge_idx]);
+
+                let dedup_key = (src_key.clone(), dst_key.clone(), edge_type);
+                if seen_edges.insert(dedup_key) {
+                    let new_src = idx_map[&src];
+                    let new_dst = idx_map[&dst];
+                    merged
+                        .graph
+                        .add_edge(new_src, new_dst, store.graph[old_edge_idx].clone());
+                }
+            }
+
+            for (file, keys) in &store.file_nodes {
+                let entry = merged.file_nodes.entry(file.clone()).or_default();
+                for key in keys {
+                    if !entry.contains(key) {
+                        entry.push(key.clone());
+                    }
+                }
+            }
+
+            for (file, edges) in &store.file_edges {
+                let entry = merged.file_edges.entry(file.clone()).or_default();
+                for edge in edges {
+                    if !entry.contains(edge) {
+                        entry.push(edge.clone());
+                    }
+                }
+            }
+
+            for (file, records) in &store.manifest {
+                merged.manifest.insert(file.clone(), records.clone());
+            }
+        }
+
+        merged.rebuild_reverse_deps();
+        merged.touch();
+        merged
+    }
+
+    fn rebuild_reverse_deps(&mut self) {
+        self.reverse_deps.clear();
+
+        let node_to_file: HashMap<NodeKey, PathBuf> = self
+            .file_nodes
+            .iter()
+            .flat_map(|(f, keys)| keys.iter().map(|k| (k.clone(), f.clone())))
+            .collect();
+
+        for (src_file, edges) in &self.file_edges {
+            for (_, dst_key) in edges {
+                if let Some(dst_file) = node_to_file.get(dst_key) {
+                    if dst_file != src_file {
+                        self.reverse_deps
+                            .entry(dst_file.clone())
+                            .or_default()
+                            .insert(src_file.clone());
+                    }
+                }
+            }
+        }
+    }
 }
 
-#[allow(dead_code)]
 fn node_source_file(node: &Node) -> Option<PathBuf> {
     match node {
         Node::Procedure { location, .. } => Some(location.file.clone()),
@@ -232,6 +317,21 @@ fn timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn edge_type_tag(edge: &crate::graph::Edge) -> String {
+    match edge {
+        crate::graph::Edge::DirectCall { .. } => "direct",
+        crate::graph::Edge::DynamicCall { .. } => "dynamic",
+        crate::graph::Edge::CallsProcedure { .. } => "calls_procedure",
+        crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
+        crate::graph::Edge::CallsJava { .. } => "calls_java",
+        crate::graph::Edge::ContainsMethod => "contains_method",
+        crate::graph::Edge::Extends { .. } => "extends",
+        crate::graph::Edge::Implements { .. } => "implements",
+        crate::graph::Edge::ReferencesTable { .. } => "references_table",
+    }
+    .to_string()
 }
 
 #[allow(dead_code)]

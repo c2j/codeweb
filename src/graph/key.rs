@@ -81,12 +81,8 @@ impl NodeKey {
                 namespace: namespace.clone(),
                 statement_id: statement_id.clone(),
             },
-            super::Node::JavaMethod { fqn, .. } => NodeKey::JavaMethod {
-                fqn: fqn.clone(),
-            },
-            super::Node::JavaClass { fqn, .. } => NodeKey::JavaClass {
-                fqn: fqn.clone(),
-            },
+            super::Node::JavaMethod { fqn, .. } => NodeKey::JavaMethod { fqn: fqn.clone() },
+            super::Node::JavaClass { fqn, .. } => NodeKey::JavaClass { fqn: fqn.clone() },
             super::Node::Table { schema, name } => NodeKey::Table {
                 schema: schema.clone(),
                 name: name.clone(),
@@ -95,7 +91,9 @@ impl NodeKey {
                 schema: schema.clone(),
                 name: name.clone(),
             },
-            super::Node::JavaSql { java_file, line, .. } => NodeKey::JavaSql {
+            super::Node::JavaSql {
+                java_file, line, ..
+            } => NodeKey::JavaSql {
                 file: java_file.to_string_lossy().to_string(),
                 line: *line,
             },
