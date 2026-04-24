@@ -107,6 +107,16 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+
+    /// Trace complete call chain from a node
+    Trace {
+        /// Node name to search for (substring match)
+        from: String,
+
+        /// Project directory
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() {
@@ -135,6 +145,7 @@ fn run() -> Result<()> {
         }) => cmd_merge(&stores, &output, &name),
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
+        Some(Commands::Trace { from, project }) => cmd_trace(&from, &project),
         None => cmd_legacy(cli),
     }
 }
@@ -185,12 +196,8 @@ fn cmd_diff(project: &Path) -> Result<()> {
 }
 
 fn cmd_export(format: &str, output: Option<&Path>, project: &Path) -> Result<()> {
-    let proj = project::Project::find(project)?;
-    let store = proj
-        .store()
-        .ok_or_else(|| error::CodeWebError::ExportError {
-            message: "no store found — run `codeweb analyze` first".to_string(),
-        })?;
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
 
     let graph = store.graph();
     let result = match format {
@@ -233,6 +240,34 @@ fn cmd_merge(stores: &[PathBuf], output: &Path, name: &str) -> Result<()> {
 #[cfg(feature = "tui")]
 fn cmd_tui(project: &Path) -> Result<()> {
     tui::run(project)
+}
+
+fn cmd_trace(from: &str, project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+
+    let graph = store.graph();
+    let matches = graph::traverse::find_nodes_by_name(graph, from);
+
+    if matches.is_empty() {
+        eprintln!("No nodes matching '{}'", from);
+        return Ok(());
+    }
+
+    if matches.len() > 1 {
+        eprintln!("Multiple matches found:");
+        for (i, (_, name)) in matches.iter().enumerate() {
+            eprintln!("  {}: {}", i + 1, name);
+        }
+        eprintln!("Using first match: {}", matches[0].1);
+    }
+
+    let (start_idx, start_name) = &matches[0];
+    eprintln!("Tracing from: {}", start_name);
+
+    let chain = graph::traverse::trace_chain(graph, *start_idx);
+    println!("{}", graph::traverse::format_chain_tree(&chain, graph));
+    Ok(())
 }
 
 fn cmd_legacy(cli: Cli) -> Result<()> {

@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod key;
 pub mod store;
+pub mod traverse;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

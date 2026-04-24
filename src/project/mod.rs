@@ -224,6 +224,25 @@ impl Project {
         self.store.as_ref()
     }
 
+    pub fn load_store(&mut self) -> Result<&GraphStore> {
+        let store_path = self.store_path();
+        if self.store.is_none() && store_path.exists() {
+            let loaded = match self.config.store.format {
+                config::StoreFormat::Bincode => GraphStore::load_bincode(&store_path)?,
+                config::StoreFormat::Json => GraphStore::load_json(&store_path)?,
+            };
+            self.store = Some(loaded);
+        }
+        self.store
+            .as_ref()
+            .ok_or_else(|| CodeWebError::ExportError {
+                message: format!(
+                    "no store found at {} — run `codeweb analyze` first",
+                    store_path.display()
+                ),
+            })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
