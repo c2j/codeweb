@@ -3,7 +3,6 @@ use crate::graph::traverse;
 use crate::graph::Node;
 use crate::project::Project;
 use petgraph::graph::NodeIndex;
-use petgraph::visit::EdgeRef;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -537,107 +536,64 @@ impl App {
             };
 
             if let Some(node_idx) = selected_node_idx {
-                let node = &graph[node_idx];
-                let key = NodeKey::from_node(node);
-                let (tag, color) = node_tag(node);
+                let chain = traverse::trace_chain(graph, node_idx);
 
-                let mut lines: Vec<Line> = vec![
-                    Line::from(vec![
-                        Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
-                        Span::styled(
-                            key.to_string(),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(""),
-                ];
+                let mut lines: Vec<Line> = Vec::new();
 
-                let incoming: Vec<_> = graph
-                    .edges_directed(node_idx, petgraph::Direction::Incoming)
-                    .collect();
-                let outgoing: Vec<_> = graph
-                    .edges_directed(node_idx, petgraph::Direction::Outgoing)
-                    .collect();
-
-                if incoming.is_empty() && outgoing.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "── CALLERS ──",
+                    Style::default().fg(Color::Cyan),
+                )));
+                if chain.callers.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        "  (orphaned — no links)",
+                        "  (none)",
                         Style::default().fg(Color::DarkGray),
                     )));
-                } else if incoming.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("── LINKS ({}) ──", outgoing.len()),
-                        Style::default().fg(Color::Cyan),
-                    )));
-                    for edge in &outgoing {
-                        let dst_key = NodeKey::from_node(&graph[edge.target()]);
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(
-                                key.to_string(),
-                                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" ─[{}]─▶ ", edge_tag(edge.weight())),
-                                Style::default().fg(Color::Yellow),
-                            ),
-                            Span::styled(dst_key.to_string(), Style::default().fg(Color::White)),
-                        ]));
-                    }
-                } else if outgoing.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("── LINKS ({}) ──", incoming.len()),
-                        Style::default().fg(Color::Cyan),
-                    )));
-                    for edge in &incoming {
-                        let src_key = NodeKey::from_node(&graph[edge.source()]);
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(src_key.to_string(), Style::default().fg(Color::White)),
-                            Span::styled(
-                                format!(" ─[{}]─▶ ", edge_tag(edge.weight())),
-                                Style::default().fg(Color::Yellow),
-                            ),
-                            Span::styled(
-                                key.to_string(),
-                                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
                 } else {
-                    let total = incoming.len() * outgoing.len();
+                    for (i, caller) in chain.callers.iter().enumerate() {
+                        let is_last = i == chain.callers.len() - 1;
+                        tree_node_to_lines(caller, graph, "  ", is_last, &mut lines);
+                    }
+                }
+
+                lines.push(Line::from(""));
+                let target_key = NodeKey::from_node(&graph[node_idx]);
+                let (target_tag, target_color) = node_tag(&graph[node_idx]);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ▶ ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<8} ", target_tag),
+                        Style::default()
+                            .fg(target_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        target_key.to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── CALLEES ──",
+                    Style::default().fg(Color::Green),
+                )));
+                if chain.callees.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        format!("── CHAINS ({}) ──", total),
-                        Style::default().fg(Color::Cyan),
+                        "  (none)",
+                        Style::default().fg(Color::DarkGray),
                     )));
-                    for in_edge in &incoming {
-                        let src_key = NodeKey::from_node(&graph[in_edge.source()]);
-                        for out_edge in &outgoing {
-                            let dst_key = NodeKey::from_node(&graph[out_edge.target()]);
-                            lines.push(Line::from(vec![
-                                Span::styled("  ", Style::default()),
-                                Span::styled(
-                                    src_key.to_string(),
-                                    Style::default().fg(Color::White),
-                                ),
-                                Span::styled(
-                                    format!(" ─[{}]─▶ ", edge_tag(in_edge.weight())),
-                                    Style::default().fg(Color::Yellow),
-                                ),
-                                Span::styled(
-                                    key.to_string(),
-                                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    format!(" ─[{}]─▶ ", edge_tag(out_edge.weight())),
-                                    Style::default().fg(Color::Yellow),
-                                ),
-                                Span::styled(
-                                    dst_key.to_string(),
-                                    Style::default().fg(Color::Green),
-                                ),
-                            ]));
-                        }
+                } else {
+                    for (i, callee) in chain.callees.iter().enumerate() {
+                        let is_last = i == chain.callees.len() - 1;
+                        tree_node_to_lines(callee, graph, "  ", is_last, &mut lines);
                     }
                 }
 
@@ -725,16 +681,30 @@ fn node_tag(node: &Node) -> (&'static str, Color) {
     }
 }
 
-fn edge_tag(edge: &crate::graph::Edge) -> &'static str {
-    match edge {
-        crate::graph::Edge::DirectCall { .. } => "direct",
-        crate::graph::Edge::DynamicCall { .. } => "dynamic",
-        crate::graph::Edge::CallsProcedure { .. } => "calls_proc",
-        crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
-        crate::graph::Edge::CallsJava { .. } => "calls_java",
-        crate::graph::Edge::ContainsMethod => "contains",
-        crate::graph::Edge::Extends { .. } => "extends",
-        crate::graph::Edge::Implements { .. } => "implements",
-        crate::graph::Edge::ReferencesTable { .. } => "refs_table",
+fn tree_node_to_lines(
+    node: &crate::graph::traverse::TreeNode,
+    graph: &crate::graph::CodeGraph,
+    prefix: &str,
+    is_last: bool,
+    lines: &mut Vec<Line>,
+) {
+    let connector = if is_last { "└── " } else { "├── " };
+    let (tag, color) = node_tag(&graph[node.idx]);
+    let key = NodeKey::from_node(&graph[node.idx]);
+    lines.push(Line::from(vec![
+        Span::raw(prefix.to_string()),
+        Span::styled(connector.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
+        Span::styled(key.to_string(), Style::default().fg(Color::White)),
+    ]));
+
+    let child_prefix = if is_last {
+        format!("{}    ", prefix)
+    } else {
+        format!("{}│   ", prefix)
+    };
+    for (i, child) in node.children.iter().enumerate() {
+        let child_last = i == node.children.len() - 1;
+        tree_node_to_lines(child, graph, &child_prefix, child_last, lines);
     }
 }
