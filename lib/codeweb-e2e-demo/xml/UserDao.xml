@@ -16,4 +16,12 @@
     <update id="deactivateUser">
         CALL pkg_user_mgmt.deactivate_user(#{userId})
     </update>
+
+    <update id="archiveById">
+        CALL pkg_user_mgmt.archive_user(#{userId})
+    </update>
+
+    <update id="transferUser">
+        CALL pkg_user_mgmt.transfer_user(#{userId}, #{targetOrg})
+    </update>
 </mapper>

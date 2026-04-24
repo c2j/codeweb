@@ -1,6 +1,8 @@
 use crate::graph::{ProcedureId, SourceLocation};
 use ogsql_parser::ast::plpgsql::{PlExecuteStmt, PlProcedureCall, PlStatement};
-use ogsql_parser::ast::{CallFuncStatement, ObjectName, Statement, TableRef as AstTableRef};
+use ogsql_parser::ast::{
+    CallFuncStatement, ObjectName, SelectStatement, Statement, TableRef as AstTableRef,
+};
 use ogsql_parser::{Visitor, VisitorResult};
 use std::path::PathBuf;
 
@@ -42,6 +44,16 @@ impl CallExtractor {
             location: self.make_location(line),
         });
     }
+
+    fn extract_call_from_sql_text(&mut self, sql_text: &str) {
+        let normalized = sql_text.to_lowercase().replace(' ', "");
+        if let Some(rest) = normalized.strip_prefix("call") {
+            let call_target = rest.split('(').next().unwrap_or("");
+            if !call_target.is_empty() {
+                self.push_call(call_target, false, 0);
+            }
+        }
+    }
 }
 
 impl Visitor for CallExtractor {
@@ -73,16 +85,48 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
-        if let PlStatement::Execute(PlExecuteStmt {
-            parsed_query: None,
-            string_expr,
-            ..
-        }) = stmt
-        {
-            let raw = format!("{:?}", string_expr);
-            self.push_call(&raw, true, 0);
+        match stmt {
+            PlStatement::Execute(PlExecuteStmt {
+                parsed_query: None,
+                string_expr,
+                ..
+            }) => {
+                let raw = format!("{:?}", string_expr);
+                self.push_call(&raw, true, 0);
+            }
+            PlStatement::Sql(sql_text) => {
+                self.extract_call_from_sql_text(sql_text);
+            }
+            _ => {}
         }
         VisitorResult::Continue
+    }
+
+    fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
+        for tr in &select.from {
+            self.extract_func_from_table_ref(tr);
+        }
+        VisitorResult::Continue
+    }
+}
+
+impl CallExtractor {
+    fn extract_func_from_table_ref(&mut self, tr: &AstTableRef) {
+        match tr {
+            AstTableRef::FunctionCall { name, .. } => {
+                let callee: String = name.join(".");
+                self.push_call(&callee, false, 0);
+            }
+            AstTableRef::Join { left, right, .. } => {
+                self.extract_func_from_table_ref(left);
+                self.extract_func_from_table_ref(right);
+            }
+            AstTableRef::Subquery { query, .. } => {
+                let stmt = Statement::Select(query.as_ref().clone());
+                ogsql_parser::walk_statement(self, &stmt);
+            }
+            _ => {}
+        }
     }
 }
 

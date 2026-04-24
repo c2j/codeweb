@@ -6,7 +6,7 @@
     </select>
 
     <update id="cancelOrder">
-        UPDATE t_orders SET status = 'CANCELLED' WHERE id = #{orderId}
+        CALL pkg_order.cancel_order(#{orderId})
     </update>
 
     <select id="computeScore" resultType="int">
@@ -14,6 +14,6 @@
     </select>
 
     <update id="cancelByUserId">
-        CALL pkg_user_mgmt.deactivate_user(#{userId})
+        CALL pkg_order.batch_cancel_by_user(#{userId})
     </update>
 </mapper>

@@ -1,7 +1,3 @@
--- ============================================================
--- Package: pkg_user_mgmt — user management stored procedures
--- ============================================================
-
 CREATE OR REPLACE FUNCTION pkg_user_mgmt.compute_level(
     p_score INTEGER
 ) RETURNS VARCHAR AS $$
@@ -44,5 +40,16 @@ BEGIN
     CALL pkg_user_mgmt.create_user('transfer_shadow', '');
     PERFORM pkg_audit.log_transfer(p_user_id, p_target_org);
     COMMIT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE PROCEDURE pkg_user_mgmt.archive_user(
+    p_user_id BIGINT
+) AS $$
+BEGIN
+    CALL pkg_user_mgmt.deactivate_user(p_user_id);
+    PERFORM pkg_notify.send_event('USER_ARCHIVED', p_user_id);
+    CALL pkg_notify.broadcast('user archived: ' || p_user_id);
+    DELETE FROM t_user_settings WHERE user_id = p_user_id;
 END;
 $$ LANGUAGE plpgsql;

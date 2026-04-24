@@ -1,7 +1,3 @@
--- ============================================================
--- Package: pkg_audit — audit logging
--- ============================================================
-
 CREATE OR REPLACE FUNCTION pkg_audit.log_transfer(
     p_user_id BIGINT,
     p_org_id  BIGINT
@@ -9,6 +5,16 @@ CREATE OR REPLACE FUNCTION pkg_audit.log_transfer(
 BEGIN
     INSERT INTO t_audit_log(action, ref_id, detail)
     VALUES('TRANSFER', p_user_id, 'org=' || p_org_id);
+    PERFORM pkg_audit.log_detail('TRANSFER', p_user_id::TEXT);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION pkg_audit.log_detail(
+    p_action VARCHAR,
+    p_detail VARCHAR
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO t_audit_detail(action, detail) VALUES(p_action, p_detail);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -17,5 +23,6 @@ CREATE OR REPLACE PROCEDURE pkg_audit.purge_old_logs(
 ) AS $$
 BEGIN
     DELETE FROM t_audit_log WHERE created_at < now() - INTERVAL '1 day' * p_days;
+    PERFORM pkg_notify.send_event('AUDIT_PURGE', p_days::BIGINT);
 END;
 $$ LANGUAGE plpgsql;

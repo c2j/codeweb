@@ -27,6 +27,11 @@ public class UserService {
         orderDao.cancelByUserId(userId);
     }
 
+    public void archiveUser(Long userId) {
+        deactivateUser(userId);
+        userDao.archiveById(userId);
+    }
+
     private void logAction(String action) {
         System.out.println(action);
     }
