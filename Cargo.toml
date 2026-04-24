@@ -27,6 +27,7 @@ bincode = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+indicatif = "0.18.4"
 
 [dev-dependencies]
 tempfile = "3"

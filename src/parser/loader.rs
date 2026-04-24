@@ -49,7 +49,7 @@ pub fn load_sql_files(input: &Path) -> Result<Vec<ParsedFile>> {
     Ok(parse_sql_files(&scanned.sql_files))
 }
 
-fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
+pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
     use rayon::prelude::*;
 
     paths

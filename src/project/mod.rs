@@ -113,9 +113,18 @@ impl Project {
                 .collect()
         };
 
-        // Phase 1: Scan files and compute fingerprints
+        // Phase 1: Scan files
+        let pb = indicatif::ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner} {msg}")
+                .unwrap(),
+        );
+        pb.set_message("Scanning files...");
         let current_files = scan_with_fingerprints(&input_paths);
         let files_scanned = current_files.len();
+        let total = files_scanned;
+        pb.finish_with_message(format!("Scanned {} files", files_scanned));
 
         // Phase 2: Load existing store and diff against manifest
         let existing_manifest: HashMap<PathBuf, FileRecord> = self
@@ -151,7 +160,16 @@ impl Project {
             });
         }
 
-        // Phase 3: Rebuild (full rebuild for now; surgical incremental later)
+        // Phase 3: Parse files with progress
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  {bar:40.cyan/blue} {pos}/{len} {wide_msg:.dim}",
+            )
+            .unwrap()
+            .progress_chars("━━╾─"),
+        );
+
         let mut all_files = parser::AllParsedFiles {
             sql_files: Vec::new(),
             java_files: Vec::new(),
@@ -160,15 +178,65 @@ impl Project {
         };
 
         for input in &input_paths {
-            let loaded = parser::load_all_files(input)?;
-            all_files.sql_files.extend(loaded.sql_files);
-            all_files.java_files.extend(loaded.java_files);
-            all_files.ibatis_files.extend(loaded.ibatis_files);
+            let scanned = parser::scan_directory(input);
+
+            pb.set_message("Parsing SQL...");
+            for path in &scanned.sql_files {
+                pb.set_message(format!(
+                    "{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                pb.inc(1);
+            }
+            all_files
+                .sql_files
+                .extend(parser::parse_sql_files(&scanned.sql_files));
+
+            pb.set_message("Parsing Java...");
+            for path in &scanned.java_files {
+                pb.set_message(format!(
+                    "{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                pb.inc(1);
+            }
+            all_files
+                .java_files
+                .extend(parser::java_loader::load_java_files_from_paths(
+                    &scanned.java_files,
+                ));
+
+            pb.set_message("Parsing XML mappers...");
+            for path in &scanned.xml_files {
+                pb.set_message(format!(
+                    "{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                pb.inc(1);
+            }
+            all_files
+                .ibatis_files
+                .extend(parser::ibatis_loader::load_ibatis_files_from_paths(
+                    &scanned.xml_files,
+                ));
+
+            pb.set_message("Extracting Java methods...");
             all_files
                 .java_method_results
-                .extend(loaded.java_method_results);
+                .extend(parser::java_method::parse_java_files_from_paths(
+                    &scanned.java_files,
+                ));
         }
+        pb.finish_with_message(format!(
+            "Parsed {} files ({} SQL, {} Java, {} XML)",
+            all_files.sql_files.len() + all_files.java_files.len() + all_files.ibatis_files.len(),
+            all_files.sql_files.len(),
+            all_files.java_files.len(),
+            all_files.ibatis_files.len(),
+        ));
 
+        // Phase 4: Build graph
+        eprintln!("  Building graph...");
         let builder = GraphBuilder::new();
         let mut new_store = builder.build_store(&all_files, &self.config.project.name);
 

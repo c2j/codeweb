@@ -17,6 +17,6 @@ pub use java_method::{
     parse_java_file, parse_java_files_from_paths, JavaClassInfo, JavaMethodInfo, JavaParseResult,
     MethodCallInfo,
 };
-pub use loader::{load_all_files, load_sql_files, AllParsedFiles, ParsedFile};
+pub use loader::{load_all_files, load_sql_files, parse_sql_files, AllParsedFiles, ParsedFile};
 #[allow(unused_imports)]
 pub use scanner::{scan_directory, ScannedFiles};
