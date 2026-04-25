@@ -540,3 +540,157 @@ fn test_e2e_full_chain() {
         "Expected at least one java_method → mapped_statement chain"
     );
 }
+
+#[test]
+fn test_package_body_in_call_graph() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "pkg.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_api AS
+            PROCEDURE do_work(p_id INT) IS
+            BEGIN
+                helper.validate(p_id);
+            END;
+        END pkg_api;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let has_package = nodes.iter().any(|n| n["type"] == "package");
+    assert!(has_package, "Expected a package node, got nodes: {:?}", nodes);
+
+    let has_package_proc = nodes.iter().any(|n| n["type"] == "procedure" && n["name"] == "do_work");
+    assert!(has_package_proc, "Expected a procedure node for do_work");
+}
+
+#[test]
+fn test_trigger_in_call_graph() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "trigger.sql",
+        r#"
+        CREATE OR REPLACE FUNCTION trg_func() RETURNS TRIGGER AS $$
+        BEGIN
+            INSERT INTO t_log(action) VALUES('FIRED');
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER trg_after_insert
+        AFTER INSERT ON t_users
+        FOR EACH ROW EXECUTE PROCEDURE trg_func();
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let has_trigger = nodes.iter().any(|n| n["type"] == "trigger");
+    assert!(has_trigger, "Expected a trigger node");
+
+    let edges = parsed["edges"].as_array().unwrap();
+    let has_triggers_routine = edges.iter().any(|e| e["type"] == "triggers_routine");
+    assert!(has_triggers_routine, "Expected a triggers_routine edge");
+}
+
+#[test]
+fn test_view_table_references() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "view.sql",
+        r#"
+        CREATE VIEW v_active_users AS
+        SELECT u.id, u.name
+        FROM t_users u
+        WHERE u.status = 'ACTIVE';
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let has_view = nodes
+        .iter()
+        .any(|n| n["type"] == "view" && n["name"] == "v_active_users");
+    assert!(has_view, "Expected a view node named v_active_users");
+}
+
+#[test]
+fn test_package_cross_call_resolution() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "mixed.sql",
+        r#"
+        CREATE OR REPLACE PROCEDURE caller_proc() AS $$
+        BEGIN
+            pkg_api.do_work(42);
+        END;
+        $$;
+
+        CREATE OR REPLACE PACKAGE BODY pkg_api AS
+            PROCEDURE do_work(p_id INT) IS
+            BEGIN
+                helper.validate(p_id);
+            END;
+        END pkg_api;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let caller_idx = nodes.iter().position(|n| n["name"] == "caller_proc");
+    let dowork_idx = nodes.iter().position(|n| n["name"] == "do_work");
+    assert!(caller_idx.is_some(), "Expected a node for caller_proc");
+    assert!(dowork_idx.is_some(), "Expected a node for do_work");
+
+    let edges = parsed["edges"].as_array().unwrap();
+    let has_call_edge = edges.iter().any(|e| {
+        e["type"] == "calls_procedure"
+            && e["source"] == serde_json::Value::from(caller_idx.unwrap() as u64)
+            && e["target"] == serde_json::Value::from(dowork_idx.unwrap() as u64)
+    });
+    assert!(
+        has_call_edge,
+        "Expected calls_procedure edge from caller_proc to do_work"
+    );
+}
