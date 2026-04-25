@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GraphStore {
     pub version: u32,
     pub project_name: String,
@@ -434,4 +434,37 @@ pub struct StoreStats {
     pub views: usize,
     pub edges: usize,
     pub files: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_old_cache_version_rejected() {
+        let dir = TempDir::new().unwrap();
+        let json_path = dir.path().join("test.json");
+
+        let graph = CodeGraph::new();
+        let store = GraphStore::from_graph("test", graph);
+        store.save_json(&json_path).unwrap();
+
+        let loaded = GraphStore::load_json(&json_path);
+        assert!(loaded.is_ok(), "Current version should load fine");
+
+        let json_str = std::fs::read_to_string(&json_path).unwrap();
+        let mut json_val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        json_val["version"] = serde_json::Value::from(1u64);
+        std::fs::write(&json_path, serde_json::to_string(&json_val).unwrap()).unwrap();
+
+        let result = GraphStore::load_json(&json_path);
+        assert!(result.is_err(), "Version 1 cache should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "Error should mention version: {}",
+            err_msg
+        );
+    }
 }
