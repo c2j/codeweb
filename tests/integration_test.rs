@@ -817,3 +817,219 @@ fn test_package_spec_and_body_only_body_produces_nodes() {
         "get_name has no body implementation — should not appear as a node"
     );
 }
+
+#[test]
+fn test_procedure_table_write_access() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE PROCEDURE insert_user(p_name VARCHAR) AS $$
+        BEGIN
+            INSERT INTO t_users(name) VALUES(p_name);
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let write_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .filter(|e| {
+            let modes = e["modes"].as_array().unwrap();
+            modes.iter().any(|m| m == "write")
+        })
+        .collect();
+    assert!(!write_edges.is_empty(), "Expected write table_access edge");
+
+    let has_insert_kind = write_edges.iter().any(|e| {
+        let wk = e["write_kinds"].as_array().unwrap();
+        wk.iter().any(|k| k == "insert")
+    });
+    assert!(has_insert_kind, "Expected insert write_kind");
+}
+
+#[test]
+fn test_procedure_table_read_access() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE PROCEDURE get_user(p_id INT) AS $$
+        BEGIN
+            SELECT * FROM t_users WHERE id = p_id;
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let read_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .filter(|e| {
+            let modes = e["modes"].as_array().unwrap();
+            modes.iter().any(|m| m == "read")
+        })
+        .collect();
+    assert!(!read_edges.is_empty(), "Expected read table_access edge");
+}
+
+#[test]
+fn test_insert_select_read_write() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE PROCEDURE copy_users() AS $$
+        BEGIN
+            INSERT INTO t_archive SELECT * FROM t_users;
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let table_access_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .collect();
+    assert!(
+        table_access_edges.len() >= 2,
+        "Expected >= 2 table_access edges (t_archive + t_users), got {}",
+        table_access_edges.len()
+    );
+
+    // t_archive should be write (insert_select)
+    let archive_idx = nodes
+        .iter()
+        .position(|n| n["type"] == "table" && n["name"] == "t_archive");
+    let archive_edge = table_access_edges.iter().find(|e| {
+        archive_idx.map_or(false, |idx| {
+            e["target"] == serde_json::Value::from(idx as u64)
+        })
+    });
+    assert!(archive_edge.is_some(), "Expected edge to t_archive");
+    let modes = archive_edge.unwrap()["modes"].as_array().unwrap();
+    assert!(
+        modes.iter().any(|m| m == "write"),
+        "t_archive should have write mode"
+    );
+    let wk = archive_edge.unwrap()["write_kinds"].as_array().unwrap();
+    assert!(
+        wk.iter().any(|k| k == "insert_select"),
+        "t_archive should have insert_select write_kind"
+    );
+
+    // t_users should be read
+    let users_idx = nodes
+        .iter()
+        .position(|n| n["type"] == "table" && n["name"] == "t_users");
+    let users_edge = table_access_edges.iter().find(|e| {
+        users_idx.map_or(false, |idx| {
+            e["target"] == serde_json::Value::from(idx as u64)
+        })
+    });
+    assert!(users_edge.is_some(), "Expected edge to t_users");
+    let modes = users_edge.unwrap()["modes"].as_array().unwrap();
+    assert!(
+        modes.iter().any(|m| m == "read"),
+        "t_users should have read mode"
+    );
+}
+
+#[test]
+fn test_view_reads_from_table() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE VIEW v_users AS
+        SELECT id, name FROM t_users WHERE status = 'ACTIVE';
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let view_to_table: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .collect();
+    assert!(
+        !view_to_table.is_empty(),
+        "Expected table_access edge from view to table"
+    );
+
+    // View should only have read mode
+    let modes = view_to_table[0]["modes"].as_array().unwrap();
+    assert!(
+        modes.iter().any(|m| m == "read"),
+        "View→table edge should have read mode"
+    );
+    assert!(
+        !modes.iter().any(|m| m == "write"),
+        "View→table edge should NOT have write mode"
+    );
+}
+
+#[test]
+fn test_package_procedure_table_access() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_ops AS
+            PROCEDURE update_status(p_id INT, p_status VARCHAR) IS
+            BEGIN
+                UPDATE t_orders SET status = p_status WHERE id = p_id;
+            END;
+        END pkg_ops;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let write_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .filter(|e| {
+            let modes = e["modes"].as_array().unwrap();
+            modes.iter().any(|m| m == "write")
+        })
+        .collect();
+    assert!(
+        !write_edges.is_empty(),
+        "Expected write table_access from package procedure"
+    );
+
+    let has_update_kind = write_edges.iter().any(|e| {
+        let wk = e["write_kinds"].as_array().unwrap();
+        wk.iter().any(|k| k == "update")
+    });
+    assert!(has_update_kind, "Expected update write_kind");
+}

@@ -628,19 +628,19 @@ impl GraphBuilder {
                     };
                     let view_idx = graph.add_node(view_node);
 
-                    let mut extractor = crate::parser::TableRefExtractor::new();
+                    let mut extractor = crate::parser::TableAccessExtractor::new();
                     let wrapped = Statement::Select(v.query.as_ref().clone());
                     walk_statement(&mut extractor, &wrapped);
 
-                    for tref in &extractor.tables {
-                        let key = match &tref.schema {
-                            Some(s) => format!("{}.{}", s, tref.name),
-                            None => tref.name.clone(),
+                    for access in &extractor.accesses {
+                        let key = match &access.schema {
+                            Some(s) => format!("{}.{}", s, access.name),
+                            None => access.name.clone(),
                         };
                         let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                             let node = Node::Table {
-                                schema: tref.schema.clone(),
-                                name: tref.name.clone(),
+                                schema: access.schema.clone(),
+                                name: access.name.clone(),
                             };
                             graph.add_node(node)
                         });
@@ -1352,134 +1352,5 @@ mod tests {
             1,
             "View should reference 1 table (t_users)"
         );
-    }
-
-    #[test]
-    #[ignore] // Diagnostic test, run with: cargo test builder::tests::diagnose_deposit -- --ignored --nocapture
-    fn diagnose_deposit_package() {
-        let sql = std::fs::read_to_string(
-            "/Users/c2j/Projects/Desktop_Projects/CODE/cobweb/lib/codeweb-complex-demo/sql/PKG_DEPOSIT_ACNT_INFO_INQUIRY.sql"
-        ).unwrap();
-
-        let tokens = ogsql_parser::Tokenizer::new(&sql).tokenize().unwrap();
-        let mut parser = ogsql_parser::Parser::with_source(tokens, sql);
-        let stmts = parser.parse_with_text();
-
-        for err in parser.errors() {
-            eprintln!("PARSE ERR: {}", err);
-        }
-
-        eprintln!("\n=== {} statements ===", stmts.len());
-        for (i, info) in stmts.iter().enumerate() {
-            eprintln!("\n--- Stmt {} @ line {} ---", i, info.start_line);
-            match &info.statement {
-                ogsql_parser::ast::Statement::CreatePackage(pkg) => {
-                    eprintln!("CreatePackage name={:?}", pkg.name);
-                    eprintln!("  items: {}", pkg.items.len());
-                    for (j, item) in pkg.items.iter().enumerate() {
-                        match item {
-                            ogsql_parser::ast::PackageItem::Procedure(p) => {
-                                eprintln!(
-                                    "  [{}] Proc {:?} block={}",
-                                    j,
-                                    p.name,
-                                    p.block.is_some()
-                                );
-                            }
-                            ogsql_parser::ast::PackageItem::Function(f) => {
-                                eprintln!(
-                                    "  [{}] Func {:?} block={}",
-                                    j,
-                                    f.name,
-                                    f.block.is_some()
-                                );
-                            }
-                            ogsql_parser::ast::PackageItem::Raw(r) => {
-                                eprintln!("  [{}] Raw({:?})", j, &r[..r.len().min(50)]);
-                            }
-                        }
-                    }
-                }
-                ogsql_parser::ast::Statement::CreatePackageBody(pkg) => {
-                    eprintln!("CreatePackageBody name={:?}", pkg.name);
-                    eprintln!("  items: {}", pkg.items.len());
-                    for (j, item) in pkg.items.iter().enumerate() {
-                        match item {
-                            ogsql_parser::ast::PackageItem::Procedure(p) => {
-                                eprintln!(
-                                    "  [{}] Proc {:?} block={}",
-                                    j,
-                                    p.name,
-                                    p.block.is_some()
-                                );
-                            }
-                            ogsql_parser::ast::PackageItem::Function(f) => {
-                                eprintln!(
-                                    "  [{}] Func {:?} block={}",
-                                    j,
-                                    f.name,
-                                    f.block.is_some()
-                                );
-                            }
-                            ogsql_parser::ast::PackageItem::Raw(r) => {
-                                eprintln!("  [{}] Raw({:?})", j, &r[..r.len().min(50)]);
-                            }
-                        }
-                    }
-                }
-                other => {
-                    eprintln!("Other: {:?}", std::mem::discriminant(other));
-                }
-            }
-        }
-
-        // Build the graph and inspect
-        let parsed = vec![ParsedFile {
-            path: PathBuf::from("test.sql"),
-            statements: stmts,
-        }];
-        let graph = GraphBuilder::new().build(&parsed);
-
-        eprintln!(
-            "\n=== GRAPH: {} nodes, {} edges ===",
-            graph.node_count(),
-            graph.edge_count()
-        );
-        for idx in graph.node_indices() {
-            let node = &graph[idx];
-            let in_deg = graph
-                .neighbors_directed(idx, petgraph::Direction::Incoming)
-                .count();
-            let out_deg = graph
-                .neighbors_directed(idx, petgraph::Direction::Outgoing)
-                .count();
-            match node {
-                Node::Package { name, .. } => {
-                    eprintln!("  Package({}) in={} out={}", name, in_deg, out_deg)
-                }
-                Node::Procedure { id, .. } => eprintln!(
-                    "  Proc({}.{}) in={} out={}",
-                    id.package.as_deref().unwrap_or("-"),
-                    id.name,
-                    in_deg,
-                    out_deg
-                ),
-                Node::Trigger { name, .. } => {
-                    eprintln!("  Trigger({}) in={} out={}", name, in_deg, out_deg)
-                }
-                Node::Table { name, .. } => {
-                    eprintln!("  Table({}) in={} out={}", name, in_deg, out_deg)
-                }
-                Node::View { name, .. } => {
-                    eprintln!("  View({}) in={} out={}", name, in_deg, out_deg)
-                }
-                Node::Unresolved { raw_expr, .. } => {
-                    eprintln!("  Unresolved({}) in={} out={}", raw_expr, in_deg, out_deg)
-                }
-                _ => eprintln!("  Other in={} out={}", in_deg, out_deg),
-            }
-        }
-
-        panic!("Diagnostic test - check stderr output above");
     }
 }
