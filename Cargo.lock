@@ -99,6 +99,9 @@ name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "blake3"
@@ -206,6 +209,7 @@ name = "codeweb"
 version = "0.2.0"
 dependencies = [
  "bincode",
+ "bitflags",
  "blake3",
  "clap",
  "crossterm",
@@ -626,7 +630,7 @@ dependencies = [
 [[package]]
 name = "ogsql-parser"
 version = "0.1.0"
-source = "git+https://github.com/c2j/ogsql-parser#b9c90768ea12d8d847decf924e5273f8873492b7"
+source = "git+https://github.com/c2j/ogsql-parser#dc407068cd57352ee7eb297afb461b7f0b2d5f4c"
 dependencies = [
  "encoding_rs",
  "phf",
