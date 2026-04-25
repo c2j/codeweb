@@ -211,3 +211,140 @@ impl Visitor for TableRefExtractor {
         VisitorResult::Continue
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ogsql_parser::{walk_statement, Tokenizer};
+
+    fn extract_edges(sql: &str) -> Vec<CallEdge> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut all_edges = Vec::new();
+        for info in &stmts {
+            let mut extractor = CallExtractor::new(PathBuf::from("test.sql"));
+            walk_statement(&mut extractor, &info.statement);
+            all_edges.extend(extractor.edges);
+        }
+        all_edges
+    }
+
+    #[test]
+    fn standalone_procedure_call() {
+        let sql = "CREATE PROCEDURE a() AS $$ BEGIN b(); END; $$;";
+        let edges = extract_edges(sql);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].caller,
+            Some(ProcedureId {
+                schema: None,
+                name: "a".to_string()
+            })
+        );
+        assert_eq!(edges[0].callee_name, "b");
+        assert!(!edges[0].is_dynamic);
+    }
+
+    #[test]
+    fn schema_qualified_call() {
+        let sql = "CREATE PROCEDURE a() AS $$ BEGIN pkg.b(); END; $$;";
+        let edges = extract_edges(sql);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].callee_name, "pkg.b");
+    }
+
+    #[test]
+    fn dynamic_sql_is_marked() {
+        let sql =
+            "CREATE PROCEDURE a() AS $$ BEGIN EXECUTE IMMEDIATE 'CALL ' || v_proc || '()'; END; $$;";
+        let edges = extract_edges(sql);
+        assert!(
+            edges.iter().any(|e| e.is_dynamic),
+            "expected at least one dynamic edge, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn multiple_calls_in_one_procedure() {
+        let sql = "CREATE PROCEDURE a() AS $$ BEGIN b(); c(1); d(1,2); END; $$;";
+        let edges = extract_edges(sql);
+        assert_eq!(edges.len(), 3);
+        let names: Vec<&str> = edges.iter().map(|e| e.callee_name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn top_level_call_statement() {
+        let sql = "CALL my_proc(1, 2);";
+        let edges = extract_edges(sql);
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].caller.is_none());
+        assert_eq!(edges[0].callee_name, "my_proc");
+    }
+
+    #[test]
+    fn function_in_select_from() {
+        let sql = "CREATE FUNCTION a() RETURNS void AS $$ BEGIN SELECT * FROM generate_series(1,10); END; $$ LANGUAGE plpgsql;";
+        let edges = extract_edges(sql);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].callee_name, "generate_series");
+        assert_eq!(
+            edges[0].caller,
+            Some(ProcedureId {
+                schema: None,
+                name: "a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn package_body_procedure_calls_have_caller_context() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_api AS
+                PROCEDURE do_work(p_id INT) IS
+                BEGIN
+                    helper.validate(p_id);
+                    helper.process(p_id);
+                END;
+            END pkg_api;
+        "#;
+        let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+
+        let mut extractor = CallExtractor::new(PathBuf::from("test.sql"));
+
+        for info in &stmts {
+            if let ogsql_parser::ast::Statement::CreatePackageBody(pkg) = &info.statement {
+                for item in &pkg.items {
+                    if let ogsql_parser::ast::PackageItem::Procedure(p) = item {
+                        if let Some(ref block) = p.block {
+                            extractor.current_procedure = Some(ProcedureId {
+                                schema: None,
+                                name: "pkg_api.do_work".to_string(),
+                            });
+                            ogsql_parser::walk_pl_block(&mut extractor, block);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            extractor.edges.len(),
+            2,
+            "Expected 2 call edges from do_work"
+        );
+        for edge in &extractor.edges {
+            let caller = edge
+                .caller
+                .as_ref()
+                .expect("caller should be set for package routine");
+            assert_eq!(caller.name, "pkg_api.do_work");
+        }
+        assert_eq!(extractor.edges[0].callee_name, "helper.validate");
+        assert_eq!(extractor.edges[1].callee_name, "helper.process");
+    }
+}
