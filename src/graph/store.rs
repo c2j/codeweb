@@ -124,6 +124,7 @@ impl GraphStore {
         for idx in self.graph.node_indices() {
             match &self.graph[idx] {
                 Node::Procedure { .. } => s.procedures += 1,
+                Node::Function { .. } => s.functions += 1,
                 Node::Unresolved { .. } => s.unresolved += 1,
                 Node::MappedStatement { .. } => s.mappers += 1,
                 Node::JavaSql { .. } => s.java_sql += 1,
@@ -304,6 +305,7 @@ impl GraphStore {
 fn node_source_file(node: &Node) -> Option<PathBuf> {
     match node {
         Node::Procedure { location, .. } => Some(location.file.clone()),
+        Node::Function { location, .. } => Some(location.file.clone()),
         Node::MappedStatement { xml_file, .. } => Some(xml_file.clone()),
         Node::JavaSql { java_file, .. } => Some(java_file.clone()),
         Node::JavaMethod { file, .. } => Some(file.clone()),
@@ -343,6 +345,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
 #[derive(Debug, Default)]
 pub struct StoreStats {
     pub procedures: usize,
+    pub functions: usize,
     pub unresolved: usize,
     pub mappers: usize,
     pub java_sql: usize,

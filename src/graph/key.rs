@@ -9,6 +9,11 @@ pub enum NodeKey {
         package: Option<String>,
         name: String,
     },
+    Function {
+        schema: Option<String>,
+        package: Option<String>,
+        name: String,
+    },
     Mapper {
         namespace: String,
         statement_id: String,
@@ -57,6 +62,16 @@ impl fmt::Display for NodeKey {
                 (None, Some(p)) => write!(f, "proc:{}.{}", p, name),
                 (None, None) => write!(f, "proc:{}", name),
             },
+            NodeKey::Function {
+                schema,
+                package,
+                name,
+            } => match (schema, package) {
+                (Some(s), Some(p)) => write!(f, "func:{}.{}.{}", s, p, name),
+                (Some(s), None) => write!(f, "func:{}.{}", s, name),
+                (None, Some(p)) => write!(f, "func:{}.{}", p, name),
+                (None, None) => write!(f, "func:{}", name),
+            },
             NodeKey::Mapper {
                 namespace,
                 statement_id,
@@ -89,6 +104,11 @@ impl NodeKey {
     pub fn from_node(node: &super::Node) -> Self {
         match node {
             super::Node::Procedure { id, .. } => NodeKey::Procedure {
+                schema: id.schema.clone(),
+                package: id.package.clone(),
+                name: id.name.clone(),
+            },
+            super::Node::Function { id, .. } => NodeKey::Function {
                 schema: id.schema.clone(),
                 package: id.package.clone(),
                 name: id.name.clone(),

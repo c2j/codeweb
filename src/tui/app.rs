@@ -680,6 +680,7 @@ impl App {
 fn node_tag(node: &Node) -> (&'static str, Color) {
     match node {
         Node::Procedure { .. } => ("proc", Color::Green),
+        Node::Function { .. } => ("func", Color::LightGreen),
         Node::Unresolved { .. } => ("unres", Color::Red),
         Node::MappedStatement { .. } => ("mapper", Color::Blue),
         Node::JavaSql { .. } => ("sql", Color::Magenta),

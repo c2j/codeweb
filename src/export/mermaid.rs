@@ -6,6 +6,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
     for idx in graph.node_indices() {
         let (label, shape_fmt) = match &graph[idx] {
             Node::Procedure { id, .. } => (id.to_string(), ("[\"", "\"]")),
+            Node::Function { id, .. } => (id.to_string(), ("{{\"", "\"}}")),
             Node::Unresolved { raw_expr, .. } => {
                 (format!("?{}", truncate(raw_expr, 30)), ("[\"", "\"]"))
             }

@@ -24,6 +24,12 @@ enum NodeKindJson {
         file: String,
         line: usize,
     },
+    Function {
+        name: String,
+        schema: Option<String>,
+        file: String,
+        line: usize,
+    },
     Unresolved {
         raw_expr: String,
         context: String,
@@ -127,6 +133,15 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             Node::Procedure { id, location } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Procedure {
+                    name: id.name.clone(),
+                    schema: id.schema.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Function { id, location } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Function {
                     name: id.name.clone(),
                     schema: id.schema.clone(),
                     file: location.file.to_string_lossy().to_string(),

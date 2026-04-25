@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
-use crate::graph::{CodeGraph, Edge, Node, ProcedureId, SourceLocation};
+use crate::graph::{CodeGraph, Edge, Node, RoutineId, RoutineKind, SourceLocation};
 use crate::parser::{AllParsedFiles, CallEdge, CallExtractor, ParsedFile};
 use ogsql_parser::ast::{PackageItem, Statement};
 use ogsql_parser::{walk_pl_block, walk_statement};
@@ -17,7 +17,7 @@ impl GraphBuilder {
 
     pub fn build(&self, files: &[ParsedFile]) -> CodeGraph {
         let mut graph = CodeGraph::new();
-        let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut proc_index: HashMap<RoutineId, petgraph::graph::NodeIndex> = HashMap::new();
         let mut package_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
@@ -38,7 +38,7 @@ impl GraphBuilder {
 
     pub fn build_all(&self, all: &AllParsedFiles) -> CodeGraph {
         let mut graph = CodeGraph::new();
-        let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut proc_index: HashMap<RoutineId, petgraph::graph::NodeIndex> = HashMap::new();
         let mut package_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
@@ -87,7 +87,7 @@ impl GraphBuilder {
     #[allow(dead_code)]
     pub fn build_store(&self, all: &AllParsedFiles, project_name: &str) -> GraphStore {
         let mut graph = CodeGraph::new();
-        let mut proc_index: HashMap<ProcedureId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut proc_index: HashMap<RoutineId, petgraph::graph::NodeIndex> = HashMap::new();
         let mut package_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
@@ -136,14 +136,14 @@ impl GraphBuilder {
     fn create_procedure_nodes(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
-        proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         package_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for file in files {
             for info in &file.statements {
                 match &info.statement {
                     Statement::CreateProcedure(p) => {
-                        let id = ProcedureId::from_object_name(&p.name);
+                        let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                         proc_index.entry(id.clone()).or_insert_with(|| {
                             let node = Node::Procedure {
                                 id,
@@ -156,9 +156,9 @@ impl GraphBuilder {
                         });
                     }
                     Statement::CreateFunction(f) => {
-                        let id = ProcedureId::from_object_name(&f.name);
+                        let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                         proc_index.entry(id.clone()).or_insert_with(|| {
-                            let node = Node::Procedure {
+                            let node = Node::Function {
                                 id,
                                 location: SourceLocation {
                                     file: file.path.clone(),
@@ -201,7 +201,8 @@ impl GraphBuilder {
                         };
                         let trigger_idx = graph.add_node(trigger_node);
 
-                        let func_id = ProcedureId::from_object_name(&t.func_name);
+                        let func_id =
+                            RoutineId::from_object_name(&t.func_name, RoutineKind::Function);
                         let func_idx = proc_index.get(&func_id).copied().unwrap_or_else(|| {
                             let unresolved = Node::Unresolved {
                                 raw_expr: t.func_name.join("."),
@@ -235,7 +236,7 @@ impl GraphBuilder {
         start_line: usize,
         file_path: &std::path::Path,
         graph: &mut CodeGraph,
-        proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         package_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default();
@@ -262,29 +263,40 @@ impl GraphBuilder {
         });
 
         for item in pkg_items {
-            let (proc_name, has_block) = match item {
-                PackageItem::Procedure(p) => (p.name.join("."), p.block.is_some()),
-                PackageItem::Function(f) => (f.name.join("."), f.block.is_some()),
+            let (proc_name, block, kind) = match item {
+                PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
+                PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
                 PackageItem::Raw(_) => continue,
             };
-            let proc_id = ProcedureId {
+            let Some(_block) = block else {
+                continue;
+            };
+            let proc_id = RoutineId {
                 schema: schema_part.clone(),
                 package: Some(pkg_name_part.clone()),
                 name: proc_name,
+                kind,
             };
             let proc_idx = proc_index.entry(proc_id.clone()).or_insert_with(|| {
-                let node = Node::Procedure {
-                    id: proc_id.clone(),
-                    location: SourceLocation {
-                        file: file_path.to_path_buf(),
-                        line: start_line,
+                let node = match kind {
+                    RoutineKind::Procedure => Node::Procedure {
+                        id: proc_id.clone(),
+                        location: SourceLocation {
+                            file: file_path.to_path_buf(),
+                            line: start_line,
+                        },
+                    },
+                    RoutineKind::Function => Node::Function {
+                        id: proc_id.clone(),
+                        location: SourceLocation {
+                            file: file_path.to_path_buf(),
+                            line: start_line,
+                        },
                     },
                 };
                 graph.add_node(node)
             });
-            if has_block {
-                graph.add_edge(pkg_idx, *proc_idx, Edge::ContainsRoutine);
-            }
+            graph.add_edge(pkg_idx, *proc_idx, Edge::ContainsRoutine);
         }
     }
 
@@ -303,20 +315,22 @@ impl GraphBuilder {
             match item {
                 PackageItem::Procedure(p) => {
                     if let Some(ref block) = p.block {
-                        extractor.current_procedure = Some(ProcedureId {
+                        extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
                             name: p.name.join("."),
+                            kind: RoutineKind::Procedure,
                         });
                         walk_pl_block(extractor, block);
                     }
                 }
                 PackageItem::Function(f) => {
                     if let Some(ref block) = f.block {
-                        extractor.current_procedure = Some(ProcedureId {
+                        extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
                             name: f.name.join("."),
+                            kind: RoutineKind::Function,
                         });
                         walk_pl_block(extractor, block);
                     }
@@ -351,7 +365,7 @@ impl GraphBuilder {
     fn create_edges(
         edges: &[CallEdge],
         graph: &mut CodeGraph,
-        proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
     ) {
         let mut seen: HashMap<(Option<String>, String), usize> = HashMap::new();
 
@@ -365,18 +379,25 @@ impl GraphBuilder {
             }
             seen.insert(key, edge.location.line);
 
-            let caller_idx = edge
-                .caller
-                .as_ref()
-                .and_then(|id| proc_index.get(id).copied());
+            let caller_idx = edge.caller.as_ref().and_then(|id| {
+                let rid = RoutineId {
+                    schema: id.schema.clone(),
+                    package: id.package.clone(),
+                    name: id.name.clone(),
+                    kind: RoutineKind::Procedure,
+                };
+                proc_index.get(&rid).copied()
+            });
 
-            let callee_id = ProcedureId::from_qualified_name(&edge.callee_name);
+            let callee_id =
+                RoutineId::from_qualified_name(&edge.callee_name, RoutineKind::Procedure);
             let callee_idx = proc_index.get(&callee_id).copied().or_else(|| {
                 if callee_id.schema.is_some() && callee_id.package.is_none() {
-                    let alt_id = ProcedureId {
+                    let alt_id = RoutineId {
                         schema: None,
                         package: callee_id.schema.clone(),
                         name: callee_id.name.clone(),
+                        kind: RoutineKind::Procedure,
                     };
                     proc_index.get(&alt_id).copied()
                 } else {
@@ -430,7 +451,7 @@ impl GraphBuilder {
     fn add_ibatis_nodes_from_parsed(
         ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         graph: &mut CodeGraph,
-        proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -456,7 +477,8 @@ impl GraphBuilder {
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
                     for callee_name in calls {
-                        let callee_id = ProcedureId::from_qualified_name(&callee_name);
+                        let callee_id =
+                            RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
                             let unresolved = Node::Unresolved {
                                 raw_expr: callee_name.clone(),
@@ -491,7 +513,7 @@ impl GraphBuilder {
     fn add_java_nodes_from_parsed(
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
-        proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -514,7 +536,8 @@ impl GraphBuilder {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &java_path);
                     for callee_name in calls {
-                        let callee_id = ProcedureId::from_qualified_name(&callee_name);
+                        let callee_id =
+                            RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
                             let unresolved = Node::Unresolved {
                                 raw_expr: callee_name.clone(),
@@ -637,7 +660,7 @@ impl GraphBuilder {
     fn add_table_refs_from_sql(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
-        proc_index: &HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         _package_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -645,7 +668,7 @@ impl GraphBuilder {
             for info in &file.statements {
                 match &info.statement {
                     Statement::CreateProcedure(p) => {
-                        let proc_id = ProcedureId::from_object_name(&p.name);
+                        let proc_id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                         if let Some(&proc_idx) = proc_index.get(&proc_id) {
                             Self::extract_and_add_table_refs(
                                 std::slice::from_ref(info),
@@ -657,7 +680,7 @@ impl GraphBuilder {
                         }
                     }
                     Statement::CreateFunction(f) => {
-                        let proc_id = ProcedureId::from_object_name(&f.name);
+                        let proc_id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                         if let Some(&proc_idx) = proc_index.get(&proc_id) {
                             Self::extract_and_add_table_refs(
                                 std::slice::from_ref(info),
@@ -702,7 +725,7 @@ impl GraphBuilder {
         pkg_items: &[PackageItem],
         info: &ogsql_parser::StatementInfo,
         file_path: &std::path::Path,
-        proc_index: &HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -713,15 +736,16 @@ impl GraphBuilder {
             None
         };
         for item in pkg_items {
-            let (proc_name, block) = match item {
-                PackageItem::Procedure(p) => (p.name.join("."), &p.block),
-                PackageItem::Function(f) => (f.name.join("."), &f.block),
+            let (proc_name, block, kind) = match item {
+                PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
+                PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
                 PackageItem::Raw(_) => continue,
             };
-            let proc_id = ProcedureId {
+            let proc_id = RoutineId {
                 schema: schema_part.clone(),
                 package: Some(pkg_name_part.clone()),
                 name: proc_name,
+                kind,
             };
             if let Some(&proc_idx) = proc_index.get(&proc_id) {
                 if let Some(ref block) = block {
@@ -786,7 +810,7 @@ impl GraphBuilder {
     fn add_java_method_nodes_from_parsed(
         java_results: &[crate::parser::java_method::JavaParseResult],
         graph: &mut CodeGraph,
-        _proc_index: &mut HashMap<ProcedureId, petgraph::graph::NodeIndex>,
+        _proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let mut class_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
@@ -1194,7 +1218,7 @@ mod tests {
 
         let (src, dst) = graph.edge_endpoints(trigger_edges[0]).unwrap();
         assert!(matches!(graph[src], Node::Trigger { .. }));
-        assert!(matches!(graph[dst], Node::Procedure { .. }));
+        assert!(matches!(graph[dst], Node::Function { .. }));
     }
 
     #[test]
@@ -1270,5 +1294,134 @@ mod tests {
             1,
             "View should reference 1 table (t_users)"
         );
+    }
+
+    #[test]
+    #[ignore] // Diagnostic test, run with: cargo test builder::tests::diagnose_deposit -- --ignored --nocapture
+    fn diagnose_deposit_package() {
+        let sql = std::fs::read_to_string(
+            "/Users/c2j/Projects/Desktop_Projects/CODE/cobweb/lib/codeweb-complex-demo/sql/PKG_DEPOSIT_ACNT_INFO_INQUIRY.sql"
+        ).unwrap();
+
+        let tokens = ogsql_parser::Tokenizer::new(&sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql);
+        let stmts = parser.parse_with_text();
+
+        for err in parser.errors() {
+            eprintln!("PARSE ERR: {}", err);
+        }
+
+        eprintln!("\n=== {} statements ===", stmts.len());
+        for (i, info) in stmts.iter().enumerate() {
+            eprintln!("\n--- Stmt {} @ line {} ---", i, info.start_line);
+            match &info.statement {
+                ogsql_parser::ast::Statement::CreatePackage(pkg) => {
+                    eprintln!("CreatePackage name={:?}", pkg.name);
+                    eprintln!("  items: {}", pkg.items.len());
+                    for (j, item) in pkg.items.iter().enumerate() {
+                        match item {
+                            ogsql_parser::ast::PackageItem::Procedure(p) => {
+                                eprintln!(
+                                    "  [{}] Proc {:?} block={}",
+                                    j,
+                                    p.name,
+                                    p.block.is_some()
+                                );
+                            }
+                            ogsql_parser::ast::PackageItem::Function(f) => {
+                                eprintln!(
+                                    "  [{}] Func {:?} block={}",
+                                    j,
+                                    f.name,
+                                    f.block.is_some()
+                                );
+                            }
+                            ogsql_parser::ast::PackageItem::Raw(r) => {
+                                eprintln!("  [{}] Raw({:?})", j, &r[..r.len().min(50)]);
+                            }
+                        }
+                    }
+                }
+                ogsql_parser::ast::Statement::CreatePackageBody(pkg) => {
+                    eprintln!("CreatePackageBody name={:?}", pkg.name);
+                    eprintln!("  items: {}", pkg.items.len());
+                    for (j, item) in pkg.items.iter().enumerate() {
+                        match item {
+                            ogsql_parser::ast::PackageItem::Procedure(p) => {
+                                eprintln!(
+                                    "  [{}] Proc {:?} block={}",
+                                    j,
+                                    p.name,
+                                    p.block.is_some()
+                                );
+                            }
+                            ogsql_parser::ast::PackageItem::Function(f) => {
+                                eprintln!(
+                                    "  [{}] Func {:?} block={}",
+                                    j,
+                                    f.name,
+                                    f.block.is_some()
+                                );
+                            }
+                            ogsql_parser::ast::PackageItem::Raw(r) => {
+                                eprintln!("  [{}] Raw({:?})", j, &r[..r.len().min(50)]);
+                            }
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("Other: {:?}", std::mem::discriminant(other));
+                }
+            }
+        }
+
+        // Build the graph and inspect
+        let parsed = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: stmts,
+        }];
+        let graph = GraphBuilder::new().build(&parsed);
+
+        eprintln!(
+            "\n=== GRAPH: {} nodes, {} edges ===",
+            graph.node_count(),
+            graph.edge_count()
+        );
+        for idx in graph.node_indices() {
+            let node = &graph[idx];
+            let in_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
+            match node {
+                Node::Package { name, .. } => {
+                    eprintln!("  Package({}) in={} out={}", name, in_deg, out_deg)
+                }
+                Node::Procedure { id, .. } => eprintln!(
+                    "  Proc({}.{}) in={} out={}",
+                    id.package.as_deref().unwrap_or("-"),
+                    id.name,
+                    in_deg,
+                    out_deg
+                ),
+                Node::Trigger { name, .. } => {
+                    eprintln!("  Trigger({}) in={} out={}", name, in_deg, out_deg)
+                }
+                Node::Table { name, .. } => {
+                    eprintln!("  Table({}) in={} out={}", name, in_deg, out_deg)
+                }
+                Node::View { name, .. } => {
+                    eprintln!("  View({}) in={} out={}", name, in_deg, out_deg)
+                }
+                Node::Unresolved { raw_expr, .. } => {
+                    eprintln!("  Unresolved({}) in={} out={}", raw_expr, in_deg, out_deg)
+                }
+                _ => eprintln!("  Other in={} out={}", in_deg, out_deg),
+            }
+        }
+
+        panic!("Diagnostic test - check stderr output above");
     }
 }

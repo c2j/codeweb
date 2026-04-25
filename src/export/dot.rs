@@ -7,6 +7,7 @@ pub fn to_dot(graph: &CodeGraph) -> String {
     for idx in graph.node_indices() {
         let (label, shape, style) = match &graph[idx] {
             Node::Procedure { id, .. } => (id.to_string(), "box", ""),
+            Node::Function { id, .. } => (id.to_string(), "ellipse", ""),
             Node::Unresolved { raw_expr, .. } => (
                 format!("?{}", truncate(raw_expr, 40)),
                 "box",

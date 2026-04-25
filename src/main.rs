@@ -342,6 +342,7 @@ fn cmd_stats(project: &Path) -> Result<()> {
     println!("Project: {}", proj.name());
     println!();
     println!("  {:>12}  procedures", stats.procedures,);
+    println!("  {:>12}  functions", stats.functions,);
     println!("  {:>12}  mappers", stats.mappers,);
     println!("  {:>12}  java methods", stats.java_methods,);
     println!("  {:>12}  java classes", stats.java_classes,);
@@ -400,6 +401,7 @@ fn cmd_files(project: &Path) -> Result<()> {
 fn node_type_tag(node: &Node) -> &'static str {
     match node {
         Node::Procedure { .. } => "proc",
+        Node::Function { .. } => "func",
         Node::Unresolved { .. } => "unres",
         Node::MappedStatement { .. } => "mapper",
         Node::JavaSql { .. } => "sql",
@@ -625,6 +627,7 @@ fn print_analyze_report(report: &project::AnalyzeReport) {
 
 fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut procedures = 0usize;
+    let mut functions = 0usize;
     let mut unresolved = 0usize;
     let mut mappers = 0usize;
     let mut java_sql = 0usize;
@@ -636,6 +639,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     for idx in graph.node_indices() {
         match &graph[idx] {
             Node::Procedure { .. } => procedures += 1,
+            Node::Function { .. } => functions += 1,
             Node::Unresolved { .. } => unresolved += 1,
             Node::MappedStatement { .. } => mappers += 1,
             Node::JavaSql { .. } => java_sql += 1,
@@ -651,13 +655,13 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} unresolved, {} edges",
-            procedures, mappers, java_sql, java_methods, java_classes, tables, views, unresolved, edges
+            "graph: {} procedures, {} functions, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} unresolved, {} edges",
+            procedures, functions, mappers, java_sql, java_methods, java_classes, tables, views, unresolved, edges
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} edges",
-            procedures, mappers, java_sql, java_methods, java_classes, tables, views, edges
+            "graph: {} procedures, {} functions, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} edges",
+            procedures, functions, mappers, java_sql, java_methods, java_classes, tables, views, edges
         );
     }
 }

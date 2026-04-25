@@ -396,7 +396,11 @@ fn test_e2e_full_chain() {
 
     assert!(
         node_types.contains("procedure"),
-        "Expected procedure nodes (SQL stored procs/functions)"
+        "Expected procedure nodes (SQL stored procs)"
+    );
+    assert!(
+        node_types.contains("function"),
+        "Expected function nodes (SQL functions)"
     );
     assert!(
         node_types.contains("mapped_statement"),
@@ -453,8 +457,14 @@ fn test_e2e_full_chain() {
         proc_names.contains(&"deactivate_user"),
         "Expected pkg_user_mgmt.deactivate_user procedure"
     );
+
+    let func_names: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n["type"] == "function")
+        .filter_map(|n| n["name"].as_str())
+        .collect();
     assert!(
-        proc_names.contains(&"send_event"),
+        func_names.contains(&"send_event"),
         "Expected pkg_notify.send_event function"
     );
 
@@ -499,7 +509,8 @@ fn test_e2e_full_chain() {
             let tgt = e["target"].as_u64()? as usize;
             let src_type = nodes.get(src)?["type"].as_str()?;
             let tgt_type = nodes.get(tgt)?["type"].as_str()?;
-            if src_type == "mapped_statement" && tgt_type == "procedure" {
+            if src_type == "mapped_statement" && (tgt_type == "procedure" || tgt_type == "function")
+            {
                 Some((src, tgt))
             } else {
                 None
@@ -508,7 +519,7 @@ fn test_e2e_full_chain() {
         .collect();
     assert!(
         !mapper_to_proc.is_empty(),
-        "Expected at least one mapped_statement → procedure chain"
+        "Expected at least one mapped_statement → procedure/function chain"
     );
 
     let invokes_mapper_edges: Vec<&serde_json::Value> = edges
@@ -615,6 +626,11 @@ fn test_trigger_in_call_graph() {
     let has_trigger = nodes.iter().any(|n| n["type"] == "trigger");
     assert!(has_trigger, "Expected a trigger node");
 
+    let has_function = nodes
+        .iter()
+        .any(|n| n["type"] == "function" && n["name"] == "trg_func");
+    assert!(has_function, "Expected trg_func as a function node");
+
     let edges = parsed["edges"].as_array().unwrap();
     let has_triggers_routine = edges.iter().any(|e| e["type"] == "triggers_routine");
     assert!(has_triggers_routine, "Expected a triggers_routine edge");
@@ -698,5 +714,106 @@ fn test_package_cross_call_resolution() {
     assert!(
         has_call_edge,
         "Expected calls_procedure edge from caller_proc to do_work"
+    );
+}
+
+#[test]
+fn test_package_spec_no_ghost_procedure_nodes() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "pkg_spec.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE pkg_example IS
+            PROCEDURE do_work(p_id INT);
+            FUNCTION get_name(p_id INT) RETURN VARCHAR2;
+        END pkg_example;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let has_package = nodes.iter().any(|n| n["type"] == "package");
+    assert!(
+        has_package,
+        "Expected a package node, got nodes: {:?}",
+        nodes
+    );
+
+    let procedure_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "procedure").collect();
+    assert!(
+        procedure_nodes.is_empty(),
+        "Spec-only items should NOT create procedure nodes, but found: {:?}",
+        procedure_nodes
+    );
+}
+
+#[test]
+fn test_package_spec_and_body_only_body_produces_nodes() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "pkg_full.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE pkg_full IS
+            PROCEDURE do_work(p_id INT);
+            FUNCTION get_name(p_id INT) RETURN VARCHAR2;
+        END pkg_full;
+
+        CREATE OR REPLACE PACKAGE BODY pkg_full AS
+            PROCEDURE do_work(p_id INT) IS
+            BEGIN
+                INSERT INTO t_log VALUES(p_id);
+            END;
+        END pkg_full;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let procedure_names: Vec<_> = nodes
+        .iter()
+        .filter(|n| n["type"] == "procedure")
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert_eq!(
+        procedure_names,
+        vec!["do_work"],
+        "Only body procedures should appear, not spec-only declarations"
+    );
+
+    let function_names: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            n["type"] == "procedure"
+                && nodes
+                    .iter()
+                    .any(|m| m["type"] == "procedure" && m["name"] == n["name"])
+        })
+        .filter_map(|n| n["name"].as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        !function_names.contains(&"get_name"),
+        "get_name has no body implementation — should not appear as a node"
     );
 }

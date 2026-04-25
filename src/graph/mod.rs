@@ -5,7 +5,6 @@ pub mod traverse;
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -39,65 +38,6 @@ pub enum WriteKind {
 pub enum RoutineKind {
     Procedure,
     Function,
-}
-
-/// Unique identifier for a stored procedure or function.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ProcedureId {
-    pub schema: Option<String>,
-    pub package: Option<String>,
-    pub name: String,
-}
-
-impl ProcedureId {
-    /// Parse a qualified name like "schema.name" or just "name".
-    pub fn from_qualified_name(qualified: &str) -> Self {
-        if let Some((schema, name)) = qualified.rsplit_once('.') {
-            Self {
-                schema: Some(schema.to_string()),
-                package: None,
-                name: name.to_string(),
-            }
-        } else {
-            Self {
-                schema: None,
-                package: None,
-                name: qualified.to_string(),
-            }
-        }
-    }
-
-    /// Build from an ObjectName (Vec<String>).
-    pub fn from_object_name(parts: &[String]) -> Self {
-        match parts.len() {
-            0 => Self {
-                schema: None,
-                package: None,
-                name: String::new(),
-            },
-            1 => Self {
-                schema: None,
-                package: None,
-                name: parts[0].clone(),
-            },
-            _ => Self {
-                schema: Some(parts[..parts.len() - 1].join(".")),
-                package: None,
-                name: parts[parts.len() - 1].clone(),
-            },
-        }
-    }
-}
-
-impl fmt::Display for ProcedureId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.schema, &self.package) {
-            (Some(s), Some(p)) => write!(f, "{}.{}.{}", s, p, self.name),
-            (Some(s), None) => write!(f, "{}.{}", s, self.name),
-            (None, Some(p)) => write!(f, "{}.{}", p, self.name),
-            (None, None) => write!(f, "{}", self.name),
-        }
-    }
 }
 
 /// Unique identifier for a stored procedure or function (unified).
@@ -173,9 +113,14 @@ pub struct SourceLocation {
 /// A node in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
-    /// A resolved procedure or function.
+    /// A resolved stored procedure.
     Procedure {
-        id: ProcedureId,
+        id: RoutineId,
+        location: SourceLocation,
+    },
+    /// A resolved SQL function.
+    Function {
+        id: RoutineId,
         location: SourceLocation,
     },
     /// An unresolved call target (e.g. dynamic SQL).
@@ -292,6 +237,7 @@ impl Node {
     pub fn file(&self) -> &Path {
         match self {
             Node::Procedure { location, .. } => &location.file,
+            Node::Function { location, .. } => &location.file,
             Node::Unresolved { .. } => Path::new(""),
             Node::MappedStatement { xml_file, .. } => xml_file,
             Node::JavaSql { java_file, .. } => java_file,
@@ -308,7 +254,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn access_mode_bitflags_or() {
@@ -373,12 +319,15 @@ mod tests {
             name: "do_thing".to_string(),
             kind: RoutineKind::Function,
         };
-        assert_ne!(proc, func, "Same name but different kind should not be equal");
+        assert_ne!(
+            proc, func,
+            "Same name but different kind should not be equal"
+        );
     }
 
     #[test]
-    fn procedure_id_standalone() {
-        let id = ProcedureId::from_qualified_name("my_proc");
+    fn routine_id_standalone() {
+        let id = RoutineId::from_qualified_name("my_proc", RoutineKind::Procedure);
         assert_eq!(id.schema, None);
         assert_eq!(id.package, None);
         assert_eq!(id.name, "my_proc");
@@ -386,8 +335,8 @@ mod tests {
     }
 
     #[test]
-    fn procedure_id_schema_qualified() {
-        let id = ProcedureId::from_qualified_name("public.my_proc");
+    fn routine_id_schema_qualified() {
+        let id = RoutineId::from_qualified_name("public.my_proc", RoutineKind::Procedure);
         assert_eq!(id.schema, Some("public".to_string()));
         assert_eq!(id.package, None);
         assert_eq!(id.name, "my_proc");
@@ -395,47 +344,52 @@ mod tests {
     }
 
     #[test]
-    fn procedure_id_package_member_display() {
-        let id = ProcedureId {
+    fn routine_id_package_member_display() {
+        let id = RoutineId {
             schema: None,
             package: Some("pkg_api".to_string()),
             name: "do_work".to_string(),
+            kind: RoutineKind::Procedure,
         };
         assert_eq!(id.to_string(), "pkg_api.do_work");
     }
 
     #[test]
-    fn procedure_id_schema_package_member_display() {
-        let id = ProcedureId {
+    fn routine_id_schema_package_member_display() {
+        let id = RoutineId {
             schema: Some("myschema".to_string()),
             package: Some("pkg_utils".to_string()),
             name: "cleanup".to_string(),
+            kind: RoutineKind::Procedure,
         };
         assert_eq!(id.to_string(), "myschema.pkg_utils.cleanup");
     }
 
     #[test]
-    fn procedure_id_equality() {
-        let a = ProcedureId {
+    fn routine_id_equality() {
+        let a = RoutineId {
             schema: None,
             package: Some("pkg".to_string()),
             name: "proc".to_string(),
+            kind: RoutineKind::Procedure,
         };
-        let b = ProcedureId {
+        let b = RoutineId {
             schema: None,
             package: Some("pkg".to_string()),
             name: "proc".to_string(),
+            kind: RoutineKind::Procedure,
         };
         assert_eq!(a, b);
     }
 
     #[test]
-    fn procedure_id_hash_in_hashmap() {
+    fn routine_id_hash_in_hashmap() {
         let mut map = HashMap::new();
-        let id = ProcedureId {
+        let id = RoutineId {
             schema: None,
             package: Some("pkg".to_string()),
             name: "proc".to_string(),
+            kind: RoutineKind::Procedure,
         };
         map.insert(id.clone(), 42);
         assert_eq!(map.get(&id), Some(&42));
