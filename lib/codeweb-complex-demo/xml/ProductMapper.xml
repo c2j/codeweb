@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.ProductDao">
+    <select id="getProductInfo" resultType="map">
+        CALL pkg_product.get_product_info(#{productId})
+    </select>
+
+    <select id="searchProducts" resultType="map">
+        CALL pkg_product.search_products(#{keyword}, #{category})
+    </select>
+
+    <update id="updatePrice">
+        CALL pkg_product.update_product_price(#{productId}, #{newPrice})
+    </update>
+
+    <update id="batchUpdatePrices">
+        CALL pkg_product.batch_update_prices(#{category}, #{multiplier})
+    </update>
+
+    <update id="deactivateProduct">
+        CALL pkg_product.deactivate_product(#{productId})
+    </update>
+</mapper>

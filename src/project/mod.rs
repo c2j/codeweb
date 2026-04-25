@@ -114,6 +114,9 @@ impl Project {
     pub fn analyze(&mut self) -> Result<AnalyzeReport> {
         let start = std::time::Instant::now();
 
+        let codeweb_dir = self.root.join(".codeweb");
+        crate::parse_log::init(&codeweb_dir);
+
         let input_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
             vec![self.root.clone()]
         } else {

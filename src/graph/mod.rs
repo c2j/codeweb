@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcedureId {
     pub schema: Option<String>,
+    pub package: Option<String>,
     pub name: String,
 }
 
@@ -20,11 +21,13 @@ impl ProcedureId {
         if let Some((schema, name)) = qualified.rsplit_once('.') {
             Self {
                 schema: Some(schema.to_string()),
+                package: None,
                 name: name.to_string(),
             }
         } else {
             Self {
                 schema: None,
+                package: None,
                 name: qualified.to_string(),
             }
         }
@@ -35,14 +38,17 @@ impl ProcedureId {
         match parts.len() {
             0 => Self {
                 schema: None,
+                package: None,
                 name: String::new(),
             },
             1 => Self {
                 schema: None,
+                package: None,
                 name: parts[0].clone(),
             },
             _ => Self {
                 schema: Some(parts[..parts.len() - 1].join(".")),
+                package: None,
                 name: parts[parts.len() - 1].clone(),
             },
         }
@@ -51,9 +57,11 @@ impl ProcedureId {
 
 impl fmt::Display for ProcedureId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.schema {
-            Some(s) => write!(f, "{}.{}", s, self.name),
-            None => write!(f, "{}", self.name),
+        match (&self.schema, &self.package) {
+            (Some(s), Some(p)) => write!(f, "{}.{}.{}", s, p, self.name),
+            (Some(s), None) => write!(f, "{}.{}", s, self.name),
+            (None, Some(p)) => write!(f, "{}.{}", p, self.name),
+            (None, None) => write!(f, "{}", self.name),
         }
     }
 }
@@ -121,13 +129,25 @@ pub enum Node {
         schema: Option<String>,
         name: String,
     },
+    Package {
+        schema: Option<String>,
+        name: String,
+        location: SourceLocation,
+    },
+    Trigger {
+        name: String,
+        table: Vec<String>,
+        location: SourceLocation,
+    },
 }
 
 /// An edge in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Edge {
     /// Direct static call to a known procedure.
-    DirectCall { location: SourceLocation },
+    DirectCall {
+        location: SourceLocation,
+    },
     /// Dynamic call via EXECUTE with unparseable SQL.
     DynamicCall {
         raw_expr: String,
@@ -135,20 +155,36 @@ pub enum Edge {
     },
 
     /// A MappedStatement or JavaSql calls a stored procedure.
-    CallsProcedure { location: SourceLocation },
+    CallsProcedure {
+        location: SourceLocation,
+    },
     /// A JavaSql is linked to a MappedStatement via namespace.method matching.
-    InvokesMapper { location: SourceLocation },
+    InvokesMapper {
+        location: SourceLocation,
+    },
 
     /// A Java method calls another Java method.
-    CallsJava { location: SourceLocation },
+    CallsJava {
+        location: SourceLocation,
+    },
     /// A Java class contains a Java method.
     ContainsMethod,
     /// A Java class extends another class.
-    Extends { location: SourceLocation },
+    Extends {
+        location: SourceLocation,
+    },
     /// A Java class implements an interface.
-    Implements { location: SourceLocation },
+    Implements {
+        location: SourceLocation,
+    },
     /// A statement references a table or view.
-    ReferencesTable { location: SourceLocation },
+    ReferencesTable {
+        location: SourceLocation,
+    },
+    ContainsRoutine,
+    TriggersRoutine {
+        location: SourceLocation,
+    },
 }
 
 /// The call graph itself.
@@ -166,6 +202,79 @@ impl Node {
             Node::JavaClass { file, .. } => file,
             Node::Table { .. } => Path::new(""),
             Node::View { .. } => Path::new(""),
+            Node::Package { location, .. } => &location.file,
+            Node::Trigger { location, .. } => &location.file,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn procedure_id_standalone() {
+        let id = ProcedureId::from_qualified_name("my_proc");
+        assert_eq!(id.schema, None);
+        assert_eq!(id.package, None);
+        assert_eq!(id.name, "my_proc");
+        assert_eq!(id.to_string(), "my_proc");
+    }
+
+    #[test]
+    fn procedure_id_schema_qualified() {
+        let id = ProcedureId::from_qualified_name("public.my_proc");
+        assert_eq!(id.schema, Some("public".to_string()));
+        assert_eq!(id.package, None);
+        assert_eq!(id.name, "my_proc");
+        assert_eq!(id.to_string(), "public.my_proc");
+    }
+
+    #[test]
+    fn procedure_id_package_member_display() {
+        let id = ProcedureId {
+            schema: None,
+            package: Some("pkg_api".to_string()),
+            name: "do_work".to_string(),
+        };
+        assert_eq!(id.to_string(), "pkg_api.do_work");
+    }
+
+    #[test]
+    fn procedure_id_schema_package_member_display() {
+        let id = ProcedureId {
+            schema: Some("myschema".to_string()),
+            package: Some("pkg_utils".to_string()),
+            name: "cleanup".to_string(),
+        };
+        assert_eq!(id.to_string(), "myschema.pkg_utils.cleanup");
+    }
+
+    #[test]
+    fn procedure_id_equality() {
+        let a = ProcedureId {
+            schema: None,
+            package: Some("pkg".to_string()),
+            name: "proc".to_string(),
+        };
+        let b = ProcedureId {
+            schema: None,
+            package: Some("pkg".to_string()),
+            name: "proc".to_string(),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn procedure_id_hash_in_hashmap() {
+        let mut map = HashMap::new();
+        let id = ProcedureId {
+            schema: None,
+            package: Some("pkg".to_string()),
+            name: "proc".to_string(),
+        };
+        map.insert(id.clone(), 42);
+        assert_eq!(map.get(&id), Some(&42));
     }
 }

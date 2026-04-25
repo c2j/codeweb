@@ -351,6 +351,16 @@ pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
     let mut walker = JavaTreeWalker::new(&source_bytes, path);
     walker.walk_with_methods(tree.root_node());
 
+    let file_str = path.to_string_lossy();
+    crate::parse_log::info(
+        &file_str,
+        &format!(
+            "{} classes, {} methods",
+            walker.classes.len(),
+            walker.methods.len()
+        ),
+    );
+
     Ok(JavaParseResult {
         file: path.to_path_buf(),
         package: walker.package,

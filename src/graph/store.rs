@@ -131,6 +131,7 @@ impl GraphStore {
                 Node::JavaClass { .. } => s.java_classes += 1,
                 Node::Table { .. } => s.tables += 1,
                 Node::View { .. } => s.views += 1,
+                Node::Package { .. } | Node::Trigger { .. } => {}
             }
         }
         s.edges = self.graph.edge_count();
@@ -308,6 +309,8 @@ fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::JavaMethod { file, .. } => Some(file.clone()),
         Node::JavaClass { file, .. } => Some(file.clone()),
         Node::Table { .. } | Node::View { .. } | Node::Unresolved { .. } => None,
+        Node::Package { location, .. } => Some(location.file.clone()),
+        Node::Trigger { location, .. } => Some(location.file.clone()),
     }
 }
 
@@ -330,6 +333,8 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",
         crate::graph::Edge::ReferencesTable { .. } => "references_table",
+        crate::graph::Edge::ContainsRoutine => "contains_routine",
+        crate::graph::Edge::TriggersRoutine { .. } => "triggers_routine",
     }
     .to_string()
 }

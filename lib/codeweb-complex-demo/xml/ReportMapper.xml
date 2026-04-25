@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.ReportDao">
+    <update id="generateDailyReport">
+        CALL pkg_report.generate_daily_report(#{date})
+    </update>
+
+    <update id="generateSalesReport">
+        CALL pkg_report.generate_sales_report(#{startDate}, #{endDate})
+    </update>
+
+    <update id="exportReport">
+        CALL pkg_report.export_report_to_file(#{reportId})
+    </update>
+
+    <update id="cleanupOldReports">
+        CALL pkg_report.cleanup_old_reports(#{days})
+    </update>
+</mapper>

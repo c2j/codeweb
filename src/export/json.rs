@@ -65,6 +65,20 @@ enum NodeKindJson {
         schema: Option<String>,
         name: String,
     },
+    #[serde(rename = "package")]
+    Package {
+        schema: Option<String>,
+        name: String,
+        file: String,
+        line: usize,
+    },
+    #[serde(rename = "trigger")]
+    Trigger {
+        name: String,
+        table: String,
+        file: String,
+        line: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -100,6 +114,10 @@ enum EdgeKindJson {
     Implements { file: String, line: usize },
     #[serde(rename = "references_table")]
     ReferencesTable { file: String, line: usize },
+    #[serde(rename = "contains_routine")]
+    ContainsRoutine,
+    #[serde(rename = "triggers_routine")]
+    TriggersRoutine { file: String, line: usize },
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
@@ -202,6 +220,32 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     name: name.clone(),
                 },
             },
+            Node::Package {
+                schema,
+                name,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Package {
+                    schema: schema.clone(),
+                    name: name.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Trigger {
+                name,
+                table,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Trigger {
+                    name: name.clone(),
+                    table: table.join("."),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
         };
         nodes.push(node_json);
     }
@@ -278,6 +322,19 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::ReferencesTable {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::ContainsRoutine => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::ContainsRoutine,
+            },
+            Edge::TriggersRoutine { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::TriggersRoutine {
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },

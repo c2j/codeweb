@@ -6,6 +6,7 @@ use std::fmt;
 pub enum NodeKey {
     Procedure {
         schema: Option<String>,
+        package: Option<String>,
         name: String,
     },
     Mapper {
@@ -26,6 +27,13 @@ pub enum NodeKey {
         schema: Option<String>,
         name: String,
     },
+    Package {
+        schema: Option<String>,
+        name: String,
+    },
+    Trigger {
+        name: String,
+    },
     JavaSql {
         file: String,
         line: usize,
@@ -39,9 +47,15 @@ pub enum NodeKey {
 impl fmt::Display for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NodeKey::Procedure { schema, name } => match schema {
-                Some(s) => write!(f, "proc:{}.{}", s, name),
-                None => write!(f, "proc:{}", name),
+            NodeKey::Procedure {
+                schema,
+                package,
+                name,
+            } => match (schema, package) {
+                (Some(s), Some(p)) => write!(f, "proc:{}.{}.{}", s, p, name),
+                (Some(s), None) => write!(f, "proc:{}.{}", s, name),
+                (None, Some(p)) => write!(f, "proc:{}.{}", p, name),
+                (None, None) => write!(f, "proc:{}", name),
             },
             NodeKey::Mapper {
                 namespace,
@@ -57,6 +71,11 @@ impl fmt::Display for NodeKey {
                 Some(s) => write!(f, "view:{}.{}", s, name),
                 None => write!(f, "view:{}", name),
             },
+            NodeKey::Package { schema, name } => match schema {
+                Some(s) => write!(f, "pkg:{}.{}", s, name),
+                None => write!(f, "pkg:{}", name),
+            },
+            NodeKey::Trigger { name } => write!(f, "trigger:{}", name),
             NodeKey::JavaSql { file, line } => write!(f, "javasql:{}:{}", file, line),
             NodeKey::Unresolved { raw_expr, context } => {
                 write!(f, "unresolved:{} (in {})", raw_expr, context)
@@ -71,6 +90,7 @@ impl NodeKey {
         match node {
             super::Node::Procedure { id, .. } => NodeKey::Procedure {
                 schema: id.schema.clone(),
+                package: id.package.clone(),
                 name: id.name.clone(),
             },
             super::Node::MappedStatement {
@@ -91,6 +111,11 @@ impl NodeKey {
                 schema: schema.clone(),
                 name: name.clone(),
             },
+            super::Node::Package { schema, name, .. } => NodeKey::Package {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            super::Node::Trigger { name, .. } => NodeKey::Trigger { name: name.clone() },
             super::Node::JavaSql {
                 java_file, line, ..
             } => NodeKey::JavaSql {

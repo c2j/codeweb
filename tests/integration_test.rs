@@ -569,9 +569,15 @@ fn test_package_body_in_call_graph() {
     let nodes = parsed["nodes"].as_array().unwrap();
 
     let has_package = nodes.iter().any(|n| n["type"] == "package");
-    assert!(has_package, "Expected a package node, got nodes: {:?}", nodes);
+    assert!(
+        has_package,
+        "Expected a package node, got nodes: {:?}",
+        nodes
+    );
 
-    let has_package_proc = nodes.iter().any(|n| n["type"] == "procedure" && n["name"] == "do_work");
+    let has_package_proc = nodes
+        .iter()
+        .any(|n| n["type"] == "procedure" && n["name"] == "do_work");
     assert!(has_package_proc, "Expected a procedure node for do_work");
 }
 

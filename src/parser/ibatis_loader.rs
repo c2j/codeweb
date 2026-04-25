@@ -24,13 +24,25 @@ fn load_ibatis_file(path: &Path) -> Result<ParsedMapper, String> {
     let file_path = path.to_string_lossy().to_string();
     let result = parse_mapper_bytes_with_path(&bytes, Some(&file_path));
 
-    if !result.errors.is_empty() {
-        eprintln!(
-            "warning: {} error(s) in {}",
-            result.errors.len(),
-            path.display()
-        );
+    if result.namespace.is_empty() && result.statements.is_empty() && result.errors.is_empty() {
+        crate::parse_log::info(&file_path, "skipped: not a mapper file");
+        return Err("not a mapper file".to_string());
     }
+
+    if !result.errors.is_empty() {
+        for err in &result.errors {
+            crate::parse_log::warn(&file_path, &err.to_string());
+        }
+    }
+
+    crate::parse_log::info(
+        &file_path,
+        &format!(
+            "namespace={}, {} statements",
+            result.namespace,
+            result.statements.len()
+        ),
+    );
 
     Ok(result)
 }

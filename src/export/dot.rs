@@ -49,6 +49,14 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 };
                 (label, "cylinder", ", style=filled, fillcolor=lightcyan")
             }
+            Node::Package { name, schema, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, "component", "")
+            }
+            Node::Trigger { name, .. } => (name.clone(), "hexagon", ""),
         };
         let escaped = dot_escape(&label);
         out.push_str(&format!(
@@ -77,6 +85,8 @@ pub fn to_dot(graph: &CodeGraph) -> String {
             Edge::Implements { .. } => ("label=\"implements\"".to_string(), "style=dashed,"),
             Edge::DirectCall { .. } => (String::new(), ""),
             Edge::ReferencesTable { .. } => (String::new(), "color=purple,"),
+            Edge::ContainsRoutine => ("label=\"contains\"".to_string(), "style=dotted,"),
+            Edge::TriggersRoutine { .. } => ("label=\"triggers\"".to_string(), "color=red,"),
         };
         out.push_str(&format!(
             "    {} -> {} [{}{}];\n",

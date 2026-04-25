@@ -75,15 +75,13 @@ fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {
     let mut parser = ogsql_parser::Parser::with_source(tokens, sql);
     let stmts = parser.parse_with_text();
 
+    let file_str = path.to_string_lossy().to_string();
     if !parser.errors().is_empty() {
-        let first_err = &parser.errors()[0];
-        eprintln!(
-            "warning: parse errors in {}: {} ({} total errors)",
-            path.display(),
-            first_err,
-            parser.errors().len()
-        );
+        for err in parser.errors() {
+            crate::parse_log::warn(&file_str, &err.to_string());
+        }
     }
+    crate::parse_log::info(&file_str, &format!("{} statements parsed", stmts.len()));
 
     Ok(stmts)
 }

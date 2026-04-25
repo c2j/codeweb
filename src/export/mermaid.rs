@@ -46,6 +46,14 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 };
                 (label, ("([", "])"))
             }
+            Node::Package { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, ("[/", "/]"))
+            }
+            Node::Trigger { name, .. } => (name.clone(), ("{{\"", "\"}}")),
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);
@@ -73,6 +81,8 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::Implements { .. } => "-->",
             Edge::DirectCall { .. } => "-->",
             Edge::ReferencesTable { .. } => "-.->",
+            Edge::ContainsRoutine => "-.->",
+            Edge::TriggersRoutine { .. } => "==>",
         };
 
         out.push_str(&format!("    {} {} {}\n", src_id, arrow, dst_id));

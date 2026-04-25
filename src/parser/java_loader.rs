@@ -30,12 +30,15 @@ fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {
     let result = extract_sql_from_java(&source, &file_path, &config);
 
     if !result.errors.is_empty() {
-        eprintln!(
-            "warning: {} error(s) in {}",
-            result.errors.len(),
-            path.display()
-        );
+        for err in &result.errors {
+            crate::parse_log::warn(&file_path, &err.to_string());
+        }
     }
+
+    crate::parse_log::info(
+        &file_path,
+        &format!("{} SQL extractions", result.extractions.len()),
+    );
 
     Ok(result)
 }

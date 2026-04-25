@@ -239,6 +239,7 @@ mod tests {
             edges[0].caller,
             Some(ProcedureId {
                 schema: None,
+                package: None,
                 name: "a".to_string()
             })
         );
@@ -294,6 +295,7 @@ mod tests {
             edges[0].caller,
             Some(ProcedureId {
                 schema: None,
+                package: None,
                 name: "a".to_string()
             })
         );
@@ -323,6 +325,7 @@ mod tests {
                         if let Some(ref block) = p.block {
                             extractor.current_procedure = Some(ProcedureId {
                                 schema: None,
+                                package: None,
                                 name: "pkg_api.do_work".to_string(),
                             });
                             ogsql_parser::walk_pl_block(&mut extractor, block);

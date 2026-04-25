@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.OrderDao">
+    <select id="findByUserId" resultType="map">
+        SELECT * FROM t_orders WHERE user_id = #{userId} AND status = 'CREATED'
+    </select>
+
+    <update id="createOrder">
+        CALL pkg_order.create_order(#{userId}, #{productId}, #{qty})
+    </update>
+
+    <update id="cancelOrder">
+        CALL pkg_order.cancel_order(#{orderId})
+    </update>
+
+    <select id="findOrderDetail" resultType="map">
+        CALL pkg_order.get_order_detail(#{orderId})
+    </select>
+
+    <update id="batchCreateOrders">
+        CALL pkg_order.batch_create_orders(#{userId}, #{items})
+    </update>
+
+    <update id="completeOrder">
+        CALL pkg_order.complete_order(#{orderId})
+    </update>
+</mapper>

@@ -1,6 +1,7 @@
 mod error;
 mod export;
 mod graph;
+mod parse_log;
 #[allow(dead_code)]
 mod parser;
 #[allow(dead_code)]
@@ -117,6 +118,53 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+
+    /// Show project statistics
+    Stats {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// List analyzed files with node counts
+    Files {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// List graph nodes with optional filtering
+    Nodes {
+        /// Search nodes by name (substring match)
+        #[arg(short, long)]
+        search: Option<String>,
+
+        /// Show only orphan nodes (no connections)
+        #[arg(long)]
+        orphan: bool,
+
+        /// Show nodes with total degree ≤ N
+        #[arg(long)]
+        low_degree: Option<usize>,
+
+        /// Filter by node type (proc, mapper, method, class, table, view, unres)
+        #[arg(short = 't', long)]
+        node_type: Option<String>,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// Show callers/callees detail for a node
+    Detail {
+        /// Node name to search for (substring match)
+        name: String,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() {
@@ -146,6 +194,22 @@ fn run() -> Result<()> {
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
         Some(Commands::Trace { from, project }) => cmd_trace(&from, &project),
+        Some(Commands::Stats { project }) => cmd_stats(&project),
+        Some(Commands::Files { project }) => cmd_files(&project),
+        Some(Commands::Nodes {
+            search,
+            orphan,
+            low_degree,
+            node_type,
+            project,
+        }) => cmd_nodes(
+            search.as_deref(),
+            orphan,
+            low_degree,
+            node_type.as_deref(),
+            &project,
+        ),
+        Some(Commands::Detail { name, project }) => cmd_detail(&name, &project),
         None => cmd_legacy(cli),
     }
 }
@@ -270,6 +334,204 @@ fn cmd_trace(from: &str, project: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cmd_stats(project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let stats = store.stats();
+
+    println!("Project: {}", proj.name());
+    println!();
+    println!("  {:>12}  procedures", stats.procedures,);
+    println!("  {:>12}  mappers", stats.mappers,);
+    println!("  {:>12}  java methods", stats.java_methods,);
+    println!("  {:>12}  java classes", stats.java_classes,);
+    println!("  {:>12}  tables", stats.tables,);
+    println!("  {:>12}  views", stats.views,);
+    if stats.unresolved > 0 {
+        println!("  {:>12}  unresolved", stats.unresolved,);
+    }
+    println!();
+    println!("  {:>12}  edges", stats.edges,);
+    println!("  {:>12}  files", stats.files,);
+
+    Ok(())
+}
+
+fn cmd_files(project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let root = proj.root().to_path_buf();
+    let store = proj.load_store();
+
+    if let Ok(store) = store {
+        let manifest = store.manifest();
+        let file_nodes = store.file_nodes();
+        let mut entries: Vec<_> = manifest.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+
+        println!("{:<4} {:>5}  PATH", "TYPE", "NODES");
+        for (path, record) in &entries {
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            let type_tag = match record.file_type {
+                parser::fingerprint::FileType::Sql => "SQL",
+                parser::fingerprint::FileType::Java => "Java",
+                parser::fingerprint::FileType::Xml => "XML",
+            };
+            let node_count = file_nodes
+                .get(path as &std::path::Path)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            println!(
+                "{:<4} {:>5}  {}",
+                type_tag,
+                node_count,
+                rel.to_string_lossy()
+            );
+        }
+        println!();
+        println!("{} files total", entries.len());
+    } else {
+        let report = proj.analyze()?;
+        print_analyze_report(&report);
+    }
+
+    Ok(())
+}
+
+fn node_type_tag(node: &Node) -> &'static str {
+    match node {
+        Node::Procedure { .. } => "proc",
+        Node::Unresolved { .. } => "unres",
+        Node::MappedStatement { .. } => "mapper",
+        Node::JavaSql { .. } => "sql",
+        Node::JavaMethod { .. } => "method",
+        Node::JavaClass { .. } => "class",
+        Node::Table { .. } => "table",
+        Node::View { .. } => "view",
+        Node::Package { .. } => "pkg",
+        Node::Trigger { .. } => "trigger",
+    }
+}
+
+fn cmd_nodes(
+    search: Option<&str>,
+    orphan: bool,
+    low_degree: Option<usize>,
+    node_type: Option<&str>,
+    project: &Path,
+) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    let max_degree = if orphan { Some(0) } else { low_degree };
+
+    let type_filter = node_type.map(|t| t.to_lowercase());
+
+    let indices: Vec<petgraph::graph::NodeIndex> = if let Some(query) = search {
+        let matches = graph::traverse::find_nodes_by_name(graph, query);
+        if matches.is_empty() {
+            eprintln!("No nodes matching '{}'", query);
+            return Ok(());
+        }
+        matches.into_iter().map(|(idx, _)| idx).collect()
+    } else {
+        graph.node_indices().collect()
+    };
+
+    let filtered: Vec<_> = indices
+        .into_iter()
+        .filter(|idx| {
+            if let Some(ref tf) = type_filter {
+                let tag = node_type_tag(&graph[*idx]).to_lowercase();
+                if tag != *tf {
+                    return false;
+                }
+            }
+            true
+        })
+        .filter_map(|idx| {
+            let in_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
+            let total = in_deg + out_deg;
+
+            if let Some(max) = max_degree {
+                if total > max {
+                    return None;
+                }
+            }
+
+            Some((idx, in_deg, out_deg, total))
+        })
+        .collect();
+
+    if let Some(max) = max_degree {
+        let label = if orphan { "orphan" } else { "low-degree" };
+        println!("{} (degree ≤ {}, {} shown)", label, max, filtered.len(),);
+        println!();
+    }
+
+    println!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
+    for (idx, in_deg, out_deg, total) in &filtered {
+        let tag = node_type_tag(&graph[*idx]);
+        let key = graph::key::NodeKey::from_node(&graph[*idx]);
+        println!(
+            "{:<8} {:>3} {:>3} {:>3}  {}",
+            tag, in_deg, out_deg, total, key
+        );
+    }
+
+    if !filtered.is_empty() {
+        println!();
+        println!("{} nodes", filtered.len());
+    }
+
+    Ok(())
+}
+
+fn cmd_detail(name: &str, project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    let matches = graph::traverse::find_nodes_by_name(graph, name);
+
+    if matches.is_empty() {
+        eprintln!("No nodes matching '{}'", name);
+        return Ok(());
+    }
+
+    if matches.len() > 1 {
+        eprintln!("Multiple matches found:");
+        for (i, (_, n)) in matches.iter().enumerate() {
+            eprintln!("  {}: {}", i + 1, n);
+        }
+        eprintln!("Using first match: {}", matches[0].1);
+    }
+
+    let (start_idx, start_name) = &matches[0];
+
+    let tag = node_type_tag(&graph[*start_idx]);
+    let in_deg = graph
+        .neighbors_directed(*start_idx, petgraph::Direction::Incoming)
+        .count();
+    let out_deg = graph
+        .neighbors_directed(*start_idx, petgraph::Direction::Outgoing)
+        .count();
+
+    println!("  {} {}", tag, start_name);
+    println!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
+    println!();
+
+    let chain = graph::traverse::trace_chain(graph, *start_idx);
+    println!("{}", graph::traverse::format_chain_tree(&chain, graph));
+
+    Ok(())
+}
+
 fn cmd_legacy(cli: Cli) -> Result<()> {
     let input = cli.input.ok_or_else(|| error::CodeWebError::NoFilesFound {
         path: PathBuf::from("."),
@@ -351,6 +613,14 @@ fn print_analyze_report(report: &project::AnalyzeReport) {
         report.edges,
         report.elapsed_ms as f64 / 1000.0,
     );
+
+    let (warnings, errors) = parse_log::summary();
+    if warnings > 0 || errors > 0 {
+        eprintln!(
+            "  ⚠ {} warnings, {} errors — see .codeweb/parse.log",
+            warnings, errors
+        );
+    }
 }
 
 fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
@@ -373,6 +643,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::JavaClass { .. } => java_classes += 1,
             Node::Table { .. } => tables += 1,
             Node::View { .. } => views += 1,
+            Node::Package { .. } | Node::Trigger { .. } => {}
         }
     }
 

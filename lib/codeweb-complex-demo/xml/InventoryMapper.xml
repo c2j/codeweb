@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.InventoryDao">
+    <select id="checkStock" resultType="int">
+        CALL pkg_inventory.check_stock(#{productId}, #{qty})
+    </select>
+
+    <update id="reserveStock">
+        CALL pkg_inventory.reserve_stock(#{productId}, #{qty})
+    </update>
+
+    <update id="releaseStock">
+        CALL pkg_inventory.release_stock(#{productId}, #{qty})
+    </update>
+
+    <update id="syncFromSupplier">
+        CALL pkg_inventory.sync_from_supplier(#{supplierId})
+    </update>
+</mapper>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dao.PaymentDao">
+    <update id="processPayment">
+        CALL pkg_payment.process_payment(#{orderId}, #{amount}, #{method})
+    </update>
+
+    <update id="refundPayment">
+        CALL pkg_payment.refund_payment(#{orderId})
+    </update>
+
+    <select id="queryStatus" resultType="string">
+        SELECT pkg_payment.query_payment_status(#{orderId})
+    </select>
+
+    <update id="reconcilePayments">
+        CALL pkg_payment.reconcile_payments(#{date})
+    </update>
+</mapper>

@@ -336,7 +336,7 @@ impl App {
             Screen::Trace => "[Esc]Back  [1]Dashboard  [2]Files  [3]Graph  [Q]uit",
         };
         let bar = Paragraph::new(format!(" {}", hints))
-            .style(Style::default().bg(Color::DarkGray).fg(Color::Yellow));
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         f.render_widget(bar, area);
     }
 
@@ -350,40 +350,45 @@ impl App {
             let stats = store.stats();
             let lines = vec![
                 Line::from(vec![
-                    Span::styled("Project: ", Style::default().fg(Color::Gray)),
-                    Span::styled(self.project.name(), Style::default().fg(Color::White)),
+                    Span::styled("Project: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        self.project.name(),
+                        Style::default()
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Procedures: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Procedures: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.procedures)),
                     Span::raw("  "),
-                    Span::styled("Mappers: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Mappers: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.mappers)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Java Methods: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Java Methods: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.java_methods)),
                     Span::raw("  "),
-                    Span::styled("Java Classes: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Java Classes: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.java_classes)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Tables: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Tables: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.tables)),
                     Span::raw("  "),
-                    Span::styled("Views: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Views: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.views)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Edges: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Edges: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.edges)),
                     Span::raw("  "),
-                    Span::styled("Unresolved: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Unresolved: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.unresolved)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Files: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Files: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{}", stats.files)),
                 ]),
             ];
@@ -464,7 +469,7 @@ impl App {
                         .borders(Borders::ALL)
                         .title(format!(" Files ({}) ", manifest.len())),
                 )
-                .highlight_style(Style::default().bg(Color::DarkGray));
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
             f.render_stateful_widget(list, area, &mut self.list_state.clone());
         }
     }
@@ -500,7 +505,7 @@ impl App {
                         self.filter_threshold,
                         filtered.len()
                     )))
-                    .highlight_style(Style::default().bg(Color::DarkGray));
+                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
                 f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
 
                 self.list_state
@@ -527,7 +532,7 @@ impl App {
                             .borders(Borders::ALL)
                             .title(format!(" Graph Nodes ({}) ", graph.node_count())),
                     )
-                    .highlight_style(Style::default().bg(Color::DarkGray));
+                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
                 f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
 
                 self.list_state
@@ -547,7 +552,9 @@ impl App {
                 if chain.callers.is_empty() {
                     lines.push(Line::from(Span::styled(
                         "  (none)",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default()
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::DIM),
                     )));
                 } else {
                     for (i, caller) in chain.callers.iter().enumerate() {
@@ -588,7 +595,9 @@ impl App {
                 if chain.callees.is_empty() {
                     lines.push(Line::from(Span::styled(
                         "  (none)",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default()
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::DIM),
                     )));
                 } else {
                     for (i, callee) in chain.callees.iter().enumerate() {
@@ -637,7 +646,7 @@ impl App {
                 .enumerate()
                 .map(|(i, (_, name))| {
                     let style = if i == self.search_selected {
-                        Style::default().bg(Color::DarkGray)
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
                     } else {
                         Style::default()
                     };
@@ -675,9 +684,11 @@ fn node_tag(node: &Node) -> (&'static str, Color) {
         Node::MappedStatement { .. } => ("mapper", Color::Blue),
         Node::JavaSql { .. } => ("sql", Color::Magenta),
         Node::JavaMethod { .. } => ("method", Color::Cyan),
-        Node::JavaClass { .. } => ("class", Color::Yellow),
-        Node::Table { .. } => ("table", Color::Yellow),
+        Node::JavaClass { .. } => ("class", Color::Rgb(180, 100, 0)),
+        Node::Table { .. } => ("table", Color::Rgb(180, 100, 0)),
         Node::View { .. } => ("view", Color::Blue),
+        Node::Package { .. } => ("pkg", Color::Yellow),
+        Node::Trigger { .. } => ("trigger", Color::Red),
     }
 }
 
@@ -693,9 +704,14 @@ fn tree_node_to_lines(
     let key = NodeKey::from_node(&graph[node.idx]);
     lines.push(Line::from(vec![
         Span::raw(prefix.to_string()),
-        Span::styled(connector.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            connector.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
         Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
-        Span::styled(key.to_string(), Style::default().fg(Color::White)),
+        Span::styled(key.to_string(), Style::default().fg(Color::Black)),
     ]));
 
     let child_prefix = if is_last {
