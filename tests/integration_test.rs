@@ -691,7 +691,7 @@ fn test_package_cross_call_resolution() {
 
     let edges = parsed["edges"].as_array().unwrap();
     let has_call_edge = edges.iter().any(|e| {
-        e["type"] == "calls_procedure"
+        e["type"] == "direct"
             && e["source"] == serde_json::Value::from(caller_idx.unwrap() as u64)
             && e["target"] == serde_json::Value::from(dowork_idx.unwrap() as u64)
     });
