@@ -3,9 +3,43 @@ pub mod key;
 pub mod store;
 pub mod traverse;
 
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+bitflags! {
+    /// Access mode for table references (read/write/lock/truncate).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct AccessMode: u8 {
+        const Read     = 0b0001;
+        const Write    = 0b0010;
+        const LockRead = 0b0100;
+        const Truncate = 0b1000;
+    }
+}
+
+/// What kind of write operation was performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WriteKind {
+    Insert,
+    InsertSelect,
+    Update,
+    Delete,
+    MergeInsert,
+    MergeUpdate,
+    MergeDelete,
+    SelectInto,
+    Truncate,
+}
+
+/// Whether a routine is a procedure or a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RoutineKind {
+    Procedure,
+    Function,
+}
 
 /// Unique identifier for a stored procedure or function.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56,6 +90,69 @@ impl ProcedureId {
 }
 
 impl fmt::Display for ProcedureId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.schema, &self.package) {
+            (Some(s), Some(p)) => write!(f, "{}.{}.{}", s, p, self.name),
+            (Some(s), None) => write!(f, "{}.{}", s, self.name),
+            (None, Some(p)) => write!(f, "{}.{}", p, self.name),
+            (None, None) => write!(f, "{}", self.name),
+        }
+    }
+}
+
+/// Unique identifier for a stored procedure or function (unified).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RoutineId {
+    pub schema: Option<String>,
+    pub package: Option<String>,
+    pub name: String,
+    pub kind: RoutineKind,
+}
+
+impl RoutineId {
+    pub fn from_qualified_name(qualified: &str, kind: RoutineKind) -> Self {
+        if let Some((schema, name)) = qualified.rsplit_once('.') {
+            Self {
+                schema: Some(schema.to_string()),
+                package: None,
+                name: name.to_string(),
+                kind,
+            }
+        } else {
+            Self {
+                schema: None,
+                package: None,
+                name: qualified.to_string(),
+                kind,
+            }
+        }
+    }
+
+    pub fn from_object_name(parts: &[String], kind: RoutineKind) -> Self {
+        match parts.len() {
+            0 => Self {
+                schema: None,
+                package: None,
+                name: String::new(),
+                kind,
+            },
+            1 => Self {
+                schema: None,
+                package: None,
+                name: parts[0].clone(),
+                kind,
+            },
+            _ => Self {
+                schema: Some(parts[..parts.len() - 1].join(".")),
+                package: None,
+                name: parts[parts.len() - 1].clone(),
+                kind,
+            },
+        }
+    }
+}
+
+impl fmt::Display for RoutineId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.schema, &self.package) {
             (Some(s), Some(p)) => write!(f, "{}.{}.{}", s, p, self.name),
@@ -212,6 +309,72 @@ impl Node {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn access_mode_bitflags_or() {
+        let rw = AccessMode::Read | AccessMode::Write;
+        assert!(rw.contains(AccessMode::Read));
+        assert!(rw.contains(AccessMode::Write));
+        assert!(!rw.contains(AccessMode::LockRead));
+        assert!(!rw.contains(AccessMode::Truncate));
+    }
+
+    #[test]
+    fn access_mode_empty_is_invalid() {
+        let empty = AccessMode::empty();
+        assert!(!empty.contains(AccessMode::Read));
+        assert!(!empty.contains(AccessMode::Write));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn write_kind_serialization_roundtrip() {
+        let mut kinds = HashSet::new();
+        kinds.insert(WriteKind::Insert);
+        kinds.insert(WriteKind::Update);
+        let json = serde_json::to_string(&kinds).unwrap();
+        let deserialized: HashSet<WriteKind> = serde_json::from_str(&json).unwrap();
+        assert_eq!(kinds, deserialized);
+    }
+
+    #[test]
+    fn routine_id_with_kind() {
+        let id = RoutineId {
+            schema: Some("myschema".to_string()),
+            package: Some("pkg_api".to_string()),
+            name: "do_work".to_string(),
+            kind: RoutineKind::Procedure,
+        };
+        assert_eq!(id.to_string(), "myschema.pkg_api.do_work");
+    }
+
+    #[test]
+    fn routine_id_function_display() {
+        let id = RoutineId {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "calc_total".to_string(),
+            kind: RoutineKind::Function,
+        };
+        assert_eq!(id.to_string(), "public.calc_total");
+    }
+
+    #[test]
+    fn routine_id_equality_includes_kind() {
+        let proc = RoutineId {
+            schema: None,
+            package: None,
+            name: "do_thing".to_string(),
+            kind: RoutineKind::Procedure,
+        };
+        let func = RoutineId {
+            schema: None,
+            package: None,
+            name: "do_thing".to_string(),
+            kind: RoutineKind::Function,
+        };
+        assert_ne!(proc, func, "Same name but different kind should not be equal");
+    }
 
     #[test]
     fn procedure_id_standalone() {
