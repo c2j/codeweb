@@ -31,6 +31,7 @@ impl GraphBuilder {
             &package_index,
             &mut table_index,
         );
+        Self::add_view_nodes(files, &mut graph, &mut table_index);
 
         graph
     }
@@ -57,6 +58,7 @@ impl GraphBuilder {
             &package_index,
             &mut table_index,
         );
+        Self::add_view_nodes(&all.sql_files, &mut graph, &mut table_index);
 
         Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
@@ -105,6 +107,7 @@ impl GraphBuilder {
             &package_index,
             &mut table_index,
         );
+        Self::add_view_nodes(&all.sql_files, &mut graph, &mut table_index);
 
         Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
@@ -185,6 +188,39 @@ impl GraphBuilder {
                             graph,
                             proc_index,
                             package_index,
+                        );
+                    }
+                    Statement::CreateTrigger(t) => {
+                        let trigger_node = Node::Trigger {
+                            name: t.name.clone(),
+                            table: t.table.clone(),
+                            location: SourceLocation {
+                                file: file.path.clone(),
+                                line: info.start_line,
+                            },
+                        };
+                        let trigger_idx = graph.add_node(trigger_node);
+
+                        let func_id = ProcedureId::from_object_name(&t.func_name);
+                        let func_idx = proc_index.get(&func_id).copied().unwrap_or_else(|| {
+                            let unresolved = Node::Unresolved {
+                                raw_expr: t.func_name.join("."),
+                                context: format!("trigger:{}", t.name),
+                            };
+                            let idx = graph.add_node(unresolved);
+                            proc_index.insert(func_id, idx);
+                            idx
+                        });
+
+                        graph.add_edge(
+                            trigger_idx,
+                            func_idx,
+                            Edge::TriggersRoutine {
+                                location: SourceLocation {
+                                    file: file.path.clone(),
+                                    line: info.start_line,
+                                },
+                            },
                         );
                     }
                     _ => {}
@@ -546,6 +582,56 @@ impl GraphBuilder {
             }
         }
         calls
+    }
+
+    fn add_view_nodes(
+        files: &[ParsedFile],
+        graph: &mut CodeGraph,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        for file in files {
+            for info in &file.statements {
+                if let Statement::CreateView(v) = &info.statement {
+                    let view_node = Node::View {
+                        schema: if v.name.len() > 1 {
+                            Some(v.name[..v.name.len() - 1].join("."))
+                        } else {
+                            None
+                        },
+                        name: v.name.last().cloned().unwrap_or_default(),
+                    };
+                    let view_idx = graph.add_node(view_node);
+
+                    let mut extractor = crate::parser::TableRefExtractor::new();
+                    let wrapped = Statement::Select(v.query.as_ref().clone());
+                    walk_statement(&mut extractor, &wrapped);
+
+                    for tref in &extractor.tables {
+                        let key = match &tref.schema {
+                            Some(s) => format!("{}.{}", s, tref.name),
+                            None => tref.name.clone(),
+                        };
+                        let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
+                            let node = Node::Table {
+                                schema: tref.schema.clone(),
+                                name: tref.name.clone(),
+                            };
+                            graph.add_node(node)
+                        });
+                        graph.add_edge(
+                            view_idx,
+                            table_idx,
+                            Edge::ReferencesTable {
+                                location: SourceLocation {
+                                    file: file.path.clone(),
+                                    line: info.start_line,
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn add_table_refs_from_sql(
@@ -1076,6 +1162,42 @@ mod tests {
     }
 
     #[test]
+    fn trigger_creates_trigger_node_and_edge() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION trg_func() RETURNS TRIGGER AS $$
+            BEGIN
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER trg_after_insert
+            AFTER INSERT ON t_users
+            FOR EACH ROW EXECUTE PROCEDURE trg_func();
+        "#;
+        let graph = build_from_sql(sql);
+
+        let trigger_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::Trigger { .. }))
+            .collect();
+        assert_eq!(trigger_nodes.len(), 1, "Expected 1 Trigger node");
+
+        if let Node::Trigger { name, .. } = &graph[trigger_nodes[0]] {
+            assert_eq!(name, "trg_after_insert");
+        }
+
+        let trigger_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(graph[*e], Edge::TriggersRoutine { .. }))
+            .collect();
+        assert_eq!(trigger_edges.len(), 1, "Expected 1 TriggersRoutine edge");
+
+        let (src, dst) = graph.edge_endpoints(trigger_edges[0]).unwrap();
+        assert!(matches!(graph[src], Node::Trigger { .. }));
+        assert!(matches!(graph[dst], Node::Procedure { .. }));
+    }
+
+    #[test]
     fn standalone_call_to_package_routine_resolves() {
         let sql = r#"
             CREATE OR REPLACE PROCEDURE caller_proc() AS $$
@@ -1117,5 +1239,36 @@ mod tests {
         if let Node::Procedure { id, .. } = &graph[dowork_idx] {
             assert_eq!(id.package, Some("pkg_api".to_string()));
         }
+    }
+
+    #[test]
+    fn view_creates_view_node_and_table_refs() {
+        let sql = r#"
+            CREATE VIEW v_active_users AS
+            SELECT u.id, u.name
+            FROM t_users u
+            WHERE u.status = 'ACTIVE';
+        "#;
+        let graph = build_from_sql(sql);
+
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        assert_eq!(view_nodes.len(), 1, "Expected 1 View node");
+
+        if let Node::View { name, .. } = &graph[view_nodes[0]] {
+            assert_eq!(name, "v_active_users");
+        }
+
+        let refs_from_view: Vec<_> = graph
+            .edges_directed(view_nodes[0], petgraph::Direction::Outgoing)
+            .filter(|e| matches!(e.weight(), Edge::ReferencesTable { .. }))
+            .collect();
+        assert_eq!(
+            refs_from_view.len(),
+            1,
+            "View should reference 1 table (t_users)"
+        );
     }
 }
