@@ -1,4 +1,4 @@
-use crate::graph::{CodeGraph, Edge, Node};
+use crate::graph::{AccessMode, CodeGraph, Edge, Node, WriteKind};
 
 pub fn to_dot(graph: &CodeGraph) -> String {
     let mut out = String::from("digraph callgraph {\n");
@@ -76,18 +76,60 @@ pub fn to_dot(graph: &CodeGraph) -> String {
         let (label_attr, style_attr) = match &graph[edge_idx] {
             Edge::DynamicCall { raw_expr, .. } => (
                 format!("label=\"{}\"", dot_escape(&truncate(raw_expr, 30))),
-                "style=dashed,",
+                "style=dashed,".to_string(),
             ),
-            Edge::CallsProcedure { .. } => (String::new(), "color=blue,"),
-            Edge::InvokesMapper { .. } => (String::new(), "color=green,"),
-            Edge::CallsJava { .. } => (String::new(), "color=orange,"),
-            Edge::ContainsMethod => (String::new(), "style=dotted,"),
-            Edge::Extends { .. } => ("label=\"extends\"".to_string(), "style=bold,"),
-            Edge::Implements { .. } => ("label=\"implements\"".to_string(), "style=dashed,"),
-            Edge::DirectCall { .. } => (String::new(), ""),
-            Edge::ReferencesTable { .. } => (String::new(), "color=purple,"),
-            Edge::ContainsRoutine => ("label=\"contains\"".to_string(), "style=dotted,"),
-            Edge::TriggersRoutine { .. } => ("label=\"triggers\"".to_string(), "color=red,"),
+            Edge::CallsProcedure { .. } => (String::new(), "color=blue,".to_string()),
+            Edge::InvokesMapper { .. } => (String::new(), "color=green,".to_string()),
+            Edge::CallsJava { .. } => (String::new(), "color=orange,".to_string()),
+            Edge::ContainsMethod => (String::new(), "style=dotted,".to_string()),
+            Edge::Extends { .. } => ("label=\"extends\"".to_string(), "style=bold,".to_string()),
+            Edge::Implements { .. } => (
+                "label=\"implements\"".to_string(),
+                "style=dashed,".to_string(),
+            ),
+            Edge::DirectCall { .. } => (String::new(), String::new()),
+            Edge::TableAccess {
+                modes, write_kinds, ..
+            } => {
+                let color = if modes.contains(AccessMode::Read) && modes.contains(AccessMode::Write)
+                {
+                    "purple"
+                } else if modes.contains(AccessMode::LockRead) {
+                    "orange"
+                } else if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate)
+                {
+                    "red"
+                } else {
+                    "blue"
+                };
+                let label = if write_kinds.is_empty() {
+                    String::new()
+                } else {
+                    let parts: Vec<&str> = write_kinds
+                        .iter()
+                        .map(|wk| match wk {
+                            WriteKind::Insert => "insert",
+                            WriteKind::InsertSelect => "insert_select",
+                            WriteKind::Update => "update",
+                            WriteKind::Delete => "delete",
+                            WriteKind::MergeInsert => "merge_insert",
+                            WriteKind::MergeUpdate => "merge_update",
+                            WriteKind::MergeDelete => "merge_delete",
+                            WriteKind::SelectInto => "select_into",
+                            WriteKind::Truncate => "truncate",
+                        })
+                        .collect();
+                    format!("label=\"{}\"", parts.join(","))
+                };
+                (label, format!("color={color},"))
+            }
+            Edge::ContainsRoutine => (
+                "label=\"contains\"".to_string(),
+                "style=dotted,".to_string(),
+            ),
+            Edge::TriggersRoutine { .. } => {
+                ("label=\"triggers\"".to_string(), "color=red,".to_string())
+            }
         };
         out.push_str(&format!(
             "    {} -> {} [{}{}];\n",

@@ -1,11 +1,11 @@
 #[allow(unused_imports)]
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
-use crate::graph::{CodeGraph, Edge, Node, RoutineId, RoutineKind, SourceLocation};
+use crate::graph::{AccessMode, CodeGraph, Edge, Node, RoutineId, RoutineKind, SourceLocation};
 use crate::parser::{AllParsedFiles, CallEdge, CallExtractor, ParsedFile};
 use ogsql_parser::ast::{PackageItem, Statement};
 use ogsql_parser::{walk_pl_block, walk_statement};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub struct GraphBuilder;
@@ -24,7 +24,7 @@ impl GraphBuilder {
         Self::create_procedure_nodes(files, &mut graph, &mut proc_index, &mut package_index);
         let edges = Self::collect_call_edges(files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
-        Self::add_table_refs_from_sql(
+        Self::collect_table_access(
             files,
             &mut graph,
             &proc_index,
@@ -32,6 +32,7 @@ impl GraphBuilder {
             &mut table_index,
         );
         Self::add_view_nodes(files, &mut graph, &mut table_index);
+        Self::merge_table_access_edges(&mut graph);
 
         graph
     }
@@ -51,7 +52,7 @@ impl GraphBuilder {
         );
         let edges = Self::collect_call_edges(&all.sql_files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
-        Self::add_table_refs_from_sql(
+        Self::collect_table_access(
             &all.sql_files,
             &mut graph,
             &proc_index,
@@ -80,6 +81,7 @@ impl GraphBuilder {
             &mut proc_index,
             &mapper_index,
         );
+        Self::merge_table_access_edges(&mut graph);
 
         graph
     }
@@ -100,7 +102,7 @@ impl GraphBuilder {
         );
         let edges = Self::collect_call_edges(&all.sql_files);
         Self::create_edges(&edges, &mut graph, &mut proc_index);
-        Self::add_table_refs_from_sql(
+        Self::collect_table_access(
             &all.sql_files,
             &mut graph,
             &proc_index,
@@ -129,6 +131,7 @@ impl GraphBuilder {
             &mut proc_index,
             &mapper_index,
         );
+        Self::merge_table_access_edges(&mut graph);
 
         GraphStore::from_graph(project_name, graph)
     }
@@ -498,7 +501,7 @@ impl GraphBuilder {
                         );
                     }
 
-                    Self::extract_and_add_table_refs(
+                    Self::collect_table_access_from_statements(
                         statements,
                         &xml_path,
                         node_idx,
@@ -561,7 +564,7 @@ impl GraphBuilder {
                         );
                     }
 
-                    Self::extract_and_add_table_refs(
+                    Self::collect_table_access_from_statements(
                         &parse_result.statements,
                         &java_path,
                         node_idx,
@@ -644,7 +647,9 @@ impl GraphBuilder {
                         graph.add_edge(
                             view_idx,
                             table_idx,
-                            Edge::ReferencesTable {
+                            Edge::TableAccess {
+                                modes: AccessMode::Read,
+                                write_kinds: HashSet::new(),
                                 location: SourceLocation {
                                     file: file.path.clone(),
                                     line: info.start_line,
@@ -657,7 +662,7 @@ impl GraphBuilder {
         }
     }
 
-    fn add_table_refs_from_sql(
+    fn collect_table_access(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
@@ -670,7 +675,7 @@ impl GraphBuilder {
                     Statement::CreateProcedure(p) => {
                         let proc_id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                         if let Some(&proc_idx) = proc_index.get(&proc_id) {
-                            Self::extract_and_add_table_refs(
+                            Self::collect_table_access_from_statements(
                                 std::slice::from_ref(info),
                                 &file.path,
                                 proc_idx,
@@ -682,7 +687,7 @@ impl GraphBuilder {
                     Statement::CreateFunction(f) => {
                         let proc_id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                         if let Some(&proc_idx) = proc_index.get(&proc_id) {
-                            Self::extract_and_add_table_refs(
+                            Self::collect_table_access_from_statements(
                                 std::slice::from_ref(info),
                                 &file.path,
                                 proc_idx,
@@ -692,7 +697,7 @@ impl GraphBuilder {
                         }
                     }
                     Statement::CreatePackage(pkg) => {
-                        Self::add_package_table_refs(
+                        Self::add_package_table_access(
                             &pkg.name,
                             &pkg.items,
                             info,
@@ -703,7 +708,7 @@ impl GraphBuilder {
                         );
                     }
                     Statement::CreatePackageBody(pkg) => {
-                        Self::add_package_table_refs(
+                        Self::add_package_table_access(
                             &pkg.name,
                             &pkg.items,
                             info,
@@ -720,7 +725,7 @@ impl GraphBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_package_table_refs(
+    fn add_package_table_access(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
         info: &ogsql_parser::StatementInfo,
@@ -759,7 +764,7 @@ impl GraphBuilder {
                             block: block.clone(),
                         }),
                     };
-                    Self::extract_and_add_table_refs(
+                    Self::collect_table_access_from_statements(
                         std::slice::from_ref(&block_stmt),
                         file_path,
                         proc_idx,
@@ -771,7 +776,7 @@ impl GraphBuilder {
         }
     }
 
-    fn extract_and_add_table_refs(
+    fn collect_table_access_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &std::path::Path,
         source_idx: petgraph::graph::NodeIndex,
@@ -779,24 +784,26 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for info in statements {
-            let mut extractor = crate::parser::TableRefExtractor::new();
+            let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
-            for tref in &extractor.tables {
-                let key = match &tref.schema {
-                    Some(s) => format!("{}.{}", s, tref.name),
-                    None => tref.name.clone(),
+            for access in &extractor.accesses {
+                let key = match &access.schema {
+                    Some(s) => format!("{}.{}", s, access.name),
+                    None => access.name.clone(),
                 };
                 let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                     let node = Node::Table {
-                        schema: tref.schema.clone(),
-                        name: tref.name.clone(),
+                        schema: access.schema.clone(),
+                        name: access.name.clone(),
                     };
                     graph.add_node(node)
                 });
                 graph.add_edge(
                     source_idx,
                     table_idx,
-                    Edge::ReferencesTable {
+                    Edge::TableAccess {
+                        modes: access.modes,
+                        write_kinds: access.write_kinds.clone(),
                         location: SourceLocation {
                             file: file_path.to_path_buf(),
                             line: info.start_line,
@@ -804,6 +811,57 @@ impl GraphBuilder {
                     },
                 );
             }
+        }
+    }
+
+    fn merge_table_access_edges(graph: &mut CodeGraph) {
+        let mut merge_targets: HashMap<
+            (petgraph::graph::NodeIndex, petgraph::graph::NodeIndex),
+            Vec<petgraph::graph::EdgeIndex>,
+        > = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            if let Edge::TableAccess { .. } = &graph[edge_idx] {
+                let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
+                merge_targets.entry((src, dst)).or_default().push(edge_idx);
+            }
+        }
+        let mut edges_to_remove = Vec::new();
+        for (_, mut edge_indices) in merge_targets {
+            if edge_indices.len() <= 1 {
+                continue;
+            }
+            let keep = edge_indices.remove(0);
+            let (mut merged_modes, mut merged_kinds) =
+                if let Edge::TableAccess {
+                    modes, write_kinds, ..
+                } = &graph[keep]
+                {
+                    (*modes, write_kinds.clone())
+                } else {
+                    continue;
+                };
+            for &remove_idx in &edge_indices {
+                if let Edge::TableAccess {
+                    modes, write_kinds, ..
+                } = &graph[remove_idx]
+                {
+                    merged_modes |= *modes;
+                    for wk in write_kinds {
+                        merged_kinds.insert(*wk);
+                    }
+                }
+            }
+            if let Edge::TableAccess {
+                modes, write_kinds, ..
+            } = &mut graph[keep]
+            {
+                *modes = merged_modes;
+                *write_kinds = merged_kinds;
+            }
+            edges_to_remove.extend(edge_indices);
+        }
+        for idx in edges_to_remove {
+            graph.remove_edge(idx);
         }
     }
 
@@ -1287,7 +1345,7 @@ mod tests {
 
         let refs_from_view: Vec<_> = graph
             .edges_directed(view_nodes[0], petgraph::Direction::Outgoing)
-            .filter(|e| matches!(e.weight(), Edge::ReferencesTable { .. }))
+            .filter(|e| matches!(e.weight(), Edge::TableAccess { .. }))
             .collect();
         assert_eq!(
             refs_from_view.len(),

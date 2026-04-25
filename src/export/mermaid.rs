@@ -1,4 +1,4 @@
-use crate::graph::{CodeGraph, Edge, Node};
+use crate::graph::{AccessMode, CodeGraph, Edge, Node};
 
 pub fn to_mermaid(graph: &CodeGraph) -> String {
     let mut out = String::from("graph LR\n");
@@ -81,7 +81,13 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::Extends { .. } => "==>",
             Edge::Implements { .. } => "-->",
             Edge::DirectCall { .. } => "-->",
-            Edge::ReferencesTable { .. } => "-.->",
+            Edge::TableAccess { modes, .. } => {
+                if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate) {
+                    "==>"
+                } else {
+                    "-.->"
+                }
+            }
             Edge::ContainsRoutine => "-.->",
             Edge::TriggersRoutine { .. } => "==>",
         };

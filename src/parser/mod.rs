@@ -7,7 +7,7 @@ mod loader;
 pub mod scanner;
 
 #[allow(unused_imports)]
-pub use extractor::{CallEdge, CallExtractor, TableRef, TableRefExtractor};
+pub use extractor::{CallEdge, CallExtractor, TableAccessExtractor, TableRef, TableRefExtractor};
 #[allow(unused_imports)]
 pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
 #[allow(unused_imports)]

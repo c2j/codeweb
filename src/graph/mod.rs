@@ -219,8 +219,10 @@ pub enum Edge {
     Implements {
         location: SourceLocation,
     },
-    /// A statement references a table or view.
-    ReferencesTable {
+    /// A statement accesses a table with specific read/write/lock modes.
+    TableAccess {
+        modes: AccessMode,
+        write_kinds: std::collections::HashSet<WriteKind>,
         location: SourceLocation,
     },
     ContainsRoutine,

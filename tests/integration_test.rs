@@ -440,8 +440,8 @@ fn test_e2e_full_chain() {
         "Expected contains_method edges: class → method"
     );
     assert!(
-        edge_types.contains("references_table"),
-        "Expected references_table edges: procedure/mapper → table"
+        edge_types.contains("table_access"),
+        "Expected table_access edges: procedure/mapper → table"
     );
 
     let proc_names: Vec<&str> = nodes
@@ -482,14 +482,14 @@ fn test_e2e_full_chain() {
         "Expected t_orders table node"
     );
 
-    let refs_table_edges: Vec<&serde_json::Value> = edges
+    let table_access_edges: Vec<&serde_json::Value> = edges
         .iter()
-        .filter(|e| e["type"] == "references_table")
+        .filter(|e| e["type"] == "table_access")
         .collect();
     assert!(
-        refs_table_edges.len() >= 5,
-        "Expected >= 5 references_table edges, got {}",
-        refs_table_edges.len()
+        table_access_edges.len() >= 5,
+        "Expected >= 5 table_access edges, got {}",
+        table_access_edges.len()
     );
 
     let calls_proc_edges: Vec<&serde_json::Value> = edges

@@ -30,7 +30,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 1,
+            version: 2,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -82,7 +82,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 1,
+            version: 2,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -177,9 +177,16 @@ impl GraphStore {
             path: path.to_path_buf(),
             source: e,
         })?;
-        bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
-            message: format!("bincode deserialize: {}", e),
-        })
+        let store: Self =
+            bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
+                message: format!("bincode deserialize: {}", e),
+            })?;
+        if store.version != 2 {
+            return Err(crate::error::CodeWebError::ExportError {
+                message: format!("unsupported cache version {}, expected 2", store.version),
+            });
+        }
+        Ok(store)
     }
 
     pub fn save_json(&self, path: &Path) -> crate::error::Result<()> {
@@ -207,9 +214,16 @@ impl GraphStore {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-        serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
-            message: format!("json deserialize: {}", e),
-        })
+        let store: Self =
+            serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
+                message: format!("json deserialize: {}", e),
+            })?;
+        if store.version != 2 {
+            return Err(crate::error::CodeWebError::ExportError {
+                message: format!("unsupported cache version {}, expected 2", store.version),
+            });
+        }
+        Ok(store)
     }
 
     fn touch(&mut self) {
@@ -234,21 +248,34 @@ impl GraphStore {
             }
 
             let mut seen_edges: HashSet<(NodeKey, NodeKey, String)> = HashSet::new();
+            let mut table_access_merge_map: HashMap<
+                (NodeKey, NodeKey),
+                petgraph::graph::EdgeIndex,
+            > = HashMap::new();
             for old_edge_idx in store.graph.edge_indices() {
                 let (src, dst) = store.graph.edge_endpoints(old_edge_idx).unwrap();
                 let src_key = NodeKey::from_node(&store.graph[src]);
                 let dst_key = NodeKey::from_node(&store.graph[dst]);
                 let edge_type = edge_type_tag(&store.graph[old_edge_idx]);
 
-                let dedup_key = (src_key.clone(), dst_key.clone(), edge_type);
-                if seen_edges.insert(dedup_key) {
-                    let new_src = idx_map[&src];
-                    let new_dst = idx_map[&dst];
+                let dedup_key = (src_key.clone(), dst_key.clone(), edge_type.clone());
+                if !seen_edges.insert(dedup_key) {
+                    continue;
+                }
+
+                let new_src = idx_map[&src];
+                let new_dst = idx_map[&dst];
+                let new_edge =
                     merged
                         .graph
                         .add_edge(new_src, new_dst, store.graph[old_edge_idx].clone());
+
+                if edge_type == "table_access" {
+                    table_access_merge_map.insert((src_key, dst_key), new_edge);
                 }
             }
+
+            Self::merge_duplicate_table_access_edges(&mut merged.graph);
 
             for (file, keys) in &store.file_nodes {
                 let entry = merged.file_nodes.entry(file.clone()).or_default();
@@ -300,6 +327,58 @@ impl GraphStore {
             }
         }
     }
+
+    fn merge_duplicate_table_access_edges(graph: &mut crate::graph::CodeGraph) {
+        use std::collections::HashMap;
+        let mut merge_targets: HashMap<
+            (petgraph::graph::NodeIndex, petgraph::graph::NodeIndex),
+            Vec<petgraph::graph::EdgeIndex>,
+        > = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            if let crate::graph::Edge::TableAccess { .. } = &graph[edge_idx] {
+                let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
+                merge_targets.entry((src, dst)).or_default().push(edge_idx);
+            }
+        }
+        let mut edges_to_remove = Vec::new();
+        for (_, mut edge_indices) in merge_targets {
+            if edge_indices.len() <= 1 {
+                continue;
+            }
+            let keep = edge_indices.remove(0);
+            let (mut merged_modes, mut merged_kinds) =
+                if let crate::graph::Edge::TableAccess {
+                    modes, write_kinds, ..
+                } = &graph[keep]
+                {
+                    (*modes, write_kinds.clone())
+                } else {
+                    continue;
+                };
+            for &remove_idx in &edge_indices {
+                if let crate::graph::Edge::TableAccess {
+                    modes, write_kinds, ..
+                } = &graph[remove_idx]
+                {
+                    merged_modes |= *modes;
+                    for wk in write_kinds {
+                        merged_kinds.insert(*wk);
+                    }
+                }
+            }
+            if let crate::graph::Edge::TableAccess {
+                modes, write_kinds, ..
+            } = &mut graph[keep]
+            {
+                *modes = merged_modes;
+                *write_kinds = merged_kinds;
+            }
+            edges_to_remove.extend(edge_indices);
+        }
+        for idx in edges_to_remove {
+            graph.remove_edge(idx);
+        }
+    }
 }
 
 fn node_source_file(node: &Node) -> Option<PathBuf> {
@@ -334,7 +413,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::ContainsMethod => "contains_method",
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",
-        crate::graph::Edge::ReferencesTable { .. } => "references_table",
+        crate::graph::Edge::TableAccess { .. } => "table_access",
         crate::graph::Edge::ContainsRoutine => "contains_routine",
         crate::graph::Edge::TriggersRoutine { .. } => "triggers_routine",
     }

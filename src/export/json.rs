@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::graph::{CodeGraph, Edge, Node};
+use crate::graph::{AccessMode, CodeGraph, Edge, Node, WriteKind};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -118,8 +118,13 @@ enum EdgeKindJson {
     Extends { file: String, line: usize },
     #[serde(rename = "implements")]
     Implements { file: String, line: usize },
-    #[serde(rename = "references_table")]
-    ReferencesTable { file: String, line: usize },
+    #[serde(rename = "table_access")]
+    TableAccess {
+        modes: Vec<String>,
+        write_kinds: Vec<String>,
+        file: String,
+        line: usize,
+    },
     #[serde(rename = "contains_routine")]
     ContainsRoutine,
     #[serde(rename = "triggers_routine")]
@@ -333,14 +338,49 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.line,
                 },
             },
-            Edge::ReferencesTable { location } => EdgeJson {
-                source: src.index(),
-                target: dst.index(),
-                kind: EdgeKindJson::ReferencesTable {
-                    file: location.file.to_string_lossy().to_string(),
-                    line: location.line,
-                },
-            },
+            Edge::TableAccess {
+                modes,
+                write_kinds,
+                location,
+            } => {
+                let mode_strs: Vec<String> = [
+                    (AccessMode::Read, "read"),
+                    (AccessMode::Write, "write"),
+                    (AccessMode::LockRead, "lock_read"),
+                    (AccessMode::Truncate, "truncate"),
+                ]
+                .iter()
+                .filter(|(flag, _)| modes.contains(*flag))
+                .map(|(_, s)| s.to_string())
+                .collect();
+
+                let wk_strs: Vec<String> = write_kinds
+                    .iter()
+                    .map(|wk| match wk {
+                        WriteKind::Insert => "insert",
+                        WriteKind::InsertSelect => "insert_select",
+                        WriteKind::Update => "update",
+                        WriteKind::Delete => "delete",
+                        WriteKind::MergeInsert => "merge_insert",
+                        WriteKind::MergeUpdate => "merge_update",
+                        WriteKind::MergeDelete => "merge_delete",
+                        WriteKind::SelectInto => "select_into",
+                        WriteKind::Truncate => "truncate",
+                    })
+                    .map(String::from)
+                    .collect();
+
+                EdgeJson {
+                    source: src.index(),
+                    target: dst.index(),
+                    kind: EdgeKindJson::TableAccess {
+                        modes: mode_strs,
+                        write_kinds: wk_strs,
+                        file: location.file.to_string_lossy().to_string(),
+                        line: location.line,
+                    },
+                }
+            }
             Edge::ContainsRoutine => EdgeJson {
                 source: src.index(),
                 target: dst.index(),
