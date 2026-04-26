@@ -6,8 +6,14 @@ pub fn to_dot(graph: &CodeGraph) -> String {
 
     for idx in graph.node_indices() {
         let (label, shape, style) = match &graph[idx] {
-            Node::Procedure { id, .. } => (id.to_string(), "box", ""),
-            Node::Function { id, .. } => (id.to_string(), "ellipse", ""),
+            Node::Procedure { id, partial, .. } => {
+                let style = if *partial { ", style=dashed" } else { "" };
+                (id.to_string(), "box", style)
+            }
+            Node::Function { id, partial, .. } => {
+                let style = if *partial { ", style=dashed" } else { "" };
+                (id.to_string(), "ellipse", style)
+            }
             Node::Unresolved { raw_expr, .. } => (
                 format!("?{}", truncate(raw_expr, 40)),
                 "box",
@@ -58,6 +64,66 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 (label, "component", "")
             }
             Node::Trigger { name, .. } => (name.clone(), "hexagon", ""),
+            Node::Type { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (
+                    label,
+                    "parallelogram",
+                    ", style=filled, fillcolor=lightyellow",
+                )
+            }
+            Node::Sequence { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, "box3d", "")
+            }
+            Node::Index {
+                name,
+                table_name,
+                unique,
+                ..
+            } => {
+                let label = match name {
+                    Some(n) => format!("{}[{}]", table_name, n),
+                    None => table_name.clone(),
+                };
+                let style = if *unique {
+                    ", style=filled, fillcolor=lightgreen"
+                } else {
+                    ""
+                };
+                (label, "house", style)
+            }
+            Node::MaterializedView { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, "cylinder", ", style=filled, fillcolor=lightcyan")
+            }
+            Node::Synonym {
+                schema,
+                name,
+                target_schema,
+                target_name,
+                ..
+            } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                let target = match target_schema {
+                    Some(s) => format!("{}.{}", s, target_name),
+                    None => target_name.clone(),
+                };
+                (format!("{}→{}", label, target), "trapezium", "")
+            }
+            Node::Event { name, .. } => (name.clone(), "octagon", ""),
         };
         let escaped = dot_escape(&label);
         out.push_str(&format!(
@@ -130,6 +196,18 @@ pub fn to_dot(graph: &CodeGraph) -> String {
             Edge::TriggersRoutine { .. } => {
                 ("label=\"triggers\"".to_string(), "color=red,".to_string())
             }
+            Edge::ReferencesType { .. } => {
+                ("label=\"refs\"".to_string(), "color=teal,".to_string())
+            }
+            Edge::UsesSequence { .. } => ("label=\"uses\"".to_string(), "color=olive,".to_string()),
+            Edge::IndexesTable { .. } => (
+                "label=\"indexes\"".to_string(),
+                "color=gray, style=dotted,".to_string(),
+            ),
+            Edge::AliasesObject { .. } => (
+                "label=\"aliases\"".to_string(),
+                "color=purple, style=dashed,".to_string(),
+            ),
         };
         out.push_str(&format!(
             "    {} -> {} [{}{}];\n",

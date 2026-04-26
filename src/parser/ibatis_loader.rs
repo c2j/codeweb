@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use ogsql_parser::ibatis::{parse_mapper_bytes_with_path, ParsedMapper, StatementKind};
 
 pub struct IbatisParsedFile {
+    pub path: PathBuf,
     pub result: ParsedMapper,
+    pub content_hash: String,
 }
 
 pub fn load_ibatis_files_from_paths(paths: &[PathBuf]) -> Vec<IbatisParsedFile> {
@@ -14,13 +16,18 @@ pub fn load_ibatis_files_from_paths(paths: &[PathBuf]) -> Vec<IbatisParsedFile> 
         .filter_map(|path| {
             load_ibatis_file(path)
                 .ok()
-                .map(|result| IbatisParsedFile { result })
+                .map(|(result, hash)| IbatisParsedFile {
+                    path: path.clone(),
+                    result,
+                    content_hash: hash,
+                })
         })
         .collect()
 }
 
-fn load_ibatis_file(path: &Path) -> Result<ParsedMapper, String> {
+fn load_ibatis_file(path: &Path) -> Result<(ParsedMapper, String), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let content_hash = blake3::hash(&bytes).to_hex().to_string();
     let file_path = path.to_string_lossy().to_string();
     let result = parse_mapper_bytes_with_path(&bytes, Some(&file_path));
 
@@ -44,7 +51,7 @@ fn load_ibatis_file(path: &Path) -> Result<ParsedMapper, String> {
         ),
     );
 
-    Ok(result)
+    Ok((result, content_hash))
 }
 
 pub fn statement_kind_label(kind: &StatementKind) -> &'static str {

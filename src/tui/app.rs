@@ -690,6 +690,12 @@ fn node_tag(node: &Node) -> (&'static str, Color) {
         Node::View { .. } => ("view", Color::Blue),
         Node::Package { .. } => ("pkg", Color::Yellow),
         Node::Trigger { .. } => ("trigger", Color::Red),
+        Node::Type { .. } => ("type", Color::Yellow),
+        Node::Sequence { .. } => ("seq", Color::LightGreen),
+        Node::Index { .. } => ("index", Color::Gray),
+        Node::MaterializedView { .. } => ("mview", Color::Cyan),
+        Node::Synonym { .. } => ("synonym", Color::Magenta),
+        Node::Event { .. } => ("event", Color::LightRed),
     }
 }
 

@@ -138,7 +138,6 @@ impl Project {
         pb.set_message("Scanning files...");
         let current_files = scan_with_fingerprints(&input_paths);
         let files_scanned = current_files.len();
-        let total = files_scanned;
         pb.finish_with_message(format!("Scanned {} files", files_scanned));
 
         // Phase 2: Load existing store and diff against manifest
@@ -175,6 +174,19 @@ impl Project {
             });
         }
 
+        // Collect all scanned paths once (avoid re-scanning per input)
+        let mut all_sql_paths: Vec<PathBuf> = Vec::new();
+        let mut all_java_paths: Vec<PathBuf> = Vec::new();
+        let mut all_xml_paths: Vec<PathBuf> = Vec::new();
+        for input in &input_paths {
+            let scanned = parser::scan_directory(input);
+            all_sql_paths.extend(scanned.sql_files);
+            all_java_paths.extend(scanned.java_files);
+            all_xml_paths.extend(scanned.xml_files);
+        }
+
+        let total = all_sql_paths.len() + all_java_paths.len() + all_xml_paths.len();
+
         // Phase 3: Parse files with progress
         let pb = indicatif::ProgressBar::new(total as u64);
         pb.set_style(
@@ -185,78 +197,75 @@ impl Project {
             .progress_chars("━━╾─"),
         );
 
-        let mut all_files = parser::AllParsedFiles {
-            sql_files: Vec::new(),
-            java_files: Vec::new(),
-            ibatis_files: Vec::new(),
-            java_method_results: Vec::new(),
-        };
+        pb.set_message("Parsing SQL...");
+        let sql_files = parser::parse_sql_files(&all_sql_paths);
+        pb.inc(all_sql_paths.len() as u64);
 
-        for input in &input_paths {
-            let scanned = parser::scan_directory(input);
+        pb.set_message("Parsing Java (single-pass)...");
+        let java_combined = parser::java_loader::load_java_files_combined(&all_java_paths);
+        pb.inc(all_java_paths.len() as u64);
 
-            pb.set_message("Parsing SQL...");
-            for path in &scanned.sql_files {
-                pb.set_message(format!(
-                    "{}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                pb.inc(1);
-            }
-            all_files
-                .sql_files
-                .extend(parser::parse_sql_files(&scanned.sql_files));
+        let (java_files, java_method_results): (Vec<_>, Vec<_>) = java_combined
+            .into_iter()
+            .map(|(path, combined)| {
+                (
+                    parser::JavaParsedFile {
+                        path: path.clone(),
+                        result: combined.sql_result,
+                        content_hash: combined.content_hash,
+                    },
+                    combined.method_result,
+                )
+            })
+            .unzip();
 
-            pb.set_message("Parsing Java...");
-            for path in &scanned.java_files {
-                pb.set_message(format!(
-                    "{}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                pb.inc(1);
-            }
-            all_files
-                .java_files
-                .extend(parser::java_loader::load_java_files_from_paths(
-                    &scanned.java_files,
-                ));
+        pb.set_message("Parsing XML mappers...");
+        let ibatis_files = parser::ibatis_loader::load_ibatis_files_from_paths(&all_xml_paths);
+        pb.inc(all_xml_paths.len() as u64);
 
-            pb.set_message("Parsing XML mappers...");
-            for path in &scanned.xml_files {
-                pb.set_message(format!(
-                    "{}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                pb.inc(1);
-            }
-            all_files
-                .ibatis_files
-                .extend(parser::ibatis_loader::load_ibatis_files_from_paths(
-                    &scanned.xml_files,
-                ));
-
-            pb.set_message("Extracting Java methods...");
-            all_files
-                .java_method_results
-                .extend(parser::java_method::parse_java_files_from_paths(
-                    &scanned.java_files,
-                ));
-        }
         pb.finish_with_message(format!(
             "Parsed {} files ({} SQL, {} Java, {} XML)",
-            all_files.sql_files.len() + all_files.java_files.len() + all_files.ibatis_files.len(),
-            all_files.sql_files.len(),
-            all_files.java_files.len(),
-            all_files.ibatis_files.len(),
+            sql_files.len() + java_files.len() + ibatis_files.len(),
+            sql_files.len(),
+            java_files.len(),
+            ibatis_files.len(),
         ));
+
+        let all_files = parser::AllParsedFiles {
+            sql_files,
+            java_files,
+            ibatis_files,
+            java_method_results,
+        };
 
         // Phase 4: Build graph
         eprintln!("  Building graph...");
         let builder = GraphBuilder::new();
         let mut new_store = builder.build_store(&all_files, &self.config.project.name);
 
-        // Phase 4: Update manifest with new fingerprints
-        let new_records = compute_all_records(&current_files);
+        // Phase 5: Build manifest from inline content hashes (no re-reading files)
+        let mut new_records = Vec::new();
+        for pf in &all_files.sql_files {
+            if let Some(record) =
+                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Sql)
+            {
+                new_records.push(record);
+            }
+        }
+        for pf in &all_files.java_files {
+            if let Some(record) =
+                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Java)
+            {
+                new_records.push(record);
+            }
+        }
+        for pf in &all_files.ibatis_files {
+            if let Some(record) =
+                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Xml)
+            {
+                new_records.push(record);
+            }
+        }
         new_store.update_manifest(new_records);
         new_store.remove_manifest_entries(&changes.deleted);
 
@@ -377,11 +386,4 @@ fn scan_with_fingerprints(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
         }
     }
     files
-}
-
-fn compute_all_records(files: &[(PathBuf, FileType)]) -> Vec<FileRecord> {
-    files
-        .iter()
-        .filter_map(|(path, ft)| FileRecord::compute(path, *ft))
-        .collect()
 }

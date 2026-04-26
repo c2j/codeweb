@@ -1,11 +1,12 @@
 use crate::graph::{AccessMode, RoutineId, RoutineKind, SourceLocation, WriteKind};
 use ogsql_parser::ast::plpgsql::{PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::{
-    CallFuncStatement, ObjectName, SelectStatement, Statement, TableRef as AstTableRef,
+    CallFuncStatement, DataType, Expr, Literal, ObjectName, SelectStatement, Statement,
+    TableRef as AstTableRef,
 };
 use ogsql_parser::{Visitor, VisitorResult};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct CallEdge {
@@ -18,11 +19,11 @@ pub struct CallEdge {
 pub struct CallExtractor {
     pub current_procedure: Option<RoutineId>,
     pub edges: Vec<CallEdge>,
-    file: PathBuf,
+    file: Arc<std::path::PathBuf>,
 }
 
 impl CallExtractor {
-    pub fn new(file: PathBuf) -> Self {
+    pub fn new(file: Arc<std::path::PathBuf>) -> Self {
         Self {
             current_procedure: None,
             edges: Vec::new(),
@@ -128,6 +129,160 @@ impl CallExtractor {
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeRef {
+    pub type_name: String,
+    pub context: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceRef {
+    pub sequence_name: String,
+    pub via: SequenceRefVia,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SequenceRefVia {
+    Nextval,
+    Currval,
+    Setval,
+    DotNextval,
+    DotCurrval,
+}
+
+pub struct TypeSequenceRefExtractor {
+    pub known_types: HashSet<String>,
+    pub type_refs: Vec<TypeRef>,
+    pub sequence_refs: Vec<SequenceRef>,
+    pub current_context: String,
+}
+
+impl TypeSequenceRefExtractor {
+    pub fn new(known_types: HashSet<String>) -> Self {
+        Self {
+            known_types,
+            type_refs: Vec::new(),
+            sequence_refs: Vec::new(),
+            current_context: String::new(),
+        }
+    }
+
+    fn is_known_type(&self, name: &str) -> bool {
+        self.known_types.contains(&name.to_lowercase()) || self.known_types.contains(name)
+    }
+
+    fn resolve_sequence_name(name: &str) -> String {
+        name.trim_matches('\'').trim_matches('"').to_string()
+    }
+
+    fn extract_sequence_from_expr(&mut self, expr: &Expr, via: SequenceRefVia) {
+        match expr {
+            Expr::Literal(Literal::String(s)) => {
+                self.sequence_refs.push(SequenceRef {
+                    sequence_name: Self::resolve_sequence_name(s),
+                    via,
+                });
+            }
+            Expr::ColumnRef(name) | Expr::PlVariable(name) if !name.is_empty() => {
+                let seq_name = name.join(".");
+                self.sequence_refs.push(SequenceRef {
+                    sequence_name: Self::resolve_sequence_name(&seq_name),
+                    via,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Visitor for TypeSequenceRefExtractor {
+    fn visit_pl_declaration(
+        &mut self,
+        decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
+    ) -> VisitorResult {
+        if let ogsql_parser::ast::plpgsql::PlDeclaration::Variable(var_decl) = decl {
+            if let ogsql_parser::ast::plpgsql::PlDataType::TypeName(type_name) = &var_decl.data_type
+            {
+                if self.is_known_type(type_name) {
+                    self.type_refs.push(TypeRef {
+                        type_name: type_name.clone(),
+                        context: self.current_context.clone(),
+                    });
+                }
+            }
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
+        match expr {
+            Expr::FunctionCall { name, args, .. } if !name.is_empty() => {
+                let func_name = name[name.len() - 1].to_lowercase();
+                match func_name.as_str() {
+                    "nextval" if !args.is_empty() => {
+                        self.extract_sequence_from_expr(&args[0], SequenceRefVia::Nextval);
+                    }
+                    "currval" if !args.is_empty() => {
+                        self.extract_sequence_from_expr(&args[0], SequenceRefVia::Currval);
+                    }
+                    "setval" if !args.is_empty() => {
+                        self.extract_sequence_from_expr(&args[0], SequenceRefVia::Setval);
+                    }
+                    _ => {}
+                }
+            }
+            Expr::FieldAccess { object, field } => {
+                let field_upper = field.to_uppercase();
+                let via = match field_upper.as_str() {
+                    "NEXTVAL" => Some(SequenceRefVia::DotNextval),
+                    "CURRVAL" => Some(SequenceRefVia::DotCurrval),
+                    _ => None,
+                };
+                if let Some(via) = via {
+                    if let Expr::ColumnRef(name) | Expr::PlVariable(name) = object.as_ref() {
+                        if !name.is_empty() {
+                            let seq_name = name.join(".");
+                            self.sequence_refs.push(SequenceRef {
+                                sequence_name: Self::resolve_sequence_name(&seq_name),
+                                via,
+                            });
+                        }
+                    }
+                }
+            }
+            Expr::ColumnRef(name) if name.len() >= 2 => {
+                let last = name[name.len() - 1].to_uppercase();
+                let via = match last.as_str() {
+                    "NEXTVAL" => Some(SequenceRefVia::DotNextval),
+                    "CURRVAL" => Some(SequenceRefVia::DotCurrval),
+                    _ => None,
+                };
+                if let Some(via) = via {
+                    let seq_name = name[..name.len() - 1].join(".");
+                    self.sequence_refs.push(SequenceRef {
+                        sequence_name: Self::resolve_sequence_name(&seq_name),
+                        via,
+                    });
+                }
+            }
+            Expr::TypeCast {
+                type_name: DataType::Custom(name, ..),
+                ..
+            } => {
+                let type_name_str = name.join(".");
+                if self.is_known_type(&type_name_str) {
+                    self.type_refs.push(TypeRef {
+                        type_name: type_name_str,
+                        context: self.current_context.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
     }
 }
 
@@ -377,6 +532,7 @@ impl Visitor for TableAccessExtractor {
 mod tests {
     use super::*;
     use ogsql_parser::{walk_statement, Tokenizer};
+    use std::path::PathBuf;
 
     fn extract_accesses(sql: &str) -> Vec<TableAccessInfo> {
         let tokens = Tokenizer::new(sql).tokenize().unwrap();
@@ -645,11 +801,25 @@ mod tests {
         let stmts = parser.parse_with_text();
         let mut all_edges = Vec::new();
         for info in &stmts {
-            let mut extractor = CallExtractor::new(PathBuf::from("test.sql"));
+            let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
             walk_statement(&mut extractor, &info.statement);
             all_edges.extend(extractor.edges);
         }
         all_edges
+    }
+
+    fn extract_type_seq_refs(
+        sql: &str,
+        known_types: HashSet<String>,
+    ) -> (Vec<TypeRef>, Vec<SequenceRef>) {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut extractor = TypeSequenceRefExtractor::new(known_types);
+        for info in &stmts {
+            walk_statement(&mut extractor, &info.statement);
+        }
+        (extractor.type_refs, extractor.sequence_refs)
     }
 
     #[test]
@@ -740,7 +910,7 @@ mod tests {
         let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
         let stmts = parser.parse_with_text();
 
-        let mut extractor = CallExtractor::new(PathBuf::from("test.sql"));
+        let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
 
         for info in &stmts {
             if let ogsql_parser::ast::Statement::CreatePackageBody(pkg) = &info.statement {
@@ -774,5 +944,130 @@ mod tests {
         }
         assert_eq!(extractor.edges[0].callee_name, "helper.validate");
         assert_eq!(extractor.edges[1].callee_name, "helper.process");
+    }
+
+    #[test]
+    fn type_ref_from_pl_variable_declaration() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE
+                v_foo my_custom_type;
+            BEGIN
+                NULL;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let mut known = HashSet::new();
+        known.insert("my_custom_type".to_string());
+        let (type_refs, seq_refs) = extract_type_seq_refs(sql, known);
+        assert_eq!(seq_refs.len(), 0, "expected no sequence refs");
+        assert_eq!(
+            type_refs.len(),
+            1,
+            "expected 1 type ref, got: {:?}",
+            type_refs
+        );
+        assert_eq!(type_refs[0].type_name, "my_custom_type");
+    }
+
+    #[test]
+    fn sequence_ref_via_nextval_function_call() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            BEGIN
+                SELECT nextval('my_seq') INTO v_id;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let (type_refs, seq_refs) = extract_type_seq_refs(sql, HashSet::new());
+        assert_eq!(type_refs.len(), 0, "expected no type refs");
+        assert_eq!(
+            seq_refs.len(),
+            1,
+            "expected 1 sequence ref, got: {:?}",
+            seq_refs
+        );
+        assert_eq!(seq_refs[0].sequence_name, "my_seq");
+        assert!(matches!(seq_refs[0].via, SequenceRefVia::Nextval));
+    }
+
+    #[test]
+    fn sequence_ref_via_dot_nextval_field_access() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            BEGIN
+                v_id := my_seq.NEXTVAL;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let (type_refs, seq_refs) = extract_type_seq_refs(sql, HashSet::new());
+        assert_eq!(type_refs.len(), 0, "expected no type refs");
+        assert_eq!(
+            seq_refs.len(),
+            1,
+            "expected 1 sequence ref, got: {:?}",
+            seq_refs
+        );
+        assert_eq!(seq_refs[0].sequence_name, "my_seq");
+        assert!(matches!(seq_refs[0].via, SequenceRefVia::DotNextval));
+    }
+
+    #[test]
+    fn sequence_ref_via_currval_function_call() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            BEGIN
+                SELECT currval('my_seq') INTO v_id;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let (type_refs, seq_refs) = extract_type_seq_refs(sql, HashSet::new());
+        assert_eq!(type_refs.len(), 0, "expected no type refs");
+        assert_eq!(
+            seq_refs.len(),
+            1,
+            "expected 1 sequence ref, got: {:?}",
+            seq_refs
+        );
+        assert_eq!(seq_refs[0].sequence_name, "my_seq");
+        assert!(matches!(seq_refs[0].via, SequenceRefVia::Currval));
+    }
+
+    #[test]
+    fn unknown_type_is_ignored() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE
+                v_foo unknown_type;
+            BEGIN
+                NULL;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let mut known = HashSet::new();
+        known.insert("my_custom_type".to_string());
+        let (type_refs, _) = extract_type_seq_refs(sql, known);
+        assert_eq!(type_refs.len(), 0, "expected 0 type refs for unknown type");
+    }
+
+    #[test]
+    fn type_ref_from_typecast_custom_datatype() {
+        let sql = r#"
+            CREATE PROCEDURE test_proc() AS $$
+            BEGIN
+                v_foo := 'value'::my_custom_type;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let mut known = HashSet::new();
+        known.insert("my_custom_type".to_string());
+        let (type_refs, _) = extract_type_seq_refs(sql, known);
+        assert_eq!(
+            type_refs.len(),
+            1,
+            "expected 1 type ref from typecast, got: {:?}",
+            type_refs
+        );
+        assert_eq!(type_refs[0].type_name, "my_custom_type");
     }
 }

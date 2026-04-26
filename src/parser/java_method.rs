@@ -54,6 +54,7 @@ pub struct JavaParseResult {
     pub imports: Vec<String>,
     pub classes: Vec<JavaClassInfo>,
     pub methods: Vec<JavaMethodInfo>,
+    pub content_hash: String,
 }
 
 // Internal extraction engine
@@ -341,14 +342,15 @@ impl<'a> JavaTreeWalker<'a> {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
-    let source_bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+/// Parse Java source from pre-read bytes. Used by combined Java parser to avoid double-reading.
+pub fn parse_java_source(path: &Path, source_bytes: &[u8]) -> Result<JavaParseResult, String> {
+    let content_hash = blake3::hash(source_bytes).to_hex().to_string();
 
     let tree = JAVA_PARSER
-        .with(|p| p.borrow_mut().parse(&source_bytes, None))
+        .with(|p| p.borrow_mut().parse(source_bytes, None))
         .ok_or_else(|| format!("parse timeout or failure: {}", path.display()))?;
 
-    let mut walker = JavaTreeWalker::new(&source_bytes, path);
+    let mut walker = JavaTreeWalker::new(source_bytes, path);
     walker.walk_with_methods(tree.root_node());
 
     let file_str = path.to_string_lossy();
@@ -367,7 +369,13 @@ pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
         imports: walker.imports,
         classes: walker.classes,
         methods: walker.methods,
+        content_hash,
     })
+}
+
+pub fn parse_java_file(path: &Path) -> Result<JavaParseResult, String> {
+    let source_bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    parse_java_source(path, &source_bytes)
 }
 
 pub fn parse_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParseResult> {
@@ -406,6 +414,7 @@ mod tests {
             imports: walker.imports,
             classes: walker.classes,
             methods: walker.methods,
+            content_hash: String::new(),
         }
     }
 

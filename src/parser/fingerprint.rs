@@ -24,6 +24,27 @@ pub struct FileRecord {
 
 #[allow(dead_code)]
 impl FileRecord {
+    pub fn from_parts(path: PathBuf, content_hash: String, file_type: FileType) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        let mtime_ns = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let size = metadata.len();
+
+        Some(FileRecord {
+            path,
+            content_hash,
+            mtime_ns,
+            size,
+            file_type,
+            parse_ok: false,
+            node_count: 0,
+        })
+    }
+
     pub fn compute(path: &std::path::Path, file_type: FileType) -> Option<Self> {
         let metadata = std::fs::metadata(path).ok()?;
         let mtime_ns = metadata

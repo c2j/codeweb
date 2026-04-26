@@ -132,7 +132,14 @@ impl GraphStore {
                 Node::JavaClass { .. } => s.java_classes += 1,
                 Node::Table { .. } => s.tables += 1,
                 Node::View { .. } => s.views += 1,
-                Node::Package { .. } | Node::Trigger { .. } => {}
+                Node::Package { .. } => s.packages += 1,
+                Node::Trigger { .. } => s.triggers += 1,
+                Node::Type { .. } => s.types += 1,
+                Node::Sequence { .. } => s.sequences += 1,
+                Node::Index { .. } => s.indexes += 1,
+                Node::MaterializedView { .. } => s.materialized_views += 1,
+                Node::Synonym { .. } => s.synonyms += 1,
+                Node::Event { .. } => s.events += 1,
             }
         }
         s.edges = self.graph.edge_count();
@@ -383,15 +390,21 @@ impl GraphStore {
 
 fn node_source_file(node: &Node) -> Option<PathBuf> {
     match node {
-        Node::Procedure { location, .. } => Some(location.file.clone()),
-        Node::Function { location, .. } => Some(location.file.clone()),
+        Node::Procedure { location, .. } => Some(location.file.to_path_buf()),
+        Node::Function { location, .. } => Some(location.file.to_path_buf()),
         Node::MappedStatement { xml_file, .. } => Some(xml_file.clone()),
         Node::JavaSql { java_file, .. } => Some(java_file.clone()),
         Node::JavaMethod { file, .. } => Some(file.clone()),
         Node::JavaClass { file, .. } => Some(file.clone()),
         Node::Table { .. } | Node::View { .. } | Node::Unresolved { .. } => None,
-        Node::Package { location, .. } => Some(location.file.clone()),
-        Node::Trigger { location, .. } => Some(location.file.clone()),
+        Node::Package { location, .. } => Some(location.file.to_path_buf()),
+        Node::Trigger { location, .. } => Some(location.file.to_path_buf()),
+        Node::Type { location, .. } => Some(location.file.to_path_buf()),
+        Node::Sequence { location, .. } => Some(location.file.to_path_buf()),
+        Node::Index { location, .. } => Some(location.file.to_path_buf()),
+        Node::MaterializedView { location, .. } => Some(location.file.to_path_buf()),
+        Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
+        Node::Event { location, .. } => Some(location.file.to_path_buf()),
     }
 }
 
@@ -416,6 +429,10 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::TableAccess { .. } => "table_access",
         crate::graph::Edge::ContainsRoutine => "contains_routine",
         crate::graph::Edge::TriggersRoutine { .. } => "triggers_routine",
+        crate::graph::Edge::ReferencesType { .. } => "references_type",
+        crate::graph::Edge::UsesSequence { .. } => "uses_sequence",
+        crate::graph::Edge::IndexesTable { .. } => "indexes_table",
+        crate::graph::Edge::AliasesObject { .. } => "aliases_object",
     }
     .to_string()
 }
@@ -432,6 +449,14 @@ pub struct StoreStats {
     pub java_classes: usize,
     pub tables: usize,
     pub views: usize,
+    pub packages: usize,
+    pub triggers: usize,
+    pub types: usize,
+    pub sequences: usize,
+    pub indexes: usize,
+    pub materialized_views: usize,
+    pub synonyms: usize,
+    pub events: usize,
     pub edges: usize,
     pub files: usize,
 }

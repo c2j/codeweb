@@ -2,6 +2,10 @@ use crate::error::Result;
 use crate::graph::{AccessMode, CodeGraph, Edge, Node, WriteKind};
 use serde::Serialize;
 
+fn is_false(v: &bool) -> bool {
+    !v
+}
+
 #[derive(Serialize)]
 struct GraphJson {
     nodes: Vec<NodeJson>,
@@ -23,12 +27,16 @@ enum NodeKindJson {
         schema: Option<String>,
         file: String,
         line: usize,
+        #[serde(skip_serializing_if = "is_false")]
+        partial: bool,
     },
     Function {
         name: String,
         schema: Option<String>,
         file: String,
         line: usize,
+        #[serde(skip_serializing_if = "is_false")]
+        partial: bool,
     },
     Unresolved {
         raw_expr: String,
@@ -85,6 +93,45 @@ enum NodeKindJson {
         file: String,
         line: usize,
     },
+    Type {
+        name: String,
+        schema: Option<String>,
+        type_kind: String,
+        file: String,
+        line: usize,
+    },
+    Sequence {
+        name: String,
+        schema: Option<String>,
+        file: String,
+        line: usize,
+    },
+    Index {
+        name: Option<String>,
+        table_name: String,
+        unique: bool,
+        file: String,
+        line: usize,
+    },
+    MaterializedView {
+        name: String,
+        schema: Option<String>,
+        file: String,
+        line: usize,
+    },
+    Synonym {
+        name: String,
+        schema: Option<String>,
+        target_name: String,
+        target_schema: Option<String>,
+        file: String,
+        line: usize,
+    },
+    Event {
+        name: String,
+        file: String,
+        line: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -129,28 +176,46 @@ enum EdgeKindJson {
     ContainsRoutine,
     #[serde(rename = "triggers_routine")]
     TriggersRoutine { file: String, line: usize },
+    #[serde(rename = "references_type")]
+    ReferencesType { file: String, line: usize },
+    #[serde(rename = "uses_sequence")]
+    UsesSequence { file: String, line: usize },
+    #[serde(rename = "indexes_table")]
+    IndexesTable { file: String, line: usize },
+    #[serde(rename = "aliases_object")]
+    AliasesObject { file: String, line: usize },
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
     let mut nodes = Vec::new();
     for idx in graph.node_indices() {
         let node_json = match &graph[idx] {
-            Node::Procedure { id, location } => NodeJson {
+            Node::Procedure {
+                id,
+                location,
+                partial,
+            } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Procedure {
                     name: id.name.clone(),
                     schema: id.schema.clone(),
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
+                    partial: *partial,
                 },
             },
-            Node::Function { id, location } => NodeJson {
+            Node::Function {
+                id,
+                location,
+                partial,
+            } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Function {
                     name: id.name.clone(),
                     schema: id.schema.clone(),
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
+                    partial: *partial,
                 },
             },
             Node::Unresolved { raw_expr, context } => NodeJson {
@@ -262,6 +327,88 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 kind: NodeKindJson::Trigger {
                     name: name.clone(),
                     table: table.join("."),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Type {
+                schema,
+                name,
+                type_kind,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Type {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    type_kind: type_kind.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Sequence {
+                schema,
+                name,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Sequence {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Index {
+                name,
+                table_schema: _,
+                table_name,
+                unique,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Index {
+                    name: name.clone(),
+                    table_name: table_name.clone(),
+                    unique: *unique,
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::MaterializedView {
+                schema,
+                name,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::MaterializedView {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Synonym {
+                schema,
+                name,
+                target_schema,
+                target_name,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Synonym {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    target_name: target_name.clone(),
+                    target_schema: target_schema.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Node::Event { name, location } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Event {
+                    name: name.clone(),
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },
@@ -390,6 +537,38 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::TriggersRoutine {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::ReferencesType { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::ReferencesType {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::UsesSequence { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::UsesSequence {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::IndexesTable { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::IndexesTable {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::AliasesObject { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::AliasesObject {
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },

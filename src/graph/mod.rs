@@ -7,6 +7,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 bitflags! {
     /// Access mode for table references (read/write/lock/truncate).
@@ -106,7 +107,7 @@ impl fmt::Display for RoutineId {
 /// Source location within a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLocation {
-    pub file: PathBuf,
+    pub file: Arc<PathBuf>,
     pub line: usize,
 }
 
@@ -117,11 +118,19 @@ pub enum Node {
     Procedure {
         id: RoutineId,
         location: SourceLocation,
+        /// True if this node was created from a spec declaration but the body
+        /// implementation could not be parsed (partial/placeholder node).
+        #[serde(default)]
+        partial: bool,
     },
     /// A resolved SQL function.
     Function {
         id: RoutineId,
         location: SourceLocation,
+        /// True if this node was created from a spec declaration but the body
+        /// implementation could not be parsed (partial/placeholder node).
+        #[serde(default)]
+        partial: bool,
     },
     /// An unresolved call target (e.g. dynamic SQL).
     Unresolved { raw_expr: String, context: String },
@@ -181,6 +190,46 @@ pub enum Node {
         table: Vec<String>,
         location: SourceLocation,
     },
+    /// A user-defined TYPE (composite, enum, range, base, table-of, shell).
+    Type {
+        schema: Option<String>,
+        name: String,
+        type_kind: String,
+        location: SourceLocation,
+    },
+    /// A database SEQUENCE.
+    Sequence {
+        schema: Option<String>,
+        name: String,
+        location: SourceLocation,
+    },
+    /// A database INDEX.
+    Index {
+        name: Option<String>,
+        table_schema: Option<String>,
+        table_name: String,
+        unique: bool,
+        location: SourceLocation,
+    },
+    /// A MATERIALIZED VIEW.
+    MaterializedView {
+        schema: Option<String>,
+        name: String,
+        location: SourceLocation,
+    },
+    /// A database SYNONYM (alias for another object).
+    Synonym {
+        schema: Option<String>,
+        name: String,
+        target_schema: Option<String>,
+        target_name: String,
+        location: SourceLocation,
+    },
+    /// A scheduled EVENT (openGauss JOB).
+    Event {
+        name: String,
+        location: SourceLocation,
+    },
 }
 
 /// An edge in the call graph.
@@ -229,6 +278,22 @@ pub enum Edge {
     TriggersRoutine {
         location: SourceLocation,
     },
+    /// A routine references a custom TYPE.
+    ReferencesType {
+        location: SourceLocation,
+    },
+    /// A routine uses a SEQUENCE (nextval/currval/setval).
+    UsesSequence {
+        location: SourceLocation,
+    },
+    /// An INDEX belongs to a TABLE.
+    IndexesTable {
+        location: SourceLocation,
+    },
+    /// A SYNONYM aliases another object.
+    AliasesObject {
+        location: SourceLocation,
+    },
 }
 
 /// The call graph itself.
@@ -249,6 +314,12 @@ impl Node {
             Node::View { .. } => Path::new(""),
             Node::Package { location, .. } => &location.file,
             Node::Trigger { location, .. } => &location.file,
+            Node::Type { location, .. } => &location.file,
+            Node::Sequence { location, .. } => &location.file,
+            Node::Index { location, .. } => &location.file,
+            Node::MaterializedView { location, .. } => &location.file,
+            Node::Synonym { location, .. } => &location.file,
+            Node::Event { location, .. } => &location.file,
         }
     }
 }
@@ -395,5 +466,79 @@ mod tests {
         };
         map.insert(id.clone(), 42);
         assert_eq!(map.get(&id), Some(&42));
+    }
+
+    #[test]
+    fn new_node_variants_file() {
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 42,
+        };
+
+        let type_node = Node::Type {
+            schema: Some("public".to_string()),
+            name: "my_type".to_string(),
+            type_kind: "composite".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(type_node.file(), Path::new("test.sql"));
+
+        let seq_node = Node::Sequence {
+            schema: Some("public".to_string()),
+            name: "my_seq".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(seq_node.file(), Path::new("test.sql"));
+
+        let idx_node = Node::Index {
+            name: Some("idx_name".to_string()),
+            table_schema: Some("public".to_string()),
+            table_name: "my_table".to_string(),
+            unique: true,
+            location: loc.clone(),
+        };
+        assert_eq!(idx_node.file(), Path::new("test.sql"));
+
+        let mview_node = Node::MaterializedView {
+            schema: Some("public".to_string()),
+            name: "my_mview".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(mview_node.file(), Path::new("test.sql"));
+
+        let syn_node = Node::Synonym {
+            schema: Some("public".to_string()),
+            name: "my_syn".to_string(),
+            target_schema: Some("other".to_string()),
+            target_name: "real_obj".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(syn_node.file(), Path::new("test.sql"));
+
+        let event_node = Node::Event {
+            name: "my_event".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(event_node.file(), Path::new("test.sql"));
+    }
+
+    #[test]
+    fn new_edge_variants_construct() {
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = SourceLocation { file, line: 1 };
+
+        let _ = Edge::ReferencesType {
+            location: loc.clone(),
+        };
+        let _ = Edge::UsesSequence {
+            location: loc.clone(),
+        };
+        let _ = Edge::IndexesTable {
+            location: loc.clone(),
+        };
+        let _ = Edge::AliasesObject {
+            location: loc.clone(),
+        };
     }
 }

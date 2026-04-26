@@ -1033,3 +1033,428 @@ fn test_package_procedure_table_access() {
     });
     assert!(has_update_kind, "Expected update write_kind");
 }
+
+#[test]
+fn test_create_type_node() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE TYPE address_t AS (
+            street VARCHAR(200),
+            city   VARCHAR(100)
+        );
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let type_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "type").collect();
+    assert_eq!(type_nodes.len(), 1, "Expected 1 type node");
+    assert_eq!(type_nodes[0]["name"], "address_t");
+    assert_eq!(type_nodes[0]["type_kind"], "composite");
+}
+
+#[test]
+fn test_create_enum_type_node() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE TYPE status_t AS ENUM ('ACTIVE', 'INACTIVE');
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let type_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "type").collect();
+    assert_eq!(type_nodes.len(), 1, "Expected 1 type node");
+    assert_eq!(type_nodes[0]["name"], "status_t");
+    assert_eq!(type_nodes[0]["type_kind"], "enum");
+}
+
+#[test]
+fn test_create_sequence_node() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE SEQUENCE user_id_seq START WITH 1 INCREMENT BY 1;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let seq_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "sequence").collect();
+    assert_eq!(seq_nodes.len(), 1, "Expected 1 sequence node");
+    assert_eq!(seq_nodes[0]["name"], "user_id_seq");
+}
+
+#[test]
+fn test_create_index_node_and_edge() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE UNIQUE INDEX idx_users_email ON t_users(email);
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let index_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "index").collect();
+    assert_eq!(index_nodes.len(), 1, "Expected 1 index node");
+    assert_eq!(index_nodes[0]["name"], "idx_users_email");
+    assert_eq!(index_nodes[0]["table_name"], "t_users");
+    assert_eq!(index_nodes[0]["unique"], true);
+
+    let indexes_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "indexes_table")
+        .collect();
+    assert_eq!(indexes_edges.len(), 1, "Expected 1 indexes_table edge");
+}
+
+#[test]
+fn test_create_materialized_view_node() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE MATERIALIZED VIEW mv_summary AS
+        SELECT user_id, COUNT(*) as cnt FROM t_orders GROUP BY user_id
+        WITH DATA;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let mview_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|n| n["type"] == "materialized_view")
+        .collect();
+    assert_eq!(mview_nodes.len(), 1, "Expected 1 materialized_view node");
+    assert_eq!(mview_nodes[0]["name"], "mv_summary");
+
+    let table_access: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .collect();
+    assert!(
+        !table_access.is_empty(),
+        "Expected table_access edge from materialized view"
+    );
+}
+
+#[test]
+fn test_create_synonym_node_and_edge() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE OR REPLACE PROCEDURE remote_pkg.do_work(p_id INT) AS $$
+        BEGIN
+            NULL;
+        END;
+        $$;
+
+        CREATE SYNONYM my_work FOR remote_pkg.do_work;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let syn_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "synonym").collect();
+    assert_eq!(syn_nodes.len(), 1, "Expected 1 synonym node");
+    assert_eq!(syn_nodes[0]["name"], "my_work");
+
+    let alias_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "aliases_object")
+        .collect();
+    assert_eq!(alias_edges.len(), 1, "Expected 1 aliases_object edge");
+}
+
+#[test]
+fn test_create_event_node() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE EVENT evt_cleanup ON SCHEDULE EVERY 1 DAY DO CALL cleanup_proc();
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let event_nodes: Vec<_> = nodes.iter().filter(|n| n["type"] == "event").collect();
+    assert_eq!(event_nodes.len(), 1, "Expected 1 event node");
+    assert_eq!(event_nodes[0]["name"], "evt_cleanup");
+}
+
+#[test]
+fn test_type_reference_edge() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE TYPE address_t AS (
+            street VARCHAR(200),
+            city   VARCHAR(100)
+        );
+
+        CREATE OR REPLACE PROCEDURE print_address(
+            p_addr address_t
+        ) AS $$
+        BEGIN
+            RAISE NOTICE 'City: %', p_addr.city;
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+
+    let type_ref_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "references_type")
+        .collect();
+    assert_eq!(
+        type_ref_edges.len(),
+        1,
+        "Expected 1 references_type edge from procedure to type"
+    );
+
+    let proc_idx = nodes
+        .iter()
+        .position(|n| n["type"] == "procedure" && n["name"] == "print_address")
+        .expect("should find print_address procedure");
+    let type_idx = nodes
+        .iter()
+        .position(|n| n["type"] == "type" && n["name"] == "address_t")
+        .expect("should find address_t type");
+
+    assert_eq!(
+        type_ref_edges[0]["source"],
+        serde_json::Value::from(proc_idx as u64)
+    );
+    assert_eq!(
+        type_ref_edges[0]["target"],
+        serde_json::Value::from(type_idx as u64)
+    );
+}
+
+#[test]
+fn test_sequence_usage_edge_nextval() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE SEQUENCE user_id_seq;
+
+        CREATE OR REPLACE FUNCTION next_user_id() RETURNS BIGINT AS $$
+        BEGIN
+            RETURN nextval('user_id_seq');
+        END;
+        $$ LANGUAGE plpgsql;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let seq_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "uses_sequence")
+        .collect();
+    assert_eq!(
+        seq_edges.len(),
+        1,
+        "Expected 1 uses_sequence edge from function to sequence"
+    );
+}
+
+#[test]
+fn test_sequence_usage_edge_dot_nextval() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE SEQUENCE order_id_seq;
+
+        CREATE OR REPLACE PROCEDURE create_order() AS $$
+        BEGIN
+            INSERT INTO t_orders(id) VALUES(order_id_seq.NEXTVAL);
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let seq_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "uses_sequence")
+        .collect();
+    assert!(
+        !seq_edges.is_empty(),
+        "Expected at least 1 uses_sequence edge for seq.NEXTVAL usage"
+    );
+}
+
+#[test]
+fn test_e2e_demo_all_object_types() {
+    let demo_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("lib")
+        .join("codeweb-e2e-demo");
+
+    let output = run_codeweb(&[demo_dir.to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let node_types: std::collections::HashSet<String> = nodes
+        .iter()
+        .filter_map(|n| n["type"].as_str().map(String::from))
+        .collect();
+
+    assert!(
+        node_types.contains("type"),
+        "Expected type nodes from types_and_sequences.sql"
+    );
+    assert!(
+        node_types.contains("sequence"),
+        "Expected sequence nodes from types_and_sequences.sql"
+    );
+    assert!(
+        node_types.contains("index"),
+        "Expected index nodes from types_and_sequences.sql"
+    );
+    assert!(
+        node_types.contains("materialized_view"),
+        "Expected materialized_view nodes"
+    );
+    assert!(node_types.contains("synonym"), "Expected synonym nodes");
+    assert!(node_types.contains("event"), "Expected event nodes");
+
+    let edge_types: std::collections::HashSet<String> = edges
+        .iter()
+        .filter_map(|e| e["type"].as_str().map(String::from))
+        .collect();
+
+    assert!(
+        edge_types.contains("references_type"),
+        "Expected references_type edges"
+    );
+    assert!(
+        edge_types.contains("uses_sequence"),
+        "Expected uses_sequence edges"
+    );
+    assert!(
+        edge_types.contains("indexes_table"),
+        "Expected indexes_table edges"
+    );
+    assert!(
+        edge_types.contains("aliases_object"),
+        "Expected aliases_object edges"
+    );
+}

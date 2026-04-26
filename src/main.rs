@@ -168,6 +168,36 @@ enum Commands {
 }
 
 fn main() {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let rayon_threads = std::cmp::max(2, cores / 3);
+
+    let builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .thread_name(|idx| format!("codeweb-worker-{idx}"))
+        .spawn_handler(|thread| {
+            std::thread::Builder::new()
+                .name(thread.name().unwrap_or_default().to_string())
+                .spawn(move || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let qos: libc::qos_class_t = unsafe { std::mem::transmute(0x11u32) };
+                        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = unsafe { libc::nice(10) };
+                    }
+                    thread.run()
+                })
+                .map(|_| ())
+        });
+
+    if let Err(e) = builder.build_global() {
+        eprintln!("warning: failed to configure thread pool: {e}");
+    }
+
     if let Err(e) = run() {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -343,11 +373,19 @@ fn cmd_stats(project: &Path) -> Result<()> {
     println!();
     println!("  {:>12}  procedures", stats.procedures,);
     println!("  {:>12}  functions", stats.functions,);
+    println!("  {:>12}  packages", stats.packages,);
+    println!("  {:>12}  triggers", stats.triggers,);
+    println!("  {:>12}  types", stats.types,);
+    println!("  {:>12}  sequences", stats.sequences,);
+    println!("  {:>12}  indexes", stats.indexes,);
+    println!("  {:>12}  views", stats.views,);
+    println!("  {:>12}  materialized views", stats.materialized_views,);
+    println!("  {:>12}  synonyms", stats.synonyms,);
+    println!("  {:>12}  events", stats.events,);
+    println!("  {:>12}  tables", stats.tables,);
     println!("  {:>12}  mappers", stats.mappers,);
     println!("  {:>12}  java methods", stats.java_methods,);
     println!("  {:>12}  java classes", stats.java_classes,);
-    println!("  {:>12}  tables", stats.tables,);
-    println!("  {:>12}  views", stats.views,);
     if stats.unresolved > 0 {
         println!("  {:>12}  unresolved", stats.unresolved,);
     }
@@ -400,7 +438,9 @@ fn cmd_files(project: &Path) -> Result<()> {
 
 fn node_type_tag(node: &Node) -> &'static str {
     match node {
+        Node::Procedure { partial: true, .. } => "proc*",
         Node::Procedure { .. } => "proc",
+        Node::Function { partial: true, .. } => "func*",
         Node::Function { .. } => "func",
         Node::Unresolved { .. } => "unres",
         Node::MappedStatement { .. } => "mapper",
@@ -411,6 +451,12 @@ fn node_type_tag(node: &Node) -> &'static str {
         Node::View { .. } => "view",
         Node::Package { .. } => "pkg",
         Node::Trigger { .. } => "trigger",
+        Node::Type { .. } => "type",
+        Node::Sequence { .. } => "seq",
+        Node::Index { .. } => "index",
+        Node::MaterializedView { .. } => "mview",
+        Node::Synonym { .. } => "synonym",
+        Node::Event { .. } => "event",
     }
 }
 
@@ -494,6 +540,13 @@ fn cmd_nodes(
     Ok(())
 }
 
+fn is_partial(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Procedure { partial: true, .. } | Node::Function { partial: true, .. }
+    )
+}
+
 fn cmd_detail(name: &str, project: &Path) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
@@ -525,6 +578,9 @@ fn cmd_detail(name: &str, project: &Path) -> Result<()> {
         .count();
 
     println!("  {} {}", tag, start_name);
+    if is_partial(&graph[*start_idx]) {
+        println!("  ⚠ partial node — body implementation could not be parsed");
+    }
     println!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
     println!();
 
@@ -635,10 +691,27 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut java_classes = 0usize;
     let mut tables = 0usize;
     let mut views = 0usize;
+    let mut packages = 0usize;
+    let mut triggers = 0usize;
+    let mut types = 0usize;
+    let mut sequences = 0usize;
+    let mut indexes = 0usize;
+    let mut materialized_views = 0usize;
+    let mut synonyms = 0usize;
+    let mut events = 0usize;
+    let mut partial = 0usize;
 
     for idx in graph.node_indices() {
         match &graph[idx] {
+            Node::Procedure { partial: true, .. } => {
+                procedures += 1;
+                partial += 1;
+            }
             Node::Procedure { .. } => procedures += 1,
+            Node::Function { partial: true, .. } => {
+                functions += 1;
+                partial += 1;
+            }
             Node::Function { .. } => functions += 1,
             Node::Unresolved { .. } => unresolved += 1,
             Node::MappedStatement { .. } => mappers += 1,
@@ -647,7 +720,14 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::JavaClass { .. } => java_classes += 1,
             Node::Table { .. } => tables += 1,
             Node::View { .. } => views += 1,
-            Node::Package { .. } | Node::Trigger { .. } => {}
+            Node::Package { .. } => packages += 1,
+            Node::Trigger { .. } => triggers += 1,
+            Node::Type { .. } => types += 1,
+            Node::Sequence { .. } => sequences += 1,
+            Node::Index { .. } => indexes += 1,
+            Node::MaterializedView { .. } => materialized_views += 1,
+            Node::Synonym { .. } => synonyms += 1,
+            Node::Event { .. } => events += 1,
         }
     }
 
@@ -655,13 +735,16 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} functions, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} unresolved, {} edges",
-            procedures, functions, mappers, java_sql, java_methods, java_classes, tables, views, unresolved, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} unresolved, {} edges",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, unresolved, edges
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} functions, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} tables, {} views, {} edges",
-            procedures, functions, mappers, java_sql, java_methods, java_classes, tables, views, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} edges",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, edges
         );
+    }
+    if partial > 0 {
+        eprintln!("  ⚠ {} partial nodes (unparsed body)", partial);
     }
 }

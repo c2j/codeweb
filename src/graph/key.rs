@@ -39,6 +39,29 @@ pub enum NodeKey {
     Trigger {
         name: String,
     },
+    Type {
+        schema: Option<String>,
+        name: String,
+    },
+    Sequence {
+        schema: Option<String>,
+        name: String,
+    },
+    Index {
+        name: Option<String>,
+        table_name: String,
+    },
+    MaterializedView {
+        schema: Option<String>,
+        name: String,
+    },
+    Synonym {
+        schema: Option<String>,
+        name: String,
+    },
+    Event {
+        name: String,
+    },
     JavaSql {
         file: String,
         line: usize,
@@ -91,6 +114,27 @@ impl fmt::Display for NodeKey {
                 None => write!(f, "pkg:{}", name),
             },
             NodeKey::Trigger { name } => write!(f, "trigger:{}", name),
+            NodeKey::Type { schema, name } => match schema {
+                Some(s) => write!(f, "type:{}.{}", s, name),
+                None => write!(f, "type:{}", name),
+            },
+            NodeKey::Sequence { schema, name } => match schema {
+                Some(s) => write!(f, "seq:{}.{}", s, name),
+                None => write!(f, "seq:{}", name),
+            },
+            NodeKey::Index { name, table_name } => match name {
+                Some(n) => write!(f, "idx:{}[{}]", table_name, n),
+                None => write!(f, "idx:{}", table_name),
+            },
+            NodeKey::MaterializedView { schema, name } => match schema {
+                Some(s) => write!(f, "mview:{}.{}", s, name),
+                None => write!(f, "mview:{}", name),
+            },
+            NodeKey::Synonym { schema, name } => match schema {
+                Some(s) => write!(f, "syn:{}.{}", s, name),
+                None => write!(f, "syn:{}", name),
+            },
+            NodeKey::Event { name } => write!(f, "event:{}", name),
             NodeKey::JavaSql { file, line } => write!(f, "javasql:{}:{}", file, line),
             NodeKey::Unresolved { raw_expr, context } => {
                 write!(f, "unresolved:{} (in {})", raw_expr, context)
@@ -136,6 +180,29 @@ impl NodeKey {
                 name: name.clone(),
             },
             super::Node::Trigger { name, .. } => NodeKey::Trigger { name: name.clone() },
+            super::Node::Type { schema, name, .. } => NodeKey::Type {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            super::Node::Sequence { schema, name, .. } => NodeKey::Sequence {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            super::Node::Index {
+                name, table_name, ..
+            } => NodeKey::Index {
+                name: name.clone(),
+                table_name: table_name.clone(),
+            },
+            super::Node::MaterializedView { schema, name, .. } => NodeKey::MaterializedView {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            super::Node::Synonym { schema, name, .. } => NodeKey::Synonym {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            super::Node::Event { name, .. } => NodeKey::Event { name: name.clone() },
             super::Node::JavaSql {
                 java_file, line, ..
             } => NodeKey::JavaSql {

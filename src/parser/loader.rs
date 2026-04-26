@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub struct ParsedFile {
     pub path: PathBuf,
     pub statements: Vec<StatementInfo>,
+    pub content_hash: String,
 }
 
 pub struct AllParsedFiles {
@@ -55,16 +56,18 @@ pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
     paths
         .par_iter()
         .filter_map(|path| {
-            parse_file(path).ok().map(|statements| ParsedFile {
+            parse_file(path).ok().map(|(statements, hash)| ParsedFile {
                 path: path.clone(),
                 statements,
+                content_hash: hash,
             })
         })
         .collect()
 }
 
-fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {
+fn parse_file(path: &Path) -> std::result::Result<(Vec<StatementInfo>, String), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let content_hash = blake3::hash(&bytes).to_hex().to_string();
     let sql = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
 
@@ -83,5 +86,5 @@ fn parse_file(path: &Path) -> std::result::Result<Vec<StatementInfo>, String> {
     }
     crate::parse_log::info(&file_str, &format!("{} statements parsed", stmts.len()));
 
-    Ok(stmts)
+    Ok((stmts, content_hash))
 }

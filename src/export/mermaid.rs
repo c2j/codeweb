@@ -5,8 +5,22 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
 
     for idx in graph.node_indices() {
         let (label, shape_fmt) = match &graph[idx] {
-            Node::Procedure { id, .. } => (id.to_string(), ("[\"", "\"]")),
-            Node::Function { id, .. } => (id.to_string(), ("{{\"", "\"}}")),
+            Node::Procedure { id, partial, .. } => {
+                let label = if *partial {
+                    format!("⚠ {}", id)
+                } else {
+                    id.to_string()
+                };
+                (label, ("[\"", "\"]"))
+            }
+            Node::Function { id, partial, .. } => {
+                let label = if *partial {
+                    format!("⚠ {}", id)
+                } else {
+                    id.to_string()
+                };
+                (label, ("{{\"", "\"}}"))
+            }
             Node::Unresolved { raw_expr, .. } => {
                 (format!("?{}", truncate(raw_expr, 30)), ("[\"", "\"]"))
             }
@@ -55,6 +69,54 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 (label, ("[/", "/]"))
             }
             Node::Trigger { name, .. } => (name.clone(), ("{{\"", "\"}}")),
+            Node::Type { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, ("[/", "/]"))
+            }
+            Node::Sequence { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, ("[", "]"))
+            }
+            Node::Index {
+                name, table_name, ..
+            } => {
+                let label = match name {
+                    Some(n) => format!("{}[{}]", table_name, n),
+                    None => table_name.clone(),
+                };
+                (label, ("{{", "}}"))
+            }
+            Node::MaterializedView { schema, name, .. } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                (label, ("([", "])"))
+            }
+            Node::Synonym {
+                schema,
+                name,
+                target_schema,
+                target_name,
+                ..
+            } => {
+                let label = match schema {
+                    Some(s) => format!("{}.{}", s, name),
+                    None => name.clone(),
+                };
+                let target = match target_schema {
+                    Some(s) => format!("{}.{}", s, target_name),
+                    None => target_name.clone(),
+                };
+                (format!("{}→{}", label, target), ("[\\", "/]"))
+            }
+            Node::Event { name, .. } => (name.clone(), ("{{", "}}")),
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);
@@ -90,6 +152,10 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             }
             Edge::ContainsRoutine => "-.->",
             Edge::TriggersRoutine { .. } => "==>",
+            Edge::ReferencesType { .. } => "-->",
+            Edge::UsesSequence { .. } => "-->",
+            Edge::IndexesTable { .. } => "-.->",
+            Edge::AliasesObject { .. } => "-.->",
         };
 
         out.push_str(&format!("    {} {} {}\n", src_id, arrow, dst_id));

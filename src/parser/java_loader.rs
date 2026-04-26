@@ -5,7 +5,16 @@ use ogsql_parser::java::{
 };
 
 pub struct JavaParsedFile {
+    pub path: PathBuf,
     pub result: JavaExtractResult,
+    pub content_hash: String,
+}
+
+/// Combined result from a single-pass Java parse (SQL extraction + method extraction).
+pub struct JavaCombinedResult {
+    pub sql_result: JavaExtractResult,
+    pub method_result: crate::parser::java_method::JavaParseResult,
+    pub content_hash: String,
 }
 
 pub fn load_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParsedFile> {
@@ -16,13 +25,33 @@ pub fn load_java_files_from_paths(paths: &[PathBuf]) -> Vec<JavaParsedFile> {
         .filter_map(|path| {
             load_java_file(path)
                 .ok()
-                .map(|result| JavaParsedFile { result })
+                .map(|(result, hash)| JavaParsedFile {
+                    path: path.clone(),
+                    result,
+                    content_hash: hash,
+                })
         })
         .collect()
 }
 
-fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {
+/// Parse all Java files in a single pass: reads each file once, runs both SQL extraction
+/// and tree-sitter method extraction, returns combined results with content hash.
+pub fn load_java_files_combined(paths: &[PathBuf]) -> Vec<(PathBuf, JavaCombinedResult)> {
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            parse_java_combined(path)
+                .ok()
+                .map(|combined| (path.clone(), combined))
+        })
+        .collect()
+}
+
+fn load_java_file(path: &Path) -> Result<(JavaExtractResult, String), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let content_hash = blake3::hash(&bytes).to_hex().to_string();
     let source = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     let file_path = path.to_string_lossy();
@@ -40,7 +69,48 @@ fn load_java_file(path: &Path) -> Result<JavaExtractResult, String> {
         &format!("{} SQL extractions", result.extractions.len()),
     );
 
-    Ok(result)
+    Ok((result, content_hash))
+}
+
+/// Single-pass Java parsing: reads file once, runs both SQL extraction and method extraction.
+fn parse_java_combined(path: &Path) -> Result<JavaCombinedResult, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let content_hash = blake3::hash(&bytes).to_hex().to_string();
+    let source = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let file_path_str = path.to_string_lossy();
+
+    // SQL extraction via ogsql-parser
+    let config = JavaExtractConfig::default();
+    let sql_result = extract_sql_from_java(&source, &file_path_str, &config);
+
+    if !sql_result.errors.is_empty() {
+        for err in &sql_result.errors {
+            crate::parse_log::warn(&file_path_str, &err.to_string());
+        }
+    }
+    crate::parse_log::info(
+        &file_path_str,
+        &format!("{} SQL extractions", sql_result.extractions.len()),
+    );
+
+    // Method extraction via tree-sitter
+    let method_result = crate::parser::java_method::parse_java_source(path, source.as_bytes())?;
+
+    crate::parse_log::info(
+        &file_path_str,
+        &format!(
+            "{} classes, {} methods",
+            method_result.classes.len(),
+            method_result.methods.len()
+        ),
+    );
+
+    Ok(JavaCombinedResult {
+        sql_result,
+        method_result,
+        content_hash,
+    })
 }
 
 pub fn extraction_method_label(method: &ExtractionMethod) -> &'static str {

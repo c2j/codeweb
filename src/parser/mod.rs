@@ -7,15 +7,20 @@ mod loader;
 pub mod scanner;
 
 #[allow(unused_imports)]
-pub use extractor::{CallEdge, CallExtractor, TableAccessExtractor};
+pub use extractor::{
+    CallEdge, CallExtractor, SequenceRef, SequenceRefVia, TableAccessExtractor, TypeRef,
+    TypeSequenceRefExtractor,
+};
 #[allow(unused_imports)]
 pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
 #[allow(unused_imports)]
-pub use java_loader::{load_java_files_from_paths, JavaParsedFile};
+pub use java_loader::{
+    load_java_files_combined, load_java_files_from_paths, JavaCombinedResult, JavaParsedFile,
+};
 #[allow(unused_imports)]
 pub use java_method::{
-    parse_java_file, parse_java_files_from_paths, JavaClassInfo, JavaMethodInfo, JavaParseResult,
-    MethodCallInfo,
+    parse_java_file, parse_java_files_from_paths, parse_java_source, JavaClassInfo, JavaMethodInfo,
+    JavaParseResult, MethodCallInfo,
 };
 pub use loader::{load_all_files, load_sql_files, parse_sql_files, AllParsedFiles, ParsedFile};
 #[allow(unused_imports)]
