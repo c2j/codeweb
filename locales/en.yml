@@ -1,0 +1,56 @@
+_version: 1
+
+screen.explorer: "Explorer"
+screen.detail: "Detail"
+screen.info: "Info"
+
+panel.search: "Search"
+panel.nodes: "Nodes"
+panel.nodes_matched: "Nodes (%{matched}/%{total} matched)"
+panel.preview: "Preview"
+panel.detail: "Node Detail"
+panel.stats: "Stats"
+panel.files: "Files"
+
+hint.nav: "Nav"
+hint.full: "Full"
+hint.style: "Style"
+hint.filter_on: "Filter:ON"
+hint.filter_off: "Filter"
+hint.info: "Info"
+hint.scroll: "Scroll"
+hint.back: "Back"
+hint.quit: "Quit"
+hint.lang: "Lang"
+
+statusbar.explorer_filter_on: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_on} [+/-]  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
+statusbar.explorer_filter_off: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_off}  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
+statusbar.detail: "[↑↓]%{scroll}  [Esc]%{back}  [S]%{style}:%{style_val}  [\\]%{lang}  [Q]%{quit}"
+statusbar.info: "[↑↓]%{scroll}  [Esc]%{back}  [\\]%{lang}  [Q]%{quit}"
+
+callers: "── CALLERS ──"
+callees: "── CALLEES ──"
+target: "── TARGET ──"
+convergence: "── CONVERGENCE ──"
+none: "  (none)"
+select_node: "Select a node to preview"
+
+stat.procedures: "Procedures"
+stat.functions: "Functions"
+stat.tables: "Tables"
+stat.views: "Views"
+stat.mappers: "Mappers"
+stat.java_methods: "Java Methods"
+stat.edges: "Edges"
+stat.files: "Files"
+
+degree.in: "in"
+degree.out: "out"
+degree.total: "total"
+
+style.tree: "Tree"
+style.path: "Path"
+
+filetype.sql: "SQL"
+filetype.java: "Java"
+filetype.xml: "XML"

@@ -1,0 +1,56 @@
+_version: 1
+
+screen.explorer: "资源管理器"
+screen.detail: "详情"
+screen.info: "信息"
+
+panel.search: "搜索"
+panel.nodes: "节点"
+panel.nodes_matched: "节点 (%{matched}/%{total} 匹配)"
+panel.preview: "预览"
+panel.detail: "节点详情"
+panel.stats: "统计"
+panel.files: "文件"
+
+hint.nav: "导航"
+hint.full: "全屏"
+hint.style: "样式"
+hint.filter_on: "过滤:开"
+hint.filter_off: "过滤"
+hint.info: "信息"
+hint.scroll: "滚动"
+hint.back: "返回"
+hint.quit: "退出"
+hint.lang: "语言"
+
+statusbar.explorer_filter_on: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_on} [+/-]  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
+statusbar.explorer_filter_off: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_off}  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
+statusbar.detail: "[↑↓]%{scroll}  [Esc]%{back}  [S]%{style}:%{style_val}  [\\]%{lang}  [Q]%{quit}"
+statusbar.info: "[↑↓]%{scroll}  [Esc]%{back}  [\\]%{lang}  [Q]%{quit}"
+
+callers: "── 上游调用 ──"
+callees: "── 下游调用 ──"
+target: "── 目标 ──"
+convergence: "── 汇聚点 ──"
+none: "  (无)"
+select_node: "选择节点以预览"
+
+stat.procedures: "存储过程"
+stat.functions: "函数"
+stat.tables: "表"
+stat.views: "视图"
+stat.mappers: "映射"
+stat.java_methods: "Java 方法"
+stat.edges: "边"
+stat.files: "文件"
+
+degree.in: "入"
+degree.out: "出"
+degree.total: "总"
+
+style.tree: "树"
+style.path: "路径"
+
+filetype.sql: "SQL"
+filetype.java: "Java"
+filetype.xml: "XML"

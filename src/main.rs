@@ -1,3 +1,8 @@
+#[macro_use]
+extern crate rust_i18n;
+
+i18n!("locales", fallback = "en");
+
 mod error;
 mod export;
 mod graph;
@@ -264,7 +269,11 @@ fn run() -> Result<()> {
         }) => cmd_merge(&stores, &output, &name),
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
-        Some(Commands::Trace { from, project, style }) => cmd_trace(&from, &project, &style),
+        Some(Commands::Trace {
+            from,
+            project,
+            style,
+        }) => cmd_trace(&from, &project, &style),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -284,7 +293,11 @@ fn run() -> Result<()> {
             has_distribute,
             &project,
         ),
-        Some(Commands::Detail { name, project, style }) => cmd_detail(&name, &project, &style),
+        Some(Commands::Detail {
+            name,
+            project,
+            style,
+        }) => cmd_detail(&name, &project, &style),
         Some(Commands::Import {
             file,
             output,
@@ -413,7 +426,10 @@ fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
 
     let chain = graph::traverse::trace_chain(graph, *start_idx);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
-    println!("{}", graph::traverse::format_chain(&chain, graph, chain_style));
+    println!(
+        "{}",
+        graph::traverse::format_chain(&chain, graph, chain_style)
+    );
     Ok(())
 }
 
@@ -660,7 +676,10 @@ fn cmd_detail(name: &str, project: &Path, style: &str) -> Result<()> {
 
     let chain = graph::traverse::trace_chain(graph, *start_idx);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
-    println!("{}", graph::traverse::format_chain(&chain, graph, chain_style));
+    println!(
+        "{}",
+        graph::traverse::format_chain(&chain, graph, chain_style)
+    );
 
     Ok(())
 }
