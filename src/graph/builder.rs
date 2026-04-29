@@ -1,7 +1,10 @@
 #[allow(unused_imports)]
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
-use crate::graph::{AccessMode, CodeGraph, Edge, Node, RoutineId, RoutineKind, SourceLocation};
+use crate::graph::{
+    determine_call_scope, extract_routine_id, CallScope, CodeGraph, DataFlowKind, Edge, Node,
+    RoutineId, RoutineKind, SourceLocation,
+};
 use crate::graph::{ColumnSummary, DistributeInfo, PartitionInfo};
 use crate::parser::{
     AllParsedFiles, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
@@ -293,9 +296,7 @@ impl GraphBuilder {
                             graph.add_edge(
                                 view_idx,
                                 table_idx,
-                                Edge::TableAccess {
-                                    modes: AccessMode::Read,
-                                    write_kinds: HashSet::new(),
+                                Edge::DependsOn {
                                     location: SourceLocation {
                                         file: file_arc.clone(),
                                         line: info.start_line,
@@ -669,9 +670,7 @@ impl GraphBuilder {
                             graph.add_edge(
                                 mview_idx,
                                 table_idx,
-                                Edge::TableAccess {
-                                    modes: AccessMode::Read,
-                                    write_kinds: HashSet::new(),
+                                Edge::DependsOn {
                                     location: SourceLocation {
                                         file: file_arc.clone(),
                                         line: info.start_line,
@@ -1329,6 +1328,7 @@ impl GraphBuilder {
 
             match (caller_idx, callee_idx) {
                 (Some(from), Some(to)) => {
+                    let scope = edge_call_scope(graph, from, to);
                     let g_edge = if edge.is_dynamic {
                         Edge::DynamicCall {
                             raw_expr: edge.callee_name.clone(),
@@ -1336,6 +1336,7 @@ impl GraphBuilder {
                         }
                     } else {
                         Edge::DirectCall {
+                            scope,
                             location: edge.location.clone(),
                         }
                     };
@@ -1373,6 +1374,7 @@ impl GraphBuilder {
                         }
                     } else {
                         Edge::DirectCall {
+                            scope: CallScope::External,
                             location: edge.location.clone(),
                         }
                     };
@@ -1647,6 +1649,7 @@ impl GraphBuilder {
                     source_idx,
                     table_idx,
                     Edge::TableAccess {
+                        flow_kind: DataFlowKind::DmlAccess,
                         modes: access.modes,
                         write_kinds: access.write_kinds.clone(),
                         location: SourceLocation {
@@ -1768,13 +1771,20 @@ impl GraphBuilder {
 
     fn merge_table_access_edges(graph: &mut CodeGraph) {
         let mut merge_targets: HashMap<
-            (petgraph::graph::NodeIndex, petgraph::graph::NodeIndex),
+            (
+                petgraph::graph::NodeIndex,
+                petgraph::graph::NodeIndex,
+                DataFlowKind,
+            ),
             Vec<petgraph::graph::EdgeIndex>,
         > = HashMap::new();
         for edge_idx in graph.edge_indices() {
-            if let Edge::TableAccess { .. } = &graph[edge_idx] {
+            if let Edge::TableAccess { flow_kind, .. } = &graph[edge_idx] {
                 let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
-                merge_targets.entry((src, dst)).or_default().push(edge_idx);
+                merge_targets
+                    .entry((src, dst, *flow_kind))
+                    .or_default()
+                    .push(edge_idx);
             }
         }
         let mut edges_to_remove = Vec::new();
@@ -2122,6 +2132,19 @@ fn split_object_name(name: &[String]) -> (Option<String>, String) {
     }
 }
 
+fn edge_call_scope(
+    graph: &CodeGraph,
+    caller_idx: petgraph::graph::NodeIndex,
+    callee_idx: petgraph::graph::NodeIndex,
+) -> CallScope {
+    let caller = extract_routine_id(&graph[caller_idx]);
+    let callee = extract_routine_id(&graph[callee_idx]);
+    match (caller, callee) {
+        (Some(a), Some(b)) => determine_call_scope(&a, &b),
+        _ => CallScope::External,
+    }
+}
+
 impl Default for GraphBuilder {
     fn default() -> Self {
         Self::new()
@@ -2321,12 +2344,12 @@ mod tests {
 
         let refs_from_view: Vec<_> = graph
             .edges_directed(view_nodes[0], petgraph::Direction::Outgoing)
-            .filter(|e| matches!(e.weight(), Edge::TableAccess { .. }))
+            .filter(|e| matches!(e.weight(), Edge::DependsOn { .. }))
             .collect();
         assert_eq!(
             refs_from_view.len(),
             1,
-            "View should reference 1 table (t_users)"
+            "View should depend on 1 table (t_users)"
         );
     }
 
@@ -2393,9 +2416,9 @@ mod tests {
 
         let refs: Vec<_> = graph
             .edges_directed(mview_nodes[0], petgraph::Direction::Outgoing)
-            .filter(|e| matches!(e.weight(), Edge::TableAccess { .. }))
+            .filter(|e| matches!(e.weight(), Edge::DependsOn { .. }))
             .collect();
-        assert_eq!(refs.len(), 1, "MView should reference 1 table");
+        assert_eq!(refs.len(), 1, "MView should depend on 1 table");
     }
 
     #[test]
