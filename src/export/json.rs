@@ -178,7 +178,11 @@ struct EdgeJson {
 #[serde(tag = "type")]
 enum EdgeKindJson {
     #[serde(rename = "direct")]
-    Direct { file: String, line: usize },
+    Direct {
+        scope: String,
+        file: String,
+        line: usize,
+    },
     #[serde(rename = "dynamic")]
     Dynamic {
         raw_expr: String,
@@ -199,11 +203,14 @@ enum EdgeKindJson {
     Implements { file: String, line: usize },
     #[serde(rename = "table_access")]
     TableAccess {
+        flow_kind: String,
         modes: Vec<String>,
         write_kinds: Vec<String>,
         file: String,
         line: usize,
     },
+    #[serde(rename = "depends_on")]
+    DependsOn { file: String, line: usize },
     #[serde(rename = "contains_routine")]
     ContainsRoutine,
     #[serde(rename = "triggers_routine")]
@@ -513,10 +520,15 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             .edge_endpoints(edge_idx)
             .expect("edge should have endpoints");
         let edge_json = match &graph[edge_idx] {
-            Edge::DirectCall { location } => EdgeJson {
+            Edge::DirectCall { scope, location } => EdgeJson {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::Direct {
+                    scope: match scope {
+                        crate::graph::CallScope::IntraPackage => "intra".to_string(),
+                        crate::graph::CallScope::CrossPackage => "cross".to_string(),
+                        crate::graph::CallScope::External => "external".to_string(),
+                    },
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },
@@ -576,6 +588,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 },
             },
             Edge::TableAccess {
+                flow_kind,
                 modes,
                 write_kinds,
                 location,
@@ -611,6 +624,12 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     source: src.index(),
                     target: dst.index(),
                     kind: EdgeKindJson::TableAccess {
+                        flow_kind: match flow_kind {
+                            crate::graph::DataFlowKind::DmlAccess => "dml".to_string(),
+                            crate::graph::DataFlowKind::DefinitionDependency => {
+                                "definition".to_string()
+                            }
+                        },
                         modes: mode_strs,
                         write_kinds: wk_strs,
                         file: location.file.to_string_lossy().to_string(),
@@ -618,6 +637,14 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     },
                 }
             }
+            Edge::DependsOn { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::DependsOn {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
             Edge::ContainsRoutine => EdgeJson {
                 source: src.index(),
                 target: dst.index(),
