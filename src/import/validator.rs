@@ -128,6 +128,8 @@ fn standard_node_types() -> HashSet<&'static str> {
 fn standard_edge_types() -> HashSet<&'static str> {
     [
         "direct",
+        "intra_call",
+        "cross_call",
         "dynamic",
         "calls_procedure",
         "invokes_mapper",
@@ -136,6 +138,7 @@ fn standard_edge_types() -> HashSet<&'static str> {
         "extends",
         "implements",
         "table_access",
+        "depends_on",
         "contains_routine",
         "triggers_routine",
         "references_type",
