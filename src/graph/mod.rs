@@ -61,6 +61,41 @@ bitflags! {
     }
 }
 
+/// Scope of a call relationship — determined by comparing caller and callee package context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CallScope {
+    /// Call within the same package (highest coupling, internal implementation detail).
+    IntraPackage,
+    /// Call across different packages (interface-level coupling).
+    CrossPackage,
+    /// Call to an external/standalone routine.
+    External,
+}
+
+/// Distinguishes data flow semantics for TableAccess edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DataFlowKind {
+    /// Runtime DML access (procedure/function → table via SELECT/INSERT/UPDATE/DELETE).
+    DmlAccess,
+    /// Definition-time dependency (view/materialized view → table).
+    DefinitionDependency,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeCategory {
+    /// Control flow: one routine invokes another.
+    Call,
+    /// Structural containment: package→routine, class→method.
+    Composition,
+    /// Data flow: read/write between routines and tables, structural dependencies.
+    DataFlow,
+    /// Type/object reference: routine references a type, sequence, trigger, synonym.
+    Reference,
+    /// Inheritance: extends/implements.
+    Inheritance,
+}
+
 /// What kind of write operation was performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WriteKind {
@@ -346,62 +381,54 @@ pub enum Node {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]
 pub enum Edge {
-    /// Direct static call to a known procedure.
     DirectCall {
+        scope: CallScope,
         location: SourceLocation,
     },
-    /// Dynamic call via EXECUTE with unparseable SQL.
     DynamicCall {
         raw_expr: String,
         location: SourceLocation,
     },
 
-    /// A MappedStatement or JavaSql calls a stored procedure.
     CallsProcedure {
         location: SourceLocation,
     },
-    /// A JavaSql is linked to a MappedStatement via namespace.method matching.
     InvokesMapper {
         location: SourceLocation,
     },
 
-    /// A Java method calls another Java method.
     CallsJava {
         location: SourceLocation,
     },
-    /// A Java class contains a Java method.
     ContainsMethod,
-    /// A Java class extends another class.
     Extends {
         location: SourceLocation,
     },
-    /// A Java class implements an interface.
     Implements {
         location: SourceLocation,
     },
-    /// A statement accesses a table with specific read/write/lock modes.
     TableAccess {
+        flow_kind: DataFlowKind,
         modes: AccessMode,
         write_kinds: std::collections::HashSet<WriteKind>,
+        location: SourceLocation,
+    },
+    DependsOn {
         location: SourceLocation,
     },
     ContainsRoutine,
     TriggersRoutine {
         location: SourceLocation,
     },
-    /// A routine references a custom TYPE.
     ReferencesType {
         location: SourceLocation,
     },
-    /// A routine uses a SEQUENCE (nextval/currval/setval).
     UsesSequence {
         location: SourceLocation,
     },
-    /// An INDEX belongs to a TABLE.
     IndexesTable {
         location: SourceLocation,
     },
-    /// A SYNONYM aliases another object.
     AliasesObject {
         location: SourceLocation,
     },
@@ -414,6 +441,43 @@ pub enum Edge {
 
 /// The call graph itself.
 pub type CodeGraph = petgraph::Graph<Node, Edge>;
+
+impl Edge {
+    #[allow(dead_code)]
+    pub fn category(&self) -> EdgeCategory {
+        match self {
+            Edge::DirectCall { .. }
+            | Edge::DynamicCall { .. }
+            | Edge::CallsProcedure { .. }
+            | Edge::InvokesMapper { .. }
+            | Edge::CallsJava { .. } => EdgeCategory::Call,
+            Edge::ContainsRoutine | Edge::ContainsMethod => EdgeCategory::Composition,
+            Edge::TableAccess { .. } | Edge::DependsOn { .. } => EdgeCategory::DataFlow,
+            Edge::TriggersRoutine { .. }
+            | Edge::ReferencesType { .. }
+            | Edge::UsesSequence { .. }
+            | Edge::IndexesTable { .. }
+            | Edge::AliasesObject { .. } => EdgeCategory::Reference,
+            Edge::Extends { .. } | Edge::Implements { .. } => EdgeCategory::Inheritance,
+            Edge::CustomEdge { .. } => EdgeCategory::Reference,
+        }
+    }
+}
+
+pub fn determine_call_scope(caller: &RoutineId, callee: &RoutineId) -> CallScope {
+    match (&caller.package, &callee.package) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => CallScope::IntraPackage,
+        (Some(_), Some(_)) => CallScope::CrossPackage,
+        _ => CallScope::External,
+    }
+}
+
+fn extract_routine_id(node: &Node) -> Option<RoutineId> {
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => Some(id.clone()),
+        _ => None,
+    }
+}
 
 impl Node {
     #[allow(dead_code)]
