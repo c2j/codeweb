@@ -1,6 +1,8 @@
 mod error;
 mod export;
 mod graph;
+#[allow(dead_code)]
+mod import;
 mod parse_log;
 #[allow(dead_code)]
 mod parser;
@@ -117,6 +119,10 @@ enum Commands {
         /// Project directory
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+
+        /// Display style for call chain output
+        #[arg(short, long, default_value = "tree", value_parser = ["tree", "path"])]
+        style: String,
     },
 
     /// Show project statistics
@@ -151,9 +157,40 @@ enum Commands {
         #[arg(short = 't', long)]
         node_type: Option<String>,
 
+        /// Show only partitioned tables
+        #[arg(long)]
+        has_partition: bool,
+
+        /// Show only distributed tables
+        #[arg(long)]
+        has_distribute: bool,
+
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+    },
+
+    /// Import a CGEF JSON graph file into a standalone GraphStore
+    Import {
+        /// Path to the CGEF JSON file to import
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Output path for the generated GraphStore (.bincode or .json)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Path prefix to prepend to all relative file paths
+        #[arg(short, long)]
+        prefix: Option<String>,
+
+        /// Project name for the imported GraphStore
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Force import even when validation or parse errors are found
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show callers/callees detail for a node
@@ -164,6 +201,10 @@ enum Commands {
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+
+        /// Display style for call chain output
+        #[arg(short, long, default_value = "tree", value_parser = ["tree", "path"])]
+        style: String,
     },
 }
 
@@ -171,7 +212,7 @@ fn main() {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let rayon_threads = std::cmp::max(2, cores / 3);
+    let rayon_threads = std::cmp::max(4, cores - 2);
 
     let builder = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
@@ -223,7 +264,7 @@ fn run() -> Result<()> {
         }) => cmd_merge(&stores, &output, &name),
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
-        Some(Commands::Trace { from, project }) => cmd_trace(&from, &project),
+        Some(Commands::Trace { from, project, style }) => cmd_trace(&from, &project, &style),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -231,15 +272,26 @@ fn run() -> Result<()> {
             orphan,
             low_degree,
             node_type,
+            has_partition,
+            has_distribute,
             project,
         }) => cmd_nodes(
             search.as_deref(),
             orphan,
             low_degree,
             node_type.as_deref(),
+            has_partition,
+            has_distribute,
             &project,
         ),
-        Some(Commands::Detail { name, project }) => cmd_detail(&name, &project),
+        Some(Commands::Detail { name, project, style }) => cmd_detail(&name, &project, &style),
+        Some(Commands::Import {
+            file,
+            output,
+            prefix,
+            name,
+            force,
+        }) => cmd_import(&file, &output, prefix.as_deref(), name.as_deref(), force),
         None => cmd_legacy(cli),
     }
 }
@@ -336,7 +388,7 @@ fn cmd_tui(project: &Path) -> Result<()> {
     tui::run(project)
 }
 
-fn cmd_trace(from: &str, project: &Path) -> Result<()> {
+fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
 
@@ -360,7 +412,8 @@ fn cmd_trace(from: &str, project: &Path) -> Result<()> {
     eprintln!("Tracing from: {}", start_name);
 
     let chain = graph::traverse::trace_chain(graph, *start_idx);
-    println!("{}", graph::traverse::format_chain_tree(&chain, graph));
+    let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
+    println!("{}", graph::traverse::format_chain(&chain, graph, chain_style));
     Ok(())
 }
 
@@ -402,7 +455,7 @@ fn cmd_files(project: &Path) -> Result<()> {
     let store = proj.load_store();
 
     if let Ok(store) = store {
-        let manifest = store.manifest();
+        let manifest: &std::collections::HashMap<std::path::PathBuf, _> = store.manifest();
         let file_nodes = store.file_nodes();
         let mut entries: Vec<_> = manifest.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -436,27 +489,28 @@ fn cmd_files(project: &Path) -> Result<()> {
     Ok(())
 }
 
-fn node_type_tag(node: &Node) -> &'static str {
+fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
     match node {
-        Node::Procedure { partial: true, .. } => "proc*",
-        Node::Procedure { .. } => "proc",
-        Node::Function { partial: true, .. } => "func*",
-        Node::Function { .. } => "func",
-        Node::Unresolved { .. } => "unres",
-        Node::MappedStatement { .. } => "mapper",
-        Node::JavaSql { .. } => "sql",
-        Node::JavaMethod { .. } => "method",
-        Node::JavaClass { .. } => "class",
-        Node::Table { .. } => "table",
-        Node::View { .. } => "view",
-        Node::Package { .. } => "pkg",
-        Node::Trigger { .. } => "trigger",
-        Node::Type { .. } => "type",
-        Node::Sequence { .. } => "seq",
-        Node::Index { .. } => "index",
-        Node::MaterializedView { .. } => "mview",
-        Node::Synonym { .. } => "synonym",
-        Node::Event { .. } => "event",
+        Node::Procedure { partial: true, .. } => std::borrow::Cow::Borrowed("proc*"),
+        Node::Procedure { .. } => std::borrow::Cow::Borrowed("proc"),
+        Node::Function { partial: true, .. } => std::borrow::Cow::Borrowed("func*"),
+        Node::Function { .. } => std::borrow::Cow::Borrowed("func"),
+        Node::Unresolved { .. } => std::borrow::Cow::Borrowed("unres"),
+        Node::MappedStatement { .. } => std::borrow::Cow::Borrowed("mapper"),
+        Node::JavaSql { .. } => std::borrow::Cow::Borrowed("sql"),
+        Node::JavaMethod { .. } => std::borrow::Cow::Borrowed("method"),
+        Node::JavaClass { .. } => std::borrow::Cow::Borrowed("class"),
+        Node::Table { .. } => std::borrow::Cow::Borrowed("table"),
+        Node::View { .. } => std::borrow::Cow::Borrowed("view"),
+        Node::Package { .. } => std::borrow::Cow::Borrowed("pkg"),
+        Node::Trigger { .. } => std::borrow::Cow::Borrowed("trigger"),
+        Node::Type { .. } => std::borrow::Cow::Borrowed("type"),
+        Node::Sequence { .. } => std::borrow::Cow::Borrowed("seq"),
+        Node::Index { .. } => std::borrow::Cow::Borrowed("index"),
+        Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
+        Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
+        Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
+        Node::Custom { type_name, .. } => std::borrow::Cow::Owned(type_name.clone()),
     }
 }
 
@@ -465,6 +519,8 @@ fn cmd_nodes(
     orphan: bool,
     low_degree: Option<usize>,
     node_type: Option<&str>,
+    has_partition: bool,
+    has_distribute: bool,
     project: &Path,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
@@ -496,6 +552,23 @@ fn cmd_nodes(
                 }
             }
             true
+        })
+        .filter(|idx| {
+            if has_partition || has_distribute {
+                match &graph[*idx] {
+                    Node::Table {
+                        partition_by,
+                        distribute_by,
+                        ..
+                    } => {
+                        (!has_partition || partition_by.is_some())
+                            && (!has_distribute || distribute_by.is_some())
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            }
         })
         .filter_map(|idx| {
             let in_deg = graph
@@ -547,7 +620,7 @@ fn is_partial(node: &Node) -> bool {
     )
 }
 
-fn cmd_detail(name: &str, project: &Path) -> Result<()> {
+fn cmd_detail(name: &str, project: &Path, style: &str) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
     let graph = store.graph();
@@ -582,10 +655,226 @@ fn cmd_detail(name: &str, project: &Path) -> Result<()> {
         println!("  ⚠ partial node — body implementation could not be parsed");
     }
     println!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
+    print_node_details(&graph[*start_idx]);
     println!();
 
     let chain = graph::traverse::trace_chain(graph, *start_idx);
-    println!("{}", graph::traverse::format_chain_tree(&chain, graph));
+    let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
+    println!("{}", graph::traverse::format_chain(&chain, graph, chain_style));
+
+    Ok(())
+}
+
+fn print_node_details(node: &Node) {
+    use graph::{DistributeInfo, PartitionInfo};
+    if let Node::Table {
+        location,
+        columns,
+        partition_by,
+        distribute_by,
+        tablespace,
+        temporary,
+        unlogged,
+        ddl_source,
+        ..
+    } = node
+    {
+        if let Some(loc) = location {
+            println!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
+        } else {
+            println!("  file: (implicit)");
+        }
+        if *temporary {
+            println!("  temporary: true");
+        }
+        if *unlogged {
+            println!("  unlogged: true");
+        }
+        if let Some(ts) = tablespace {
+            println!("  tablespace: {}", ts);
+        }
+        if !columns.is_empty() {
+            println!("  columns ({}):", columns.len());
+            for col in columns {
+                let pk = if col.is_primary_key { " [PK]" } else { "" };
+                let null = if col.nullable { "NULL" } else { "NOT NULL" };
+                let def = col
+                    .default_value
+                    .as_deref()
+                    .map(|d| format!(" DEFAULT {}", d))
+                    .unwrap_or_default();
+                println!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
+            }
+        }
+        if let Some(part) = partition_by {
+            match part {
+                PartitionInfo::Range {
+                    columns,
+                    partitions,
+                } => {
+                    println!(
+                        "  partition: RANGE({}) [{} partitions]",
+                        columns.join(", "),
+                        partitions.len()
+                    );
+                }
+                PartitionInfo::List {
+                    columns,
+                    partitions,
+                } => {
+                    println!(
+                        "  partition: LIST({}) [{} partitions]",
+                        columns.join(", "),
+                        partitions.len()
+                    );
+                }
+                PartitionInfo::Hash {
+                    columns,
+                    partitions_count,
+                } => {
+                    println!(
+                        "  partition: HASH({}) [{}]",
+                        columns.join(", "),
+                        partitions_count
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "auto".to_string())
+                    );
+                }
+            }
+        }
+        if let Some(dist) = distribute_by {
+            match dist {
+                DistributeInfo::Hash { columns } => {
+                    println!("  distribute: HASH({})", columns.join(", "));
+                }
+                DistributeInfo::Replication => {
+                    println!("  distribute: REPLICATION");
+                }
+                DistributeInfo::RoundRobin { columns } => {
+                    println!("  distribute: ROUNDROBIN({})", columns.join(", "));
+                }
+                DistributeInfo::Modulo { columns } => {
+                    println!("  distribute: MODULO({})", columns.join(", "));
+                }
+            }
+        }
+        if let Some(ddl) = ddl_source {
+            println!("  ddl: {}", ddl);
+        }
+    }
+}
+
+fn cmd_import(
+    file: &Path,
+    output: &Path,
+    prefix: Option<&str>,
+    name: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let json_str =
+        std::fs::read_to_string(file).map_err(|source| error::CodeWebError::FileRead {
+            path: file.to_path_buf(),
+            source,
+        })?;
+
+    let doc: import::format::CgefDocument =
+        serde_json::from_str(&json_str).map_err(|e| error::CodeWebError::ExportError {
+            message: format!("invalid CGEF JSON: {}", e),
+        })?;
+
+    let report = import::validator::validate(&doc);
+    let mut all_errors: Vec<String> = report.errors.iter().map(|e| e.to_string()).collect();
+    for w in &report.warnings {
+        eprintln!("warning: {}", w.message);
+    }
+
+    let schema_registry = import::schema::SchemaRegistry::from_document(&doc);
+    let path_mapper = import::path_mapper::PathMapper::new(prefix);
+    let parser = import::parser::CgefParser::new(path_mapper, schema_registry);
+
+    let parsed = parser.parse(doc);
+    for e in &parsed.errors {
+        all_errors.push(e.to_string());
+    }
+
+    if !all_errors.is_empty() {
+        eprintln!("found {} error(s):", all_errors.len());
+        for (i, e) in all_errors.iter().enumerate() {
+            eprintln!("  {}. {}", i + 1, e);
+        }
+        if !force {
+            return Err(error::CodeWebError::ExportError {
+                message: format!(
+                    "{} error(s) found; use --force to import anyway",
+                    all_errors.len()
+                ),
+            });
+        }
+        eprintln!(
+            "--force: importing anyway ({} nodes, {} edges skipped due to errors)",
+            parsed
+                .errors
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    import::parser::ParseError::MissingKeyField { .. }
+                        | import::parser::ParseError::UnknownNodeType { .. }
+                        | import::parser::ParseError::InvalidNode { .. }
+                ))
+                .count(),
+            parsed
+                .errors
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    import::parser::ParseError::SourceNotFound { .. }
+                        | import::parser::ParseError::TargetNotFound { .. }
+                        | import::parser::ParseError::UnknownEdgeType { .. }
+                        | import::parser::ParseError::InvalidEdge { .. }
+                ))
+                .count(),
+        );
+    }
+
+    let project_name = name.unwrap_or_else(|| {
+        file.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported")
+    });
+
+    let store = graph::store::GraphStore::from_graph(project_name, parsed.graph);
+    let stats = store.stats();
+
+    if output.extension().is_some_and(|e| e == "json") {
+        store.save_json(output)?;
+    } else {
+        store.save_bincode(output)?;
+    }
+
+    eprintln!(
+        "Imported: {} nodes ({} custom), {} edges ({} custom) → {}",
+        stats.procedures
+            + stats.functions
+            + stats.tables
+            + stats.views
+            + stats.mappers
+            + stats.java_methods
+            + stats.java_classes
+            + stats.java_sql
+            + stats.packages
+            + stats.triggers
+            + stats.types
+            + stats.sequences
+            + stats.indexes
+            + stats.materialized_views
+            + stats.synonyms
+            + stats.events
+            + stats.custom_nodes,
+        stats.custom_nodes,
+        stats.edges,
+        stats.custom_edges,
+        output.display()
+    );
 
     Ok(())
 }
@@ -728,6 +1017,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::MaterializedView { .. } => materialized_views += 1,
             Node::Synonym { .. } => synonyms += 1,
             Node::Event { .. } => events += 1,
+            Node::Custom { .. } => {}
         }
     }
 

@@ -30,7 +30,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 2,
+            version: 3,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -82,7 +82,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 2,
+            version: 3,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -140,6 +140,7 @@ impl GraphStore {
                 Node::MaterializedView { .. } => s.materialized_views += 1,
                 Node::Synonym { .. } => s.synonyms += 1,
                 Node::Event { .. } => s.events += 1,
+                Node::Custom { .. } => s.custom_nodes += 1,
             }
         }
         s.edges = self.graph.edge_count();
@@ -186,11 +187,14 @@ impl GraphStore {
         })?;
         let store: Self =
             bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
-                message: format!("bincode deserialize: {}", e),
+                message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
             })?;
-        if store.version != 2 {
+        if store.version != 3 {
             return Err(crate::error::CodeWebError::ExportError {
-                message: format!("unsupported cache version {}, expected 2", store.version),
+                message: format!(
+                    "unsupported cache version {}, expected 3 — run `codeweb analyze` to regenerate",
+                    store.version
+                ),
             });
         }
         Ok(store)
@@ -225,9 +229,12 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 2 {
+        if store.version != 3 {
             return Err(crate::error::CodeWebError::ExportError {
-                message: format!("unsupported cache version {}, expected 2", store.version),
+                message: format!(
+                    "unsupported cache version {}, expected 3 — run `codeweb analyze` to regenerate",
+                    store.version
+                ),
             });
         }
         Ok(store)
@@ -396,7 +403,9 @@ fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::JavaSql { java_file, .. } => Some(java_file.clone()),
         Node::JavaMethod { file, .. } => Some(file.clone()),
         Node::JavaClass { file, .. } => Some(file.clone()),
-        Node::Table { .. } | Node::View { .. } | Node::Unresolved { .. } => None,
+        Node::Table { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
+        Node::View { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
+        Node::Unresolved { .. } => None,
         Node::Package { location, .. } => Some(location.file.to_path_buf()),
         Node::Trigger { location, .. } => Some(location.file.to_path_buf()),
         Node::Type { location, .. } => Some(location.file.to_path_buf()),
@@ -405,6 +414,7 @@ fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::MaterializedView { location, .. } => Some(location.file.to_path_buf()),
         Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
         Node::Event { location, .. } => Some(location.file.to_path_buf()),
+        Node::Custom { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
     }
 }
 
@@ -433,6 +443,9 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::UsesSequence { .. } => "uses_sequence",
         crate::graph::Edge::IndexesTable { .. } => "indexes_table",
         crate::graph::Edge::AliasesObject { .. } => "aliases_object",
+        crate::graph::Edge::CustomEdge { type_name, .. } => {
+            return format!("custom:{}", type_name);
+        }
     }
     .to_string()
 }
@@ -457,6 +470,8 @@ pub struct StoreStats {
     pub materialized_views: usize,
     pub synonyms: usize,
     pub events: usize,
+    pub custom_nodes: usize,
+    pub custom_edges: usize,
     pub edges: usize,
     pub files: usize,
 }
@@ -465,6 +480,206 @@ pub struct StoreStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_bincode_roundtrip_edge_only() {
+        let mut graph = CodeGraph::new();
+        let proc = crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("pkg".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+                line: 1,
+            },
+            partial: false,
+        };
+        let table = crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: vec![],
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        let proc_idx = graph.add_node(proc);
+        let table_idx = graph.add_node(table);
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::TableAccess {
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: crate::graph::SourceLocation {
+                    file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+                    line: 5,
+                },
+            },
+        );
+
+        let bytes = bincode::serialize(&graph).unwrap();
+        let back: CodeGraph = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.node_count(), 2);
+        assert_eq!(back.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_bincode_roundtrip_via_file() {
+        let dir = TempDir::new().unwrap();
+
+        let mut graph = CodeGraph::new();
+        let proc = crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("pkg".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+                line: 1,
+            },
+            partial: false,
+        };
+        let table = crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: vec![],
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        let proc_idx = graph.add_node(proc);
+        let table_idx = graph.add_node(table);
+        let write_kinds = std::collections::HashSet::new();
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::TableAccess {
+                modes: crate::graph::AccessMode::Read,
+                write_kinds,
+                location: crate::graph::SourceLocation {
+                    file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+                    line: 5,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let path = dir.path().join("test.bincode");
+        store.save_bincode(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        eprintln!("File size: {} bytes", bytes.len());
+
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+        assert_eq!(loaded.graph().node_count(), 2);
+        assert_eq!(loaded.graph().edge_count(), 1);
+    }
+
+    #[test]
+    fn test_bincode_roundtrip_with_custom_node() {
+        let mut graph = CodeGraph::new();
+        let mut key_fields = std::collections::BTreeMap::new();
+        key_fields.insert("interface".to_string(), "com.example.Svc".to_string());
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("version".to_string(), serde_json::json!("2.0"));
+        let node = crate::graph::Node::Custom {
+            type_name: "dubbo_service".to_string(),
+            label: "com.example.Svc".to_string(),
+            key_fields,
+            properties: crate::graph::JsonMap(props),
+            location: None,
+        };
+        graph.add_node(node);
+
+        let store = GraphStore::from_graph("test", graph);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.bincode");
+        store.save_bincode(&path).unwrap();
+
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+        assert_eq!(loaded.graph().node_count(), 1);
+    }
+
+    #[test]
+    fn test_bincode_roundtrip_table_with_partition_and_distribute() {
+        // Regression test: PartitionInfo/DistributeInfo used #[serde(tag = "...")]
+        // which requires deserialize_any — bincode does not support that.
+        let mut graph = CodeGraph::new();
+        let table = crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: vec![
+                crate::graph::ColumnSummary {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    comment: None,
+                },
+                crate::graph::ColumnSummary {
+                    name: "created_at".to_string(),
+                    data_type: "TIMESTAMP".to_string(),
+                    nullable: false,
+                    is_primary_key: false,
+                    default_value: Some("now()".to_string()),
+                    comment: Some("creation time".to_string()),
+                },
+            ],
+            partition_by: Some(crate::graph::PartitionInfo::Range {
+                columns: vec!["created_at".to_string()],
+                partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
+            }),
+            distribute_by: Some(crate::graph::DistributeInfo::Hash {
+                columns: vec!["user_id".to_string()],
+            }),
+            tablespace: Some("pg_default".to_string()),
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        graph.add_node(table);
+
+        let store = GraphStore::from_graph("partition-test", graph);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partition.bincode");
+        store.save_bincode(&path).unwrap();
+
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+        assert_eq!(loaded.graph().node_count(), 1);
+
+        let raw_nodes = loaded.graph().raw_nodes();
+        let table_node = &raw_nodes[0].weight;
+        match table_node {
+            crate::graph::Node::Table {
+                name,
+                columns,
+                partition_by,
+                distribute_by,
+                ..
+            } => {
+                assert_eq!(name, "orders");
+                assert_eq!(columns.len(), 2);
+                assert!(partition_by.is_some());
+                assert!(distribute_by.is_some());
+            }
+            other => panic!("Expected Table node, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_old_cache_version_rejected() {

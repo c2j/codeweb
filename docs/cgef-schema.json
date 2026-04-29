@@ -1,0 +1,584 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cobweb.dev/schemas/cgef-1.json",
+  "title": "Codeweb Graph Exchange Format (CGEF) Schema",
+  "description": "JSON Schema for validating CGEF documents produced by or consumed by codeweb. CGEF is a portable graph exchange format for semantic code analysis, covering SQL stored procedures, MyBatis mappers, Java methods, and their relationships.",
+  "type": "object",
+  "required": ["format_version", "metadata", "nodes", "edges"],
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Version of the CGEF format. Must be 1."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Metadata about this CGEF document.",
+      "required": ["source", "generated_at"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Name or identifier of the source system, project, or repository that this graph represents."
+        },
+        "generated_at": {
+          "type": "string",
+          "description": "ISO 8601 timestamp indicating when this CGEF document was generated."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional human-readable description of this graph document."
+        }
+      }
+    },
+    "node_schemas": {
+      "type": "object",
+      "description": "Optional definitions for custom node types used in this document. Standard node types do not need to be declared here.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "Human-readable name for this node type."
+          },
+          "key_fields": {
+            "type": "array",
+            "description": "Ordered list of field names that form the logical key for nodes of this type.",
+            "items": { "type": "string" }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Map of property names to their type definitions.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "JSON Schema type name (e.g. string, integer, boolean, array, object)."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "Optional human-readable description of this property."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "edge_schemas": {
+      "type": "object",
+      "description": "Optional definitions for custom edge types used in this document. Standard edge types do not need to be declared here.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "Human-readable name for this edge type."
+          },
+          "source_types": {
+            "type": "array",
+            "description": "List of node type names that may appear as the source of this edge type.",
+            "items": { "type": "string" }
+          },
+          "target_types": {
+            "type": "array",
+            "description": "List of node type names that may appear as the target of this edge type.",
+            "items": { "type": "string" }
+          },
+          "properties": {
+            "type": "object",
+            "description": "Map of property names to their type definitions for edges of this type.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "JSON Schema type name (e.g. string, integer, boolean, array, object)."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "Optional human-readable description of this property."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "description": "All nodes in the graph.",
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "All edges in the graph. Each edge connects two nodes by their id values.",
+      "items": { "$ref": "#/$defs/edge" }
+    }
+  },
+  "$defs": {
+    "location": {
+      "type": "object",
+      "description": "Source location within a file. The file path must be relative to the project root.",
+      "required": ["file", "line"],
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Relative path from the project root to the source file."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based line number within the source file."
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "description": "A node in the call graph. Standard types include: procedure, function, package, trigger, type, sequence, index, materialized_view, synonym, event, table, view, mapped_statement, java_sql, java_method, java_class, unresolved. Custom types are also supported when declared in node_schemas.",
+      "required": ["id", "type", "key"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Globally unique identifier for this node within the document. Referenced by edges via source and target."
+        },
+        "type": {
+          "type": "string",
+          "description": "Node type. Standard values: procedure, function, package, trigger, type, sequence, index, materialized_view, synonym, event, table, view, mapped_statement, java_sql, java_method, java_class, unresolved. Custom values are permitted when declared in node_schemas."
+        },
+        "key": {
+          "type": "object",
+          "description": "Logical key fields that uniquely identify this node within its type. Structure varies by node type. For custom types, any fields are permitted.",
+          "additionalProperties": true
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "properties": {
+          "type": "object",
+          "description": "Additional type-specific properties not covered by key or location. For custom types, any properties are permitted.",
+          "additionalProperties": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "procedure" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "package": { "type": "string" },
+                  "name": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["procedure", "function"] }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "function" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "package": { "type": "string" },
+                  "name": { "type": "string" },
+                  "kind": { "type": "string", "enum": ["procedure", "function"] }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "table" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "view" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "mapped_statement" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "namespace": { "type": "string" },
+                  "statement_id": { "type": "string" },
+                  "kind": { "type": "string" },
+                  "xml_file": { "type": "string" },
+                  "line": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["namespace", "statement_id", "kind"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "java_method" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "fqn": { "type": "string" },
+                  "class_fqn": { "type": "string" },
+                  "name": { "type": "string" },
+                  "signature": { "type": "string" },
+                  "file": { "type": "string" },
+                  "line": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["fqn", "class_fqn", "name", "signature"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "java_class" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "fqn": { "type": "string" },
+                  "name": { "type": "string" },
+                  "package": { "type": "string" },
+                  "file": { "type": "string" },
+                  "line": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["fqn", "name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "java_sql" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "class_name": { "type": "string" },
+                  "method_name": { "type": "string" },
+                  "extraction_method": { "type": "string" },
+                  "java_file": { "type": "string" },
+                  "line": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["extraction_method"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "package" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "trigger" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "table": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "type" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" },
+                  "type_kind": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "sequence" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "index" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "table_schema": { "type": "string" },
+                  "table_name": { "type": "string" },
+                  "unique": { "type": "boolean" }
+                },
+                "required": ["table_name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "materialized_view" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "synonym" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "schema": { "type": "string" },
+                  "name": { "type": "string" },
+                  "target_schema": { "type": "string" },
+                  "target_name": { "type": "string" }
+                },
+                "required": ["name", "target_name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "event" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" }
+                },
+                "required": ["name"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "unresolved" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "object",
+                "properties": {
+                  "raw_expr": { "type": "string" },
+                  "context": { "type": "string" }
+                },
+                "required": ["raw_expr", "context"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "edge": {
+      "type": "object",
+      "description": "An edge in the call graph. Standard types include: direct, dynamic, calls_procedure, invokes_mapper, calls_java, contains_method, extends, implements, table_access, contains_routine, triggers_routine, references_type, uses_sequence, indexes_table, aliases_object. Custom types are also supported when declared in edge_schemas.",
+      "required": ["source", "target", "type"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Id of the source node. Must reference a node id in the nodes array."
+        },
+        "target": {
+          "type": "string",
+          "description": "Id of the target node. Must reference a node id in the nodes array."
+        },
+        "type": {
+          "type": "string",
+          "description": "Edge type. Standard values: direct, dynamic, calls_procedure, invokes_mapper, calls_java, contains_method, extends, implements, table_access, contains_routine, triggers_routine, references_type, uses_sequence, indexes_table, aliases_object. Custom values are permitted when declared in edge_schemas."
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "properties": {
+          "type": "object",
+          "description": "Additional type-specific properties for this edge. For custom types, any properties are permitted.",
+          "additionalProperties": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "table_access" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "properties": {
+                "type": "object",
+                "properties": {
+                  "modes": {
+                    "type": "array",
+                    "description": "Access modes applied to the target table. At least one mode must be present.",
+                    "items": {
+                      "type": "string",
+                      "enum": ["read", "write", "lock_read", "truncate"]
+                    },
+                    "minItems": 1
+                  },
+                  "write_kinds": {
+                    "type": "array",
+                    "description": "Kinds of write operations performed. Only present when modes includes write or truncate.",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "insert",
+                        "insert_select",
+                        "update",
+                        "delete",
+                        "merge_insert",
+                        "merge_update",
+                        "merge_delete",
+                        "select_into",
+                        "truncate"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "dynamic" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "properties": {
+                "type": "object",
+                "properties": {
+                  "raw_expr": {
+                    "type": "string",
+                    "description": "The raw dynamic SQL expression that could not be statically resolved."
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

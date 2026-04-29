@@ -21,6 +21,8 @@ pub struct App {
     in_search: bool,
     filter_low_degree: bool,
     filter_threshold: usize,
+    detail_node_idx: Option<NodeIndex>,
+    chain_style: traverse::ChainStyle,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -29,6 +31,7 @@ enum Screen {
     Files,
     Graph,
     Trace,
+    Detail,
 }
 
 impl App {
@@ -47,6 +50,8 @@ impl App {
             in_search: true,
             filter_low_degree: false,
             filter_threshold: 0,
+            detail_node_idx: None,
+            chain_style: traverse::ChainStyle::default(),
         }
     }
 
@@ -87,9 +92,20 @@ impl App {
             return;
         }
 
+        use crossterm::event::KeyCode;
+        if key.code == KeyCode::Char('s') && !self.in_search {
+            self.chain_style = match self.chain_style {
+                traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
+                traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
+            };
+            self.refresh_chain_display();
+            return;
+        }
+
         match self.screen {
             Screen::Trace => self.handle_trace_key(key),
             Screen::Graph => self.handle_graph_key(key),
+            Screen::Detail => self.handle_detail_key(key),
             _ => self.handle_global_key(key),
         }
     }
@@ -191,7 +207,43 @@ impl App {
                 self.filter_threshold = self.filter_threshold.saturating_sub(1);
                 self.list_state.select(Some(0));
             }
+            KeyCode::Enter => {
+                self.detail_node_idx = self.resolve_graph_selected_node();
+                if self.detail_node_idx.is_some() {
+                    self.screen = Screen::Detail;
+                }
+            }
             _ => self.handle_global_key(key),
+        }
+    }
+
+    fn handle_detail_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyEventKind};
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.screen = Screen::Graph;
+                self.detail_node_idx = None;
+            }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('1') | KeyCode::Char('d') => {
+                self.screen = Screen::Dashboard;
+                self.list_state.select(Some(0));
+                self.detail_node_idx = None;
+            }
+            KeyCode::Char('2') | KeyCode::Char('f') => {
+                self.screen = Screen::Files;
+                self.list_state.select(Some(0));
+                self.detail_node_idx = None;
+            }
+            KeyCode::Char('4') | KeyCode::Char('t') => {
+                self.screen = Screen::Trace;
+                self.detail_node_idx = None;
+            }
+            _ => {}
         }
     }
 
@@ -240,12 +292,118 @@ impl App {
         }
     }
 
+    fn resolve_graph_selected_node(&self) -> Option<NodeIndex> {
+        let store = self.project.store()?;
+        let graph = store.graph();
+        if self.filter_low_degree {
+            let filtered = traverse::low_degree_nodes(graph, self.filter_threshold);
+            self.list_state
+                .selected()
+                .and_then(|s| filtered.into_iter().nth(s).map(|d| d.idx))
+        } else {
+            let indices: Vec<_> = graph.node_indices().collect();
+            self.list_state
+                .selected()
+                .and_then(|s| indices.into_iter().nth(s))
+        }
+    }
+
     fn run_trace(&mut self, idx: NodeIndex) {
         if let Some(store) = self.project.store() {
             let chain = traverse::trace_chain(store.graph(), idx);
-            let tree = traverse::format_chain_tree(&chain, store.graph());
+            let tree = traverse::format_chain(&chain, store.graph(), self.chain_style);
             self.chain_display = tree.lines().map(|l| Line::from(l.to_string())).collect();
         }
+    }
+
+    fn refresh_chain_display(&mut self) {
+        if self.screen == Screen::Trace && !self.in_search
+            && !self.search_results.is_empty()
+            && self.search_selected < self.search_results.len()
+        {
+            let (idx, _) = self.search_results[self.search_selected];
+            self.run_trace(idx);
+        }
+    }
+
+    fn render_chain_tree_tui(
+        &self,
+        chain: &traverse::CallChain,
+        graph: &crate::graph::CodeGraph,
+        node_idx: NodeIndex,
+    ) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "── CALLERS ──",
+            Style::default().fg(Color::Cyan),
+        )));
+        if chain.callers.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (none)",
+                Style::default()
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for (i, caller) in chain.callers.iter().enumerate() {
+                let is_last = i == chain.callers.len() - 1;
+                tree_node_to_lines(caller, graph, "  ", is_last, &mut lines);
+            }
+        }
+
+        lines.push(Line::from(""));
+        let target_key = NodeKey::from_node(&graph[node_idx]);
+        let (target_tag, target_color) = node_tag(&graph[node_idx]);
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  ▶ ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<8} ", target_tag),
+                Style::default()
+                    .fg(target_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                target_key.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let attr_lines = format_node_attributes(&graph[node_idx]);
+        for attr_line in attr_lines {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", attr_line),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "── CALLEES ──",
+            Style::default().fg(Color::Green),
+        )));
+        if chain.callees.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (none)",
+                Style::default()
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for (i, callee) in chain.callees.iter().enumerate() {
+                let is_last = i == chain.callees.len() - 1;
+                tree_node_to_lines(callee, graph, "  ", is_last, &mut lines);
+            }
+        }
+
+        lines
     }
 
     fn list_len(&self) -> usize {
@@ -275,6 +433,7 @@ impl App {
                     self.chain_display.len().max(1)
                 }
             }
+            Screen::Detail => 1,
         }
     }
 
@@ -295,6 +454,7 @@ impl App {
             Screen::Files => self.draw_files(f, chunks[1]),
             Screen::Graph => self.draw_graph(f, chunks[1]),
             Screen::Trace => self.draw_trace(f, chunks[1]),
+            Screen::Detail => self.draw_detail(f, chunks[1]),
         }
 
         self.draw_status_bar(f, chunks[2]);
@@ -309,6 +469,7 @@ impl App {
                 Screen::Files => "Files",
                 Screen::Graph => "Graph",
                 Screen::Trace => "Trace",
+                Screen::Detail => "Detail",
             }
         );
         let bar = Paragraph::new(title).style(
@@ -321,19 +482,24 @@ impl App {
     }
 
     fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
-        let hints = match self.screen {
-            Screen::Dashboard => "[A]nalyze  [2]Files  [3]Graph  [4]Trace  [Q]uit",
-            Screen::Files => "[↑↓] Navigate  [1]Dashboard  [3]Graph  [4]Trace  [Q]uit",
+        let style_label = match self.chain_style {
+            traverse::ChainStyle::Tree => "Tree",
+            traverse::ChainStyle::Path => "Path",
+        };
+        let hints: String = match self.screen {
+            Screen::Dashboard => "[A]nalyze  [2]Files  [3]Graph  [4]Trace  [Q]uit".to_string(),
+            Screen::Files => "[↑↓] Navigate  [1]Dashboard  [3]Graph  [4]Trace  [Q]uit".to_string(),
             Screen::Graph if !self.filter_low_degree => {
-                "[↑↓] Navigate  [L]Filter:OFF  [1]Dashboard  [2]Files  [4]Trace  [Q]uit"
+                "[↑↓] Navigate  [Enter]Detail  [L]Filter:OFF  [S]tyle  [1]Dashboard  [2]Files  [4]Trace  [Q]uit".to_string()
             }
             Screen::Graph => {
-                "[↑↓] Navigate  [L]Filter:ON [+/-]Threshold  [1]Dashboard  [2]Files  [4]Trace  [Q]uit"
+                "[↑↓] Navigate  [Enter]Detail  [L]Filter:ON [+/-]Threshold  [S]tyle  [1]Dashboard  [2]Files  [4]Trace  [Q]uit".to_string()
             }
             Screen::Trace if self.in_search => {
-                "[Enter]Select  [Esc]Back  [1]Dashboard  [2]Files  [3]Graph  [Q]uit"
+                "[Enter]Select  [Esc]Back  [1]Dashboard  [2]Files  [3]Graph  [Q]uit".to_string()
             }
-            Screen::Trace => "[Esc]Back  [1]Dashboard  [2]Files  [3]Graph  [Q]uit",
+            Screen::Trace => format!("[Esc]Back  [S]tyle:{}  [1]Dashboard  [2]Files  [3]Graph  [Q]uit", style_label),
+            Screen::Detail => format!("[Esc]Back  [S]tyle:{}  [1]Dashboard  [2]Files  [4]Trace  [Q]uit", style_label),
         };
         let bar = Paragraph::new(format!(" {}", hints))
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -542,69 +708,18 @@ impl App {
 
             if let Some(node_idx) = selected_node_idx {
                 let chain = traverse::trace_chain(graph, node_idx);
-
-                let mut lines: Vec<Line> = Vec::new();
-
-                lines.push(Line::from(Span::styled(
-                    "── CALLERS ──",
-                    Style::default().fg(Color::Cyan),
-                )));
-                if chain.callers.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  (none)",
-                        Style::default()
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::DIM),
-                    )));
-                } else {
-                    for (i, caller) in chain.callers.iter().enumerate() {
-                        let is_last = i == chain.callers.len() - 1;
-                        tree_node_to_lines(caller, graph, "  ", is_last, &mut lines);
+                let lines = match self.chain_style {
+                    traverse::ChainStyle::Tree => {
+                        self.render_chain_tree_tui(&chain, graph, node_idx)
                     }
-                }
-
-                lines.push(Line::from(""));
-                let target_key = NodeKey::from_node(&graph[node_idx]);
-                let (target_tag, target_color) = node_tag(&graph[node_idx]);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "  ▶ ",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{:<8} ", target_tag),
-                        Style::default()
-                            .fg(target_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        target_key.to_string(),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "── CALLEES ──",
-                    Style::default().fg(Color::Green),
-                )));
-                if chain.callees.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  (none)",
-                        Style::default()
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::DIM),
-                    )));
-                } else {
-                    for (i, callee) in chain.callees.iter().enumerate() {
-                        let is_last = i == chain.callees.len() - 1;
-                        tree_node_to_lines(callee, graph, "  ", is_last, &mut lines);
+                    traverse::ChainStyle::Path => {
+                        let text =
+                            traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
+                        text.lines()
+                            .map(|l| Line::from(l.to_string()))
+                            .collect()
                     }
-                }
+                };
 
                 let para = Paragraph::new(lines).block(
                     Block::default()
@@ -675,27 +790,103 @@ impl App {
             f.render_widget(para, chunks[1]);
         }
     }
+
+    fn draw_detail(&self, f: &mut Frame, area: Rect) {
+        if let (Some(store), Some(node_idx)) = (self.project.store(), self.detail_node_idx) {
+            let graph = store.graph();
+            let node = &graph[node_idx];
+            let key = NodeKey::from_node(node);
+            let (tag, tag_color) = node_tag(node);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(8)])
+                .split(area);
+
+            let mut lines: Vec<Line> = Vec::new();
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<8} ", tag),
+                    Style::default()
+                        .fg(tag_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    key.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
+            let in_deg = graph
+                .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                .count();
+            lines.push(Line::from(Span::styled(
+                format!("in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+
+            let attr_lines = format_node_attributes_full(node);
+            for attr_line in attr_lines {
+                lines.push(Line::from(Span::styled(attr_line, Style::default().fg(Color::White))));
+            }
+
+            lines.push(Line::from(""));
+
+            let chain = traverse::trace_chain(graph, node_idx);
+            let chain_lines = match self.chain_style {
+                traverse::ChainStyle::Tree => {
+                    self.render_chain_tree_tui(&chain, graph, node_idx)
+                }
+                traverse::ChainStyle::Path => {
+                    let text =
+                        traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
+                    text.lines().map(|l| Line::from(l.to_string())).collect()
+                }
+            };
+            lines.extend(chain_lines);
+
+            let para = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" Node Detail "))
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, chunks[0]);
+        } else {
+            let para = Paragraph::new("No node selected").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Node Detail "),
+            );
+            f.render_widget(para, area);
+        }
+    }
 }
 
-fn node_tag(node: &Node) -> (&'static str, Color) {
+fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
     match node {
-        Node::Procedure { .. } => ("proc", Color::Green),
-        Node::Function { .. } => ("func", Color::LightGreen),
-        Node::Unresolved { .. } => ("unres", Color::Red),
-        Node::MappedStatement { .. } => ("mapper", Color::Blue),
-        Node::JavaSql { .. } => ("sql", Color::Magenta),
-        Node::JavaMethod { .. } => ("method", Color::Cyan),
-        Node::JavaClass { .. } => ("class", Color::Rgb(180, 100, 0)),
-        Node::Table { .. } => ("table", Color::Rgb(180, 100, 0)),
-        Node::View { .. } => ("view", Color::Blue),
-        Node::Package { .. } => ("pkg", Color::Yellow),
-        Node::Trigger { .. } => ("trigger", Color::Red),
-        Node::Type { .. } => ("type", Color::Yellow),
-        Node::Sequence { .. } => ("seq", Color::LightGreen),
-        Node::Index { .. } => ("index", Color::Gray),
-        Node::MaterializedView { .. } => ("mview", Color::Cyan),
-        Node::Synonym { .. } => ("synonym", Color::Magenta),
-        Node::Event { .. } => ("event", Color::LightRed),
+        Node::Procedure { .. } => (std::borrow::Cow::Borrowed("proc"), Color::Green),
+        Node::Function { .. } => (std::borrow::Cow::Borrowed("func"), Color::LightGreen),
+        Node::Unresolved { .. } => (std::borrow::Cow::Borrowed("unres"), Color::Red),
+        Node::MappedStatement { .. } => (std::borrow::Cow::Borrowed("mapper"), Color::Blue),
+        Node::JavaSql { .. } => (std::borrow::Cow::Borrowed("sql"), Color::Magenta),
+        Node::JavaMethod { .. } => (std::borrow::Cow::Borrowed("method"), Color::Cyan),
+        Node::JavaClass { .. } => (std::borrow::Cow::Borrowed("class"), Color::Rgb(180, 100, 0)),
+        Node::Table { .. } => (std::borrow::Cow::Borrowed("table"), Color::Rgb(180, 100, 0)),
+        Node::View { .. } => (std::borrow::Cow::Borrowed("view"), Color::Blue),
+        Node::Package { .. } => (std::borrow::Cow::Borrowed("pkg"), Color::Yellow),
+        Node::Trigger { .. } => (std::borrow::Cow::Borrowed("trigger"), Color::Red),
+        Node::Type { .. } => (std::borrow::Cow::Borrowed("type"), Color::Yellow),
+        Node::Sequence { .. } => (std::borrow::Cow::Borrowed("seq"), Color::LightGreen),
+        Node::Index { .. } => (std::borrow::Cow::Borrowed("index"), Color::Gray),
+        Node::MaterializedView { .. } => (std::borrow::Cow::Borrowed("mview"), Color::Cyan),
+        Node::Synonym { .. } => (std::borrow::Cow::Borrowed("synonym"), Color::Magenta),
+        Node::Event { .. } => (std::borrow::Cow::Borrowed("event"), Color::LightRed),
+        Node::Custom { type_name, .. } => {
+            (std::borrow::Cow::Owned(type_name.clone()), Color::DarkGray)
+        }
     }
 }
 
@@ -730,4 +921,131 @@ fn tree_node_to_lines(
         let child_last = i == node.children.len() - 1;
         tree_node_to_lines(child, graph, &child_prefix, child_last, lines);
     }
+}
+
+fn format_node_attributes(node: &Node) -> Vec<String> {
+    format_node_attributes_impl(node, true)
+}
+
+fn format_node_attributes_full(node: &Node) -> Vec<String> {
+    format_node_attributes_impl(node, false)
+}
+
+fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
+    use crate::graph::{DistributeInfo, PartitionInfo};
+    let mut attrs = Vec::new();
+    if let Node::Table {
+        location,
+        columns,
+        partition_by,
+        distribute_by,
+        tablespace,
+        temporary,
+        unlogged,
+        ddl_source,
+        ..
+    } = node
+    {
+        if let Some(loc) = location {
+            attrs.push(format!("file: {}:{}", loc.file.to_string_lossy(), loc.line));
+        } else {
+            attrs.push("file: (implicit)".to_string());
+        }
+        if *temporary {
+            attrs.push("temporary".to_string());
+        }
+        if *unlogged {
+            attrs.push("unlogged".to_string());
+        }
+        if let Some(ts) = tablespace {
+            attrs.push(format!("tablespace: {}", ts));
+        }
+        if !columns.is_empty() {
+            attrs.push(format!("columns ({}):", columns.len()));
+            let display_cols = if compact {
+                columns.iter().take(5)
+            } else {
+                columns.iter().take(50)
+            };
+            for col in display_cols {
+                let pk = if col.is_primary_key { " [PK]" } else { "" };
+                let null = if col.nullable { "NULL" } else { "NOT NULL" };
+                let def = col
+                    .default_value
+                    .as_deref()
+                    .map(|d| format!(" DEFAULT {}", d))
+                    .unwrap_or_default();
+                attrs.push(format!("  {} {} {}{}{}", col.name, col.data_type, null, pk, def));
+            }
+            if columns.len() > 5 && compact {
+                attrs.push(format!("  ... +{} more", columns.len() - 5));
+            }
+        }
+        if let Some(part) = partition_by {
+            match part {
+                PartitionInfo::Range {
+                    columns,
+                    partitions,
+                } => {
+                    attrs.push(format!(
+                        "partition: RANGE({}) [{} partitions]",
+                        columns.join(", "),
+                        partitions.len()
+                    ));
+                    if !compact && !partitions.is_empty() {
+                        for p in partitions {
+                            attrs.push(format!("  {}", p));
+                        }
+                    }
+                }
+                PartitionInfo::List {
+                    columns,
+                    partitions,
+                } => {
+                    attrs.push(format!(
+                        "partition: LIST({}) [{} partitions]",
+                        columns.join(", "),
+                        partitions.len()
+                    ));
+                    if !compact && !partitions.is_empty() {
+                        for p in partitions {
+                            attrs.push(format!("  {}", p));
+                        }
+                    }
+                }
+                PartitionInfo::Hash {
+                    columns,
+                    partitions_count,
+                } => {
+                    attrs.push(format!(
+                        "partition: HASH({}) [{}]",
+                        columns.join(", "),
+                        partitions_count
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "auto".to_string())
+                    ));
+                }
+            }
+        }
+        if let Some(dist) = distribute_by {
+            match dist {
+                DistributeInfo::Hash { columns } => {
+                    attrs.push(format!("distribute: HASH({})", columns.join(", ")));
+                }
+                DistributeInfo::Replication => {
+                    attrs.push("distribute: REPLICATION".to_string());
+                }
+                DistributeInfo::RoundRobin { columns } => {
+                    attrs.push(format!("distribute: ROUNDROBIN({})", columns.join(", ")));
+                }
+                DistributeInfo::Modulo { columns } => {
+                    attrs.push(format!("distribute: MODULO({})", columns.join(", ")));
+                }
+            }
+        }
+        if let Some(ddl) = ddl_source {
+            attrs.push(format!("ddl: {}", ddl));
+        }
+    }
+    attrs
 }

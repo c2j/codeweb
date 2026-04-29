@@ -70,6 +70,10 @@ pub enum NodeKey {
         raw_expr: String,
         context: String,
     },
+    Custom {
+        type_name: String,
+        key: String,
+    },
 }
 
 impl fmt::Display for NodeKey {
@@ -139,6 +143,7 @@ impl fmt::Display for NodeKey {
             NodeKey::Unresolved { raw_expr, context } => {
                 write!(f, "unresolved:{} (in {})", raw_expr, context)
             }
+            NodeKey::Custom { type_name, key } => write!(f, "custom:{}:{}", type_name, key),
         }
     }
 }
@@ -167,13 +172,13 @@ impl NodeKey {
             },
             super::Node::JavaMethod { fqn, .. } => NodeKey::JavaMethod { fqn: fqn.clone() },
             super::Node::JavaClass { fqn, .. } => NodeKey::JavaClass { fqn: fqn.clone() },
-            super::Node::Table { schema, name } => NodeKey::Table {
-                schema: schema.clone(),
-                name: name.clone(),
+            super::Node::Table { schema, name, .. } => NodeKey::Table {
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
-            super::Node::View { schema, name } => NodeKey::View {
-                schema: schema.clone(),
-                name: name.clone(),
+            super::Node::View { schema, name, .. } => NodeKey::View {
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
             super::Node::Package { schema, name, .. } => NodeKey::Package {
                 schema: schema.clone(),
@@ -195,12 +200,12 @@ impl NodeKey {
                 table_name: table_name.clone(),
             },
             super::Node::MaterializedView { schema, name, .. } => NodeKey::MaterializedView {
-                schema: schema.clone(),
-                name: name.clone(),
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
             super::Node::Synonym { schema, name, .. } => NodeKey::Synonym {
-                schema: schema.clone(),
-                name: name.clone(),
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
             super::Node::Event { name, .. } => NodeKey::Event { name: name.clone() },
             super::Node::JavaSql {
@@ -213,6 +218,19 @@ impl NodeKey {
                 raw_expr: raw_expr.clone(),
                 context: context.clone(),
             },
+            super::Node::Custom {
+                type_name,
+                key_fields,
+                ..
+            } => {
+                let key = serde_json::to_string(key_fields)
+                    .unwrap_or_default()
+                    .to_string();
+                NodeKey::Custom {
+                    type_name: type_name.clone(),
+                    key,
+                }
+            }
         }
     }
 }

@@ -2,10 +2,11 @@
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
 use crate::graph::{AccessMode, CodeGraph, Edge, Node, RoutineId, RoutineKind, SourceLocation};
+use crate::graph::{ColumnSummary, DistributeInfo, PartitionInfo};
 use crate::parser::{
     AllParsedFiles, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
 };
-use ogsql_parser::ast::{PackageItem, Statement};
+use ogsql_parser::ast::{ColumnConstraint, PackageItem, Statement};
 use ogsql_parser::{walk_pl_block, walk_statement};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -99,6 +100,7 @@ impl GraphBuilder {
             &mut proc_index,
             &mapper_index,
         );
+        Self::dedup_table_view_nodes(&mut graph);
         Self::merge_table_access_edges(&mut graph);
 
         graph
@@ -241,32 +243,53 @@ impl GraphBuilder {
                         );
                     }
                     Statement::CreateView(v) => {
+                        let view_schema = if v.name.len() > 1 {
+                            Some(v.name[..v.name.len() - 1].join("."))
+                        } else {
+                            None
+                        };
+                        let view_name = v.name.last().cloned().unwrap_or_default();
                         let view_node = Node::View {
-                            schema: if v.name.len() > 1 {
-                                Some(v.name[..v.name.len() - 1].join("."))
-                            } else {
-                                None
-                            },
-                            name: v.name.last().cloned().unwrap_or_default(),
+                            schema: view_schema.clone(),
+                            name: view_name.clone(),
+                            location: None,
                         };
                         let view_idx = graph.add_node(view_node);
+
+                        let view_key = normalize_table_key(view_schema.as_deref(), &view_name);
+                        table_index.entry(view_key).or_insert(view_idx);
+                        if view_schema.is_some() {
+                            table_index
+                                .entry(view_name.to_lowercase())
+                                .or_insert(view_idx);
+                        }
 
                         let mut extractor = crate::parser::TableAccessExtractor::new();
                         let wrapped = Statement::Select(v.query.as_ref().clone());
                         walk_statement(&mut extractor, &wrapped);
 
                         for access in &extractor.accesses {
-                            let key = match &access.schema {
-                                Some(s) => format!("{}.{}", s, access.name),
-                                None => access.name.clone(),
-                            };
+                            let key = normalize_table_key(access.schema.as_deref(), &access.name);
                             let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                                 let node = Node::Table {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
+                                    location: None,
+                                    columns: vec![],
+                                    partition_by: None,
+                                    distribute_by: None,
+                                    tablespace: None,
+                                    temporary: false,
+                                    unlogged: false,
+                                    ddl_source: None,
                                 };
                                 graph.add_node(node)
                             });
+                            if access.schema.is_some() {
+                                table_index
+                                    .entry(access.name.to_lowercase())
+                                    .or_insert(table_idx);
+                            }
                             graph.add_edge(
                                 view_idx,
                                 table_idx,
@@ -339,21 +362,27 @@ impl GraphBuilder {
                             table_schema: table_schema.clone(),
                             table_name: table_name.clone(),
                             unique: i.unique,
+                            global: false,
                             location: SourceLocation {
                                 file: file_arc.clone(),
                                 line: info.start_line,
                             },
                         };
                         let idx = graph.add_node(index_node);
-                        let table_key = match &table_schema {
-                            Some(s) => format!("{}.{}", s, table_name),
-                            None => table_name.clone(),
-                        };
+                        let table_key = normalize_table_key(table_schema.as_deref(), &table_name);
                         let table_idx =
                             *table_index.entry(table_key.clone()).or_insert_with(|| {
                                 let node = Node::Table {
                                     schema: table_schema.clone(),
                                     name: table_name.clone(),
+                                    location: None,
+                                    columns: vec![],
+                                    partition_by: None,
+                                    distribute_by: None,
+                                    tablespace: None,
+                                    temporary: false,
+                                    unlogged: false,
+                                    ddl_source: None,
                                 };
                                 graph.add_node(node)
                             });
@@ -368,6 +397,231 @@ impl GraphBuilder {
                             },
                         );
                     }
+                    Statement::CreateTable(t) => {
+                        let (schema, name) = split_object_name(&t.name);
+
+                        let columns: Vec<ColumnSummary> = t
+                            .columns
+                            .iter()
+                            .map(|c| {
+                                let is_pk = c
+                                    .constraints
+                                    .iter()
+                                    .any(|cc| matches!(cc, ColumnConstraint::PrimaryKey));
+                                let nullable = !c
+                                    .constraints
+                                    .iter()
+                                    .any(|cc| matches!(cc, ColumnConstraint::NotNull));
+                                let default_value = c.constraints.iter().find_map(|cc| {
+                                    if let ColumnConstraint::Default(expr) = cc {
+                                        Some(format!("{:?}", expr))
+                                    } else {
+                                        None
+                                    }
+                                });
+                                ColumnSummary {
+                                    name: c.name.clone(),
+                                    data_type: format!("{:?}", c.data_type),
+                                    nullable,
+                                    is_primary_key: is_pk,
+                                    default_value,
+                                    comment: c.comment.clone(),
+                                }
+                            })
+                            .collect();
+
+                        let partition_by = t.partition_by.as_ref().map(|p| match p {
+                            ogsql_parser::ast::PartitionClause::Range {
+                                columns,
+                                partitions,
+                                ..
+                            } => PartitionInfo::Range {
+                                columns: columns.iter().map(|c| c.join(".")).collect(),
+                                partitions: partitions.iter().map(|pd| pd.name.clone()).collect(),
+                            },
+                            ogsql_parser::ast::PartitionClause::List {
+                                columns,
+                                partitions,
+                                ..
+                            } => PartitionInfo::List {
+                                columns: columns.iter().map(|c| c.join(".")).collect(),
+                                partitions: partitions.iter().map(|pd| pd.name.clone()).collect(),
+                            },
+                            ogsql_parser::ast::PartitionClause::Hash {
+                                columns,
+                                partitions_count,
+                                ..
+                            } => PartitionInfo::Hash {
+                                columns: columns.iter().map(|c| c.join(".")).collect(),
+                                partitions_count: *partitions_count,
+                            },
+                        });
+
+                        let distribute_by = t.distribute_by.as_ref().map(|d| match d {
+                            ogsql_parser::ast::DistributeClause::Hash { columns } => {
+                                DistributeInfo::Hash {
+                                    columns: columns.clone(),
+                                }
+                            }
+                            ogsql_parser::ast::DistributeClause::Replication => {
+                                DistributeInfo::Replication
+                            }
+                            ogsql_parser::ast::DistributeClause::RoundRobin { columns } => {
+                                DistributeInfo::RoundRobin {
+                                    columns: columns.clone(),
+                                }
+                            }
+                            ogsql_parser::ast::DistributeClause::Modulo { columns } => {
+                                DistributeInfo::Modulo {
+                                    columns: columns.clone(),
+                                }
+                            }
+                        });
+
+                        let table_node = Node::Table {
+                            schema: schema.clone(),
+                            name: name.clone(),
+                            location: Some(SourceLocation {
+                                file: file_arc.clone(),
+                                line: info.start_line,
+                            }),
+                            columns,
+                            partition_by,
+                            distribute_by,
+                            tablespace: t.tablespace.clone(),
+                            temporary: t.temporary,
+                            unlogged: t.unlogged,
+                            ddl_source: None,
+                        };
+
+                        let key = normalize_table_key(schema.as_deref(), &name);
+                        let idx = *table_index
+                            .entry(key.clone())
+                            .or_insert_with(|| graph.add_node(table_node));
+
+                        // If the node already existed (implicit), replace its data
+                        if let Node::Table {
+                            location,
+                            columns,
+                            partition_by,
+                            distribute_by,
+                            tablespace,
+                            temporary,
+                            unlogged,
+                            ddl_source,
+                            ..
+                        } = &mut graph[idx]
+                        {
+                            if location.is_none() {
+                                *location = Some(SourceLocation {
+                                    file: file_arc.clone(),
+                                    line: info.start_line,
+                                });
+                            }
+                            let new_cols: Vec<ColumnSummary> = t
+                                .columns
+                                .iter()
+                                .map(|c| {
+                                    let is_pk = c
+                                        .constraints
+                                        .iter()
+                                        .any(|cc| matches!(cc, ColumnConstraint::PrimaryKey));
+                                    let nullable = !c
+                                        .constraints
+                                        .iter()
+                                        .any(|cc| matches!(cc, ColumnConstraint::NotNull));
+                                    let default_value = c.constraints.iter().find_map(|cc| {
+                                        if let ColumnConstraint::Default(expr) = cc {
+                                            Some(format!("{:?}", expr))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    ColumnSummary {
+                                        name: c.name.clone(),
+                                        data_type: format!("{:?}", c.data_type),
+                                        nullable,
+                                        is_primary_key: is_pk,
+                                        default_value,
+                                        comment: c.comment.clone(),
+                                    }
+                                })
+                                .collect();
+                            if columns.is_empty() {
+                                *columns = new_cols;
+                            }
+                            if partition_by.is_none() && t.partition_by.is_some() {
+                                *partition_by = t.partition_by.as_ref().map(|p| match p {
+                                    ogsql_parser::ast::PartitionClause::Range {
+                                        columns,
+                                        partitions,
+                                        ..
+                                    } => PartitionInfo::Range {
+                                        columns: columns.iter().map(|c| c.join(".")).collect(),
+                                        partitions: partitions
+                                            .iter()
+                                            .map(|pd| pd.name.clone())
+                                            .collect(),
+                                    },
+                                    ogsql_parser::ast::PartitionClause::List {
+                                        columns,
+                                        partitions,
+                                        ..
+                                    } => PartitionInfo::List {
+                                        columns: columns.iter().map(|c| c.join(".")).collect(),
+                                        partitions: partitions
+                                            .iter()
+                                            .map(|pd| pd.name.clone())
+                                            .collect(),
+                                    },
+                                    ogsql_parser::ast::PartitionClause::Hash {
+                                        columns,
+                                        partitions_count,
+                                        ..
+                                    } => PartitionInfo::Hash {
+                                        columns: columns.iter().map(|c| c.join(".")).collect(),
+                                        partitions_count: *partitions_count,
+                                    },
+                                });
+                            }
+                            if distribute_by.is_none() && t.distribute_by.is_some() {
+                                *distribute_by = t.distribute_by.as_ref().map(|d| match d {
+                                    ogsql_parser::ast::DistributeClause::Hash { columns } => {
+                                        DistributeInfo::Hash {
+                                            columns: columns.clone(),
+                                        }
+                                    }
+                                    ogsql_parser::ast::DistributeClause::Replication => {
+                                        DistributeInfo::Replication
+                                    }
+                                    ogsql_parser::ast::DistributeClause::RoundRobin { columns } => {
+                                        DistributeInfo::RoundRobin {
+                                            columns: columns.clone(),
+                                        }
+                                    }
+                                    ogsql_parser::ast::DistributeClause::Modulo { columns } => {
+                                        DistributeInfo::Modulo {
+                                            columns: columns.clone(),
+                                        }
+                                    }
+                                });
+                            }
+                            if tablespace.is_none() {
+                                *tablespace = t.tablespace.clone();
+                            }
+                            if !*temporary {
+                                *temporary = t.temporary;
+                            }
+                            if !*unlogged {
+                                *unlogged = t.unlogged;
+                            }
+                            _ = ddl_source;
+                        }
+
+                        if schema.is_some() {
+                            table_index.entry(name.to_lowercase()).or_insert(idx);
+                        }
+                    }
                     Statement::CreateMaterializedView(v) => {
                         let (schema, name) = split_object_name(&v.name);
                         let mview_node = Node::MaterializedView {
@@ -380,22 +634,38 @@ impl GraphBuilder {
                         };
                         let mview_idx = graph.add_node(mview_node);
 
+                        let mview_key = normalize_table_key(schema.as_deref(), &name);
+                        table_index.entry(mview_key).or_insert(mview_idx);
+                        if schema.is_some() {
+                            table_index.entry(name.to_lowercase()).or_insert(mview_idx);
+                        }
+
                         let mut extractor = crate::parser::TableAccessExtractor::new();
                         let wrapped = Statement::Select(v.query.as_ref().clone());
                         walk_statement(&mut extractor, &wrapped);
 
                         for access in &extractor.accesses {
-                            let key = match &access.schema {
-                                Some(s) => format!("{}.{}", s, access.name),
-                                None => access.name.clone(),
-                            };
+                            let key = normalize_table_key(access.schema.as_deref(), &access.name);
                             let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                                 let node = Node::Table {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
+                                    location: None,
+                                    columns: vec![],
+                                    partition_by: None,
+                                    distribute_by: None,
+                                    tablespace: None,
+                                    temporary: false,
+                                    unlogged: false,
+                                    ddl_source: None,
                                 };
                                 graph.add_node(node)
                             });
+                            if access.schema.is_some() {
+                                table_index
+                                    .entry(access.name.to_lowercase())
+                                    .or_insert(table_idx);
+                            }
                             graph.add_edge(
                                 mview_idx,
                                 table_idx,
@@ -425,10 +695,8 @@ impl GraphBuilder {
                         };
                         let syn_idx = graph.add_node(syn_node);
 
-                        let target_key = match &target_schema {
-                            Some(ts) => format!("{}.{}", ts, target_name),
-                            None => target_name.clone(),
-                        };
+                        let target_key =
+                            normalize_table_key(target_schema.as_deref(), &target_name);
                         let target_idx = proc_index
                             .get(&RoutineId::from_qualified_name(
                                 &target_key,
@@ -1079,7 +1347,11 @@ impl GraphBuilder {
                         &format!(
                             "unresolved: call target '{}' (from {}:{}) not found in parsed files",
                             edge.callee_name,
-                            edge.location.file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                            edge.location
+                                .file
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default(),
                             edge.location.line,
                         ),
                     );
@@ -1350,17 +1622,27 @@ impl GraphBuilder {
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
             for access in &extractor.accesses {
-                let key = match &access.schema {
-                    Some(s) => format!("{}.{}", s, access.name),
-                    None => access.name.clone(),
-                };
+                let key = normalize_table_key(access.schema.as_deref(), &access.name);
                 let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                     let node = Node::Table {
                         schema: access.schema.clone(),
                         name: access.name.clone(),
+                        location: None,
+                        columns: vec![],
+                        partition_by: None,
+                        distribute_by: None,
+                        tablespace: None,
+                        temporary: false,
+                        unlogged: false,
+                        ddl_source: None,
                     };
                     graph.add_node(node)
                 });
+                if access.schema.is_some() {
+                    table_index
+                        .entry(access.name.to_lowercase())
+                        .or_insert(table_idx);
+                }
                 graph.add_edge(
                     source_idx,
                     table_idx,
@@ -1374,6 +1656,113 @@ impl GraphBuilder {
                     },
                 );
             }
+        }
+    }
+
+    fn dedup_table_view_nodes(graph: &mut CodeGraph) {
+        let mut merges: Vec<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> = Vec::new();
+
+        // Phase 1: merge Table nodes into View/MaterializedView nodes
+        {
+            let mut view_map: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+
+            for idx in graph.node_indices() {
+                let (schema, name) = match &graph[idx] {
+                    Node::View { schema, name, .. } => (schema.clone(), name.clone()),
+                    Node::MaterializedView { schema, name, .. } => (schema.clone(), name.clone()),
+                    _ => continue,
+                };
+                let key = normalize_table_key(schema.as_deref(), &name);
+                view_map.entry(key).or_insert(idx);
+                if schema.is_some() {
+                    view_map.entry(name.to_lowercase()).or_insert(idx);
+                }
+            }
+
+            if !view_map.is_empty() {
+                for idx in graph.node_indices() {
+                    let (schema, name) = match &graph[idx] {
+                        Node::Table { schema, name, .. } => (schema.clone(), name.clone()),
+                        _ => continue,
+                    };
+                    let key = normalize_table_key(schema.as_deref(), &name);
+                    if let Some(&view_idx) = view_map.get(&key) {
+                        merges.push((idx, view_idx));
+                        continue;
+                    }
+                    if schema.is_none() {
+                        if let Some(&view_idx) = view_map.get(&name.to_lowercase()) {
+                            merges.push((idx, view_idx));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: merge bare-name Table nodes into schema-qualified Table nodes
+        {
+            // bare_name_lower → (schema, idx)
+            let mut qualified: HashMap<String, (String, petgraph::graph::NodeIndex)> =
+                HashMap::new();
+            let mut bare: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+
+            for idx in graph.node_indices() {
+                let (schema, name) = match &graph[idx] {
+                    Node::Table { schema, name, .. } => (schema.clone(), name.clone()),
+                    _ => continue,
+                };
+                let lower = name.to_lowercase();
+                match &schema {
+                    Some(s) => {
+                        // Keep first schema-qualified entry per bare name
+                        qualified.entry(lower.clone()).or_insert((s.clone(), idx));
+                    }
+                    None => {
+                        bare.entry(lower).or_insert(idx);
+                    }
+                }
+            }
+
+            // Only merge if there's exactly one schema for the bare name
+            for (name_lower, &bare_idx) in &bare {
+                if let Some(&(_, qual_idx)) = qualified.get(name_lower) {
+                    if bare_idx != qual_idx {
+                        merges.push((bare_idx, qual_idx));
+                    }
+                }
+            }
+        }
+
+        if merges.is_empty() {
+            return;
+        }
+
+        for (from_idx, into_idx) in merges {
+            let sources: Vec<_> = graph
+                .neighbors_directed(from_idx, petgraph::Direction::Incoming)
+                .collect();
+            for src in sources {
+                let weights: Vec<_> = graph
+                    .edges_connecting(src, from_idx)
+                    .map(|e| e.weight().clone())
+                    .collect();
+                for weight in weights {
+                    graph.add_edge(src, into_idx, weight);
+                }
+            }
+            let targets: Vec<_> = graph
+                .neighbors_directed(from_idx, petgraph::Direction::Outgoing)
+                .collect();
+            for dst in targets {
+                let weights: Vec<_> = graph
+                    .edges_connecting(from_idx, dst)
+                    .map(|e| e.weight().clone())
+                    .collect();
+                for weight in weights {
+                    graph.add_edge(into_idx, dst, weight);
+                }
+            }
+            graph.remove_node(from_idx);
         }
     }
 
@@ -1709,6 +2098,17 @@ fn names_match(field_name: &str, class_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Normalize a table/view name for case-insensitive lookup in `table_index`.
+///
+/// openGauss/GaussDB (like PostgreSQL) folds unquoted identifiers to lowercase,
+/// so `MV_ACCOUNT_PRIV` and `mv_account_priv` are the same object.
+fn normalize_table_key(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", s.to_lowercase(), name.to_lowercase()),
+        None => name.to_lowercase(),
+    }
 }
 
 fn split_object_name(name: &[String]) -> (Option<String>, String) {
@@ -2209,5 +2609,269 @@ mod tests {
             2,
             "Package should have 2 ContainsRoutine edges"
         );
+    }
+
+    #[test]
+    fn view_and_table_reference_dedup_case_insensitive() {
+        let sql = r#"
+            CREATE VIEW BIGFUND.MV_ACCOUNT_PRIV AS
+            SELECT * FROM account_priv;
+
+            CREATE OR REPLACE PROCEDURE query_priv() AS $$
+            BEGIN
+                SELECT * FROM mv_account_priv;
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::View { name, .. } if name.to_lowercase() == "mv_account_priv"))
+            .collect();
+        assert_eq!(
+            view_nodes.len(),
+            1,
+            "Expected exactly 1 View node for mv_account_priv"
+        );
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name.to_lowercase() == "mv_account_priv"))
+            .collect();
+        assert_eq!(
+            table_nodes.len(),
+            0,
+            "No Table node should be created for mv_account_priv — it's a View"
+        );
+
+        let proc_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "query_priv"))
+            .collect();
+        assert_eq!(proc_nodes.len(), 1);
+
+        use petgraph::visit::EdgeRef;
+        let access_edges: Vec<_> = graph
+            .edges_directed(proc_nodes[0], petgraph::Direction::Outgoing)
+            .filter(|e| matches!(e.weight(), Edge::TableAccess { .. }))
+            .collect();
+        assert_eq!(
+            access_edges.len(),
+            1,
+            "Procedure should reference the view via 1 TableAccess edge"
+        );
+
+        let target = access_edges[0].target();
+        assert!(
+            matches!(&graph[target], Node::View { .. }),
+            "TableAccess edge should point to the View node, not a Table node"
+        );
+    }
+
+    #[test]
+    fn table_name_case_insensitive_dedup() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p1() AS $$
+            BEGIN
+                INSERT INTO MY_TABLE VALUES (1);
+            END;
+            $$;
+
+            CREATE OR REPLACE PROCEDURE p2() AS $$
+            BEGIN
+                DELETE FROM my_table WHERE id = 1;
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name.to_lowercase() == "my_table"))
+            .collect();
+        assert_eq!(
+            table_nodes.len(),
+            1,
+            "MY_TABLE and my_table should resolve to a single Table node"
+        );
+    }
+
+    #[test]
+    fn table_created_before_view_definition_gets_merged() {
+        let sql = r#"
+            CREATE VIEW other_view AS
+            SELECT * FROM v_par_client_acnt_info_noflag;
+
+            CREATE VIEW BIGFUND.v_par_client_acnt_info_noflag AS
+            SELECT * FROM account_priv;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::View { name, .. } if name.to_lowercase() == "v_par_client_acnt_info_noflag"))
+            .collect();
+        assert_eq!(
+            view_nodes.len(),
+            1,
+            "Should have exactly 1 View node for v_par_client_acnt_info_noflag"
+        );
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name.to_lowercase() == "v_par_client_acnt_info_noflag"))
+            .collect();
+        assert_eq!(
+            table_nodes.len(),
+            0,
+            "Table node for v_par_client_acnt_info_noflag should be merged into the View node"
+        );
+    }
+
+    #[test]
+    fn bare_name_table_merged_into_schema_qualified() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p1() AS $$
+            BEGIN
+                SELECT * FROM aas_account;
+            END;
+            $$;
+
+            CREATE OR REPLACE PROCEDURE p2() AS $$
+            BEGIN
+                INSERT INTO bigfund.aas_account VALUES (1);
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let account_tables: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name.to_lowercase() == "aas_account"))
+            .collect();
+        assert_eq!(
+            account_tables.len(),
+            1,
+            "aas_account and bigfund.aas_account should resolve to a single Table node"
+        );
+
+        if let Node::Table { schema, name, .. } = &graph[account_tables[0]] {
+            assert_eq!(name.to_lowercase(), "aas_account");
+            assert_eq!(
+                schema.as_ref().map(|s| s.to_lowercase()),
+                Some("bigfund".to_string()),
+                "Should keep the schema-qualified node"
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_produces_rich_table_node() {
+        let sql = r#"
+            CREATE TABLE public.orders (
+                id BIGINT NOT NULL PRIMARY KEY,
+                amount NUMERIC(10,2) DEFAULT 0,
+                status VARCHAR(20),
+                created_at TIMESTAMP NOT NULL
+            ) PARTITION BY RANGE (created_at)
+            DISTRIBUTE BY HASH (id)
+            TABLESPACE pg_default;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { .. }))
+            .collect();
+
+        assert_eq!(table_nodes.len(), 1, "should have exactly one table node");
+        let table_node = &graph[table_nodes[0]];
+
+        if let Node::Table {
+            schema,
+            name,
+            location,
+            columns,
+            partition_by,
+            distribute_by,
+            tablespace,
+            temporary,
+            unlogged,
+            ..
+        } = table_node
+        {
+            assert_eq!(schema.as_deref(), Some("public"));
+            assert_eq!(name, "orders");
+            assert!(location.is_some(), "should have source location");
+            assert_eq!(columns.len(), 4);
+            assert!(columns[0].is_primary_key);
+            assert_eq!(columns[0].name, "id");
+            assert!(!columns[0].nullable);
+            assert!(partition_by.is_some());
+            assert!(distribute_by.is_some());
+            assert_eq!(tablespace.as_deref(), Some("pg_default"));
+            assert!(!temporary);
+            assert!(!unlogged);
+        } else {
+            panic!("expected Table node");
+        }
+    }
+
+    #[test]
+    fn create_table_simple_no_partition() {
+        let sql = "CREATE TABLE simple_t (id INT, name TEXT);";
+        let graph = build_from_sql(sql);
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name == "simple_t"))
+            .collect();
+
+        assert_eq!(table_nodes.len(), 1);
+        if let Node::Table {
+            columns,
+            partition_by,
+            distribute_by,
+            location,
+            ..
+        } = &graph[table_nodes[0]]
+        {
+            assert!(location.is_some());
+            assert_eq!(columns.len(), 2);
+            assert!(partition_by.is_none());
+            assert!(distribute_by.is_none());
+        } else {
+            panic!("expected Table");
+        }
+    }
+
+    #[test]
+    fn create_table_merges_with_implicit_reference() {
+        let sql = r#"
+            CREATE TABLE public.my_table (id INT PRIMARY KEY);
+            CREATE PROCEDURE do_insert() AS BEGIN INSERT INTO my_table(id) VALUES(1); END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Table { name, .. } if name == "my_table"))
+            .collect();
+
+        assert_eq!(table_nodes.len(), 1, "should merge into single table node");
+        if let Node::Table {
+            columns, location, ..
+        } = &graph[table_nodes[0]]
+        {
+            assert!(
+                !columns.is_empty(),
+                "merged node should keep columns from CREATE TABLE"
+            );
+            assert!(
+                location.is_some(),
+                "merged node should have location from CREATE TABLE"
+            );
+        }
     }
 }

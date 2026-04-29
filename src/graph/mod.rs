@@ -4,10 +4,51 @@ pub mod store;
 pub mod traverse;
 
 use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub struct JsonMap(pub BTreeMap<String, serde_json::Value>);
+
+impl JsonMap {
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl Default for JsonMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Serialize for JsonMap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            self.0.serialize(serializer)
+        } else {
+            let json_str = serde_json::to_string(&self.0).unwrap_or_default();
+            serializer.serialize_str(&json_str)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let map: BTreeMap<String, serde_json::Value> = BTreeMap::deserialize(deserializer)?;
+            Ok(JsonMap(map))
+        } else {
+            let json_str: String = String::deserialize(deserializer)?;
+            let map: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(&json_str).unwrap_or_default();
+            Ok(JsonMap(map))
+        }
+    }
+}
 
 bitflags! {
     /// Access mode for table references (read/write/lock/truncate).
@@ -111,6 +152,47 @@ pub struct SourceLocation {
     pub line: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnSummary {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub is_primary_key: bool,
+    #[serde(default)]
+    pub default_value: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Partition strategy for a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionInfo {
+    Range {
+        columns: Vec<String>,
+        #[serde(default)]
+        partitions: Vec<String>,
+    },
+    List {
+        columns: Vec<String>,
+        #[serde(default)]
+        partitions: Vec<String>,
+    },
+    Hash {
+        columns: Vec<String>,
+        #[serde(default)]
+        partitions_count: Option<u32>,
+    },
+}
+
+/// Distribution strategy for a distributed table (openGauss/GaussDB).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistributeInfo {
+    Hash { columns: Vec<String> },
+    Replication,
+    RoundRobin { columns: Vec<String> },
+    Modulo { columns: Vec<String> },
+}
+
 /// A node in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
@@ -174,11 +256,30 @@ pub enum Node {
     Table {
         schema: Option<String>,
         name: String,
+        /// None when table node was created implicitly (referenced but not parsed from DDL).
+        #[serde(default)]
+        location: Option<SourceLocation>,
+        #[serde(default)]
+        columns: Vec<ColumnSummary>,
+        #[serde(default)]
+        partition_by: Option<PartitionInfo>,
+        #[serde(default)]
+        distribute_by: Option<DistributeInfo>,
+        #[serde(default)]
+        tablespace: Option<String>,
+        #[serde(default)]
+        temporary: bool,
+        #[serde(default)]
+        unlogged: bool,
+        #[serde(default)]
+        ddl_source: Option<String>,
     },
     #[allow(dead_code)]
     View {
         schema: Option<String>,
         name: String,
+        #[serde(default)]
+        location: Option<SourceLocation>,
     },
     Package {
         schema: Option<String>,
@@ -209,6 +310,8 @@ pub enum Node {
         table_schema: Option<String>,
         table_name: String,
         unique: bool,
+        #[serde(default)]
+        global: bool,
         location: SourceLocation,
     },
     /// A MATERIALIZED VIEW.
@@ -230,10 +333,18 @@ pub enum Node {
         name: String,
         location: SourceLocation,
     },
+    Custom {
+        type_name: String,
+        label: String,
+        key_fields: BTreeMap<String, String>,
+        properties: JsonMap,
+        location: Option<SourceLocation>,
+    },
 }
 
 /// An edge in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
 pub enum Edge {
     /// Direct static call to a known procedure.
     DirectCall {
@@ -294,6 +405,11 @@ pub enum Edge {
     AliasesObject {
         location: SourceLocation,
     },
+    CustomEdge {
+        type_name: String,
+        properties: JsonMap,
+        location: Option<SourceLocation>,
+    },
 }
 
 /// The call graph itself.
@@ -310,8 +426,14 @@ impl Node {
             Node::JavaSql { java_file, .. } => java_file,
             Node::JavaMethod { file, .. } => file,
             Node::JavaClass { file, .. } => file,
-            Node::Table { .. } => Path::new(""),
-            Node::View { .. } => Path::new(""),
+            Node::Table { location, .. } => location
+                .as_ref()
+                .map(|l| l.file.as_path())
+                .unwrap_or(Path::new("")),
+            Node::View { location, .. } => location
+                .as_ref()
+                .map(|l| l.file.as_path())
+                .unwrap_or(Path::new("")),
             Node::Package { location, .. } => &location.file,
             Node::Trigger { location, .. } => &location.file,
             Node::Type { location, .. } => &location.file,
@@ -320,6 +442,10 @@ impl Node {
             Node::MaterializedView { location, .. } => &location.file,
             Node::Synonym { location, .. } => &location.file,
             Node::Event { location, .. } => &location.file,
+            Node::Custom { location, .. } => location
+                .as_ref()
+                .map(|l| l.file.as_path())
+                .unwrap_or(Path::new("")),
         }
     }
 }
@@ -496,6 +622,7 @@ mod tests {
             table_schema: Some("public".to_string()),
             table_name: "my_table".to_string(),
             unique: true,
+            global: false,
             location: loc.clone(),
         };
         assert_eq!(idx_node.file(), Path::new("test.sql"));
@@ -540,5 +667,122 @@ mod tests {
         let _ = Edge::AliasesObject {
             location: loc.clone(),
         };
+    }
+
+    #[test]
+    fn table_node_with_location_and_columns() {
+        let file = Arc::new(PathBuf::from("create_tables.sql"));
+        let table = Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: Some(SourceLocation {
+                file: file.clone(),
+                line: 10,
+            }),
+            columns: vec![
+                ColumnSummary {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    comment: None,
+                },
+                ColumnSummary {
+                    name: "amount".to_string(),
+                    data_type: "NUMERIC(10,2)".to_string(),
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: Some("0".to_string()),
+                    comment: Some("order amount".to_string()),
+                },
+            ],
+            partition_by: Some(PartitionInfo::Range {
+                columns: vec!["created_at".to_string()],
+                partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
+            }),
+            distribute_by: Some(DistributeInfo::Hash {
+                columns: vec!["id".to_string()],
+            }),
+            tablespace: Some("pg_default".to_string()),
+            temporary: false,
+            unlogged: false,
+            ddl_source: Some("CREATE TABLE public.orders (...)".to_string()),
+        };
+        assert_eq!(table.file(), Path::new("create_tables.sql"));
+    }
+
+    #[test]
+    fn table_node_minimal_implicit() {
+        let table = Node::Table {
+            schema: None,
+            name: "my_table".to_string(),
+            location: None,
+            columns: vec![],
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        assert_eq!(table.file(), Path::new(""));
+    }
+
+    #[test]
+    fn partition_info_serialization_roundtrip() {
+        let info = PartitionInfo::Range {
+            columns: vec!["created_at".to_string()],
+            partitions: vec!["p_2024".to_string()],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let de: PartitionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, de);
+    }
+
+    #[test]
+    fn distribute_info_serialization_roundtrip() {
+        let info = DistributeInfo::Hash {
+            columns: vec!["user_id".to_string()],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let de: DistributeInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, de);
+    }
+
+    #[test]
+    fn column_summary_serialization_roundtrip() {
+        let col = ColumnSummary {
+            name: "id".to_string(),
+            data_type: "BIGINT".to_string(),
+            nullable: false,
+            is_primary_key: true,
+            default_value: Some("nextval('seq')".to_string()),
+            comment: None,
+        };
+        let json = serde_json::to_string(&col).unwrap();
+        let de: ColumnSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(col, de);
+    }
+
+    #[test]
+    fn table_node_serde_backward_compat() {
+        let json = r#"{"schema":"public","name":"t"}"#;
+        let table: Node = serde_json::from_str(&format!("{{\"Table\":{}}}", json)).unwrap();
+        if let Node::Table {
+            schema,
+            name,
+            location,
+            columns,
+            ..
+        } = table
+        {
+            assert_eq!(schema, Some("public".to_string()));
+            assert_eq!(name, "t");
+            assert!(location.is_none());
+            assert!(columns.is_empty());
+        } else {
+            panic!("expected Table");
+        }
     }
 }

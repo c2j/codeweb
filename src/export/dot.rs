@@ -5,6 +5,18 @@ pub fn to_dot(graph: &CodeGraph) -> String {
     out.push_str("    node [shape=box];\n");
 
     for idx in graph.node_indices() {
+        match &graph[idx] {
+            Node::Table { .. } | Node::View { .. } | Node::MaterializedView { .. } => {
+                use petgraph::Direction;
+                if graph.edges_directed(idx, Direction::Outgoing).count()
+                    + graph.edges_directed(idx, Direction::Incoming).count()
+                    == 0
+                {
+                    continue;
+                }
+            }
+            _ => {}
+        }
         let (label, shape, style) = match &graph[idx] {
             Node::Procedure { id, partial, .. } => {
                 let style = if *partial { ", style=dashed" } else { "" };
@@ -42,14 +54,14 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 name, class_fqn, ..
             } => (format!("{}.{}", class_fqn, name), "diamond", ""),
             Node::JavaClass { fqn, .. } => (fqn.clone(), "folder", ""),
-            Node::Table { schema, name } => {
+            Node::Table { schema, name, .. } => {
                 let label = match schema {
                     Some(s) => format!("{}.{}", s, name),
                     None => name.clone(),
                 };
                 (label, "cylinder", ", style=filled, fillcolor=lightyellow")
             }
-            Node::View { schema, name } => {
+            Node::View { schema, name, .. } => {
                 let label = match schema {
                     Some(s) => format!("{}.{}", s, name),
                     None => name.clone(),
@@ -124,6 +136,9 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 (format!("{}→{}", label, target), "trapezium", "")
             }
             Node::Event { name, .. } => (name.clone(), "octagon", ""),
+            Node::Custom { label, .. } => {
+                (label.clone(), "box", ", style=filled, fillcolor=lightgray")
+            }
         };
         let escaped = dot_escape(&label);
         out.push_str(&format!(
@@ -207,6 +222,10 @@ pub fn to_dot(graph: &CodeGraph) -> String {
             Edge::AliasesObject { .. } => (
                 "label=\"aliases\"".to_string(),
                 "color=purple, style=dashed,".to_string(),
+            ),
+            Edge::CustomEdge { type_name, .. } => (
+                format!("label=\"{}\"", dot_escape(type_name)),
+                "style=dashed,".to_string(),
             ),
         };
         out.push_str(&format!(

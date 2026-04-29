@@ -47,14 +47,14 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 name, class_fqn, ..
             } => (format!("{}.{}", class_fqn, name), ("{{\"", "\"}}")),
             Node::JavaClass { fqn, .. } => (fqn.clone(), ("[/", "/]")),
-            Node::Table { schema, name } => {
+            Node::Table { schema, name, .. } => {
                 let label = match schema {
                     Some(s) => format!("{}.{}", s, name),
                     None => name.clone(),
                 };
                 (label, ("([", "])"))
             }
-            Node::View { schema, name } => {
+            Node::View { schema, name, .. } => {
                 let label = match schema {
                     Some(s) => format!("{}.{}", s, name),
                     None => name.clone(),
@@ -117,6 +117,9 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 (format!("{}→{}", label, target), ("[\\", "/]"))
             }
             Node::Event { name, .. } => (name.clone(), ("{{", "}}")),
+            Node::Custom {
+                label, type_name, ..
+            } => (format!("{}:{}", type_name, label), ("[\"", "\"]")),
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);
@@ -156,6 +159,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::UsesSequence { .. } => "-->",
             Edge::IndexesTable { .. } => "-.->",
             Edge::AliasesObject { .. } => "-.->",
+            Edge::CustomEdge { .. } => "-.->",
         };
 
         out.push_str(&format!("    {} {} {}\n", src_id, arrow, dst_id));

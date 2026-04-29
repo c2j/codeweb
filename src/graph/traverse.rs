@@ -5,6 +5,30 @@ use petgraph::Direction;
 
 use crate::graph::key::NodeKey;
 
+/// Display style for call chain output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChainStyle {
+    /// Traditional tree view with box-drawing characters.
+    #[default]
+    Tree,
+    /// Path-based view: each root-to-leaf path shown as a separate trace line.
+    Path,
+}
+
+impl std::str::FromStr for ChainStyle {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tree" => Ok(ChainStyle::Tree),
+            "path" => Ok(ChainStyle::Path),
+            other => Err(format!(
+                "unknown chain style '{}', expected 'tree' or 'path'",
+                other
+            )),
+        }
+    }
+}
+
 pub struct TreeNode {
     pub idx: NodeIndex,
     pub edge_label: Option<String>,
@@ -266,4 +290,157 @@ pub fn format_chain_tree(chain: &CallChain, graph: &crate::graph::CodeGraph) -> 
     }
 
     lines.join("\n")
+}
+
+#[derive(Clone)]
+struct PathStep {
+    idx: NodeIndex,
+    edge_label: Option<String>,
+}
+
+fn collect_leaf_paths(roots: &[TreeNode]) -> Vec<Vec<PathStep>> {
+    let mut paths = Vec::new();
+    let mut current = Vec::new();
+    for root in roots {
+        collect_paths_recursive(root, &mut current, &mut paths);
+    }
+    paths
+}
+
+fn collect_paths_recursive(
+    node: &TreeNode,
+    current: &mut Vec<PathStep>,
+    paths: &mut Vec<Vec<PathStep>>,
+) {
+    current.push(PathStep {
+        idx: node.idx,
+        edge_label: node.edge_label.clone(),
+    });
+    if node.children.is_empty() {
+        paths.push(current.clone());
+    } else {
+        for child in &node.children {
+            collect_paths_recursive(child, current, paths);
+        }
+    }
+    current.pop();
+}
+
+pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) -> String {
+    let mut lines = Vec::new();
+    let target_key = NodeKey::from_node(&graph[chain.target]);
+
+    // --- CALLERS: each path from farthest caller → direct caller → T0 ---
+    let caller_paths = collect_leaf_paths(&chain.callers);
+    // Reverse each path so it reads: farthest entry → ... → direct caller → T0
+    let mut caller_paths: Vec<_> = caller_paths
+        .into_iter()
+        .map(|mut p| {
+            p.reverse();
+            p
+        })
+        .collect();
+    // Sort by path length descending (longest first = deepest call chain)
+    caller_paths.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+    lines.push(format!(
+        "── CALLERS ({} paths) ──",
+        caller_paths.len()
+    ));
+    if caller_paths.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (pi, path) in caller_paths.iter().enumerate() {
+            let path_num = pi + 1;
+            let hops = path.len();
+            lines.push(format!("Path {:<4} {:>3} hops", path_num, hops));
+            for (depth, step) in path.iter().enumerate() {
+                let indent = "    ".repeat(depth);
+                let key = NodeKey::from_node(&graph[step.idx]);
+                let label = step
+                    .edge_label
+                    .as_deref()
+                    .map(|l| format!(" {}", l))
+                    .unwrap_or_default();
+                lines.push(format!("{}→ {}{}", indent, key, label));
+            }
+            let t0_indent = "    ".repeat(path.len());
+            lines.push(format!("{}→ T0 {}", t0_indent, target_key));
+            if pi < caller_paths.len() - 1 {
+                lines.push(String::new());
+            }
+        }
+    }
+
+    // --- CONVERGENCE summary ---
+    if !caller_paths.is_empty() {
+        let mut convergence: std::collections::HashMap<NodeIndex, usize> =
+            std::collections::HashMap::new();
+        for path in &caller_paths {
+            for step in path {
+                *convergence.entry(step.idx).or_insert(0) += 1;
+            }
+        }
+        let mut conv_entries: Vec<_> = convergence.into_iter().collect();
+        conv_entries.sort_by(|a, b| b.1.cmp(&a.1));
+        lines.push(String::new());
+        lines.push("── CONVERGENCE ──".to_string());
+        for (idx, count) in &conv_entries {
+            if *count > 1 {
+                let key = NodeKey::from_node(&graph[*idx]);
+                lines.push(format!("  {} ← {} paths", key, count));
+            }
+        }
+    }
+
+    // --- TARGET ---
+    lines.push(String::new());
+    lines.push("── TARGET ──".to_string());
+    lines.push(format!("  {}", target_key));
+
+    // --- CALLEES: each path from T0 → direct callee → deepest leaf ---
+    let callee_paths = collect_leaf_paths(&chain.callees);
+    let mut callee_paths = callee_paths;
+    callee_paths.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+    lines.push(String::new());
+    lines.push(format!(
+        "── CALLEES ({} paths) ──",
+        callee_paths.len()
+    ));
+    if callee_paths.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (pi, path) in callee_paths.iter().enumerate() {
+            let path_num = pi + 1;
+            let hops = path.len();
+            lines.push(format!("Path {:<4} {:>3} hops", path_num, hops));
+            for (depth, step) in path.iter().enumerate() {
+                let indent = "    ".repeat(depth);
+                let key = NodeKey::from_node(&graph[step.idx]);
+                let label = step
+                    .edge_label
+                    .as_deref()
+                    .map(|l| format!(" {}", l))
+                    .unwrap_or_default();
+                lines.push(format!("{}→ {}{}", indent, key, label));
+            }
+            if pi < callee_paths.len() - 1 {
+                lines.push(String::new());
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+pub fn format_chain(
+    chain: &CallChain,
+    graph: &crate::graph::CodeGraph,
+    style: ChainStyle,
+) -> String {
+    match style {
+        ChainStyle::Tree => format_chain_tree(chain, graph),
+        ChainStyle::Path => format_chain_paths(chain, graph),
+    }
 }

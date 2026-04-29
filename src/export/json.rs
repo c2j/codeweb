@@ -1,5 +1,7 @@
 use crate::error::Result;
-use crate::graph::{AccessMode, CodeGraph, Edge, Node, WriteKind};
+use crate::graph::{
+    AccessMode, CodeGraph, ColumnSummary, DistributeInfo, Edge, Node, PartitionInfo, WriteKind,
+};
 use serde::Serialize;
 
 fn is_false(v: &bool) -> bool {
@@ -74,10 +76,30 @@ enum NodeKindJson {
     Table {
         schema: Option<String>,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<ColumnSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_by: Option<PartitionInfo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distribute_by: Option<DistributeInfo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tablespace: Option<String>,
+        #[serde(skip_serializing_if = "is_false")]
+        temporary: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        unlogged: bool,
     },
     View {
         schema: Option<String>,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
     },
     #[serde(rename = "package")]
     Package {
@@ -110,6 +132,8 @@ enum NodeKindJson {
         name: Option<String>,
         table_name: String,
         unique: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        global: bool,
         file: String,
         line: usize,
     },
@@ -131,6 +155,14 @@ enum NodeKindJson {
         name: String,
         file: String,
         line: usize,
+    },
+    Custom {
+        custom_type: String,
+        label: String,
+        key_fields: serde_json::Value,
+        properties: serde_json::Value,
+        file: Option<String>,
+        line: Option<usize>,
     },
 }
 
@@ -184,6 +216,13 @@ enum EdgeKindJson {
     IndexesTable { file: String, line: usize },
     #[serde(rename = "aliases_object")]
     AliasesObject { file: String, line: usize },
+    #[serde(rename = "custom")]
+    CustomEdge {
+        custom_type: String,
+        properties: serde_json::Value,
+        file: Option<String>,
+        line: Option<usize>,
+    },
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
@@ -291,18 +330,48 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: *line,
                 },
             },
-            Node::Table { schema, name } => NodeJson {
+            Node::Table {
+                schema,
+                name,
+                location,
+                columns,
+                partition_by,
+                distribute_by,
+                tablespace,
+                temporary,
+                unlogged,
+                ..
+            } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Table {
                     schema: schema.clone(),
                     name: name.clone(),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
+                    columns: columns.clone(),
+                    partition_by: partition_by.clone(),
+                    distribute_by: distribute_by.clone(),
+                    tablespace: tablespace.clone(),
+                    temporary: *temporary,
+                    unlogged: *unlogged,
                 },
             },
-            Node::View { schema, name } => NodeJson {
+            Node::View {
+                schema,
+                name,
+                location,
+                ..
+            } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::View {
                     schema: schema.clone(),
                     name: name.clone(),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
                 },
             },
             Node::Package {
@@ -364,6 +433,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 table_schema: _,
                 table_name,
                 unique,
+                global,
                 location,
             } => NodeJson {
                 id: idx.index(),
@@ -371,6 +441,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     name: name.clone(),
                     table_name: table_name.clone(),
                     unique: *unique,
+                    global: *global,
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },
@@ -411,6 +482,25 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     name: name.clone(),
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
+                },
+            },
+            Node::Custom {
+                type_name,
+                label,
+                key_fields,
+                properties,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Custom {
+                    custom_type: type_name.clone(),
+                    label: label.clone(),
+                    key_fields: serde_json::to_value(key_fields).unwrap_or(serde_json::Value::Null),
+                    properties: serde_json::to_value(properties).unwrap_or(serde_json::Value::Null),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
                 },
             },
         };
@@ -571,6 +661,22 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 kind: EdgeKindJson::AliasesObject {
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
+                },
+            },
+            Edge::CustomEdge {
+                type_name,
+                properties,
+                location,
+            } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::CustomEdge {
+                    custom_type: type_name.clone(),
+                    properties: serde_json::to_value(properties).unwrap_or(serde_json::Value::Null),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
                 },
             },
         };
