@@ -4,6 +4,11 @@ version = "0.2.0"
 edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
 
+[package.metadata.i18n]
+available_locales = ["en", "zh-CN"]
+default_locale = "zh-CN"
+fallback_locale = "en"
+
 [features]
 default = ["cli", "tui"]
 cli = ["clap"]
@@ -31,6 +36,7 @@ ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 indicatif = "0.18.4"
 pathdiff = "0.2.3"
+rust-i18n = "3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,7 +30,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 3,
+            version: 4,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -82,7 +82,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 3,
+            version: 4,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -189,10 +189,10 @@ impl GraphStore {
             bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
             })?;
-        if store.version != 3 {
+        if store.version != 4 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 3 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 4 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });
@@ -229,10 +229,10 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 3 {
+        if store.version != 4 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 3 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 4 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });
@@ -345,13 +345,20 @@ impl GraphStore {
     fn merge_duplicate_table_access_edges(graph: &mut crate::graph::CodeGraph) {
         use std::collections::HashMap;
         let mut merge_targets: HashMap<
-            (petgraph::graph::NodeIndex, petgraph::graph::NodeIndex),
+            (
+                petgraph::graph::NodeIndex,
+                petgraph::graph::NodeIndex,
+                crate::graph::DataFlowKind,
+            ),
             Vec<petgraph::graph::EdgeIndex>,
         > = HashMap::new();
         for edge_idx in graph.edge_indices() {
-            if let crate::graph::Edge::TableAccess { .. } = &graph[edge_idx] {
+            if let crate::graph::Edge::TableAccess { flow_kind, .. } = &graph[edge_idx] {
                 let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
-                merge_targets.entry((src, dst)).or_default().push(edge_idx);
+                merge_targets
+                    .entry((src, dst, *flow_kind))
+                    .or_default()
+                    .push(edge_idx);
             }
         }
         let mut edges_to_remove = Vec::new();
@@ -428,7 +435,11 @@ fn timestamp_ms() -> u64 {
 
 fn edge_type_tag(edge: &crate::graph::Edge) -> String {
     match edge {
-        crate::graph::Edge::DirectCall { .. } => "direct",
+        crate::graph::Edge::DirectCall { scope, .. } => match scope {
+            crate::graph::CallScope::IntraPackage => "intra_call",
+            crate::graph::CallScope::CrossPackage => "cross_call",
+            crate::graph::CallScope::External => "direct",
+        },
         crate::graph::Edge::DynamicCall { .. } => "dynamic",
         crate::graph::Edge::CallsProcedure { .. } => "calls_procedure",
         crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
@@ -437,6 +448,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",
         crate::graph::Edge::TableAccess { .. } => "table_access",
+        crate::graph::Edge::DependsOn { .. } => "depends_on",
         crate::graph::Edge::ContainsRoutine => "contains_routine",
         crate::graph::Edge::TriggersRoutine { .. } => "triggers_routine",
         crate::graph::Edge::ReferencesType { .. } => "references_type",
@@ -515,6 +527,7 @@ mod tests {
             proc_idx,
             table_idx,
             crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
                 modes: crate::graph::AccessMode::Read,
                 write_kinds: std::collections::HashSet::new(),
                 location: crate::graph::SourceLocation {
@@ -567,6 +580,7 @@ mod tests {
             proc_idx,
             table_idx,
             crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
                 modes: crate::graph::AccessMode::Read,
                 write_kinds,
                 location: crate::graph::SourceLocation {
@@ -695,11 +709,11 @@ mod tests {
 
         let json_str = std::fs::read_to_string(&json_path).unwrap();
         let mut json_val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        json_val["version"] = serde_json::Value::from(1u64);
+        json_val["version"] = serde_json::Value::from(3u64);
         std::fs::write(&json_path, serde_json::to_string(&json_val).unwrap()).unwrap();
 
         let result = GraphStore::load_json(&json_path);
-        assert!(result.is_err(), "Version 1 cache should be rejected");
+        assert!(result.is_err(), "Version 3 cache should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("unsupported cache version"),

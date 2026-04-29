@@ -9,50 +9,63 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+const LOCALES: &[&str] = &["zh-CN", "en"];
+
 pub struct App {
     project: Project,
     screen: Screen,
-    list_state: ListState,
     should_quit: bool,
+
+    // Explorer: search + node list
     search_query: String,
-    search_results: Vec<(NodeIndex, String)>,
-    search_selected: usize,
-    chain_display: Vec<Line<'static>>,
-    in_search: bool,
+    nodes: Vec<NodeIndex>,
+    list_state: ListState,
+
+    // Detail view
+    detail_node_idx: Option<NodeIndex>,
+    detail_lines: Vec<Line<'static>>,
+    detail_scroll: u16,
+
+    // Info scroll
+    info_scroll: u16,
+
+    // Options
+    chain_style: traverse::ChainStyle,
     filter_low_degree: bool,
     filter_threshold: usize,
-    detail_node_idx: Option<NodeIndex>,
-    chain_style: traverse::ChainStyle,
+    locale_idx: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
-    Dashboard,
-    Files,
-    Graph,
-    Trace,
+    Explorer,
     Detail,
+    Info,
 }
 
 impl App {
     pub fn new(project: Project) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        Self {
+        let mut app = Self {
             project,
-            screen: Screen::Dashboard,
-            list_state,
+            screen: Screen::Explorer,
             should_quit: false,
             search_query: String::new(),
-            search_results: Vec::new(),
-            search_selected: 0,
-            chain_display: Vec::new(),
-            in_search: true,
+            nodes: Vec::new(),
+            list_state,
+            detail_node_idx: None,
+            detail_lines: Vec::new(),
+            detail_scroll: 0,
+            info_scroll: 0,
+            chain_style: traverse::ChainStyle::default(),
             filter_low_degree: false,
             filter_threshold: 0,
-            detail_node_idx: None,
-            chain_style: traverse::ChainStyle::default(),
-        }
+            locale_idx: 0,
+        };
+        rust_i18n::set_locale(LOCALES[0]);
+        app.refresh_node_list();
+        app
     }
 
     pub fn run<B: ratatui::backend::Backend>(
@@ -85,246 +98,518 @@ impl App {
         Ok(())
     }
 
+    // ── Node list management ──
+
+    fn refresh_node_list(&mut self) {
+        let Some(store) = self.project.store() else {
+            return;
+        };
+        let graph = store.graph();
+        if self.search_query.is_empty() {
+            if self.filter_low_degree {
+                self.nodes = traverse::low_degree_nodes(graph, self.filter_threshold)
+                    .into_iter()
+                    .map(|d| d.idx)
+                    .collect();
+            } else {
+                self.nodes = graph.node_indices().collect();
+            }
+        } else {
+            self.nodes = traverse::find_nodes_by_name(graph, &self.search_query)
+                .into_iter()
+                .map(|(idx, _)| idx)
+                .collect();
+        }
+        if !self.nodes.is_empty() {
+            let current = self.list_state.selected().unwrap_or(0);
+            self.list_state
+                .select(Some(current.min(self.nodes.len() - 1)));
+        }
+    }
+
+    fn selected_node(&self) -> Option<NodeIndex> {
+        let i = self.list_state.selected()?;
+        self.nodes.get(i).copied()
+    }
+
+    fn open_detail(&mut self, idx: NodeIndex) {
+        let Some(store) = self.project.store() else {
+            return;
+        };
+        let graph = store.graph();
+        let node = &graph[idx];
+        let key = NodeKey::from_node(node);
+        let (tag, tag_color) = node_tag(node);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<8} ", tag),
+                Style::default()
+                    .fg(tag_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                key.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let in_deg = graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+            .count();
+        let out_deg = graph
+            .neighbors_directed(idx, petgraph::Direction::Outgoing)
+            .count();
+        lines.push(Line::from(Span::styled(
+            format!("{}:{} {}:{} {}:{}", t!("degree.in"), in_deg, t!("degree.out"), out_deg, t!("degree.total"), in_deg + out_deg),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+
+        let attr_lines = format_node_attributes_full(node);
+        for attr_line in attr_lines {
+            lines.push(Line::from(Span::styled(
+                attr_line,
+                Style::default().fg(Color::White),
+            )));
+        }
+        lines.push(Line::from(""));
+
+        let chain = traverse::trace_chain(graph, idx);
+        let chain_lines = match self.chain_style {
+            traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
+            traverse::ChainStyle::Path => {
+                let text = traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
+                text.lines().map(|l| Line::from(l.to_string())).collect()
+            }
+        };
+        lines.extend(chain_lines);
+
+        self.detail_node_idx = Some(idx);
+        self.detail_lines = lines;
+        self.detail_scroll = 0;
+        self.screen = Screen::Detail;
+    }
+
+    // ── Key handling ──
+
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyEventKind;
-
         if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        use crossterm::event::KeyCode;
-        if key.code == KeyCode::Char('s') && !self.in_search {
-            self.chain_style = match self.chain_style {
-                traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
-                traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
-            };
-            self.refresh_chain_display();
             return;
         }
 
         match self.screen {
-            Screen::Trace => self.handle_trace_key(key),
-            Screen::Graph => self.handle_graph_key(key),
-            Screen::Detail => self.handle_detail_key(key),
-            _ => self.handle_global_key(key),
+            Screen::Explorer => self.handle_explorer_key(key.code),
+            Screen::Detail => self.handle_detail_key(key.code),
+            Screen::Info => self.handle_info_key(key.code),
         }
     }
 
-    fn handle_trace_key(&mut self, key: crossterm::event::KeyEvent) {
+    fn handle_explorer_key(&mut self, code: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
-        use crossterm::event::KeyEventKind;
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        if self.in_search {
-            match key.code {
-                KeyCode::Backspace => {
-                    self.search_query.pop();
-                    self.update_search_results();
-                    self.search_selected = 0;
-                }
-                KeyCode::Enter => {
-                    if !self.search_results.is_empty() {
-                        let (idx, _) = self.search_results[self.search_selected];
-                        self.run_trace(idx);
-                        self.in_search = false;
-                    }
-                }
-                KeyCode::Down => {
-                    if !self.search_results.is_empty() {
-                        self.search_selected =
-                            (self.search_selected + 1).min(self.search_results.len() - 1);
-                    }
-                }
-                KeyCode::Up => {
-                    self.search_selected = self.search_selected.saturating_sub(1);
-                }
-                KeyCode::Esc => {
-                    self.in_search = true;
-                    self.chain_display.clear();
-                }
-                KeyCode::Char('1') | KeyCode::Char('d') => {
-                    self.screen = Screen::Dashboard;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('2') | KeyCode::Char('f') => {
-                    self.screen = Screen::Files;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('3') | KeyCode::Char('g') => {
-                    self.screen = Screen::Graph;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char(c) => {
-                    self.search_query.push(c);
-                    self.update_search_results();
-                    self.search_selected = 0;
-                }
-                _ => {}
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('2') | KeyCode::Char('i') => {
+                self.screen = Screen::Info;
+                self.info_scroll = 0;
             }
-        } else {
-            match key.code {
-                KeyCode::Esc => {
-                    self.in_search = true;
-                    self.chain_display.clear();
-                }
-                KeyCode::Char('1') | KeyCode::Char('d') => {
-                    self.screen = Screen::Dashboard;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('2') | KeyCode::Char('f') => {
-                    self.screen = Screen::Files;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('3') | KeyCode::Char('g') => {
-                    self.screen = Screen::Graph;
-                    self.list_state.select(Some(0));
-                }
-                KeyCode::Char('q') => self.should_quit = true,
-                _ => {}
+            KeyCode::Char('a') => {
+                let _ = self.project.analyze();
+                self.refresh_node_list();
             }
-        }
-    }
-
-    fn handle_graph_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyEventKind};
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        match key.code {
+            KeyCode::Char('s') => {
+                self.chain_style = match self.chain_style {
+                    traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
+                    traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
+                };
+            }
             KeyCode::Char('l') => {
                 self.filter_low_degree = !self.filter_low_degree;
                 self.list_state.select(Some(0));
+                self.refresh_node_list();
+            }
+            KeyCode::Char('\\') => {
+                self.locale_idx = (self.locale_idx + 1) % LOCALES.len();
+                rust_i18n::set_locale(LOCALES[self.locale_idx]);
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.filter_threshold = self.filter_threshold.saturating_add(1).min(100);
                 self.list_state.select(Some(0));
+                self.refresh_node_list();
             }
             KeyCode::Char('-') => {
                 self.filter_threshold = self.filter_threshold.saturating_sub(1);
                 self.list_state.select(Some(0));
+                self.refresh_node_list();
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.list_state.select(Some(0));
+                self.refresh_node_list();
             }
             KeyCode::Enter => {
-                self.detail_node_idx = self.resolve_graph_selected_node();
-                if self.detail_node_idx.is_some() {
-                    self.screen = Screen::Detail;
+                if let Some(idx) = self.selected_node() {
+                    self.open_detail(idx);
                 }
-            }
-            _ => self.handle_global_key(key),
-        }
-    }
-
-    fn handle_detail_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyEventKind};
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
-                self.screen = Screen::Graph;
-                self.detail_node_idx = None;
-            }
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('1') | KeyCode::Char('d') => {
-                self.screen = Screen::Dashboard;
-                self.list_state.select(Some(0));
-                self.detail_node_idx = None;
-            }
-            KeyCode::Char('2') | KeyCode::Char('f') => {
-                self.screen = Screen::Files;
-                self.list_state.select(Some(0));
-                self.detail_node_idx = None;
-            }
-            KeyCode::Char('4') | KeyCode::Char('t') => {
-                self.screen = Screen::Trace;
-                self.detail_node_idx = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_global_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyEventKind};
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('1') | KeyCode::Char('d') => {
-                self.screen = Screen::Dashboard;
-                self.list_state.select(Some(0));
-            }
-            KeyCode::Char('2') | KeyCode::Char('f') => {
-                self.screen = Screen::Files;
-                self.list_state.select(Some(0));
-            }
-            KeyCode::Char('3') | KeyCode::Char('g') => {
-                self.screen = Screen::Graph;
-                self.list_state.select(Some(0));
-            }
-            KeyCode::Char('4') | KeyCode::Char('t') => {
-                self.screen = Screen::Trace;
-            }
-            KeyCode::Char('a') => {
-                let _ = self.project.analyze();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let i = self.list_state.selected().unwrap_or(0);
-                let max = self.list_len().saturating_sub(1);
+                let max = self.nodes.len().saturating_sub(1);
                 self.list_state.select(Some((i + 1).min(max)));
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let i = self.list_state.selected().unwrap_or(0);
                 self.list_state.select(Some(i.saturating_sub(1)));
             }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.list_state.select(Some(0));
+                self.refresh_node_list();
+            }
             _ => {}
         }
     }
 
-    fn update_search_results(&mut self) {
-        if let Some(store) = self.project.store() {
-            self.search_results = traverse::find_nodes_by_name(store.graph(), &self.search_query);
+    fn handle_detail_key(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => {
+                self.screen = Screen::Explorer;
+                self.detail_lines.clear();
+                self.detail_scroll = 0;
+                self.detail_node_idx = None;
+            }
+            KeyCode::Char('s') => {
+                self.chain_style = match self.chain_style {
+                    traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
+                    traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
+                };
+                if let Some(idx) = self.detail_node_idx {
+                    self.open_detail(idx);
+                }
+            }
+            KeyCode::Char('\\') => {
+                self.locale_idx = (self.locale_idx + 1) % LOCALES.len();
+                rust_i18n::set_locale(LOCALES[self.locale_idx]);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            _ => {}
         }
     }
 
-    fn resolve_graph_selected_node(&self) -> Option<NodeIndex> {
-        let store = self.project.store()?;
+    fn handle_info_key(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('1') => {
+                self.screen = Screen::Explorer;
+                self.info_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.info_scroll = self.info_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.info_scroll = self.info_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('\\') => {
+                self.locale_idx = (self.locale_idx + 1) % LOCALES.len();
+                rust_i18n::set_locale(LOCALES[self.locale_idx]);
+            }
+            _ => {}
+        }
+    }
+
+    // ── Drawing ──
+
+    fn draw(&self, f: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+
+        self.draw_title_bar(f, chunks[0]);
+
+        match self.screen {
+            Screen::Explorer => self.draw_explorer(f, chunks[1]),
+            Screen::Detail => self.draw_detail(f, chunks[1]),
+            Screen::Info => self.draw_info(f, chunks[1]),
+        }
+
+        self.draw_status_bar(f, chunks[2]);
+    }
+
+    fn draw_title_bar(&self, f: &mut Frame, area: Rect) {
+        let title = format!(
+            " codeweb ─ {} ─ {} ",
+            self.project.name(),
+            match self.screen {
+                Screen::Explorer => t!("screen.explorer").to_string(),
+                Screen::Detail => t!("screen.detail").to_string(),
+                Screen::Info => t!("screen.info").to_string(),
+            }
+        );
+        let bar = Paragraph::new(title).style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        f.render_widget(bar, area);
+    }
+
+    fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
+        let style_label = match self.chain_style {
+            traverse::ChainStyle::Tree => t!("style.tree").to_string(),
+            traverse::ChainStyle::Path => t!("style.path").to_string(),
+        };
+        let hints: String = match self.screen {
+            Screen::Explorer => {
+                if self.filter_low_degree {
+                    t!("statusbar.explorer_filter_on",
+                        nav => t!("hint.nav"),
+                        full => t!("hint.full"),
+                        style => t!("hint.style"),
+                        style_val => &style_label,
+                        filter_on => t!("hint.filter_on"),
+                        info => t!("hint.info"),
+                        lang => t!("hint.lang"),
+                        quit => t!("hint.quit"),
+                    ).to_string()
+                } else {
+                    t!("statusbar.explorer_filter_off",
+                        nav => t!("hint.nav"),
+                        full => t!("hint.full"),
+                        style => t!("hint.style"),
+                        style_val => &style_label,
+                        filter_off => t!("hint.filter_off"),
+                        info => t!("hint.info"),
+                        lang => t!("hint.lang"),
+                        quit => t!("hint.quit"),
+                    ).to_string()
+                }
+            }
+            Screen::Detail => t!("statusbar.detail",
+                scroll => t!("hint.scroll"),
+                back => t!("hint.back"),
+                style => t!("hint.style"),
+                style_val => &style_label,
+                lang => t!("hint.lang"),
+                quit => t!("hint.quit"),
+            ).to_string(),
+            Screen::Info => t!("statusbar.info",
+                scroll => t!("hint.scroll"),
+                back => t!("hint.back"),
+                lang => t!("hint.lang"),
+                quit => t!("hint.quit"),
+            ).to_string(),
+        };
+        let bar = Paragraph::new(format!(" {}", hints))
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        f.render_widget(bar, area);
+    }
+
+    fn draw_explorer(&self, f: &mut Frame, area: Rect) {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+
+        // Search bar
+        let input_text = format!("> {}_", self.search_query);
+        let search = Paragraph::new(input_text)
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.search"))));
+        f.render_widget(search, outer[0]);
+
+        // Split panel: nodes | preview
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(outer[1]);
+
+        // Node list
+        let Some(store) = self.project.store() else {
+            return;
+        };
         let graph = store.graph();
-        if self.filter_low_degree {
-            let filtered = traverse::low_degree_nodes(graph, self.filter_threshold);
-            self.list_state
-                .selected()
-                .and_then(|s| filtered.into_iter().nth(s).map(|d| d.idx))
+        let degree_map: std::collections::HashMap<NodeIndex, (usize, usize)> = if self.filter_low_degree {
+            traverse::low_degree_nodes(graph, self.filter_threshold)
+                .into_iter()
+                .map(|d| (d.idx, (d.in_degree, d.out_degree)))
+                .collect()
         } else {
-            let indices: Vec<_> = graph.node_indices().collect();
-            self.list_state
-                .selected()
-                .and_then(|s| indices.into_iter().nth(s))
+            std::collections::HashMap::new()
+        };
+        let items: Vec<ListItem> = self
+            .nodes
+            .iter()
+            .map(|idx| {
+                let node = &graph[*idx];
+                let (tag, color) = node_tag(node);
+                let key = NodeKey::from_node(node);
+                let mut spans = vec![
+                    Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
+                    Span::raw(key.to_string()),
+                ];
+                if let Some((in_deg, out_deg)) = degree_map.get(idx) {
+                    let in_label = t!("degree.in").to_string();
+                    let out_label = t!("degree.out").to_string();
+                    spans.push(Span::styled(
+                        format!(" [{}:{} {}:{}]", in_label, in_deg, out_label, out_deg),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let node_count = self.nodes.len();
+        let list_title = if self.search_query.is_empty() {
+            format!(" {} ({}) ", t!("panel.nodes"), node_count)
+        } else {
+            format!(" {} ", t!("panel.nodes_matched", matched => node_count, total => graph.node_count()))
+        };
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(list_title))
+            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        f.render_stateful_widget(list, panels[0], &mut self.list_state.clone());
+
+        // Preview panel: show call chain for selected node
+        if let Some(idx) = self.selected_node() {
+            let chain = traverse::trace_chain(graph, idx);
+            let preview_lines = match self.chain_style {
+                traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
+                traverse::ChainStyle::Path => {
+                    let text = traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
+                    text.lines().map(|l| Line::from(l.to_string())).collect()
+                }
+            };
+            let para = Paragraph::new(preview_lines)
+                .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.preview"))))
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, panels[1]);
+        } else {
+            let para = Paragraph::new(t!("select_node").to_string())
+                .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.preview"))));
+            f.render_widget(para, panels[1]);
         }
     }
 
-    fn run_trace(&mut self, idx: NodeIndex) {
-        if let Some(store) = self.project.store() {
-            let chain = traverse::trace_chain(store.graph(), idx);
-            let tree = traverse::format_chain(&chain, store.graph(), self.chain_style);
-            self.chain_display = tree.lines().map(|l| Line::from(l.to_string())).collect();
-        }
+    fn draw_detail(&self, f: &mut Frame, area: Rect) {
+        let para = Paragraph::new(self.detail_lines.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", t!("panel.detail"))),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((self.detail_scroll, 0));
+        f.render_widget(para, area);
     }
 
-    fn refresh_chain_display(&mut self) {
-        if self.screen == Screen::Trace && !self.in_search
-            && !self.search_results.is_empty()
-            && self.search_selected < self.search_results.len()
-        {
-            let (idx, _) = self.search_results[self.search_selected];
-            self.run_trace(idx);
-        }
+    fn draw_info(&self, f: &mut Frame, area: Rect) {
+        let Some(store) = self.project.store() else {
+            return;
+        };
+        let stats = store.stats();
+
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area);
+
+        // Stats
+        let stats_lines = vec![
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.procedures")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.procedures)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.functions")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.functions)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.tables")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.tables)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.views")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.views)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.mappers")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.mappers)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.java_methods")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.java_methods)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.edges")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.edges)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{}: ", t!("stat.files")), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", stats.files)),
+            ]),
+        ];
+        let stats_para = Paragraph::new(stats_lines)
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.stats"))))
+            .scroll((self.info_scroll, 0));
+        f.render_widget(stats_para, panels[0]);
+
+        // Files
+        let file_nodes = store.file_nodes();
+        let manifest = store.manifest();
+        let mut entries: Vec<_> = manifest.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let root = self.project.root();
+        let file_items: Vec<ListItem> = entries
+            .iter()
+            .map(|(path, record)| {
+                let rel = path.strip_prefix(root).unwrap_or(path);
+                let type_tag = match record.file_type {
+                    crate::parser::fingerprint::FileType::Sql => t!("filetype.sql").to_string(),
+                    crate::parser::fingerprint::FileType::Java => t!("filetype.java").to_string(),
+                    crate::parser::fingerprint::FileType::Xml => t!("filetype.xml").to_string(),
+                };
+                let node_count = file_nodes
+                    .get(path as &std::path::Path)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<4} ", type_tag),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("{:>3} ", node_count),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(rel.to_string_lossy().to_string()),
+                ]))
+            })
+            .collect();
+        let file_list = List::new(file_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ({}) ", t!("panel.files"), manifest.len())),
+        );
+        f.render_widget(file_list, panels[1]);
     }
+
+    // ── Chain tree rendering (kept from original) ──
 
     fn render_chain_tree_tui(
         &self,
@@ -335,12 +620,12 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
 
         lines.push(Line::from(Span::styled(
-            "── CALLERS ──",
+            t!("callers").to_string(),
             Style::default().fg(Color::Cyan),
         )));
         if chain.callers.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (none)",
+                t!("none").to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .add_modifier(Modifier::DIM),
@@ -386,12 +671,12 @@ impl App {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "── CALLEES ──",
+            t!("callees").to_string(),
             Style::default().fg(Color::Green),
         )));
         if chain.callees.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (none)",
+                t!("none").to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .add_modifier(Modifier::DIM),
@@ -405,465 +690,9 @@ impl App {
 
         lines
     }
-
-    fn list_len(&self) -> usize {
-        match self.screen {
-            Screen::Dashboard => 1,
-            Screen::Files => self
-                .project
-                .store()
-                .map(|s| s.manifest().len())
-                .unwrap_or(0),
-            Screen::Graph => {
-                if self.filter_low_degree {
-                    if let Some(store) = self.project.store() {
-                        return traverse::low_degree_nodes(store.graph(), self.filter_threshold)
-                            .len();
-                    }
-                }
-                self.project
-                    .store()
-                    .map(|s| s.graph().node_count())
-                    .unwrap_or(0)
-            }
-            Screen::Trace => {
-                if self.in_search {
-                    self.search_results.len().max(1)
-                } else {
-                    self.chain_display.len().max(1)
-                }
-            }
-            Screen::Detail => 1,
-        }
-    }
-
-    fn draw(&self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(f.area());
-
-        self.draw_title_bar(f, chunks[0]);
-
-        match self.screen {
-            Screen::Dashboard => self.draw_dashboard(f, chunks[1]),
-            Screen::Files => self.draw_files(f, chunks[1]),
-            Screen::Graph => self.draw_graph(f, chunks[1]),
-            Screen::Trace => self.draw_trace(f, chunks[1]),
-            Screen::Detail => self.draw_detail(f, chunks[1]),
-        }
-
-        self.draw_status_bar(f, chunks[2]);
-    }
-
-    fn draw_title_bar(&self, f: &mut Frame, area: Rect) {
-        let title = format!(
-            " codeweb ─ {} ─ {} ",
-            self.project.name(),
-            match self.screen {
-                Screen::Dashboard => "Dashboard",
-                Screen::Files => "Files",
-                Screen::Graph => "Graph",
-                Screen::Trace => "Trace",
-                Screen::Detail => "Detail",
-            }
-        );
-        let bar = Paragraph::new(title).style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        );
-        f.render_widget(bar, area);
-    }
-
-    fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
-        let style_label = match self.chain_style {
-            traverse::ChainStyle::Tree => "Tree",
-            traverse::ChainStyle::Path => "Path",
-        };
-        let hints: String = match self.screen {
-            Screen::Dashboard => "[A]nalyze  [2]Files  [3]Graph  [4]Trace  [Q]uit".to_string(),
-            Screen::Files => "[↑↓] Navigate  [1]Dashboard  [3]Graph  [4]Trace  [Q]uit".to_string(),
-            Screen::Graph if !self.filter_low_degree => {
-                "[↑↓] Navigate  [Enter]Detail  [L]Filter:OFF  [S]tyle  [1]Dashboard  [2]Files  [4]Trace  [Q]uit".to_string()
-            }
-            Screen::Graph => {
-                "[↑↓] Navigate  [Enter]Detail  [L]Filter:ON [+/-]Threshold  [S]tyle  [1]Dashboard  [2]Files  [4]Trace  [Q]uit".to_string()
-            }
-            Screen::Trace if self.in_search => {
-                "[Enter]Select  [Esc]Back  [1]Dashboard  [2]Files  [3]Graph  [Q]uit".to_string()
-            }
-            Screen::Trace => format!("[Esc]Back  [S]tyle:{}  [1]Dashboard  [2]Files  [3]Graph  [Q]uit", style_label),
-            Screen::Detail => format!("[Esc]Back  [S]tyle:{}  [1]Dashboard  [2]Files  [4]Trace  [Q]uit", style_label),
-        };
-        let bar = Paragraph::new(format!(" {}", hints))
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-        f.render_widget(bar, area);
-    }
-
-    fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        if let Some(store) = self.project.store() {
-            let stats = store.stats();
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("Project: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        self.project.name(),
-                        Style::default()
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Procedures: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.procedures)),
-                    Span::raw("  "),
-                    Span::styled("Mappers: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.mappers)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Java Methods: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.java_methods)),
-                    Span::raw("  "),
-                    Span::styled("Java Classes: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.java_classes)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Tables: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.tables)),
-                    Span::raw("  "),
-                    Span::styled("Views: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.views)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Edges: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.edges)),
-                    Span::raw("  "),
-                    Span::styled("Unresolved: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.unresolved)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Files: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!("{}", stats.files)),
-                ]),
-            ];
-            let stats_panel = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Graph Stats "),
-                )
-                .wrap(Wrap { trim: true });
-            f.render_widget(stats_panel, chunks[0]);
-
-            let file_nodes = store.file_nodes();
-            let items: Vec<ListItem> = file_nodes
-                .iter()
-                .map(|(file, keys)| {
-                    let rel = file.strip_prefix(self.project.root()).unwrap_or(file);
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{:>3} ", keys.len()),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::raw(rel.to_string_lossy().to_string()),
-                    ]))
-                })
-                .collect();
-
-            let file_list = List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Files ({}) ", file_nodes.len())),
-            );
-            f.render_widget(file_list, chunks[1]);
-        } else {
-            let msg = Paragraph::new("No store found. Press [A] to analyze.")
-                .block(Block::default().borders(Borders::ALL).title(" Dashboard "));
-            f.render_widget(msg, area);
-        }
-    }
-
-    fn draw_files(&self, f: &mut Frame, area: Rect) {
-        if let Some(store) = self.project.store() {
-            let manifest = store.manifest();
-            let mut entries: Vec<_> = manifest.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-
-            let items: Vec<ListItem> = entries
-                .iter()
-                .map(|(path, record)| {
-                    let rel = path.strip_prefix(self.project.root()).unwrap_or(path);
-                    let type_tag = match record.file_type {
-                        crate::parser::fingerprint::FileType::Sql => "SQL",
-                        crate::parser::fingerprint::FileType::Java => "Java",
-                        crate::parser::fingerprint::FileType::Xml => "XML",
-                    };
-                    let node_count = store
-                        .file_nodes()
-                        .get(path as &std::path::Path)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{:<4} ", type_tag),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::styled(
-                            format!("{:>3} ", node_count),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::raw(rel.to_string_lossy().to_string()),
-                    ]))
-                })
-                .collect();
-
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" Files ({}) ", manifest.len())),
-                )
-                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
-            f.render_stateful_widget(list, area, &mut self.list_state.clone());
-        }
-    }
-
-    fn draw_graph(&self, f: &mut Frame, area: Rect) {
-        if let Some(store) = self.project.store() {
-            let graph = store.graph();
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .split(area);
-
-            let selected_node_idx = if self.filter_low_degree {
-                let filtered = traverse::low_degree_nodes(graph, self.filter_threshold);
-                let items: Vec<ListItem> = filtered
-                    .iter()
-                    .map(|info| {
-                        let node = &graph[info.idx];
-                        let (tag, color) = node_tag(node);
-                        let key = NodeKey::from_node(node);
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
-                            Span::raw(key.to_string()),
-                            Span::raw(format!(" [in:{} out:{}]", info.in_degree, info.out_degree)),
-                        ]))
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(format!(
-                        " Graph Nodes (degree ≤ {}, {} shown) ",
-                        self.filter_threshold,
-                        filtered.len()
-                    )))
-                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
-                f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
-
-                self.list_state
-                    .selected()
-                    .and_then(|s| filtered.into_iter().nth(s).map(|d| d.idx))
-            } else {
-                let indices: Vec<_> = graph.node_indices().collect();
-                let items: Vec<ListItem> = indices
-                    .iter()
-                    .map(|idx| {
-                        let node = &graph[*idx];
-                        let (tag, color) = node_tag(node);
-                        let key = NodeKey::from_node(node);
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
-                            Span::raw(key.to_string()),
-                        ]))
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" Graph Nodes ({}) ", graph.node_count())),
-                    )
-                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
-                f.render_stateful_widget(list, chunks[0], &mut self.list_state.clone());
-
-                self.list_state
-                    .selected()
-                    .and_then(|s| indices.into_iter().nth(s))
-            };
-
-            if let Some(node_idx) = selected_node_idx {
-                let chain = traverse::trace_chain(graph, node_idx);
-                let lines = match self.chain_style {
-                    traverse::ChainStyle::Tree => {
-                        self.render_chain_tree_tui(&chain, graph, node_idx)
-                    }
-                    traverse::ChainStyle::Path => {
-                        let text =
-                            traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
-                        text.lines()
-                            .map(|l| Line::from(l.to_string()))
-                            .collect()
-                    }
-                };
-
-                let para = Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Node Detail "),
-                );
-                f.render_widget(para, chunks[1]);
-            } else {
-                let para = Paragraph::new("Select a node to view details").block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Node Detail "),
-                );
-                f.render_widget(para, chunks[1]);
-            }
-        }
-    }
-
-    fn draw_trace(&self, f: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(area);
-
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(chunks[0]);
-
-        let input_text = format!("> {}_", self.search_query);
-        let input = Paragraph::new(input_text)
-            .block(Block::default().borders(Borders::ALL).title(" Search "));
-        f.render_widget(input, inner[0]);
-
-        if !self.search_results.is_empty() {
-            let items: Vec<ListItem> = self
-                .search_results
-                .iter()
-                .enumerate()
-                .map(|(i, (_, name))| {
-                    let style = if i == self.search_selected {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(Line::from(Span::styled(name.clone(), style)))
-                })
-                .collect();
-
-            let list = List::new(items).block(Block::default().borders(Borders::NONE));
-            let mut state = ListState::default();
-            state.select(Some(self.search_selected));
-            f.render_stateful_widget(list, inner[1], &mut state);
-        }
-
-        if self.chain_display.is_empty() {
-            let msg = if self.search_query.is_empty() {
-                "Type to search for nodes"
-            } else {
-                "Press Enter on a result to trace"
-            };
-            let para = Paragraph::new(msg)
-                .block(Block::default().borders(Borders::ALL).title(" Call Chain "));
-            f.render_widget(para, chunks[1]);
-        } else {
-            let para = Paragraph::new(self.chain_display.clone())
-                .block(Block::default().borders(Borders::ALL).title(" Call Chain "));
-            f.render_widget(para, chunks[1]);
-        }
-    }
-
-    fn draw_detail(&self, f: &mut Frame, area: Rect) {
-        if let (Some(store), Some(node_idx)) = (self.project.store(), self.detail_node_idx) {
-            let graph = store.graph();
-            let node = &graph[node_idx];
-            let key = NodeKey::from_node(node);
-            let (tag, tag_color) = node_tag(node);
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(8)])
-                .split(area);
-
-            let mut lines: Vec<Line> = Vec::new();
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<8} ", tag),
-                    Style::default()
-                        .fg(tag_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    key.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]));
-
-            let in_deg = graph
-                .neighbors_directed(node_idx, petgraph::Direction::Incoming)
-                .count();
-            let out_deg = graph
-                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                .count();
-            lines.push(Line::from(Span::styled(
-                format!("in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg),
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-
-            let attr_lines = format_node_attributes_full(node);
-            for attr_line in attr_lines {
-                lines.push(Line::from(Span::styled(attr_line, Style::default().fg(Color::White))));
-            }
-
-            lines.push(Line::from(""));
-
-            let chain = traverse::trace_chain(graph, node_idx);
-            let chain_lines = match self.chain_style {
-                traverse::ChainStyle::Tree => {
-                    self.render_chain_tree_tui(&chain, graph, node_idx)
-                }
-                traverse::ChainStyle::Path => {
-                    let text =
-                        traverse::format_chain(&chain, graph, traverse::ChainStyle::Path);
-                    text.lines().map(|l| Line::from(l.to_string())).collect()
-                }
-            };
-            lines.extend(chain_lines);
-
-            let para = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Node Detail "))
-                .wrap(Wrap { trim: false });
-            f.render_widget(para, chunks[0]);
-        } else {
-            let para = Paragraph::new("No node selected").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Node Detail "),
-            );
-            f.render_widget(para, area);
-        }
-    }
 }
+
+// ── Helper functions (kept unchanged) ──
 
 fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
     match node {
@@ -975,7 +804,10 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
                     .as_deref()
                     .map(|d| format!(" DEFAULT {}", d))
                     .unwrap_or_default();
-                attrs.push(format!("  {} {} {}{}{}", col.name, col.data_type, null, pk, def));
+                attrs.push(format!(
+                    "  {} {} {}{}{}",
+                    col.name, col.data_type, null, pk, def
+                ));
             }
             if columns.len() > 5 && compact {
                 attrs.push(format!("  ... +{} more", columns.len() - 5));

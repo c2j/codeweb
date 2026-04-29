@@ -53,13 +53,24 @@ fn edge_label_for(
     from: NodeIndex,
     to: NodeIndex,
 ) -> Option<String> {
-    use crate::graph::{AccessMode, Edge, WriteKind};
+    use crate::graph::{AccessMode, CallScope, DataFlowKind, Edge, WriteKind};
     let edge = graph.edges_connecting(from, to).next()?;
     match edge.weight() {
+        Edge::DirectCall { scope, .. } => Some(match scope {
+            CallScope::IntraPackage => "[intra]".into(),
+            CallScope::CrossPackage => "[cross]".into(),
+            CallScope::External => None?,
+        }),
         Edge::TableAccess {
-            modes, write_kinds, ..
+            flow_kind,
+            modes,
+            write_kinds,
+            ..
         } => {
             let mut parts = Vec::new();
+            if matches!(flow_kind, DataFlowKind::DefinitionDependency) {
+                parts.push("dep".to_string());
+            }
             if modes.contains(AccessMode::Read) {
                 parts.push("R".to_string());
             }
@@ -96,6 +107,7 @@ fn edge_label_for(
                 Some(format!("[{}]", parts.join(",")))
             }
         }
+        Edge::DependsOn { .. } => Some("[depends_on]".into()),
         Edge::DynamicCall { .. } => Some("[dynamic]".into()),
         _ => None,
     }
@@ -343,10 +355,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
     // Sort by path length descending (longest first = deepest call chain)
     caller_paths.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-    lines.push(format!(
-        "── CALLERS ({} paths) ──",
-        caller_paths.len()
-    ));
+    lines.push(format!("── CALLERS ({} paths) ──", caller_paths.len()));
     if caller_paths.is_empty() {
         lines.push("  (none)".to_string());
     } else {
@@ -404,10 +413,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
     callee_paths.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     lines.push(String::new());
-    lines.push(format!(
-        "── CALLEES ({} paths) ──",
-        callee_paths.len()
-    ));
+    lines.push(format!("── CALLEES ({} paths) ──", callee_paths.len()));
     if callee_paths.is_empty() {
         lines.push("  (none)".to_string());
     } else {

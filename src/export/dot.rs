@@ -168,7 +168,14 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 "label=\"implements\"".to_string(),
                 "style=dashed,".to_string(),
             ),
-            Edge::DirectCall { .. } => (String::new(), String::new()),
+            Edge::DirectCall { scope, .. } => {
+                let label = match scope {
+                    crate::graph::CallScope::IntraPackage => "label=\"intra\"",
+                    crate::graph::CallScope::CrossPackage => "label=\"cross\"",
+                    crate::graph::CallScope::External => "",
+                };
+                (label.to_string(), String::new())
+            }
             Edge::TableAccess {
                 modes, write_kinds, ..
             } => {
@@ -204,6 +211,10 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 };
                 (label, format!("color={color},"))
             }
+            Edge::DependsOn { .. } => (
+                "label=\"depends_on\"".to_string(),
+                "color=darkviolet,style=dashed,".to_string(),
+            ),
             Edge::ContainsRoutine => (
                 "label=\"contains\"".to_string(),
                 "style=dotted,".to_string(),

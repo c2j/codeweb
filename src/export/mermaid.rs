@@ -153,6 +153,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                     "-.->"
                 }
             }
+            Edge::DependsOn { .. } => "-.->",
             Edge::ContainsRoutine => "-.->",
             Edge::TriggersRoutine { .. } => "==>",
             Edge::ReferencesType { .. } => "-->",

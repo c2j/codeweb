@@ -6,7 +6,8 @@ use std::sync::Arc;
 use petgraph::graph::NodeIndex;
 
 use crate::graph::{
-    AccessMode, CodeGraph, Edge, JsonMap, Node, RoutineId, RoutineKind, SourceLocation, WriteKind,
+    AccessMode, CallScope, CodeGraph, DataFlowKind, Edge, JsonMap, Node, RoutineId, RoutineKind,
+    SourceLocation, WriteKind,
 };
 use crate::import::format::{CgefDocument, CgefEdge, CgefLocation, CgefNode};
 use crate::import::path_mapper::PathMapper;
@@ -115,6 +116,8 @@ impl CgefParser {
                 Err(e) => errors.push(e),
             }
         }
+
+        Self::infer_call_scopes(&mut graph);
 
         ParsedCgef {
             graph,
@@ -553,9 +556,13 @@ impl CgefParser {
         location: Option<SourceLocation>,
     ) -> Result<Edge, ParseError> {
         match cgef.edge_type.as_str() {
-            "direct" => Ok(Edge::DirectCall {
-                location: location.unwrap_or_else(dummy_location),
-            }),
+            "direct" | "intra_call" | "cross_call" => {
+                let scope = parse_call_scope(cgef.properties.as_ref(), cgef.edge_type.as_str());
+                Ok(Edge::DirectCall {
+                    scope,
+                    location: location.unwrap_or_else(dummy_location),
+                })
+            }
             "dynamic" => {
                 let raw_expr = cgef
                     .properties
@@ -588,12 +595,17 @@ impl CgefParser {
             "table_access" => {
                 let modes = parse_access_modes(cgef.properties.as_ref());
                 let write_kinds = parse_write_kinds(cgef.properties.as_ref());
+                let flow_kind = parse_flow_kind(cgef.properties.as_ref());
                 Ok(Edge::TableAccess {
+                    flow_kind,
                     modes,
                     write_kinds,
                     location: location.unwrap_or_else(dummy_location),
                 })
             }
+            "depends_on" => Ok(Edge::DependsOn {
+                location: location.unwrap_or_else(dummy_location),
+            }),
             "contains_routine" => Ok(Edge::ContainsRoutine),
             "triggers_routine" => Ok(Edge::TriggersRoutine {
                 location: location.unwrap_or_else(dummy_location),
@@ -643,12 +655,40 @@ impl CgefParser {
             line: loc.line,
         }
     }
+
+    fn infer_call_scopes(graph: &mut CodeGraph) {
+        let edge_indices: Vec<_> = graph.edge_indices().collect();
+        for edge_idx in edge_indices {
+            if let Edge::DirectCall {
+                scope: CallScope::External,
+                ..
+            } = &graph[edge_idx]
+            {
+                let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
+                let caller_id = extract_routine_id_from_node(&graph[src]);
+                let callee_id = extract_routine_id_from_node(&graph[dst]);
+                if let (Some(caller), Some(callee)) = (caller_id, callee_id) {
+                    let inferred = crate::graph::determine_call_scope(&caller, &callee);
+                    if let Edge::DirectCall { scope, .. } = &mut graph[edge_idx] {
+                        *scope = inferred;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn dummy_location() -> SourceLocation {
     SourceLocation {
         file: Arc::new(PathBuf::new()),
         line: 0,
+    }
+}
+
+fn extract_routine_id_from_node(node: &Node) -> Option<RoutineId> {
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => Some(id.clone()),
+        _ => None,
     }
 }
 
@@ -723,6 +763,31 @@ fn parse_write_kinds(props: Option<&serde_json::Value>) -> std::collections::Has
         }
     }
     kinds
+}
+
+fn parse_call_scope(props: Option<&serde_json::Value>, edge_type: &str) -> CallScope {
+    if let Some(scope_str) = props.and_then(|p| p.get("scope")).and_then(|v| v.as_str()) {
+        match scope_str {
+            "intra" => return CallScope::IntraPackage,
+            "cross" => return CallScope::CrossPackage,
+            _ => return CallScope::External,
+        }
+    }
+    match edge_type {
+        "intra_call" => CallScope::IntraPackage,
+        "cross_call" => CallScope::CrossPackage,
+        _ => CallScope::External,
+    }
+}
+
+fn parse_flow_kind(props: Option<&serde_json::Value>) -> DataFlowKind {
+    match props
+        .and_then(|p| p.get("flow_kind"))
+        .and_then(|v| v.as_str())
+    {
+        Some("definition") => DataFlowKind::DefinitionDependency,
+        _ => DataFlowKind::DmlAccess,
+    }
 }
 
 #[cfg(test)]
@@ -889,9 +954,13 @@ mod tests {
         assert_eq!(result.graph.edge_count(), 1);
         let edge_idx = result.graph.edge_indices().next().unwrap();
         if let Edge::TableAccess {
-            modes, write_kinds, ..
+            flow_kind,
+            modes,
+            write_kinds,
+            ..
         } = &result.graph[edge_idx]
         {
+            assert!(matches!(flow_kind, DataFlowKind::DmlAccess));
             assert!(modes.contains(AccessMode::Read));
             assert!(modes.contains(AccessMode::Write));
             assert!(write_kinds.contains(&WriteKind::Insert));

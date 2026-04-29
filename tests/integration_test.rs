@@ -972,24 +972,10 @@ fn test_view_reads_from_table() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let edges = parsed["edges"].as_array().unwrap();
 
-    let view_to_table: Vec<_> = edges
-        .iter()
-        .filter(|e| e["type"] == "table_access")
-        .collect();
+    let view_to_table: Vec<_> = edges.iter().filter(|e| e["type"] == "depends_on").collect();
     assert!(
         !view_to_table.is_empty(),
-        "Expected table_access edge from view to table"
-    );
-
-    // View should only have read mode
-    let modes = view_to_table[0]["modes"].as_array().unwrap();
-    assert!(
-        modes.iter().any(|m| m == "read"),
-        "View→table edge should have read mode"
-    );
-    assert!(
-        !modes.iter().any(|m| m == "write"),
-        "View→table edge should NOT have write mode"
+        "Expected depends_on edge from view to table"
     );
 }
 
@@ -1183,13 +1169,10 @@ fn test_create_materialized_view_node() {
     assert_eq!(mview_nodes.len(), 1, "Expected 1 materialized_view node");
     assert_eq!(mview_nodes[0]["name"], "mv_summary");
 
-    let table_access: Vec<_> = edges
-        .iter()
-        .filter(|e| e["type"] == "table_access")
-        .collect();
+    let depends_on: Vec<_> = edges.iter().filter(|e| e["type"] == "depends_on").collect();
     assert!(
-        !table_access.is_empty(),
-        "Expected table_access edge from materialized view"
+        !depends_on.is_empty(),
+        "Expected depends_on edge from materialized view"
     );
 }
 
@@ -1456,5 +1439,297 @@ fn test_e2e_demo_all_object_types() {
     assert!(
         edge_types.contains("aliases_object"),
         "Expected aliases_object edges"
+    );
+}
+
+#[test]
+fn test_intra_package_call_scope() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_api AS
+            PROCEDURE do_work(p_id INT) IS
+            BEGIN
+                pkg_api.helper(p_id);
+            END;
+            PROCEDURE helper(p_id INT) IS
+            BEGIN
+                NULL;
+            END;
+        END pkg_api;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let direct_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "direct" || e["type"] == "intra_call")
+        .collect();
+    assert!(
+        !direct_edges.is_empty(),
+        "Expected at least one DirectCall edge, got: {:?}",
+        edges
+    );
+
+    let scope = direct_edges[0].get("scope").and_then(|v| v.as_str());
+    assert_eq!(
+        scope,
+        Some("intra"),
+        "Same-package call should have scope 'intra', got: {:?}",
+        direct_edges[0]
+    );
+}
+
+#[test]
+fn test_cross_package_call_scope() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_api AS
+            PROCEDURE do_work(p_id INT) IS
+            BEGIN
+                pkg_utils.format_date(SYSDATE);
+            END;
+        END pkg_api;
+
+        CREATE OR REPLACE PACKAGE BODY pkg_utils AS
+            FUNCTION format_date(d DATE) RETURN VARCHAR2 IS
+            BEGIN
+                RETURN TO_CHAR(d);
+            END;
+        END pkg_utils;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let cross_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "cross_call" || e["scope"] == "cross")
+        .collect();
+    assert!(
+        !cross_edges.is_empty(),
+        "Expected at least one cross-package DirectCall edge, got: {:?}",
+        edges
+    );
+}
+
+#[test]
+fn test_external_call_scope() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE PROCEDURE caller_proc() AS $$
+        BEGIN
+            callee_proc();
+        END;
+        $$;
+
+        CREATE PROCEDURE callee_proc() AS $$
+        BEGIN
+            NULL;
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let external_edges: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "direct" && e.get("scope").map_or(true, |s| s == "external"))
+        .collect();
+    assert!(
+        !external_edges.is_empty(),
+        "Expected at least one external DirectCall edge, got: {:?}",
+        edges
+    );
+}
+
+#[test]
+fn test_view_depends_on_table_edge() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE TABLE t_data (id INT, val VARCHAR(50));
+        CREATE VIEW v_summary AS SELECT id FROM t_data;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let depends_on: Vec<_> = edges.iter().filter(|e| e["type"] == "depends_on").collect();
+    assert!(
+        !depends_on.is_empty(),
+        "Expected depends_on edge from view to table"
+    );
+
+    let table_access: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .collect();
+    assert!(
+        table_access.is_empty(),
+        "View should NOT produce table_access edges, only depends_on"
+    );
+}
+
+#[test]
+fn test_procedure_table_access_has_flow_kind() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE TABLE t_orders (id INT, amount NUMERIC);
+        CREATE PROCEDURE sp_read_orders() AS $$
+        BEGIN
+            SELECT * FROM t_orders;
+        END;
+        $$;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let table_access: Vec<_> = edges
+        .iter()
+        .filter(|e| e["type"] == "table_access")
+        .collect();
+    assert!(!table_access.is_empty(), "Expected table_access edge");
+
+    let flow_kind = table_access[0].get("flow_kind").and_then(|v| v.as_str());
+    assert_eq!(
+        flow_kind,
+        Some("dml"),
+        "Procedure table access should have flow_kind 'dml'"
+    );
+}
+
+#[test]
+fn test_cgef_roundtrip_with_scope() {
+    let dir = TempDir::new().unwrap();
+    let cgef_json = r#"{
+        "format_version": 1,
+        "metadata": { "source": "roundtrip-test", "generated_at": "2026-04-29T00:00:00Z" },
+        "nodes": [
+            { "id": "p1", "type": "procedure", "key": {"schema": "pkg_api", "package": "pkg_api", "name": "do_work"}, "location": {"file": "pkg_api.sql", "line": 5} },
+            { "id": "p2", "type": "procedure", "key": {"schema": "pkg_api", "package": "pkg_api", "name": "helper"}, "location": {"file": "pkg_api.sql", "line": 10} }
+        ],
+        "edges": [
+            { "source": "p1", "target": "p2", "type": "direct", "location": {"file": "pkg_api.sql", "line": 7}, "properties": {"scope": "intra"} }
+        ]
+    }"#;
+    let cgef_path = dir.path().join("scope_test.json");
+    fs::write(&cgef_path, cgef_json).unwrap();
+
+    let store_path = dir.path().join("imported.bincode");
+    let import_output = run_codeweb(&[
+        "import",
+        "--file",
+        cgef_path.to_str().unwrap(),
+        "--output",
+        store_path.to_str().unwrap(),
+    ]);
+    assert!(
+        import_output.status.success(),
+        "import stderr: {}",
+        String::from_utf8_lossy(&import_output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&import_output.stderr);
+    assert!(stderr.contains("1 edges"), "Expected 1 edge: {}", stderr);
+}
+
+#[test]
+fn test_cgef_roundtrip_with_depends_on() {
+    let dir = TempDir::new().unwrap();
+    let cgef_json = r#"{
+        "format_version": 1,
+        "metadata": { "source": "roundtrip-test", "generated_at": "2026-04-29T00:00:00Z" },
+        "nodes": [
+            { "id": "v1", "type": "view", "key": {"schema": "public", "name": "v_active"}, "location": {"file": "views.sql", "line": 1} },
+            { "id": "t1", "type": "table", "key": {"schema": "public", "name": "t_users"} }
+        ],
+        "edges": [
+            { "source": "v1", "target": "t1", "type": "depends_on", "location": {"file": "views.sql", "line": 1} }
+        ]
+    }"#;
+    let cgef_path = dir.path().join("depends_test.json");
+    fs::write(&cgef_path, cgef_json).unwrap();
+
+    let store_path = dir.path().join("imported.bincode");
+    let import_output = run_codeweb(&[
+        "import",
+        "--file",
+        cgef_path.to_str().unwrap(),
+        "--output",
+        store_path.to_str().unwrap(),
+    ]);
+    assert!(
+        import_output.status.success(),
+        "import stderr: {}",
+        String::from_utf8_lossy(&import_output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&import_output.stderr);
+    assert!(
+        stderr.contains("1 edges"),
+        "Expected 1 depends_on edge: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("2 nodes"),
+        "Expected 2 nodes (view + table): {}",
+        stderr
     );
 }
