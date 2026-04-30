@@ -18,6 +18,7 @@ pub struct App {
 
     // Explorer: search + node list
     search_query: String,
+    search_mode: bool,
     nodes: Vec<NodeIndex>,
     list_state: ListState,
 
@@ -52,6 +53,7 @@ impl App {
             screen: Screen::Explorer,
             should_quit: false,
             search_query: String::new(),
+            search_mode: false,
             nodes: Vec::new(),
             list_state,
             detail_node_idx: None,
@@ -209,8 +211,34 @@ impl App {
 
     fn handle_explorer_key(&mut self, code: crossterm::event::KeyCode) {
         use crossterm::event::KeyCode;
+
+        if self.search_mode {
+            // Search mode: all keys go to search query
+            match code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.search_mode = false;
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.list_state.select(Some(0));
+                    self.refresh_node_list();
+                }
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.list_state.select(Some(0));
+                    self.refresh_node_list();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Command mode: single-key shortcuts
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('/') => {
+                self.search_mode = true;
+            }
             KeyCode::Char('2') | KeyCode::Char('i') => {
                 self.screen = Screen::Info;
                 self.info_scroll = 0;
@@ -244,11 +272,6 @@ impl App {
                 self.list_state.select(Some(0));
                 self.refresh_node_list();
             }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.list_state.select(Some(0));
-                self.refresh_node_list();
-            }
             KeyCode::Enter => {
                 if let Some(idx) = self.selected_node() {
                     self.open_detail(idx);
@@ -262,11 +285,6 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 let i = self.list_state.selected().unwrap_or(0);
                 self.list_state.select(Some(i.saturating_sub(1)));
-            }
-            KeyCode::Char(c) => {
-                self.search_query.push(c);
-                self.list_state.select(Some(0));
-                self.refresh_node_list();
             }
             _ => {}
         }
@@ -374,46 +392,56 @@ impl App {
             traverse::ChainStyle::Tree => t!("style.tree").to_string(),
             traverse::ChainStyle::Path => t!("style.path").to_string(),
         };
-        let hints: String = match self.screen {
-            Screen::Explorer => {
-                if self.filter_low_degree {
-                    t!("statusbar.explorer_filter_on",
-                        nav => t!("hint.nav"),
-                        full => t!("hint.full"),
-                        style => t!("hint.style"),
-                        style_val => &style_label,
-                        filter_on => t!("hint.filter_on"),
-                        info => t!("hint.info"),
-                        lang => t!("hint.lang"),
-                        quit => t!("hint.quit"),
-                    ).to_string()
-                } else {
-                    t!("statusbar.explorer_filter_off",
-                        nav => t!("hint.nav"),
-                        full => t!("hint.full"),
-                        style => t!("hint.style"),
-                        style_val => &style_label,
-                        filter_off => t!("hint.filter_off"),
-                        info => t!("hint.info"),
-                        lang => t!("hint.lang"),
-                        quit => t!("hint.quit"),
-                    ).to_string()
+
+        let hints: String = if self.search_mode && self.screen == Screen::Explorer {
+            t!("statusbar.explorer_search",
+                search => t!("hint.search_exit"),
+                back => t!("hint.back"),
+            ).to_string()
+        } else {
+            match self.screen {
+                Screen::Explorer => {
+                    if self.filter_low_degree {
+                        t!("statusbar.explorer_filter_on",
+                            nav => t!("hint.nav"),
+                            full => t!("hint.full"),
+                            style => t!("hint.style"),
+                            style_val => &style_label,
+                            filter_on => t!("hint.filter_on"),
+                            search => t!("hint.search"),
+                            info => t!("hint.info"),
+                            lang => t!("hint.lang"),
+                            quit => t!("hint.quit"),
+                        ).to_string()
+                    } else {
+                        t!("statusbar.explorer_filter_off",
+                            nav => t!("hint.nav"),
+                            full => t!("hint.full"),
+                            style => t!("hint.style"),
+                            style_val => &style_label,
+                            filter_off => t!("hint.filter_off"),
+                            search => t!("hint.search"),
+                            info => t!("hint.info"),
+                            lang => t!("hint.lang"),
+                            quit => t!("hint.quit"),
+                        ).to_string()
+                    }
                 }
+                Screen::Detail => t!("statusbar.detail",
+                    scroll => t!("hint.scroll"),
+                    back => t!("hint.back"),
+                    style => t!("hint.style"),
+                    style_val => &style_label,
+                    lang => t!("hint.lang"),
+                    quit => t!("hint.quit"),
+                ).to_string(),
+                Screen::Info => t!("statusbar.info",
+                    scroll => t!("hint.scroll"),
+                    back => t!("hint.back"),
+                    lang => t!("hint.lang"),
+                    quit => t!("hint.quit"),
+                ).to_string(),
             }
-            Screen::Detail => t!("statusbar.detail",
-                scroll => t!("hint.scroll"),
-                back => t!("hint.back"),
-                style => t!("hint.style"),
-                style_val => &style_label,
-                lang => t!("hint.lang"),
-                quit => t!("hint.quit"),
-            ).to_string(),
-            Screen::Info => t!("statusbar.info",
-                scroll => t!("hint.scroll"),
-                back => t!("hint.back"),
-                lang => t!("hint.lang"),
-                quit => t!("hint.quit"),
-            ).to_string(),
         };
         let bar = Paragraph::new(format!(" {}", hints))
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -427,9 +455,21 @@ impl App {
             .split(area);
 
         // Search bar
-        let input_text = format!("> {}_", self.search_query);
-        let search = Paragraph::new(input_text)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.search"))));
+        let cursor = if self.search_mode { "▏" } else { "_" };
+        let prompt = if self.search_mode {
+            format!("> {}{}", self.search_query, cursor)
+        } else if self.search_query.is_empty() {
+            format!("> {}", t!("hint.search_hint"))
+        } else {
+            format!("> {}{}", self.search_query, cursor)
+        };
+        let border_style = if self.search_mode {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let search = Paragraph::new(prompt)
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.search"))).border_style(border_style));
         f.render_widget(search, outer[0]);
 
         // Split panel: nodes | preview
