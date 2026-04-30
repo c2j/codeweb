@@ -175,15 +175,58 @@ pub fn find_nodes_by_name(
     query: &str,
 ) -> Vec<(NodeIndex, String)> {
     let lower = query.to_lowercase();
-    let mut results = Vec::new();
+    let mut results: Vec<(NodeIndex, String, MatchRank)> = Vec::new();
     for idx in graph.node_indices() {
         let key = NodeKey::from_node(&graph[idx]);
         let display = key.to_string();
-        if display.to_lowercase().contains(&lower) {
-            results.push((idx, display));
+        let display_lower = display.to_lowercase();
+        if let Some(rank) = MatchRank::classify(&lower, &display_lower) {
+            results.push((idx, display, rank));
         }
     }
-    results
+    results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+    results.into_iter().map(|(idx, display, _)| (idx, display)).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchRank {
+    Exact,
+    WordBoundary,
+    Substring,
+}
+
+impl MatchRank {
+    fn classify(query: &str, candidate: &str) -> Option<Self> {
+        if candidate == query {
+            return Some(MatchRank::Exact);
+        }
+        let name_part = candidate.split_once(':').map(|(_, n)| n).unwrap_or(candidate);
+        if name_part == query {
+            return Some(MatchRank::Exact);
+        }
+        let bare_name = name_part
+            .rsplit_once('.')
+            .map(|(_, n)| n)
+            .unwrap_or(name_part);
+        if bare_name == query {
+            return Some(MatchRank::Exact);
+        }
+        if candidate.contains(query) {
+            let idx = candidate.find(query)?;
+            let after = idx + query.len();
+            let is_word_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let at_boundary = idx == 0
+                || !is_word_char(candidate.as_bytes()[idx - 1])
+                || (after < candidate.len() && !is_word_char(candidate.as_bytes()[after]));
+            if at_boundary {
+                Some(MatchRank::WordBoundary)
+            } else {
+                Some(MatchRank::Substring)
+            }
+        } else {
+            None
+        }
+    }
 }
 
 pub fn low_degree_nodes(graph: &crate::graph::CodeGraph, max_degree: usize) -> Vec<DegreeInfo> {
@@ -448,5 +491,48 @@ pub fn format_chain(
     match style {
         ChainStyle::Tree => format_chain_tree(chain, graph),
         ChainStyle::Path => format_chain_paths(chain, graph),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_rank_exact_beats_word_boundary() {
+        let query = "func:bigfund.fnc_get_bank_account";
+        let candidate_exact = "func:bigfund.fnc_get_bank_account";
+        let candidate_longer = "func:bigfund.fnc_get_bank_account2";
+
+        let rank_exact = MatchRank::classify(query, candidate_exact).unwrap();
+        let rank_longer = MatchRank::classify(query, candidate_longer).unwrap();
+        assert!(rank_exact < rank_longer);
+    }
+
+    #[test]
+    fn match_rank_bare_name_is_exact() {
+        let query = "fnc_get_bank_account";
+        let candidate = "func:bigfund.fnc_get_bank_account";
+        let rank = MatchRank::classify(query, candidate).unwrap();
+        assert_eq!(rank, MatchRank::Exact);
+    }
+
+    #[test]
+    fn match_rank_schema_qualified_is_exact() {
+        let query = "bigfund.fnc_get_bank_account";
+        let candidate = "func:bigfund.fnc_get_bank_account";
+        let rank = MatchRank::classify(query, candidate).unwrap();
+        assert_eq!(rank, MatchRank::Exact);
+    }
+
+    #[test]
+    fn match_rank_word_boundary_beats_substring() {
+        let query = "bank";
+        let candidate_boundary = "func:bank_stuff";
+        let candidate_mid = "func:someabankc_stuff";
+
+        let rank_boundary = MatchRank::classify(query, candidate_boundary).unwrap();
+        let rank_mid = MatchRank::classify(query, candidate_mid).unwrap();
+        assert!(rank_boundary < rank_mid);
     }
 }
