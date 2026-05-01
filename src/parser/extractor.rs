@@ -88,11 +88,11 @@ impl Visitor for CallExtractor {
 
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
         match stmt {
-            PlStatement::Execute(PlExecuteStmt {
+            PlStatement::Execute(ogsql_parser::ast::Spanned { node: PlExecuteStmt {
                 parsed_query: None,
                 string_expr,
                 ..
-            }) => {
+            }, .. }) => {
                 let raw = format!("{:?}", string_expr);
                 self.push_call(&raw, true, 0);
             }
@@ -124,7 +124,7 @@ impl CallExtractor {
                 self.extract_func_from_table_ref(right);
             }
             AstTableRef::Subquery { query, .. } => {
-                let stmt = Statement::Select(query.as_ref().clone());
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: query.as_ref().clone(), span: None });
                 ogsql_parser::walk_statement(self, &stmt);
             }
             _ => {}
@@ -356,7 +356,7 @@ impl TableAccessExtractor {
                     self.extract_reads_from_table_refs(std::slice::from_ref(source));
                 }
                 AstTableRef::Subquery { query, .. } => {
-                    let stmt = Statement::Select(query.as_ref().clone());
+                    let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: query.as_ref().clone(), span: None });
                     ogsql_parser::walk_statement(self, &stmt);
                 }
                 _ => {}
@@ -378,7 +378,7 @@ impl TableAccessExtractor {
                     self.extract_writes_from_table_refs(std::slice::from_ref(source), kind);
                 }
                 AstTableRef::Subquery { query, .. } => {
-                    let stmt = Statement::Select(query.as_ref().clone());
+                    let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: query.as_ref().clone(), span: None });
                     ogsql_parser::walk_statement(self, &stmt);
                 }
                 _ => {}
@@ -426,7 +426,7 @@ impl Visitor for TableAccessExtractor {
                 for target in &insert_all.else_targets {
                     self.add_access(&target.table, AccessMode::Write, Some(WriteKind::Insert));
                 }
-                let stmt = Statement::Select(insert_all.source.as_ref().clone());
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: insert_all.source.as_ref().clone(), span: None });
                 ogsql_parser::walk_statement(self, &stmt);
             }
             Statement::InsertFirst(insert_first) => {
@@ -438,7 +438,7 @@ impl Visitor for TableAccessExtractor {
                 for target in &insert_first.else_targets {
                     self.add_access(&target.table, AccessMode::Write, Some(WriteKind::Insert));
                 }
-                let stmt = Statement::Select(insert_first.source.as_ref().clone());
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: insert_first.source.as_ref().clone(), span: None });
                 ogsql_parser::walk_statement(self, &stmt);
             }
             _ => {}
@@ -509,7 +509,7 @@ impl Visitor for TableAccessExtractor {
         self.add_access(&insert.table, AccessMode::Write, Some(write_kind));
 
         if let ogsql_parser::ast::InsertSource::Select(ref select_stmt) = insert.source {
-            let stmt = Statement::Select(select_stmt.as_ref().clone());
+            let stmt = Statement::Select(ogsql_parser::ast::Spanned { node: select_stmt.as_ref().clone(), span: None });
             ogsql_parser::walk_statement(self, &stmt);
         }
         VisitorResult::Continue
