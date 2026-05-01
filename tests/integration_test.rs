@@ -1791,3 +1791,44 @@ fn test_intra_package_bare_name_resolves() {
         "Expected a call edge from submit_entry to add_job (resolved via caller-context)"
     );
 }
+
+/// Regression: ogsql-parser #70 — CDATA with XML entities (&gt;=, &lt;=)
+/// caused infinite loop in parse_mapper_bytes_with_path.
+#[test]
+fn test_mapper_cdata_with_xml_entities_no_hang() {
+    let dir = TempDir::new().unwrap();
+
+    write_xml(
+        &dir,
+        "TestMapper.xml",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="test">
+    <select id="queryRange" parameterType="map" resultType="map">
+        <![CDATA[
+            SELECT t.model_need "modelNeed"
+            FROM dat_inst_oper_type_mode t
+            WHERE t.operation_no = #{vOperationNo}
+            AND t.inure_begin_date >= #{date}
+            AND t.inure_end_date <= #{date}
+        ]]>
+    </select>
+</mapper>"#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let nodes = json["nodes"].as_array().unwrap();
+
+    assert!(
+        nodes.len() >= 2,
+        "Expected >= 2 nodes (mapper + table), got {}",
+        nodes.len()
+    );
+}
