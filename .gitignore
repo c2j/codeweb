@@ -9,3 +9,4 @@ lib/codeweb-complex-demo/codeweb.toml
 codeweb.toml
 .codeweb
 .DS_Store
+.worktrees
