@@ -59,7 +59,10 @@ mod tests {
 
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(json.is_array());
+        assert!(json["nodes"].is_array());
+        assert!(json["total"].is_number());
+        assert_eq!(json["limit"], 100);
+        assert_eq!(json["offset"], 0);
     }
 
     #[test]

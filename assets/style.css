@@ -10,7 +10,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 #node-count{color:#a0a0a0;font-size:12px}
 #content{display:flex;flex:1;overflow:hidden}
 #node-panel{width:320px;min-width:320px;flex-shrink:0;overflow-y:auto;border-right:1px solid #0f3460;background:#16213e}
-#node-list{padding:4px 0}
+#node-list{padding:4px 0;overflow-y:auto;height:calc(100vh - 120px)}
 .node-item{display:flex;align-items:center;padding:4px 12px;cursor:pointer;font-size:13px}
 .node-item:hover{background:#1a1a5e}
 .node-item.active{background:#0f3460}

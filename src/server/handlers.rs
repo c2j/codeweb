@@ -41,6 +41,8 @@ struct NodesQuery {
     node_type: Option<String>,
     orphan: Option<bool>,
     low_degree: Option<usize>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn nodes(
@@ -93,8 +95,14 @@ async fn nodes(
         })
         .collect();
 
+    let total_count = filtered.len();
+    let limit_val = query.limit.unwrap_or(100);
+    let offset_val = query.offset.unwrap_or(0);
+
     let result: Vec<Value> = filtered
         .into_iter()
+        .skip(offset_val)
+        .take(limit_val)
         .map(|(idx, in_deg, out_deg)| {
             let key = NodeKey::from_node(&graph[idx]);
             serde_json::json!({
@@ -107,7 +115,12 @@ async fn nodes(
         })
         .collect();
 
-    Json(result)
+    Json(serde_json::json!({
+        "total": total_count,
+        "limit": limit_val,
+        "offset": offset_val,
+        "nodes": result,
+    }))
 }
 
 async fn node_detail(
