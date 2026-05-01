@@ -148,12 +148,14 @@ function showDetail(d) {
   }
   document.getElementById('detail-content').innerHTML = h;
   document.getElementById('detail-panel').classList.remove('hidden');
+  requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
 }
 
 function hideDetail() {
   document.getElementById('detail-panel').classList.add('hidden');
   selectedNodeId = null;
   renderNodeList();
+  requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
 }
 
 document.addEventListener('DOMContentLoaded', init);
