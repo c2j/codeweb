@@ -11,6 +11,7 @@ fallback_locale = "en"
 
 [features]
 default = ["cli", "tui"]
+full = ["cli", "tui", "serve"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
 serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
