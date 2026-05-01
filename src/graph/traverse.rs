@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -117,7 +118,7 @@ fn build_tree_dfs(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
     direction: Direction,
-    visited: &mut HashSet<NodeIndex>,
+    ancestors: &mut HashSet<NodeIndex>,
     depth: usize,
 ) -> Vec<TreeNode> {
     let max_depth = 50;
@@ -133,41 +134,87 @@ fn build_tree_dfs(
     let mut roots = Vec::new();
     let neighbors: Vec<NodeIndex> = graph
         .neighbors_directed(start, direction)
-        .filter(|n| !visited.contains(n))
+        .filter(|n| !ancestors.contains(n))
         .collect();
 
     for neighbor in neighbors {
-        if visited.insert(neighbor) {
-            let (from, to) = match direction {
-                Direction::Outgoing => (start, neighbor),
-                Direction::Incoming => (neighbor, start),
-            };
-            let edge_label = edge_label_for(graph, from, to);
-            let children = build_tree_dfs(graph, neighbor, direction, visited, depth + 1);
-            roots.push(TreeNode {
-                idx: neighbor,
-                edge_label,
-                children,
-            });
-        }
+        let (from, to) = match direction {
+            Direction::Outgoing => (start, neighbor),
+            Direction::Incoming => (neighbor, start),
+        };
+        let edge_label = edge_label_for(graph, from, to);
+        ancestors.insert(neighbor);
+        let children = build_tree_dfs(graph, neighbor, direction, ancestors, depth + 1);
+        ancestors.remove(&neighbor);
+        roots.push(TreeNode {
+            idx: neighbor,
+            edge_label,
+            children,
+        });
     }
     roots
 }
 
 pub fn trace_chain(graph: &crate::graph::CodeGraph, start: NodeIndex) -> CallChain {
-    let mut visited_callers = HashSet::new();
-    visited_callers.insert(start);
-    let callers = build_tree_dfs(graph, start, Direction::Incoming, &mut visited_callers, 0);
+    let mut caller_ancestors = HashSet::new();
+    caller_ancestors.insert(start);
+    let callers = build_tree_dfs(graph, start, Direction::Incoming, &mut caller_ancestors, 0);
 
-    let mut visited_callees = HashSet::new();
-    visited_callees.insert(start);
-    let callees = build_tree_dfs(graph, start, Direction::Outgoing, &mut visited_callees, 0);
+    let mut callee_ancestors = HashSet::new();
+    callee_ancestors.insert(start);
+    let callees = build_tree_dfs(graph, start, Direction::Outgoing, &mut callee_ancestors, 0);
 
     CallChain {
         target: start,
         callers,
         callees,
     }
+}
+
+/// Collect all unique source files involved in a call chain.
+///
+/// Returns a sorted list of `(file_path, node_labels)` tuples, ordered by
+/// the number of nodes in descending order (most-referenced files first).
+pub fn collect_chain_files(
+    chain: &CallChain,
+    graph: &crate::graph::CodeGraph,
+) -> Vec<(PathBuf, Vec<String>)> {
+    let mut file_nodes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+
+    fn insert_node(
+        graph: &crate::graph::CodeGraph,
+        idx: NodeIndex,
+        file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
+    ) {
+        let file = graph[idx].file();
+        if !file.as_os_str().is_empty() {
+            let key = NodeKey::from_node(&graph[idx]).to_string();
+            let entry = file_nodes.entry(file.to_path_buf()).or_default();
+            if !entry.contains(&key) {
+                entry.push(key);
+            }
+        }
+    }
+
+    fn collect_from_tree(
+        nodes: &[TreeNode],
+        graph: &crate::graph::CodeGraph,
+        file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
+    ) {
+        for node in nodes {
+            insert_node(graph, node.idx, file_nodes);
+            collect_from_tree(&node.children, graph, file_nodes);
+        }
+    }
+
+    insert_node(graph, chain.target, &mut file_nodes);
+
+    collect_from_tree(&chain.callers, graph, &mut file_nodes);
+    collect_from_tree(&chain.callees, graph, &mut file_nodes);
+
+    let mut result: Vec<_> = file_nodes.into_iter().collect();
+    result.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    result
 }
 
 pub fn find_nodes_by_name(
@@ -185,7 +232,10 @@ pub fn find_nodes_by_name(
         }
     }
     results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
-    results.into_iter().map(|(idx, display, _)| (idx, display)).collect()
+    results
+        .into_iter()
+        .map(|(idx, display, _)| (idx, display))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -200,7 +250,10 @@ impl MatchRank {
         if candidate == query {
             return Some(MatchRank::Exact);
         }
-        let name_part = candidate.split_once(':').map(|(_, n)| n).unwrap_or(candidate);
+        let name_part = candidate
+            .split_once(':')
+            .map(|(_, n)| n)
+            .unwrap_or(candidate);
         if name_part == query {
             return Some(MatchRank::Exact);
         }
