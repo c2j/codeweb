@@ -35,6 +35,7 @@ pub struct App {
     filter_low_degree: bool,
     filter_threshold: usize,
     locale_idx: usize,
+    show_chain_files: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -64,6 +65,7 @@ impl App {
             filter_low_degree: false,
             filter_threshold: 0,
             locale_idx: 0,
+            show_chain_files: false,
         };
         rust_i18n::set_locale(LOCALES[0]);
         app.refresh_node_list();
@@ -147,9 +149,7 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{:<8} ", tag),
-                Style::default()
-                    .fg(tag_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 key.to_string(),
@@ -164,7 +164,15 @@ impl App {
             .neighbors_directed(idx, petgraph::Direction::Outgoing)
             .count();
         lines.push(Line::from(Span::styled(
-            format!("{}:{} {}:{} {}:{}", t!("degree.in"), in_deg, t!("degree.out"), out_deg, t!("degree.total"), in_deg + out_deg),
+            format!(
+                "{}:{} {}:{} {}:{}",
+                t!("degree.in"),
+                in_deg,
+                t!("degree.out"),
+                out_deg,
+                t!("degree.total"),
+                in_deg + out_deg
+            ),
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(""));
@@ -187,6 +195,46 @@ impl App {
             }
         };
         lines.extend(chain_lines);
+
+        if self.show_chain_files {
+            let chain_files = traverse::collect_chain_files(&chain, graph);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("── {} ({}) ──", t!("section.files"), chain_files.len()),
+                Style::default().fg(Color::Yellow),
+            )));
+            if chain_files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t!("none").to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::DIM),
+                )));
+            } else {
+                for (file, nodes) in &chain_files {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:>3} ", nodes.len()),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw(file.to_string_lossy().to_string()),
+                    ]));
+                    let display_nodes = nodes.iter().take(8);
+                    for node_label in display_nodes {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {}", node_label),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    if nodes.len() > 8 {
+                        lines.push(Line::from(Span::styled(
+                            format!("      ... +{} more", nodes.len() - 8),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
 
         self.detail_node_idx = Some(idx);
         self.detail_lines = lines;
@@ -309,6 +357,12 @@ impl App {
                     self.open_detail(idx);
                 }
             }
+            KeyCode::Char('f') => {
+                self.show_chain_files = !self.show_chain_files;
+                if let Some(idx) = self.detail_node_idx {
+                    self.open_detail(idx);
+                }
+            }
             KeyCode::Char('\\') => {
                 self.locale_idx = (self.locale_idx + 1) % LOCALES.len();
                 rust_i18n::set_locale(LOCALES[self.locale_idx]);
@@ -397,7 +451,8 @@ impl App {
             t!("statusbar.explorer_search",
                 search => t!("hint.search_exit"),
                 back => t!("hint.back"),
-            ).to_string()
+            )
+            .to_string()
         } else {
             match self.screen {
                 Screen::Explorer => {
@@ -412,7 +467,8 @@ impl App {
                             info => t!("hint.info"),
                             lang => t!("hint.lang"),
                             quit => t!("hint.quit"),
-                        ).to_string()
+                        )
+                        .to_string()
                     } else {
                         t!("statusbar.explorer_filter_off",
                             nav => t!("hint.nav"),
@@ -424,7 +480,8 @@ impl App {
                             info => t!("hint.info"),
                             lang => t!("hint.lang"),
                             quit => t!("hint.quit"),
-                        ).to_string()
+                        )
+                        .to_string()
                     }
                 }
                 Screen::Detail => t!("statusbar.detail",
@@ -432,15 +489,18 @@ impl App {
                     back => t!("hint.back"),
                     style => t!("hint.style"),
                     style_val => &style_label,
+                    files => t!("hint.files"),
                     lang => t!("hint.lang"),
                     quit => t!("hint.quit"),
-                ).to_string(),
+                )
+                .to_string(),
                 Screen::Info => t!("statusbar.info",
                     scroll => t!("hint.scroll"),
                     back => t!("hint.back"),
                     lang => t!("hint.lang"),
                     quit => t!("hint.quit"),
-                ).to_string(),
+                )
+                .to_string(),
             }
         };
         let bar = Paragraph::new(format!(" {}", hints))
@@ -468,8 +528,12 @@ impl App {
         } else {
             Style::default()
         };
-        let search = Paragraph::new(prompt)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.search"))).border_style(border_style));
+        let search = Paragraph::new(prompt).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", t!("panel.search")))
+                .border_style(border_style),
+        );
         f.render_widget(search, outer[0]);
 
         // Split panel: nodes | preview
@@ -483,14 +547,15 @@ impl App {
             return;
         };
         let graph = store.graph();
-        let degree_map: std::collections::HashMap<NodeIndex, (usize, usize)> = if self.filter_low_degree {
-            traverse::low_degree_nodes(graph, self.filter_threshold)
-                .into_iter()
-                .map(|d| (d.idx, (d.in_degree, d.out_degree)))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        let degree_map: std::collections::HashMap<NodeIndex, (usize, usize)> =
+            if self.filter_low_degree {
+                traverse::low_degree_nodes(graph, self.filter_threshold)
+                    .into_iter()
+                    .map(|d| (d.idx, (d.in_degree, d.out_degree)))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let items: Vec<ListItem> = self
             .nodes
             .iter()
@@ -518,7 +583,10 @@ impl App {
         let list_title = if self.search_query.is_empty() {
             format!(" {} ({}) ", t!("panel.nodes"), node_count)
         } else {
-            format!(" {} ", t!("panel.nodes_matched", matched => node_count, total => graph.node_count()))
+            format!(
+                " {} ",
+                t!("panel.nodes_matched", matched => node_count, total => graph.node_count())
+            )
         };
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(list_title))
@@ -536,12 +604,19 @@ impl App {
                 }
             };
             let para = Paragraph::new(preview_lines)
-                .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.preview"))))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {} ", t!("panel.preview"))),
+                )
                 .wrap(Wrap { trim: false });
             f.render_widget(para, panels[1]);
         } else {
-            let para = Paragraph::new(t!("select_node").to_string())
-                .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.preview"))));
+            let para = Paragraph::new(t!("select_node").to_string()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", t!("panel.preview"))),
+            );
             f.render_widget(para, panels[1]);
         }
     }
@@ -572,40 +647,68 @@ impl App {
         // Stats
         let stats_lines = vec![
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.procedures")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.procedures")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.procedures)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.functions")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.functions")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.functions)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.tables")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.tables")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.tables)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.views")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.views")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.views)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.mappers")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.mappers")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.mappers)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.java_methods")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.java_methods")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.java_methods)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.edges")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.edges")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.edges)),
             ]),
             Line::from(vec![
-                Span::styled(format!("{}: ", t!("stat.files")), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}: ", t!("stat.files")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{}", stats.files)),
             ]),
         ];
         let stats_para = Paragraph::new(stats_lines)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", t!("panel.stats"))))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", t!("panel.stats"))),
+            )
             .scroll((self.info_scroll, 0));
         f.render_widget(stats_para, panels[0]);
 
@@ -641,11 +744,12 @@ impl App {
                 ]))
             })
             .collect();
-        let file_list = List::new(file_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ({}) ", t!("panel.files"), manifest.len())),
-        );
+        let file_list =
+            List::new(file_items).block(Block::default().borders(Borders::ALL).title(format!(
+                " {} ({}) ",
+                t!("panel.files"),
+                manifest.len()
+            )));
         f.render_widget(file_list, panels[1]);
     }
 
