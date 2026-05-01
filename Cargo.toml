@@ -13,6 +13,7 @@ fallback_locale = "en"
 default = ["cli", "tui"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
+serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", features = ["ibatis", "java"] }
@@ -34,6 +35,11 @@ bitflags = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 indicatif = "0.18.4"
 pathdiff = "0.2.3"
 rust-i18n = "3"

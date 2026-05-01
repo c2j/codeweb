@@ -15,6 +15,8 @@ mod parser;
 mod project;
 #[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "serve")]
+mod server;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -114,6 +116,22 @@ enum Commands {
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+    },
+
+    /// Start HTTP server
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Bind address
+        #[arg(short, long, default_value = "127.0.0.1:3000")]
+        addr: String,
+
+        /// Open browser after starting
+        #[arg(long)]
+        open: bool,
     },
 
     /// Trace complete call chain from a node
@@ -269,6 +287,8 @@ fn run() -> Result<()> {
         }) => cmd_merge(&stores, &output, &name),
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
+        #[cfg(feature = "serve")]
+        Some(Commands::Serve { project, addr, open }) => server::run(&project, &addr, open),
         Some(Commands::Trace {
             from,
             project,
