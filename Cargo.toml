@@ -17,7 +17,7 @@ tui = ["ratatui", "crossterm"]
 serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
-ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", features = ["ibatis", "java"] }
+ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", rev = "ede5645ae", features = ["ibatis", "java"] }
 petgraph = { version = "0.7", features = ["serde-1"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }

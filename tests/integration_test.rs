@@ -372,7 +372,6 @@ fn test_java_extends_implements() {
 }
 
 #[test]
-#[ignore = "upstream $$ dollar-quoting regression (ogsql-parser)"]
 fn test_e2e_full_chain() {
     let demo_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("lib")
@@ -594,7 +593,6 @@ fn test_package_body_in_call_graph() {
 }
 
 #[test]
-#[ignore = "upstream $$ dollar-quoting regression (ogsql-parser)"]
 fn test_trigger_in_call_graph() {
     let dir = TempDir::new().unwrap();
     write_sql(
@@ -1179,7 +1177,6 @@ fn test_create_materialized_view_node() {
 }
 
 #[test]
-#[ignore = "upstream $$ dollar-quoting regression (ogsql-parser)"]
 fn test_create_synonym_node_and_edge() {
     let dir = TempDir::new().unwrap();
     write_sql(
@@ -1382,7 +1379,6 @@ fn test_sequence_usage_edge_dot_nextval() {
 }
 
 #[test]
-#[ignore = "upstream $$ dollar-quoting regression (ogsql-parser)"]
 fn test_e2e_demo_all_object_types() {
     let demo_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("lib")

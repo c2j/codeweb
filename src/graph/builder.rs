@@ -2270,7 +2270,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "upstream $$ dollar-quoting regression: second statement lost after $$ (ogsql-parser)"]
     fn trigger_creates_trigger_node_and_edge() {
         let sql = r#"
             CREATE OR REPLACE FUNCTION trg_func() RETURNS TRIGGER AS $$
@@ -2787,7 +2786,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "upstream $$ dollar-quoting regression: second statement lost after $$ (ogsql-parser)"]
     fn bare_name_table_merged_into_schema_qualified() {
         let sql = r#"
             CREATE OR REPLACE PROCEDURE p1() AS $$
