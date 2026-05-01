@@ -4,3 +4,6 @@ lib/codeweb-e2e-demo/codeweb.toml
 lib/codeweb-complex-demo/sql/PACK_LOG.sql
 lib/codeweb-complex-demo/sql/PKG_DEPOSIT_ACNT_INFO_INQUIRY.sql
 lib/codeweb-complex-demo/xml/GenerateInstructionsMapper.xml
+lib/codeweb-complex-demo/.codeweb/
+lib/codeweb-complex-demo/codeweb.toml
+codeweb.toml
