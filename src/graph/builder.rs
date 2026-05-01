@@ -1324,6 +1324,24 @@ impl GraphBuilder {
                     }
 
                     None
+                })
+                .or_else(|| {
+                    // Caller-context fallback: unqualified bare name → look up in caller's package.
+                    // In PL/pgSQL, an unqualified call from within a package body first resolves
+                    // to a member of the same package.
+                    if callee_id.schema.is_none() && callee_id.package.is_none() {
+                        if let Some(caller) = &edge.caller {
+                            if let Some(pkg) = &caller.package {
+                                let name_lower = callee_id.name.to_lowercase();
+                                if let Some(&idx) =
+                                    pkg_member_lower.get(&(pkg.to_lowercase(), name_lower))
+                                {
+                                    return Some(idx);
+                                }
+                            }
+                        }
+                    }
+                    None
                 });
 
             match (caller_idx, callee_idx) {

@@ -1733,3 +1733,61 @@ fn test_cgef_roundtrip_with_depends_on() {
         stderr
     );
 }
+
+#[test]
+fn test_intra_package_bare_name_resolves() {
+    let dir = TempDir::new().unwrap();
+    write_sql(
+        &dir,
+        "test.sql",
+        r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_batch AS
+            PROCEDURE submit_entry(p_id INT) IS
+            BEGIN
+                add_job(p_id);
+            END;
+            PROCEDURE add_job(p_id INT) IS
+            BEGIN
+                NULL;
+            END;
+        END pkg_batch;
+    "#,
+    );
+
+    let output = run_codeweb(&[dir.path().to_str().unwrap(), "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    let nodes = parsed["nodes"].as_array().unwrap();
+    let edges = parsed["edges"].as_array().unwrap();
+
+    let unresolved_count = nodes.iter().filter(|n| n["kind"] == "unresolved").count();
+    assert_eq!(
+        unresolved_count, 0,
+        "Expected zero unresolved nodes, but found one — bare name 'add_job' should resolve within the same package"
+    );
+
+    let submit_idx = nodes
+        .iter()
+        .position(|n| n["name"] == "submit_entry")
+        .expect("expected submit_entry node");
+    let addjob_idx = nodes
+        .iter()
+        .position(|n| n["name"] == "add_job")
+        .expect("expected add_job node");
+
+    let has_edge = edges.iter().any(|e| {
+        e["type"] != "contains"
+            && e["source"] == serde_json::Value::from(submit_idx as u64)
+            && e["target"] == serde_json::Value::from(addjob_idx as u64)
+    });
+    assert!(
+        has_edge,
+        "Expected a call edge from submit_entry to add_job (resolved via caller-context)"
+    );
+}
