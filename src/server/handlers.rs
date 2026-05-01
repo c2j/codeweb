@@ -43,7 +43,10 @@ struct NodesQuery {
     low_degree: Option<usize>,
 }
 
-async fn nodes(State(state): State<AppState>, Query(query): Query<NodesQuery>) -> impl IntoResponse {
+async fn nodes(
+    State(state): State<AppState>,
+    Query(query): Query<NodesQuery>,
+) -> impl IntoResponse {
     let graph = state.graph();
     let max_degree = if query.orphan == Some(true) {
         Some(0)
@@ -200,10 +203,7 @@ async fn trace(
 async fn graph_data(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     let graph = state.graph();
     match crate::export::json::to_json(graph) {
-        Ok(json) => Ok((
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )),
+        Ok(json) => Ok(([(header::CONTENT_TYPE, "application/json")], json)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

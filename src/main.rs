@@ -13,10 +13,10 @@ mod parse_log;
 mod parser;
 #[allow(dead_code)]
 mod project;
-#[cfg(feature = "tui")]
-mod tui;
 #[cfg(feature = "serve")]
 mod server;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -288,7 +288,11 @@ fn run() -> Result<()> {
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
         #[cfg(feature = "serve")]
-        Some(Commands::Serve { project, addr, open }) => server::run(&project, &addr, open),
+        Some(Commands::Serve {
+            project,
+            addr,
+            open,
+        }) => server::run(&project, &addr, open),
         Some(Commands::Trace {
             from,
             project,

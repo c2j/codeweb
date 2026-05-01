@@ -28,7 +28,10 @@ mod tests {
         let url = format!("http://127.0.0.1:{}{}", port, path);
         let resp = minreq::get(&url).send();
         match resp {
-            Ok(r) => (r.status_code as u16, r.as_str().unwrap_or_default().to_string()),
+            Ok(r) => (
+                r.status_code as u16,
+                r.as_str().unwrap_or_default().to_string(),
+            ),
             Err(e) => panic!("request failed: {}", e),
         }
     }

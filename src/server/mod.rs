@@ -13,26 +13,25 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
     let _ = proj.load_store()?;
     let state = state::AppState::new(proj);
 
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-        crate::error::CodeWebError::ExportError {
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| crate::error::CodeWebError::ExportError {
             message: format!("failed to create tokio runtime: {}", e),
-        }
-    })?;
+        })?;
 
     runtime.block_on(async {
         let app = handlers::router(state);
 
-        let socket_addr: SocketAddr = addr.parse().map_err(|e| {
-            crate::error::CodeWebError::ExportError {
-                message: format!("invalid address '{}': {}", addr, e),
-            }
-        })?;
+        let socket_addr: SocketAddr =
+            addr.parse()
+                .map_err(|e| crate::error::CodeWebError::ExportError {
+                    message: format!("invalid address '{}': {}", addr, e),
+                })?;
 
-        let listener = tokio::net::TcpListener::bind(socket_addr).await.map_err(|e| {
-            crate::error::CodeWebError::ExportError {
+        let listener = tokio::net::TcpListener::bind(socket_addr)
+            .await
+            .map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("failed to bind to {}: {}", addr, e),
-            }
-        })?;
+            })?;
 
         eprintln!("Server listening on http://{}", socket_addr);
 
@@ -41,11 +40,11 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
             let _ = open_browser_url(&url);
         }
 
-        axum::serve(listener, app).await.map_err(|e| {
-            crate::error::CodeWebError::ExportError {
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("server error: {}", e),
-            }
-        })
+            })
     })
 }
 
