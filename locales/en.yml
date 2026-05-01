@@ -26,10 +26,13 @@ hint.search: "Search"
 hint.search_hint: "Press [/] to search..."
 hint.search_exit: "Search (Esc to exit)"
 
+section.files: "FILES"
+hint.files: "Files"
+
 statusbar.explorer_search: "[Type]%{search}  [Esc]%{back}"
 statusbar.explorer_filter_on: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_on} [+/-]  [/]%{search}  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
 statusbar.explorer_filter_off: "[↑↓]%{nav}  [Enter]%{full}  [S]%{style}:%{style_val}  [L]%{filter_off}  [/]%{search}  [2]%{info}  [\\]%{lang}  [Q]%{quit}"
-statusbar.detail: "[↑↓]%{scroll}  [Esc]%{back}  [S]%{style}:%{style_val}  [\\]%{lang}  [Q]%{quit}"
+statusbar.detail: "[↑↓]%{scroll}  [Esc]%{back}  [S]%{style}:%{style_val}  [F]%{files}  [\\]%{lang}  [Q]%{quit}"
 statusbar.info: "[↑↓]%{scroll}  [Esc]%{back}  [\\]%{lang}  [Q]%{quit}"
 
 callers: "── CALLERS ──"
