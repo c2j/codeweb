@@ -65,8 +65,7 @@ impl GraphStore {
             .map(|idx| (NodeKey::from_node(&graph[idx]), idx))
             .collect();
 
-        let mut node_summaries: Vec<NodeSummary> =
-            Vec::with_capacity(graph.node_count());
+        let mut node_summaries: Vec<NodeSummary> = Vec::with_capacity(graph.node_count());
         for idx in graph.node_indices() {
             let key = NodeKey::from_node(&graph[idx]);
             let key_str = key.to_string();
