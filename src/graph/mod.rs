@@ -377,6 +377,32 @@ pub enum Node {
     },
 }
 
+/// Returns the short type tag string for a node (e.g. "proc", "table", "mapper").
+pub fn node_type_tag(node: &Node) -> &'static str {
+    match node {
+        Node::Procedure { partial: true, .. } => "proc*",
+        Node::Procedure { .. } => "proc",
+        Node::Function { partial: true, .. } => "func*",
+        Node::Function { .. } => "func",
+        Node::Unresolved { .. } => "unres",
+        Node::MappedStatement { .. } => "mapper",
+        Node::JavaSql { .. } => "sql",
+        Node::JavaMethod { .. } => "method",
+        Node::JavaClass { .. } => "class",
+        Node::Table { .. } => "table",
+        Node::View { .. } => "view",
+        Node::Package { .. } => "pkg",
+        Node::Trigger { .. } => "trigger",
+        Node::Type { .. } => "type",
+        Node::Sequence { .. } => "seq",
+        Node::Index { .. } => "index",
+        Node::MaterializedView { .. } => "mview",
+        Node::Synonym { .. } => "synonym",
+        Node::Event { .. } => "event",
+        Node::Custom { .. } => "custom",
+    }
+}
+
 /// An edge in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]

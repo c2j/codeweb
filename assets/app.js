@@ -36,7 +36,7 @@ async function init() {
 
   const si = document.getElementById('search-input');
   let t;
-  si.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => loadNodes(si.value), 200); });
+  si.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => loadNodes(si.value), 500); });
 
   document.addEventListener('keydown', e => {
     if (e.key === '/' && document.activeElement !== si) { e.preventDefault(); si.focus(); }
