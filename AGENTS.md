@@ -51,6 +51,8 @@ CLI: `codeweb analyze`, `codeweb trace --from <node> --direction forward|backwar
 - **Graph**: `petgraph` (in-memory), export to DOT/JSON/Mermaid
 - **Java parsing**: `tree-sitter-java` (ogsql-parser already depends on it)
 - **XML parsing**: `quick-xml` via ogsql-parser `ibatis` feature
+- **HTTP serve**: `axum` + `tokio` + `tower-http` (feature-gated behind `serve`)
+- **Browser UI**: Cytoscape.js + dagre layout (embedded via `rust-embed`)
 
 ## Conventions
 
@@ -64,8 +66,11 @@ CLI: `codeweb analyze`, `codeweb trace --from <node> --direction forward|backwar
 
 ```sh
 cargo build                  # build
+cargo build --features serve # build with HTTP server + browser UI
 cargo test                   # run all tests
+cargo test --features serve  # run all tests including serve integration tests
 cargo test --test <name>     # run single integration test
 cargo clippy -- -D warnings  # lint (CI-gating level)
+cargo clippy --features serve -- -D warnings  # lint with serve feature
 cargo fmt -- --check         # format check
 ```

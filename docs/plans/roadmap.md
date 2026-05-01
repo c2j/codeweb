@@ -687,7 +687,7 @@ codeweb query      # 查询调用链
 codeweb trace      # 从指定节点双向追踪
 codeweb stats      # 统计报告
 codeweb export     # 导出图到各种格式
-codeweb serve      # 启动 HTTP API（可选）
+codeweb serve      # 启动 HTTP API + 浏览器交互式图可视化（已实现，需 `serve` feature）
 
 # 全局选项
 codeweb --config codeweb.toml  # 配置文件支持

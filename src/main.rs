@@ -118,18 +118,24 @@ enum Commands {
         project: PathBuf,
     },
 
-    /// Start HTTP server
+    /// Start HTTP server with browser-based graph viewer
+    ///
+    /// Launches a local web server that serves an interactive UI for exploring
+    /// the code graph. The UI provides a node list with search, a Cytoscape.js
+    /// graph canvas with dagre layout, and a detail panel showing callers/callees.
+    ///
+    /// Requires the "serve" feature flag: cargo run --features serve -- serve
     #[cfg(feature = "serve")]
     Serve {
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
 
-        /// Bind address
+        /// Bind address (host:port)
         #[arg(short, long, default_value = "127.0.0.1:3000")]
         addr: String,
 
-        /// Open browser after starting
+        /// Open browser automatically after server starts
         #[arg(long)]
         open: bool,
     },
