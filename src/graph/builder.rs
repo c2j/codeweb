@@ -177,7 +177,7 @@ impl GraphBuilder {
                                 PackageItem::Function(f) => {
                                     (f.name.join("."), RoutineKind::Function)
                                 }
-                                PackageItem::Raw(_) => continue,
+                                PackageItem::Raw(_) | PackageItem::Variable(_) => continue,
                             };
                             spec_decls.push((pkg_name.clone(), name, kind));
                         }
@@ -198,7 +198,7 @@ impl GraphBuilder {
                             let name = match item {
                                 PackageItem::Procedure(p) => p.name.join("."),
                                 PackageItem::Function(f) => f.name.join("."),
-                                PackageItem::Raw(_) => continue,
+                                PackageItem::Raw(_) | PackageItem::Variable(_) => continue,
                             };
                             body_impls.push((pkg_name.clone(), name));
                         }
@@ -268,7 +268,10 @@ impl GraphBuilder {
                         }
 
                         let mut extractor = crate::parser::TableAccessExtractor::new();
-                        let wrapped = Statement::Select(v.query.as_ref().clone());
+                        let wrapped = Statement::Select(ogsql_parser::ast::Spanned {
+                            node: v.query.as_ref().clone(),
+                            span: None,
+                        });
                         walk_statement(&mut extractor, &wrapped);
 
                         for access in &extractor.accesses {
@@ -642,7 +645,10 @@ impl GraphBuilder {
                         }
 
                         let mut extractor = crate::parser::TableAccessExtractor::new();
-                        let wrapped = Statement::Select(v.query.as_ref().clone());
+                        let wrapped = Statement::Select(ogsql_parser::ast::Spanned {
+                            node: v.query.as_ref().clone(),
+                            span: None,
+                        });
                         walk_statement(&mut extractor, &wrapped);
 
                         for access in &extractor.accesses {
@@ -848,7 +854,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) => continue,
             };
             let Some(_block) = block else {
                 continue;
@@ -1150,7 +1156,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
@@ -1235,7 +1241,7 @@ impl GraphBuilder {
                         walk_pl_block(extractor, block);
                     }
                 }
-                PackageItem::Raw(_) => {}
+                PackageItem::Raw(_) | PackageItem::Variable(_) => {}
             }
         }
     }
@@ -1599,7 +1605,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
@@ -1615,8 +1621,11 @@ impl GraphBuilder {
                         start_col: 0,
                         end_line: info.end_line,
                         end_col: 0,
-                        statement: Statement::AnonyBlock(ogsql_parser::ast::AnonyBlockStatement {
-                            block: block.clone(),
+                        statement: Statement::AnonyBlock(ogsql_parser::ast::Spanned {
+                            node: ogsql_parser::ast::AnonyBlockStatement {
+                                block: block.clone(),
+                            },
+                            span: None,
                         }),
                     };
                     Self::collect_table_access_from_statements(
@@ -2544,26 +2553,29 @@ mod tests {
             start_col: 0,
             end_line: 5,
             end_col: 0,
-            statement: ogsql_parser::ast::Statement::CreatePackage(CreatePackageStatement {
-                replace: true,
-                name: vec!["pkg_test".into()],
-                authid: None,
-                items: vec![
-                    PackageItem::Procedure(PackageProcedure {
-                        name: vec!["prc_found".into()],
-                        parameters: vec![],
-                        block: None,
-                        start_line: 2,
-                        end_line: 2,
-                    }),
-                    PackageItem::Procedure(PackageProcedure {
-                        name: vec!["prc_missing".into()],
-                        parameters: vec![],
-                        block: None,
-                        start_line: 3,
-                        end_line: 3,
-                    }),
-                ],
+            statement: ogsql_parser::ast::Statement::CreatePackage(ogsql_parser::ast::Spanned {
+                node: CreatePackageStatement {
+                    replace: true,
+                    name: vec!["pkg_test".into()],
+                    authid: None,
+                    items: vec![
+                        PackageItem::Procedure(PackageProcedure {
+                            name: vec!["prc_found".into()],
+                            parameters: vec![],
+                            block: None,
+                            start_line: 2,
+                            end_line: 2,
+                        }),
+                        PackageItem::Procedure(PackageProcedure {
+                            name: vec!["prc_missing".into()],
+                            parameters: vec![],
+                            block: None,
+                            start_line: 3,
+                            end_line: 3,
+                        }),
+                    ],
+                },
+                span: None,
             }),
         };
 
@@ -2574,22 +2586,25 @@ mod tests {
             end_line: 20,
             end_col: 0,
             statement: ogsql_parser::ast::Statement::CreatePackageBody(
-                CreatePackageBodyStatement {
-                    replace: true,
-                    name: vec!["pkg_test".into()],
-                    items: vec![PackageItem::Procedure(PackageProcedure {
-                        name: vec!["prc_found".into()],
-                        parameters: vec![],
-                        block: Some(ogsql_parser::ast::plpgsql::PlBlock {
-                            label: None,
-                            declarations: vec![],
-                            body: vec![],
-                            exception_block: None,
-                            end_label: None,
-                        }),
-                        start_line: 8,
-                        end_line: 18,
-                    })],
+                ogsql_parser::ast::Spanned {
+                    node: CreatePackageBodyStatement {
+                        replace: true,
+                        name: vec!["pkg_test".into()],
+                        items: vec![PackageItem::Procedure(PackageProcedure {
+                            name: vec!["prc_found".into()],
+                            parameters: vec![],
+                            block: Some(ogsql_parser::ast::plpgsql::PlBlock {
+                                label: None,
+                                declarations: vec![],
+                                body: vec![],
+                                exception_block: None,
+                                end_label: None,
+                            }),
+                            start_line: 8,
+                            end_line: 18,
+                        })],
+                    },
+                    span: None,
                 },
             ),
         };

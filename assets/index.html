@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>codeweb</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <span id="title">codeweb</span>
+      <span id="project-name"></span>
+      <div id="search-bar">
+        <input type="text" id="search-input" placeholder="Search nodes... (press /)">
+        <span id="node-count"></span>
+      </div>
+    </div>
+    <div id="content">
+      <div id="node-panel">
+        <div id="node-list"></div>
+      </div>
+      <div id="graph-panel">
+        <div id="cy"></div>
+      </div>
+      <div id="detail-panel" class="hidden">
+        <div id="detail-header">
+          <button id="detail-close">&times;</button>
+          <span id="detail-title"></span>
+        </div>
+        <div id="detail-content"></div>
+      </div>
+    </div>
+    <div id="stats-bar"></div>
+  </div>
+  <script src="/cytoscape.min.js"></script>
+  <script src="/dagre.min.js"></script>
+  <script src="/cytoscape-dagre.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

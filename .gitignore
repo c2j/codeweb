@@ -7,3 +7,6 @@ lib/codeweb-complex-demo/xml/GenerateInstructionsMapper.xml
 lib/codeweb-complex-demo/.codeweb/
 lib/codeweb-complex-demo/codeweb.toml
 codeweb.toml
+.codeweb
+.DS_Store
+.worktrees

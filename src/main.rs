@@ -13,6 +13,8 @@ mod parse_log;
 mod parser;
 #[allow(dead_code)]
 mod project;
+#[cfg(feature = "serve")]
+mod server;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -116,6 +118,28 @@ enum Commands {
         project: PathBuf,
     },
 
+    /// Start HTTP server with browser-based graph viewer
+    ///
+    /// Launches a local web server that serves an interactive UI for exploring
+    /// the code graph. The UI provides a node list with search, a Cytoscape.js
+    /// graph canvas with dagre layout, and a detail panel showing callers/callees.
+    ///
+    /// Requires the "serve" feature flag: cargo run --features serve -- serve
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Bind address (host:port)
+        #[arg(short, long, default_value = "127.0.0.1:3000")]
+        addr: String,
+
+        /// Open browser automatically after server starts
+        #[arg(long)]
+        open: bool,
+    },
+
     /// Trace complete call chain from a node
     Trace {
         /// Node name to search for (substring match)
@@ -210,6 +234,10 @@ enum Commands {
         /// Display style for call chain output
         #[arg(short, long, default_value = "tree", value_parser = ["tree", "path"])]
         style: String,
+
+        /// Show source files involved in the upstream/downstream chain
+        #[arg(short, long)]
+        files: bool,
     },
 }
 
@@ -269,6 +297,12 @@ fn run() -> Result<()> {
         }) => cmd_merge(&stores, &output, &name),
         #[cfg(feature = "tui")]
         Some(Commands::Tui { project }) => cmd_tui(&project),
+        #[cfg(feature = "serve")]
+        Some(Commands::Serve {
+            project,
+            addr,
+            open,
+        }) => server::run(&project, &addr, open),
         Some(Commands::Trace {
             from,
             project,
@@ -297,7 +331,8 @@ fn run() -> Result<()> {
             name,
             project,
             style,
-        }) => cmd_detail(&name, &project, &style),
+            files,
+        }) => cmd_detail(&name, &project, &style, files),
         Some(Commands::Import {
             file,
             output,
@@ -636,7 +671,7 @@ fn is_partial(node: &Node) -> bool {
     )
 }
 
-fn cmd_detail(name: &str, project: &Path, style: &str) -> Result<()> {
+fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
     let graph = store.graph();
@@ -680,6 +715,25 @@ fn cmd_detail(name: &str, project: &Path, style: &str) -> Result<()> {
         "{}",
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
+
+    if show_files {
+        let chain_files = graph::traverse::collect_chain_files(&chain, graph);
+        println!();
+        println!("── FILES ({}) ──", chain_files.len());
+        if chain_files.is_empty() {
+            println!("  (none)");
+        } else {
+            for (file, nodes) in &chain_files {
+                println!("  {:>3}  {}", nodes.len(), file.to_string_lossy());
+                for node_label in nodes.iter().take(8) {
+                    println!("       {}", node_label);
+                }
+                if nodes.len() > 8 {
+                    println!("       ... +{} more", nodes.len() - 8);
+                }
+            }
+        }
+    }
 
     Ok(())
 }

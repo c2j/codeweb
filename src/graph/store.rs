@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphStore {
     pub version: u32,
     pub project_name: String,
@@ -463,7 +463,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct StoreStats {
     pub procedures: usize,
     pub functions: usize,
