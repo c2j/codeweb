@@ -1,7 +1,10 @@
-// codeweb browser UI
 let cy = null;
 let allNodes = [];
+let allNodesTotal = 0;
 let selectedNodeId = null;
+
+const ITEM_HEIGHT = 36;
+const BUFFER = 5;
 
 const TAG_COLORS = {
   proc: '#4caf50', 'proc*': '#388e3c', func: '#8bc34a', 'func*': '#689f38',
@@ -33,7 +36,7 @@ async function init() {
 
   const si = document.getElementById('search-input');
   let t;
-  si.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => loadNodes(si.value), 200); });
+  si.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => loadNodes(si.value), 500); });
 
   document.addEventListener('keydown', e => {
     if (e.key === '/' && document.activeElement !== si) { e.preventDefault(); si.focus(); }
@@ -44,27 +47,53 @@ async function init() {
 }
 
 async function loadNodes(search) {
-  const data = await api('/nodes' + (search ? '?search=' + encodeURIComponent(search) : ''));
-  allNodes = data;
-  renderNodeList();
-  document.getElementById('node-count').textContent = allNodes.length + ' nodes';
+  const data = await api('/nodes?limit=100&offset=0' + (search ? '&search=' + encodeURIComponent(search) : ''));
+  allNodes = data.nodes;
+  allNodesTotal = data.total;
+  renderVirtualList();
+  updateNodeCount();
 }
 
-function renderNodeList() {
-  document.getElementById('node-list').innerHTML = allNodes.map(n =>
-    '<div class="node-item' + (n.id === selectedNodeId ? ' active' : '') +
-    '" onclick="selectNode(' + n.id + ')" data-id="' + n.id + '">' +
-    '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
-    '<span class="node-key" title="' + esc(n.key) + '">' + esc(n.key) + '</span>' +
-    '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span></div>'
-  ).join('');
+function updateNodeCount() {
+  const el = document.getElementById('node-count');
+  if (allNodesTotal > allNodes.length) {
+    el.textContent = allNodesTotal + ' nodes (showing ' + allNodes.length + ')';
+  } else {
+    el.textContent = allNodesTotal + ' nodes';
+  }
+}
+
+function renderVirtualList() {
+  const list = document.getElementById('node-list');
+  const scrollTop = list.scrollTop;
+  const viewHeight = list.clientHeight;
+  const count = allNodes.length;
+
+  const startIdx = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER);
+  const endIdx = Math.min(count, Math.ceil((scrollTop + viewHeight) / ITEM_HEIGHT) + BUFFER);
+
+  const totalHeight = count * ITEM_HEIGHT;
+
+  let html = '<div style="height:' + totalHeight + 'px;position:relative">';
+  for (let i = startIdx; i < endIdx; i++) {
+    const n = allNodes[i];
+    if (!n) continue;
+    html += '<div class="node-item' + (n.id === selectedNodeId ? ' active' : '') +
+      '" style="position:absolute;top:' + (i * ITEM_HEIGHT) + 'px;left:0;right:0;height:' + ITEM_HEIGHT + 'px"' +
+      ' onclick="selectNode(' + n.id + ')" data-id="' + n.id + '">' +
+      '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
+      '<span class="node-key" title="' + esc(n.key) + '">' + esc(n.key) + '</span>' +
+      '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span></div>';
+  }
+  html += '</div>';
+  list.innerHTML = html;
 }
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 async function selectNode(id) {
   selectedNodeId = id;
-  renderNodeList();
+  renderVirtualList();
   const node = allNodes.find(n => n.id === id);
   if (!node) return;
 
@@ -103,7 +132,6 @@ function renderTraceGraph(trace) {
   const els = [];
   const seen = new Set();
 
-  // target node
   els.push({ data: { id: String(trace.target.id), label: trace.target.key, color: TAG_COLORS[trace.target.type] || '#999' }, classes: 'target' });
   seen.add(trace.target.id);
 
@@ -154,8 +182,9 @@ function showDetail(d) {
 function hideDetail() {
   document.getElementById('detail-panel').classList.add('hidden');
   selectedNodeId = null;
-  renderNodeList();
+  renderVirtualList();
   requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
 }
 
+document.getElementById('node-list').addEventListener('scroll', renderVirtualList);
 document.addEventListener('DOMContentLoaded', init);

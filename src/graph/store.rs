@@ -1,4 +1,5 @@
 use crate::graph::key::NodeKey;
+use crate::graph::node_type_tag;
 use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
@@ -6,6 +7,17 @@ use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Pre-computed lightweight summary of a graph node for fast listing/filtering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSummary {
+    pub id: usize,
+    pub key: String,
+    pub key_lower: String,
+    pub type_tag: String,
+    pub in_degree: usize,
+    pub out_degree: usize,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +29,7 @@ pub struct GraphStore {
 
     graph: CodeGraph,
     node_key_index: HashMap<NodeKey, NodeIndex>,
+    node_summaries: Vec<NodeSummary>,
 
     file_nodes: HashMap<PathBuf, Vec<NodeKey>>,
     file_edges: HashMap<PathBuf, Vec<(NodeKey, NodeKey)>>,
@@ -36,6 +49,7 @@ impl GraphStore {
             updated_at: now,
             graph: CodeGraph::new(),
             node_key_index: HashMap::new(),
+            node_summaries: Vec::new(),
             file_nodes: HashMap::new(),
             file_edges: HashMap::new(),
             reverse_deps: HashMap::new(),
@@ -50,6 +64,26 @@ impl GraphStore {
             .node_indices()
             .map(|idx| (NodeKey::from_node(&graph[idx]), idx))
             .collect();
+
+        let mut node_summaries: Vec<NodeSummary> = Vec::with_capacity(graph.node_count());
+        for idx in graph.node_indices() {
+            let key = NodeKey::from_node(&graph[idx]);
+            let key_str = key.to_string();
+            let in_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
+            node_summaries.push(NodeSummary {
+                id: idx.index(),
+                key: key_str.clone(),
+                key_lower: key_str.to_lowercase(),
+                type_tag: node_type_tag(&graph[idx]).to_string(),
+                in_degree: in_deg,
+                out_degree: out_deg,
+            });
+        }
 
         let mut file_nodes: HashMap<PathBuf, Vec<NodeKey>> = HashMap::new();
         for idx in graph.node_indices() {
@@ -88,6 +122,7 @@ impl GraphStore {
             updated_at: now,
             graph,
             node_key_index,
+            node_summaries,
             file_nodes,
             file_edges,
             reverse_deps,
@@ -97,6 +132,10 @@ impl GraphStore {
 
     pub fn graph(&self) -> &CodeGraph {
         &self.graph
+    }
+
+    pub fn node_summaries(&self) -> &[NodeSummary] {
+        &self.node_summaries
     }
 
     pub fn node_key_index(&self) -> &HashMap<NodeKey, NodeIndex> {

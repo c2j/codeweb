@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
@@ -12,8 +10,9 @@ use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
 use crate::graph::key::NodeKey;
+use crate::graph::node_type_tag;
 use crate::graph::traverse::{self, TreeNode};
-use crate::graph::{CodeGraph, Node};
+use crate::graph::CodeGraph;
 
 use super::state::AppState;
 
@@ -41,13 +40,14 @@ struct NodesQuery {
     node_type: Option<String>,
     orphan: Option<bool>,
     low_degree: Option<usize>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn nodes(
     State(state): State<AppState>,
     Query(query): Query<NodesQuery>,
 ) -> impl IntoResponse {
-    let graph = state.graph();
     let max_degree = if query.orphan == Some(true) {
         Some(0)
     } else {
@@ -55,59 +55,61 @@ async fn nodes(
     };
 
     let type_filter = query.node_type.map(|t| t.to_lowercase());
+    let search_lower = query.search.map(|s| s.to_lowercase());
 
-    let indices: Vec<NodeIndex> = if let Some(search) = query.search {
-        let matches = traverse::find_nodes_by_name(graph, &search);
-        matches.into_iter().map(|(idx, _)| idx).collect()
-    } else {
-        graph.node_indices().collect()
-    };
+    let summaries = state.store().node_summaries();
 
-    let filtered: Vec<_> = indices
-        .into_iter()
-        .filter(|idx| {
+    let filtered: Vec<_> = summaries
+        .iter()
+        .filter(|s| {
             if let Some(ref tf) = type_filter {
-                let tag = node_type_tag(&graph[*idx]).to_lowercase();
-                if tag != *tf {
+                if s.type_tag != *tf {
+                    return false;
+                }
+            }
+            if let Some(ref sl) = search_lower {
+                if !s.key_lower.contains(sl) {
                     return false;
                 }
             }
             true
         })
-        .filter_map(|idx| {
-            let in_deg = graph
-                .neighbors_directed(idx, petgraph::Direction::Incoming)
-                .count();
-            let out_deg = graph
-                .neighbors_directed(idx, petgraph::Direction::Outgoing)
-                .count();
-            let total = in_deg + out_deg;
-
+        .filter(|s| {
             if let Some(max) = max_degree {
+                let total = s.in_degree + s.out_degree;
                 if total > max {
-                    return None;
+                    return false;
                 }
             }
-
-            Some((idx, in_deg, out_deg))
+            true
         })
         .collect();
 
+    let total_count = filtered.len();
+    let limit_val = query.limit.unwrap_or(100);
+    let offset_val = query.offset.unwrap_or(0);
+
     let result: Vec<Value> = filtered
         .into_iter()
-        .map(|(idx, in_deg, out_deg)| {
-            let key = NodeKey::from_node(&graph[idx]);
+        .skip(offset_val)
+        .take(limit_val)
+        .map(|s| {
             serde_json::json!({
-                "id": idx.index(),
-                "key": key.to_string(),
-                "type": node_type_tag(&graph[idx]),
-                "in_degree": in_deg,
-                "out_degree": out_deg,
+                "id": s.id,
+                "key": &s.key,
+                "type": &s.type_tag,
+                "in_degree": s.in_degree,
+                "out_degree": s.out_degree,
             })
         })
         .collect();
 
-    Json(result)
+    Json(serde_json::json!({
+        "total": total_count,
+        "limit": limit_val,
+        "offset": offset_val,
+        "nodes": result,
+    }))
 }
 
 async fn node_detail(
@@ -263,31 +265,6 @@ async fn files(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
 
     Json(result)
-}
-
-fn node_type_tag(node: &Node) -> Cow<'static, str> {
-    match node {
-        Node::Procedure { partial: true, .. } => Cow::Borrowed("proc*"),
-        Node::Procedure { .. } => Cow::Borrowed("proc"),
-        Node::Function { partial: true, .. } => Cow::Borrowed("func*"),
-        Node::Function { .. } => Cow::Borrowed("func"),
-        Node::Unresolved { .. } => Cow::Borrowed("unres"),
-        Node::MappedStatement { .. } => Cow::Borrowed("mapper"),
-        Node::JavaSql { .. } => Cow::Borrowed("sql"),
-        Node::JavaMethod { .. } => Cow::Borrowed("method"),
-        Node::JavaClass { .. } => Cow::Borrowed("class"),
-        Node::Table { .. } => Cow::Borrowed("table"),
-        Node::View { .. } => Cow::Borrowed("view"),
-        Node::Package { .. } => Cow::Borrowed("pkg"),
-        Node::Trigger { .. } => Cow::Borrowed("trigger"),
-        Node::Type { .. } => Cow::Borrowed("type"),
-        Node::Sequence { .. } => Cow::Borrowed("seq"),
-        Node::Index { .. } => Cow::Borrowed("index"),
-        Node::MaterializedView { .. } => Cow::Borrowed("mview"),
-        Node::Synonym { .. } => Cow::Borrowed("synonym"),
-        Node::Event { .. } => Cow::Borrowed("event"),
-        Node::Custom { type_name, .. } => Cow::Owned(type_name.clone()),
-    }
 }
 
 fn tree_nodes_to_json(nodes: &[TreeNode], graph: &CodeGraph) -> Vec<Value> {
