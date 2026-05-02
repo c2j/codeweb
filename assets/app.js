@@ -5,6 +5,7 @@ let selectedNodeId = null;
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
+const TRACE_GRAPH_THRESHOLD = 300;
 
 const TAG_COLORS = {
   proc: '#4caf50', 'proc*': '#388e3c', func: '#8bc34a', 'func*': '#689f38',
@@ -129,6 +130,16 @@ function initGraph() {
 function renderTraceGraph(trace) {
   if (!cy) return;
   cy.elements().remove();
+  const totalCount = (trace.caller_count || 0) + (trace.callee_count || 0);
+  if (totalCount > TRACE_GRAPH_THRESHOLD) {
+    document.getElementById('cy').innerHTML =
+      '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#a0a0a0;text-align:center;padding:20px;">' +
+      '<div style="font-size:48px;font-weight:700;color:#e94560;margin-bottom:12px;">' + totalCount + '</div>' +
+      '<div style="font-size:14px;">upstream/downstream nodes — graph view hidden for large counts. Use the detail panel to browse.</div>' +
+      '</div>';
+    return;
+  }
+  document.getElementById('cy').innerHTML = '';
   const els = [];
   const seen = new Set();
 
@@ -162,21 +173,47 @@ function showDetail(d) {
   document.getElementById('detail-title').textContent = d.type + ' ' + d.key;
   let h = '<div class="section-title first">Degree</div>';
   h += '<div>in:' + d.in_degree + ' out:' + d.out_degree + ' total:' + (d.in_degree + d.out_degree) + '</div>';
-  if (d.callers && d.callers.length) {
-    h += '<div class="section-title">Callers (' + d.callers.length + ')</div>';
-    d.callers.forEach(c => {
-      h += '<div class="detail-node" onclick="selectNode(' + c.id + ')"><span class="node-tag" style="color:' + (TAG_COLORS[c.type] || '#999') + '">' + c.type + '</span> ' + esc(c.key) + '</div>';
-    });
-  }
-  if (d.callees && d.callees.length) {
-    h += '<div class="section-title">Callees (' + d.callees.length + ')</div>';
-    d.callees.forEach(c => {
-      h += '<div class="detail-node" onclick="selectNode(' + c.id + ')"><span class="node-tag" style="color:' + (TAG_COLORS[c.type] || '#999') + '">' + c.type + '</span> ' + esc(c.key) + '</div>';
-    });
-  }
+  h += '<div class="section-title">Callers (' + d.in_degree + ')</div>';
+  h += '<div id="callers-list" class="neighbor-list"><div class="loading">Loading...</div></div>';
+  h += '<div class="section-title">Callees (' + d.out_degree + ')</div>';
+  h += '<div id="callees-list" class="neighbor-list"><div class="loading">Loading...</div></div>';
   document.getElementById('detail-content').innerHTML = h;
   document.getElementById('detail-panel').classList.remove('hidden');
+  loadNeighbors(d.id, 'callers', 0);
+  loadNeighbors(d.id, 'callees', 0);
   requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
+}
+
+async function loadNeighbors(id, dir, offset) {
+  const container = document.getElementById(dir + '-list');
+  if (!container) return;
+  if (offset === 0) container.innerHTML = '<div class="loading">Loading...</div>';
+
+  const data = await api('/nodes/' + id + '/' + dir + '?limit=50&offset=' + offset);
+  const nodes = data.nodes || [];
+  const total = data.total || 0;
+
+  if (offset === 0) container.innerHTML = '';
+
+  for (const n of nodes) {
+    const el = document.createElement('div');
+    el.className = 'detail-node';
+    el.innerHTML = '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span> ' + esc(n.key);
+    el.onclick = () => selectNode(n.id);
+    container.appendChild(el);
+  }
+
+  const remaining = total - (offset + nodes.length);
+  const existingLoadMore = container.querySelector('.load-more');
+  if (existingLoadMore) existingLoadMore.remove();
+
+  if (remaining > 0) {
+    const btn = document.createElement('div');
+    btn.className = 'load-more';
+    btn.textContent = 'Load more (' + remaining + ' remaining)';
+    btn.onclick = () => loadNeighbors(id, dir, offset + nodes.length);
+    container.appendChild(btn);
+  }
 }
 
 function hideDetail() {
@@ -187,4 +224,35 @@ function hideDetail() {
 }
 
 document.getElementById('node-list').addEventListener('scroll', renderVirtualList);
+
+document.querySelectorAll('.panel-divider').forEach(divider => {
+  let startX, startLeftWidth, leftPanel, rightPanel;
+
+  divider.addEventListener('mousedown', e => {
+    e.preventDefault();
+    leftPanel = document.getElementById(divider.dataset.left);
+    rightPanel = document.getElementById(divider.dataset.right);
+    if (!leftPanel || !rightPanel) return;
+    startX = e.clientX;
+    startLeftWidth = leftPanel.getBoundingClientRect().width;
+    divider.classList.add('active');
+    document.addEventListener('mousemove', onDrag);
+    document.addEventListener('mouseup', onStop);
+  });
+
+  function onDrag(e) {
+    const dx = e.clientX - startX;
+    const newWidth = Math.max(parseInt(getComputedStyle(leftPanel).minWidth) || 150, startLeftWidth + dx);
+    leftPanel.style.width = newWidth + 'px';
+    leftPanel.style.minWidth = newWidth + 'px';
+    if (cy) cy.resize();
+  }
+
+  function onStop() {
+    divider.classList.remove('active');
+    document.removeEventListener('mousemove', onDrag);
+    document.removeEventListener('mouseup', onStop);
+  }
+});
+
 document.addEventListener('DOMContentLoaded', init);

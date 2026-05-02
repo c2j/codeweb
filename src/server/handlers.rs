@@ -22,6 +22,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/files", get(files))
         .route("/api/v1/nodes", get(nodes))
         .route("/api/v1/nodes/:id", get(node_detail))
+        .route("/api/v1/nodes/:id/callers", get(node_callers))
+        .route("/api/v1/nodes/:id/callees", get(node_callees))
         .route("/api/v1/trace", get(trace))
         .route("/api/v1/export", get(export))
         .route("/api/v1/graph", get(graph_data))
@@ -183,6 +185,8 @@ async fn node_detail(
 #[derive(serde::Deserialize)]
 struct TraceQuery {
     from: String,
+    depth: Option<usize>,
+    max_nodes: Option<usize>,
 }
 
 async fn trace(
@@ -197,7 +201,9 @@ async fn trace(
     }
 
     let (start_idx, _) = &matches[0];
-    let chain = traverse::trace_chain(graph, *start_idx);
+    let depth = query.depth.unwrap_or(2).min(10);
+    let max_nodes = query.max_nodes.unwrap_or(500);
+    let (chain, visited) = traverse::trace_chain(graph, *start_idx, depth, max_nodes);
 
     let target_key = NodeKey::from_node(&graph[chain.target]);
     let result = serde_json::json!({
@@ -208,9 +214,94 @@ async fn trace(
         },
         "callers": tree_nodes_to_json(&chain.callers, graph),
         "callees": tree_nodes_to_json(&chain.callees, graph),
+        "caller_count": chain.callers.len(),
+        "callee_count": chain.callees.len(),
+        "truncated": visited >= max_nodes,
     });
 
     Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+struct NeighborsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn node_callers(
+    State(state): State<AppState>,
+    Path(id): Path<usize>,
+    Query(query): Query<NeighborsQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let graph = state.graph();
+    let idx = NodeIndex::new(id);
+
+    if idx.index() >= graph.node_count() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let all: Vec<Value> = graph
+        .neighbors_directed(idx, petgraph::Direction::Incoming)
+        .map(|n| {
+            let key = NodeKey::from_node(&graph[n]);
+            serde_json::json!({
+                "id": n.index(),
+                "key": key.to_string(),
+                "type": node_type_tag(&graph[n]),
+            })
+        })
+        .collect();
+
+    let total = all.len();
+    let limit_val = query.limit.unwrap_or(50);
+    let offset_val = query.offset.unwrap_or(0);
+
+    let nodes: Vec<Value> = all.into_iter().skip(offset_val).take(limit_val).collect();
+
+    Ok(Json(serde_json::json!({
+        "total": total,
+        "limit": limit_val,
+        "offset": offset_val,
+        "nodes": nodes,
+    })))
+}
+
+async fn node_callees(
+    State(state): State<AppState>,
+    Path(id): Path<usize>,
+    Query(query): Query<NeighborsQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let graph = state.graph();
+    let idx = NodeIndex::new(id);
+
+    if idx.index() >= graph.node_count() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let all: Vec<Value> = graph
+        .neighbors_directed(idx, petgraph::Direction::Outgoing)
+        .map(|n| {
+            let key = NodeKey::from_node(&graph[n]);
+            serde_json::json!({
+                "id": n.index(),
+                "key": key.to_string(),
+                "type": node_type_tag(&graph[n]),
+            })
+        })
+        .collect();
+
+    let total = all.len();
+    let limit_val = query.limit.unwrap_or(50);
+    let offset_val = query.offset.unwrap_or(0);
+
+    let nodes: Vec<Value> = all.into_iter().skip(offset_val).take(limit_val).collect();
+
+    Ok(Json(serde_json::json!({
+        "total": total,
+        "limit": limit_val,
+        "offset": offset_val,
+        "nodes": nodes,
+    })))
 }
 
 async fn graph_data(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {

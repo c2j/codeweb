@@ -459,7 +459,7 @@ fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
     let (start_idx, start_name) = &matches[0];
     eprintln!("Tracing from: {}", start_name);
 
-    let chain = graph::traverse::trace_chain(graph, *start_idx);
+    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println!(
         "{}",
@@ -709,7 +709,7 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
     print_node_details(&graph[*start_idx]);
     println!();
 
-    let chain = graph::traverse::trace_chain(graph, *start_idx);
+    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println!(
         "{}",
