@@ -11,7 +11,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::graph::key::NodeKey;
 use crate::graph::node_type_tag;
-use crate::graph::traverse::{self, TreeNode};
+use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::CodeGraph;
 
 use super::state::AppState;
@@ -59,7 +59,7 @@ async fn nodes(
 
     let summaries = state.store().node_summaries();
 
-    let filtered: Vec<_> = summaries
+    let mut filtered: Vec<_> = summaries
         .iter()
         .filter(|s| {
             if let Some(ref tf) = type_filter {
@@ -84,6 +84,17 @@ async fn nodes(
             true
         })
         .collect();
+
+    if let Some(ref sl) = search_lower {
+        filtered.sort_by(|a, b| {
+            let rank_a = MatchRank::classify(sl, &a.key_lower);
+            let rank_b = MatchRank::classify(sl, &b.key_lower);
+            match rank_a.cmp(&rank_b) {
+                std::cmp::Ordering::Equal => a.key.cmp(&b.key),
+                other => other,
+            }
+        });
+    }
 
     let total_count = filtered.len();
     let limit_val = query.limit.unwrap_or(100);
