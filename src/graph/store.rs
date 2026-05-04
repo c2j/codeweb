@@ -43,6 +43,8 @@ pub struct GraphStore {
     name_index: Vec<(String, NodeIndex)>,
     /// Index: schema name → list of NodeIndex
     schema_index: HashMap<String, Vec<NodeIndex>>,
+    /// Index: EdgeCategory → list of EdgeIndex for fast edge-type filtering
+    edge_category_index: HashMap<String, Vec<petgraph::graph::EdgeIndex>>,
 }
 
 #[allow(dead_code)]
@@ -241,6 +243,30 @@ impl GraphStore {
 
     pub fn schema_index(&self) -> &HashMap<String, Vec<NodeIndex>> {
         &self.schema_index
+    }
+
+    /// Search nodes by name using the sorted name_index.
+    /// Returns Vec of (NodeIndex, display_key) ranked by MatchRank (Exact > WordBoundary > Substring).
+    pub fn search_nodes(&self, query: &str) -> Vec<(NodeIndex, String)> {
+        use crate::graph::traverse::MatchRank;
+        let lower = query.to_lowercase();
+        let mut results: Vec<(NodeIndex, String, MatchRank)> = Vec::new();
+
+        for (key_lower, idx) in &self.name_index {
+            if !key_lower.contains(&lower) {
+                continue;
+            }
+            let display = crate::graph::key::NodeKey::from_node(&self.graph[*idx]).to_string();
+            if let Some(rank) = MatchRank::classify(&lower, key_lower) {
+                results.push((*idx, display, rank));
+            }
+        }
+
+        results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        results
+            .into_iter()
+            .map(|(idx, display, _)| (idx, display))
+            .collect()
     }
 
     pub fn update_manifest(&mut self, records: Vec<FileRecord>) {
@@ -1007,5 +1033,95 @@ mod tests {
         assert_eq!(schema_index.get("schema_a").map(|v| v.len()), Some(2));
         assert_eq!(schema_index.get("schema_b").map(|v| v.len()), Some(2));
         assert_eq!(schema_index.get("schema_c").map(|v| v.len()), None);
+    }
+
+    #[test]
+    fn search_nodes_finds_exact_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("do_work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "proc:public.do_work");
+    }
+
+    #[test]
+    fn search_nodes_finds_substring_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "calculate_total".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "get_total_amount".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("total");
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("total"));
+    }
+
+    #[test]
+    fn search_nodes_returns_empty_for_no_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("nonexistent");
+        assert!(results.is_empty());
     }
 }

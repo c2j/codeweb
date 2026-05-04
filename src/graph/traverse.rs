@@ -239,14 +239,14 @@ pub fn find_nodes_by_name(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum MatchRank {
+pub enum MatchRank {
     Exact,
     WordBoundary,
     Substring,
 }
 
 impl MatchRank {
-    pub(crate) fn classify(query: &str, candidate: &str) -> Option<Self> {
+    pub fn classify(query: &str, candidate: &str) -> Option<Self> {
         if candidate == query {
             return Some(MatchRank::Exact);
         }
