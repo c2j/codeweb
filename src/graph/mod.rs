@@ -475,7 +475,6 @@ pub enum Edge {
 pub type CodeGraph = petgraph::Graph<Node, Edge>;
 
 impl Edge {
-    #[allow(dead_code)]
     pub fn category(&self) -> EdgeCategory {
         match self {
             Edge::DirectCall { .. }

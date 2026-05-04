@@ -66,6 +66,7 @@ impl GraphStore {
             type_tag_index: HashMap::new(),
             name_index: Vec::new(),
             schema_index: HashMap::new(),
+            edge_category_index: HashMap::new(),
         }
     }
 
@@ -155,6 +156,23 @@ impl GraphStore {
             }
         }
 
+        let mut edge_category_index: HashMap<String, Vec<petgraph::graph::EdgeIndex>> =
+            HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            let cat = graph[edge_idx].category();
+            let key = match cat {
+                crate::graph::EdgeCategory::Call => "call",
+                crate::graph::EdgeCategory::Composition => "composition",
+                crate::graph::EdgeCategory::DataFlow => "dataflow",
+                crate::graph::EdgeCategory::Reference => "reference",
+                crate::graph::EdgeCategory::Inheritance => "inheritance",
+            };
+            edge_category_index
+                .entry(key.to_string())
+                .or_default()
+                .push(edge_idx);
+        }
+
         Self {
             version: 4,
             project_name: project_name.to_string(),
@@ -170,6 +188,7 @@ impl GraphStore {
             type_tag_index,
             name_index,
             schema_index,
+            edge_category_index,
         }
     }
 
@@ -243,6 +262,10 @@ impl GraphStore {
 
     pub fn schema_index(&self) -> &HashMap<String, Vec<NodeIndex>> {
         &self.schema_index
+    }
+
+    pub fn edges_by_category(&self, category: &str) -> &[petgraph::graph::EdgeIndex] {
+        self.edge_category_index.get(category).map_or(&[], |v| v)
     }
 
     /// Search nodes by name using the sorted name_index.
@@ -445,6 +468,7 @@ impl GraphStore {
         self.type_tag_index.clear();
         self.name_index.clear();
         self.schema_index.clear();
+        self.edge_category_index.clear();
 
         for idx in self.graph.node_indices() {
             let tag = node_type_tag(&self.graph[idx]).to_string();
@@ -461,6 +485,22 @@ impl GraphStore {
             }
         }
         self.name_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+        use crate::graph::EdgeCategory;
+        for edge_idx in self.graph.edge_indices() {
+            let cat = self.graph[edge_idx].category();
+            let key = match cat {
+                EdgeCategory::Call => "call",
+                EdgeCategory::Composition => "composition",
+                EdgeCategory::DataFlow => "dataflow",
+                EdgeCategory::Reference => "reference",
+                EdgeCategory::Inheritance => "inheritance",
+            };
+            self.edge_category_index
+                .entry(key.to_string())
+                .or_default()
+                .push(edge_idx);
+        }
     }
 
     fn rebuild_reverse_deps(&mut self) {
@@ -1123,5 +1163,97 @@ mod tests {
         let store = GraphStore::from_graph("test", graph);
         let results = store.search_nodes("nonexistent");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn edge_category_index_groups_correctly() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        let proc_a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_a".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        let proc_b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_b".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        let table = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        graph.add_edge(
+            proc_a,
+            proc_b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::External,
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TriggersRoutine {
+                location: loc.clone(),
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+
+        let call_edges = store.edges_by_category("call");
+        assert_eq!(call_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[call_edges[0]],
+            crate::graph::Edge::DirectCall { .. }
+        ));
+
+        let dataflow_edges = store.edges_by_category("dataflow");
+        assert_eq!(dataflow_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[dataflow_edges[0]],
+            crate::graph::Edge::TableAccess { .. }
+        ));
+
+        let reference_edges = store.edges_by_category("reference");
+        assert_eq!(reference_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[reference_edges[0]],
+            crate::graph::Edge::TriggersRoutine { .. }
+        ));
+
+        let composition_edges = store.edges_by_category("composition");
+        assert!(composition_edges.is_empty());
     }
 }
