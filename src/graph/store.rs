@@ -586,7 +586,7 @@ impl GraphStore {
     }
 }
 
-fn extract_schema(node: &Node) -> Option<&str> {
+pub(crate) fn extract_schema(node: &Node) -> Option<&str> {
     match node {
         Node::Procedure { id, .. } | Node::Function { id, .. } => id.schema.as_deref(),
         Node::Table { schema, .. } | Node::View { schema, .. } => schema.as_deref(),

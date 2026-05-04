@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod key;
+pub mod query;
 pub mod store;
 pub mod traverse;
 
