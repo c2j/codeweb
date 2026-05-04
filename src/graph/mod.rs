@@ -250,7 +250,11 @@ pub enum Node {
         partial: bool,
     },
     /// An unresolved call target (e.g. dynamic SQL).
-    Unresolved { raw_expr: String, context: String },
+    #[allow(clippy::box_collection)]
+    Unresolved {
+        raw_expr: Box<String>,
+        context: Box<String>,
+    },
 
     /// A MyBatis/iBatis mapped statement from XML.
     MappedStatement {
@@ -288,6 +292,7 @@ pub enum Node {
         line: usize,
     },
     /// A database table.
+    #[allow(clippy::box_collection)]
     Table {
         schema: Option<String>,
         name: String,
@@ -295,11 +300,11 @@ pub enum Node {
         #[serde(default)]
         location: Option<SourceLocation>,
         #[serde(default)]
-        columns: Vec<ColumnSummary>,
+        columns: Box<Vec<ColumnSummary>>,
         #[serde(default)]
-        partition_by: Option<PartitionInfo>,
+        partition_by: Option<Box<PartitionInfo>>,
         #[serde(default)]
-        distribute_by: Option<DistributeInfo>,
+        distribute_by: Option<Box<DistributeInfo>>,
         #[serde(default)]
         tablespace: Option<String>,
         #[serde(default)]
@@ -307,7 +312,7 @@ pub enum Node {
         #[serde(default)]
         unlogged: bool,
         #[serde(default)]
-        ddl_source: Option<String>,
+        ddl_source: Option<Box<String>>,
     },
     #[allow(dead_code)]
     View {
@@ -368,11 +373,12 @@ pub enum Node {
         name: String,
         location: SourceLocation,
     },
+    #[allow(clippy::box_collection)]
     Custom {
-        type_name: String,
-        label: String,
-        key_fields: BTreeMap<String, String>,
-        properties: JsonMap,
+        type_name: Box<String>,
+        label: Box<String>,
+        key_fields: Box<BTreeMap<String, String>>,
+        properties: Box<JsonMap>,
         location: Option<SourceLocation>,
     },
 }
@@ -769,7 +775,7 @@ mod tests {
                 file: file.clone(),
                 line: 10,
             }),
-            columns: vec![
+            columns: Box::new(vec![
                 ColumnSummary {
                     name: "id".to_string(),
                     data_type: "INTEGER".to_string(),
@@ -786,18 +792,18 @@ mod tests {
                     default_value: Some("0".to_string()),
                     comment: Some("order amount".to_string()),
                 },
-            ],
-            partition_by: Some(PartitionInfo::Range {
+            ]),
+            partition_by: Some(Box::new(PartitionInfo::Range {
                 columns: vec!["created_at".to_string()],
                 partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
-            }),
-            distribute_by: Some(DistributeInfo::Hash {
+            })),
+            distribute_by: Some(Box::new(DistributeInfo::Hash {
                 columns: vec!["id".to_string()],
-            }),
+            })),
             tablespace: Some("pg_default".to_string()),
             temporary: false,
             unlogged: false,
-            ddl_source: Some("CREATE TABLE public.orders (...)".to_string()),
+            ddl_source: Some(Box::new("CREATE TABLE public.orders (...)".to_string())),
         };
         assert_eq!(table.file(), Path::new("create_tables.sql"));
     }
@@ -808,7 +814,7 @@ mod tests {
             schema: None,
             name: "my_table".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -874,5 +880,14 @@ mod tests {
         } else {
             panic!("expected Table");
         }
+    }
+
+    #[test]
+    fn node_enum_size_below_200_bytes() {
+        assert!(
+            std::mem::size_of::<Node>() < 200,
+            "Node enum size is {} bytes, expected < 200",
+            std::mem::size_of::<Node>()
+        );
     }
 }

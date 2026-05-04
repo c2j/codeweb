@@ -230,8 +230,8 @@ impl GraphBuilder {
                                 ),
                             );
                             let unresolved = Node::Unresolved {
-                                raw_expr: raw,
-                                context: format!("trigger:{}", t.name),
+                                raw_expr: Box::new(raw),
+                                context: Box::new(format!("trigger:{}", t.name)),
                             };
                             let idx = graph.add_node(unresolved);
                             proc_index.insert(func_id, idx);
@@ -285,7 +285,7 @@ impl GraphBuilder {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
                                     location: None,
-                                    columns: vec![],
+                                    columns: Box::new(vec![]),
                                     partition_by: None,
                                     distribute_by: None,
                                     tablespace: None,
@@ -384,7 +384,7 @@ impl GraphBuilder {
                                     schema: table_schema.clone(),
                                     name: table_name.clone(),
                                     location: None,
-                                    columns: vec![],
+                                    columns: Box::new(vec![]),
                                     partition_by: None,
                                     distribute_by: None,
                                     tablespace: None,
@@ -493,9 +493,9 @@ impl GraphBuilder {
                                 file: file_arc.clone(),
                                 line: info.start_line,
                             }),
-                            columns,
-                            partition_by,
-                            distribute_by,
+                            columns: Box::new(columns),
+                            partition_by: partition_by.map(Box::new),
+                            distribute_by: distribute_by.map(Box::new),
                             tablespace: t.tablespace.clone(),
                             temporary: t.temporary,
                             unlogged: t.unlogged,
@@ -516,35 +516,30 @@ impl GraphBuilder {
                             tablespace,
                             temporary,
                             unlogged,
-                            ddl_source,
                             ..
                         } = &mut graph[idx]
                         {
-                            if location.is_none() {
-                                *location = Some(SourceLocation {
-                                    file: file_arc.clone(),
-                                    line: info.start_line,
-                                });
-                            }
+                            *location = Some(SourceLocation {
+                                file: file_arc.clone(),
+                                line: info.start_line,
+                            });
                             let new_cols: Vec<ColumnSummary> = t
                                 .columns
                                 .iter()
                                 .map(|c| {
-                                    let is_pk = c
-                                        .constraints
-                                        .iter()
-                                        .any(|cc| matches!(cc, ColumnConstraint::PrimaryKey));
-                                    let nullable = !c
-                                        .constraints
-                                        .iter()
-                                        .any(|cc| matches!(cc, ColumnConstraint::NotNull));
-                                    let default_value = c.constraints.iter().find_map(|cc| {
-                                        if let ColumnConstraint::Default(expr) = cc {
-                                            Some(format!("{:?}", expr))
-                                        } else {
-                                            None
+                                    let mut nullable = true;
+                                    let mut is_pk = false;
+                                    let mut default_value = None;
+                                    for constraint in &c.constraints {
+                                        match constraint {
+                                            ColumnConstraint::NotNull => nullable = false,
+                                            ColumnConstraint::PrimaryKey => is_pk = true,
+                                            ColumnConstraint::Default(expr) => {
+                                                default_value = Some(format!("{:?}", expr))
+                                            }
+                                            _ => {}
                                         }
-                                    });
+                                    }
                                     ColumnSummary {
                                         name: c.name.clone(),
                                         data_type: format!("{:?}", c.data_type),
@@ -556,74 +551,73 @@ impl GraphBuilder {
                                 })
                                 .collect();
                             if columns.is_empty() {
-                                *columns = new_cols;
+                                **columns = new_cols;
                             }
                             if partition_by.is_none() && t.partition_by.is_some() {
-                                *partition_by = t.partition_by.as_ref().map(|p| match p {
-                                    ogsql_parser::ast::PartitionClause::Range {
-                                        columns,
-                                        partitions,
-                                        ..
-                                    } => PartitionInfo::Range {
-                                        columns: columns.iter().map(|c| c.join(".")).collect(),
-                                        partitions: partitions
-                                            .iter()
-                                            .map(|pd| pd.name.clone())
-                                            .collect(),
-                                    },
-                                    ogsql_parser::ast::PartitionClause::List {
-                                        columns,
-                                        partitions,
-                                        ..
-                                    } => PartitionInfo::List {
-                                        columns: columns.iter().map(|c| c.join(".")).collect(),
-                                        partitions: partitions
-                                            .iter()
-                                            .map(|pd| pd.name.clone())
-                                            .collect(),
-                                    },
-                                    ogsql_parser::ast::PartitionClause::Hash {
-                                        columns,
-                                        partitions_count,
-                                        ..
-                                    } => PartitionInfo::Hash {
-                                        columns: columns.iter().map(|c| c.join(".")).collect(),
-                                        partitions_count: *partitions_count,
-                                    },
+                                *partition_by = t.partition_by.as_ref().map(|p| {
+                                    Box::new(match p {
+                                        ogsql_parser::ast::PartitionClause::Range {
+                                            columns,
+                                            partitions,
+                                            ..
+                                        } => PartitionInfo::Range {
+                                            columns: columns.iter().map(|c| c.join(".")).collect(),
+                                            partitions: partitions
+                                                .iter()
+                                                .map(|pd| pd.name.clone())
+                                                .collect(),
+                                        },
+                                        ogsql_parser::ast::PartitionClause::List {
+                                            columns,
+                                            partitions,
+                                            ..
+                                        } => PartitionInfo::List {
+                                            columns: columns.iter().map(|c| c.join(".")).collect(),
+                                            partitions: partitions
+                                                .iter()
+                                                .map(|pd| pd.name.clone())
+                                                .collect(),
+                                        },
+                                        ogsql_parser::ast::PartitionClause::Hash {
+                                            columns,
+                                            partitions_count,
+                                            ..
+                                        } => PartitionInfo::Hash {
+                                            columns: columns.iter().map(|c| c.join(".")).collect(),
+                                            partitions_count: *partitions_count,
+                                        },
+                                    })
                                 });
                             }
                             if distribute_by.is_none() && t.distribute_by.is_some() {
-                                *distribute_by = t.distribute_by.as_ref().map(|d| match d {
-                                    ogsql_parser::ast::DistributeClause::Hash { columns } => {
-                                        DistributeInfo::Hash {
-                                            columns: columns.clone(),
+                                *distribute_by = t.distribute_by.as_ref().map(|d| {
+                                    Box::new(match d {
+                                        ogsql_parser::ast::DistributeClause::Hash { columns } => {
+                                            DistributeInfo::Hash {
+                                                columns: columns.clone(),
+                                            }
                                         }
-                                    }
-                                    ogsql_parser::ast::DistributeClause::Replication => {
-                                        DistributeInfo::Replication
-                                    }
-                                    ogsql_parser::ast::DistributeClause::RoundRobin { columns } => {
-                                        DistributeInfo::RoundRobin {
-                                            columns: columns.clone(),
+                                        ogsql_parser::ast::DistributeClause::Replication => {
+                                            DistributeInfo::Replication
                                         }
-                                    }
-                                    ogsql_parser::ast::DistributeClause::Modulo { columns } => {
-                                        DistributeInfo::Modulo {
+                                        ogsql_parser::ast::DistributeClause::RoundRobin {
+                                            columns,
+                                        } => DistributeInfo::RoundRobin {
                                             columns: columns.clone(),
+                                        },
+                                        ogsql_parser::ast::DistributeClause::Modulo { columns } => {
+                                            DistributeInfo::Modulo {
+                                                columns: columns.clone(),
+                                            }
                                         }
-                                    }
+                                    })
                                 });
                             }
                             if tablespace.is_none() {
                                 *tablespace = t.tablespace.clone();
                             }
-                            if !*temporary {
-                                *temporary = t.temporary;
-                            }
-                            if !*unlogged {
-                                *unlogged = t.unlogged;
-                            }
-                            _ = ddl_source;
+                            *temporary = t.temporary;
+                            *unlogged = t.unlogged;
                         }
 
                         if schema.is_some() {
@@ -662,7 +656,7 @@ impl GraphBuilder {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
                                     location: None,
-                                    columns: vec![],
+                                    columns: Box::new(vec![]),
                                     partition_by: None,
                                     distribute_by: None,
                                     tablespace: None,
@@ -734,12 +728,12 @@ impl GraphBuilder {
                                     ),
                                 );
                                 let unresolved = Node::Unresolved {
-                                    raw_expr: target_key.clone(),
-                                    context: format!(
+                                    raw_expr: Box::new(target_key.clone()),
+                                    context: Box::new(format!(
                                         "synonym:{}.{}",
                                         schema.as_deref().unwrap_or(""),
                                         name
-                                    ),
+                                    )),
                                 };
                                 graph.add_node(unresolved)
                             });
@@ -1385,12 +1379,13 @@ impl GraphBuilder {
                         ),
                     );
                     let unresolved_node = Node::Unresolved {
-                        raw_expr: edge.callee_name.clone(),
-                        context: edge
-                            .caller
-                            .as_ref()
-                            .map(|c| c.to_string())
-                            .unwrap_or_default(),
+                        raw_expr: Box::new(edge.callee_name.clone()),
+                        context: Box::new(
+                            edge.caller
+                                .as_ref()
+                                .map(|c| c.to_string())
+                                .unwrap_or_default(),
+                        ),
                     };
                     let to = graph.add_node(unresolved_node);
                     proc_index.insert(callee_id, to);
@@ -1454,8 +1449,8 @@ impl GraphBuilder {
                                 ),
                             );
                             let unresolved = Node::Unresolved {
-                                raw_expr: callee_name.clone(),
-                                context: format!("{}.{}", namespace, stmt.id),
+                                raw_expr: Box::new(callee_name.clone()),
+                                context: Box::new(format!("{}.{}", namespace, stmt.id)),
                             };
                             graph.add_node(unresolved)
                         });
@@ -1522,12 +1517,12 @@ impl GraphBuilder {
                                 ),
                             );
                             let unresolved = Node::Unresolved {
-                                raw_expr: callee_name.clone(),
-                                context: format!(
+                                raw_expr: Box::new(callee_name.clone()),
+                                context: Box::new(format!(
                                     "{}.{}",
                                     extraction.origin.class_name.as_deref().unwrap_or("?"),
                                     extraction.origin.method_name.as_deref().unwrap_or("?")
-                                ),
+                                )),
                             };
                             graph.add_node(unresolved)
                         });
@@ -1661,7 +1656,7 @@ impl GraphBuilder {
                         schema: access.schema.clone(),
                         name: access.name.clone(),
                         location: None,
-                        columns: vec![],
+                        columns: Box::new(vec![]),
                         partition_by: None,
                         distribute_by: None,
                         tablespace: None,

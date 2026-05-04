@@ -561,7 +561,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
         Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
         Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
-        Node::Custom { type_name, .. } => std::borrow::Cow::Owned(type_name.clone()),
+        Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
     }
 }
 
@@ -768,7 +768,7 @@ fn print_node_details(node: &Node) {
         }
         if !columns.is_empty() {
             println!("  columns ({}):", columns.len());
-            for col in columns {
+            for col in columns.iter() {
                 let pk = if col.is_primary_key { " [PK]" } else { "" };
                 let null = if col.nullable { "NULL" } else { "NOT NULL" };
                 let def = col
@@ -780,7 +780,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(part) = partition_by {
-            match part {
+            match part.as_ref() {
                 PartitionInfo::Range {
                     columns,
                     partitions,
@@ -816,7 +816,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(dist) = distribute_by {
-            match dist {
+            match dist.as_ref() {
                 DistributeInfo::Hash { columns } => {
                     println!("  distribute: HASH({})", columns.join(", "));
                 }
@@ -832,7 +832,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(ddl) = ddl_source {
-            println!("  ddl: {}", ddl);
+            println!("  ddl: {}", ddl.as_ref());
         }
     }
 }

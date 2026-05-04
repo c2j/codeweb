@@ -552,7 +552,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -604,7 +604,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -649,10 +649,10 @@ mod tests {
         let mut props = std::collections::BTreeMap::new();
         props.insert("version".to_string(), serde_json::json!("2.0"));
         let node = crate::graph::Node::Custom {
-            type_name: "dubbo_service".to_string(),
-            label: "com.example.Svc".to_string(),
-            key_fields,
-            properties: crate::graph::JsonMap(props),
+            type_name: Box::new("dubbo_service".to_string()),
+            label: Box::new("com.example.Svc".to_string()),
+            key_fields: Box::new(key_fields),
+            properties: Box::new(crate::graph::JsonMap(props)),
             location: None,
         };
         graph.add_node(node);
@@ -675,7 +675,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![
+            columns: Box::new(vec![
                 crate::graph::ColumnSummary {
                     name: "id".to_string(),
                     data_type: "BIGINT".to_string(),
@@ -692,14 +692,14 @@ mod tests {
                     default_value: Some("now()".to_string()),
                     comment: Some("creation time".to_string()),
                 },
-            ],
-            partition_by: Some(crate::graph::PartitionInfo::Range {
+            ]),
+            partition_by: Some(Box::new(crate::graph::PartitionInfo::Range {
                 columns: vec!["created_at".to_string()],
                 partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
-            }),
-            distribute_by: Some(crate::graph::DistributeInfo::Hash {
+            })),
+            distribute_by: Some(Box::new(crate::graph::DistributeInfo::Hash {
                 columns: vec!["user_id".to_string()],
-            }),
+            })),
             tablespace: Some("pg_default".to_string()),
             temporary: false,
             unlogged: false,

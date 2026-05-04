@@ -857,9 +857,10 @@ fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
         Node::MaterializedView { .. } => (std::borrow::Cow::Borrowed("mview"), Color::Cyan),
         Node::Synonym { .. } => (std::borrow::Cow::Borrowed("synonym"), Color::Magenta),
         Node::Event { .. } => (std::borrow::Cow::Borrowed("event"), Color::LightRed),
-        Node::Custom { type_name, .. } => {
-            (std::borrow::Cow::Owned(type_name.clone()), Color::DarkGray)
-        }
+        Node::Custom { type_name, .. } => (
+            std::borrow::Cow::Owned((**type_name).clone()),
+            Color::DarkGray,
+        ),
     }
 }
 
@@ -958,7 +959,7 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
             }
         }
         if let Some(part) = partition_by {
-            match part {
+            match part.as_ref() {
                 PartitionInfo::Range {
                     columns,
                     partitions,
@@ -1004,7 +1005,7 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
             }
         }
         if let Some(dist) = distribute_by {
-            match dist {
+            match dist.as_ref() {
                 DistributeInfo::Hash { columns } => {
                     attrs.push(format!("distribute: HASH({})", columns.join(", ")));
                 }
@@ -1020,7 +1021,7 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
             }
         }
         if let Some(ddl) = ddl_source {
-            attrs.push(format!("ddl: {}", ddl));
+            attrs.push(format!("ddl: {}", ddl.as_ref()));
         }
     }
     attrs

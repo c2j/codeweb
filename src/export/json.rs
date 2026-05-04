@@ -267,8 +267,8 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             Node::Unresolved { raw_expr, context } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Unresolved {
-                    raw_expr: raw_expr.clone(),
-                    context: context.clone(),
+                    raw_expr: (**raw_expr).clone(),
+                    context: (**context).clone(),
                 },
             },
             Node::MappedStatement {
@@ -357,9 +357,9 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                         .as_ref()
                         .map(|l| l.file.to_string_lossy().to_string()),
                     line: location.as_ref().map(|l| l.line),
-                    columns: columns.clone(),
-                    partition_by: partition_by.clone(),
-                    distribute_by: distribute_by.clone(),
+                    columns: (**columns).clone(),
+                    partition_by: partition_by.as_deref().cloned(),
+                    distribute_by: distribute_by.as_deref().cloned(),
                     tablespace: tablespace.clone(),
                     temporary: *temporary,
                     unlogged: *unlogged,
@@ -500,10 +500,12 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Custom {
-                    custom_type: type_name.clone(),
-                    label: label.clone(),
-                    key_fields: serde_json::to_value(key_fields).unwrap_or(serde_json::Value::Null),
-                    properties: serde_json::to_value(properties).unwrap_or(serde_json::Value::Null),
+                    custom_type: (**type_name).clone(),
+                    label: (**label).clone(),
+                    key_fields: serde_json::to_value(&**key_fields)
+                        .unwrap_or(serde_json::Value::Null),
+                    properties: serde_json::to_value(&**properties)
+                        .unwrap_or(serde_json::Value::Null),
                     file: location
                         .as_ref()
                         .map(|l| l.file.to_string_lossy().to_string()),
