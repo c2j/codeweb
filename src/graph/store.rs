@@ -36,6 +36,13 @@ pub struct GraphStore {
     reverse_deps: HashMap<PathBuf, HashSet<PathBuf>>,
 
     manifest: HashMap<PathBuf, FileRecord>,
+
+    /// Index: type tag → list of NodeIndex (e.g., "proc" → [idx1, idx2, ...])
+    type_tag_index: HashMap<String, Vec<NodeIndex>>,
+    /// Index: lowercase name → list of (NodeIndex, display_key) for prefix/substring search
+    name_index: Vec<(String, NodeIndex)>,
+    /// Index: schema name → list of NodeIndex
+    schema_index: HashMap<String, Vec<NodeIndex>>,
 }
 
 #[allow(dead_code)]
@@ -54,6 +61,9 @@ impl GraphStore {
             file_edges: HashMap::new(),
             reverse_deps: HashMap::new(),
             manifest: HashMap::new(),
+            type_tag_index: HashMap::new(),
+            name_index: Vec::new(),
+            schema_index: HashMap::new(),
         }
     }
 
@@ -96,6 +106,34 @@ impl GraphStore {
         let mut file_edges: HashMap<PathBuf, Vec<(NodeKey, NodeKey)>> = HashMap::new();
         let mut reverse_deps: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
+        // Build type_tag_index
+        let mut type_tag_index: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+        for idx in graph.node_indices() {
+            let tag = node_type_tag(&graph[idx]).to_string();
+            type_tag_index.entry(tag).or_default().push(idx);
+        }
+
+        // Build name_index (sorted by lowercase key for binary search)
+        let mut name_index: Vec<(String, NodeIndex)> = graph
+            .node_indices()
+            .map(|idx| {
+                let key = NodeKey::from_node(&graph[idx]);
+                (key.to_string().to_lowercase(), idx)
+            })
+            .collect();
+        name_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Build schema_index
+        let mut schema_index: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+        for idx in graph.node_indices() {
+            if let Some(schema) = extract_schema(&graph[idx]) {
+                schema_index
+                    .entry(schema.to_lowercase())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
         for edge_idx in graph.edge_indices() {
             let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
             let src_key = NodeKey::from_node(&graph[src]);
@@ -127,6 +165,9 @@ impl GraphStore {
             file_edges,
             reverse_deps,
             manifest: HashMap::new(),
+            type_tag_index,
+            name_index,
+            schema_index,
         }
     }
 
@@ -185,6 +226,21 @@ impl GraphStore {
         s.edges = self.graph.edge_count();
         s.files = self.manifest.len();
         s
+    }
+
+    pub fn nodes_by_type(&self, type_tag: &str) -> &[NodeIndex] {
+        self.type_tag_index
+            .get(type_tag)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn name_index(&self) -> &[(String, NodeIndex)] {
+        &self.name_index
+    }
+
+    pub fn schema_index(&self) -> &HashMap<String, Vec<NodeIndex>> {
+        &self.schema_index
     }
 
     pub fn update_manifest(&mut self, records: Vec<FileRecord>) {
@@ -438,6 +494,19 @@ impl GraphStore {
         for idx in edges_to_remove {
             graph.remove_edge(idx);
         }
+    }
+}
+
+fn extract_schema(node: &Node) -> Option<&str> {
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => id.schema.as_deref(),
+        Node::Table { schema, .. } | Node::View { schema, .. } => schema.as_deref(),
+        Node::Package { schema, .. } => schema.as_deref(),
+        Node::Type { schema, .. } => schema.as_deref(),
+        Node::Sequence { schema, .. } => schema.as_deref(),
+        Node::MaterializedView { schema, .. } => schema.as_deref(),
+        Node::Synonym { schema, .. } => schema.as_deref(),
+        _ => None,
     }
 }
 
@@ -759,5 +828,161 @@ mod tests {
             "Error should mention version: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn type_tag_index_returns_correct_nodes() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        for i in 0..3 {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: format!("proc{}", i),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+            });
+        }
+        for i in 0..2 {
+            graph.add_node(crate::graph::Node::Table {
+                schema: Some("public".to_string()),
+                name: format!("table{}", i),
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            });
+        }
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "my_func".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.nodes_by_type("proc").len(), 3);
+        assert_eq!(store.nodes_by_type("table").len(), 2);
+        assert_eq!(store.nodes_by_type("func").len(), 1);
+        assert_eq!(store.nodes_by_type("view").len(), 0);
+    }
+
+    #[test]
+    fn name_index_is_sorted_and_complete() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "zebra".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "apple".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "mango".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let name_index = store.name_index();
+        assert_eq!(name_index.len(), 3);
+        for i in 1..name_index.len() {
+            assert!(
+                name_index[i - 1].0 <= name_index[i].0,
+                "name_index should be sorted"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_index_groups_by_schema() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("schema_a".to_string()),
+                package: None,
+                name: "p1".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("schema_a".to_string()),
+            name: "t1".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("schema_b".to_string()),
+                package: None,
+                name: "f1".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::View {
+            schema: Some("schema_b".to_string()),
+            name: "v1".to_string(),
+            location: None,
+        });
+        graph.add_node(crate::graph::Node::Trigger {
+            name: "trig1".to_string(),
+            table: vec!["t1".to_string()],
+            location: loc.clone(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let schema_index = store.schema_index();
+        assert_eq!(schema_index.get("schema_a").map(|v| v.len()), Some(2));
+        assert_eq!(schema_index.get("schema_b").map(|v| v.len()), Some(2));
+        assert_eq!(schema_index.get("schema_c").map(|v| v.len()), None);
     }
 }

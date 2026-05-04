@@ -890,4 +890,83 @@ mod tests {
             std::mem::size_of::<Node>()
         );
     }
+
+    #[test]
+    fn synthetic_100k_nodes_memory_report() {
+        use std::sync::Arc;
+
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("bench.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+        let edge = Edge::DirectCall {
+            scope: CallScope::IntraPackage,
+            location: loc.clone(),
+        };
+
+        let mut node_indices = Vec::with_capacity(100_000);
+
+        // 50K Procedure nodes
+        for i in 0..50_000 {
+            let node = Node::Procedure {
+                id: RoutineId {
+                    schema: Some("bench".to_string()),
+                    package: Some(format!("pkg_{}", i % 100)),
+                    name: format!("proc_{}", i),
+                    kind: RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+            };
+            node_indices.push(graph.add_node(node));
+        }
+
+        // 50K Table nodes
+        for i in 0..50_000 {
+            let node = Node::Table {
+                schema: Some("bench".to_string()),
+                name: format!("table_{}", i),
+                location: None,
+                columns: Box::new(vec![ColumnSummary {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    comment: None,
+                }]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            };
+            node_indices.push(graph.add_node(node));
+        }
+
+        // 200K edges between sequential nodes (bidirectional cycle)
+        for i in 0..100_000 {
+            let a = node_indices[i];
+            let b = node_indices[(i + 1) % 100_000];
+            graph.add_edge(a, b, edge.clone());
+            graph.add_edge(b, a, edge.clone());
+        }
+
+        let node_count = graph.node_count();
+        let edge_count = graph.edge_count();
+        eprintln!("Node size: {} bytes", std::mem::size_of::<Node>());
+        eprintln!("Edge size: {} bytes", std::mem::size_of::<Edge>());
+        eprintln!("node_count: {}", node_count);
+        eprintln!("edge_count: {}", edge_count);
+
+        assert_eq!(node_count, 100_000);
+        assert_eq!(edge_count, 200_000);
+
+        let store = crate::graph::store::GraphStore::from_graph("bench", graph);
+        let stats = store.stats();
+        eprintln!("GraphStore stats: {:?}", stats);
+    }
 }
