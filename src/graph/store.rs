@@ -410,8 +410,31 @@ impl GraphStore {
         }
 
         merged.rebuild_reverse_deps();
+        merged.rebuild_secondary_indexes();
         merged.touch();
         merged
+    }
+
+    fn rebuild_secondary_indexes(&mut self) {
+        self.type_tag_index.clear();
+        self.name_index.clear();
+        self.schema_index.clear();
+
+        for idx in self.graph.node_indices() {
+            let tag = node_type_tag(&self.graph[idx]).to_string();
+            self.type_tag_index.entry(tag).or_default().push(idx);
+
+            let key = NodeKey::from_node(&self.graph[idx]);
+            self.name_index.push((key.to_string().to_lowercase(), idx));
+
+            if let Some(schema) = extract_schema(&self.graph[idx]) {
+                self.schema_index
+                    .entry(schema.to_lowercase())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+        self.name_index.sort_by(|a, b| a.0.cmp(&b.0));
     }
 
     fn rebuild_reverse_deps(&mut self) {
