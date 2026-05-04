@@ -526,6 +526,63 @@ impl GraphStore {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn dead_routines(&self) -> Vec<NodeIndex> {
+        self.nodes_by_type("proc")
+            .iter()
+            .chain(self.nodes_by_type("func").iter())
+            .filter(|&&idx| {
+                self.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .count()
+                    == 0
+                    && self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                        .count()
+                        == 0
+            })
+            .copied()
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn entry_points(&self) -> Vec<NodeIndex> {
+        self.graph
+            .node_indices()
+            .filter(|&idx| {
+                self.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .count()
+                    == 0
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn find_cycles(&self) -> Vec<Vec<NodeIndex>> {
+        petgraph::algo::kosaraju_scc(&self.graph)
+            .into_iter()
+            .filter(|scc| scc.len() > 1)
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn impact(&self, node: NodeIndex, max_depth: Option<usize>) -> Vec<NodeIndex> {
+        use crate::graph::query::filter::EdgeFilter;
+        use crate::graph::query::traversal::GraphTraversal;
+
+        let mut traversal = GraphTraversal::new(&self.graph, node)
+            .incoming()
+            .edge_filter(EdgeFilter::new());
+
+        if let Some(depth) = max_depth {
+            traversal = traversal.max_depth(depth);
+        }
+
+        traversal.collect_nodes()
+    }
+
     fn merge_duplicate_table_access_edges(graph: &mut crate::graph::CodeGraph) {
         use std::collections::HashMap;
         let mut merge_targets: HashMap<
@@ -1255,5 +1312,202 @@ mod tests {
 
         let composition_edges = store.edges_by_category("composition");
         assert!(composition_edges.is_empty());
+    }
+
+    #[test]
+    fn dead_routines_finds_unreferenced_procs() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let called = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "called".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let orphan = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "orphan".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        let caller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "caller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 3,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            caller,
+            called,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 3,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let dead = store.dead_routines();
+        assert!(dead.contains(&orphan));
+        assert!(!dead.contains(&called));
+        assert!(
+            !dead.contains(&caller),
+            "caller has no incoming edges but it calls something"
+        );
+    }
+
+    #[test]
+    fn find_cycles_detects_mutual_calls() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "a".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "b".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 1,
+                },
+            },
+        );
+        graph.add_edge(
+            b,
+            a,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 2,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let cycles = store.find_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].len(), 2);
+    }
+
+    #[test]
+    fn impact_traces_backward() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let target = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "target".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let caller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "caller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        let grandcaller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "grandcaller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 3,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            caller,
+            target,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 2,
+                },
+            },
+        );
+        graph.add_edge(
+            grandcaller,
+            caller,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 3,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let impacted = store.impact(target, None);
+        assert_eq!(impacted.len(), 2);
+        assert!(impacted.contains(&caller));
+        assert!(impacted.contains(&grandcaller));
     }
 }
