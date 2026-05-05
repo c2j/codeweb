@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod key;
+pub mod query;
 pub mod store;
 pub mod traverse;
 
@@ -250,7 +251,11 @@ pub enum Node {
         partial: bool,
     },
     /// An unresolved call target (e.g. dynamic SQL).
-    Unresolved { raw_expr: String, context: String },
+    #[allow(clippy::box_collection)]
+    Unresolved {
+        raw_expr: Box<String>,
+        context: Box<String>,
+    },
 
     /// A MyBatis/iBatis mapped statement from XML.
     MappedStatement {
@@ -288,6 +293,7 @@ pub enum Node {
         line: usize,
     },
     /// A database table.
+    #[allow(clippy::box_collection)]
     Table {
         schema: Option<String>,
         name: String,
@@ -295,11 +301,11 @@ pub enum Node {
         #[serde(default)]
         location: Option<SourceLocation>,
         #[serde(default)]
-        columns: Vec<ColumnSummary>,
+        columns: Box<Vec<ColumnSummary>>,
         #[serde(default)]
-        partition_by: Option<PartitionInfo>,
+        partition_by: Option<Box<PartitionInfo>>,
         #[serde(default)]
-        distribute_by: Option<DistributeInfo>,
+        distribute_by: Option<Box<DistributeInfo>>,
         #[serde(default)]
         tablespace: Option<String>,
         #[serde(default)]
@@ -307,7 +313,7 @@ pub enum Node {
         #[serde(default)]
         unlogged: bool,
         #[serde(default)]
-        ddl_source: Option<String>,
+        ddl_source: Option<Box<String>>,
     },
     #[allow(dead_code)]
     View {
@@ -368,11 +374,12 @@ pub enum Node {
         name: String,
         location: SourceLocation,
     },
+    #[allow(clippy::box_collection)]
     Custom {
-        type_name: String,
-        label: String,
-        key_fields: BTreeMap<String, String>,
-        properties: JsonMap,
+        type_name: Box<String>,
+        label: Box<String>,
+        key_fields: Box<BTreeMap<String, String>>,
+        properties: Box<JsonMap>,
         location: Option<SourceLocation>,
     },
 }
@@ -469,7 +476,6 @@ pub enum Edge {
 pub type CodeGraph = petgraph::Graph<Node, Edge>;
 
 impl Edge {
-    #[allow(dead_code)]
     pub fn category(&self) -> EdgeCategory {
         match self {
             Edge::DirectCall { .. }
@@ -769,7 +775,7 @@ mod tests {
                 file: file.clone(),
                 line: 10,
             }),
-            columns: vec![
+            columns: Box::new(vec![
                 ColumnSummary {
                     name: "id".to_string(),
                     data_type: "INTEGER".to_string(),
@@ -786,18 +792,18 @@ mod tests {
                     default_value: Some("0".to_string()),
                     comment: Some("order amount".to_string()),
                 },
-            ],
-            partition_by: Some(PartitionInfo::Range {
+            ]),
+            partition_by: Some(Box::new(PartitionInfo::Range {
                 columns: vec!["created_at".to_string()],
                 partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
-            }),
-            distribute_by: Some(DistributeInfo::Hash {
+            })),
+            distribute_by: Some(Box::new(DistributeInfo::Hash {
                 columns: vec!["id".to_string()],
-            }),
+            })),
             tablespace: Some("pg_default".to_string()),
             temporary: false,
             unlogged: false,
-            ddl_source: Some("CREATE TABLE public.orders (...)".to_string()),
+            ddl_source: Some(Box::new("CREATE TABLE public.orders (...)".to_string())),
         };
         assert_eq!(table.file(), Path::new("create_tables.sql"));
     }
@@ -808,7 +814,7 @@ mod tests {
             schema: None,
             name: "my_table".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -874,5 +880,93 @@ mod tests {
         } else {
             panic!("expected Table");
         }
+    }
+
+    #[test]
+    fn node_enum_size_below_200_bytes() {
+        assert!(
+            std::mem::size_of::<Node>() < 200,
+            "Node enum size is {} bytes, expected < 200",
+            std::mem::size_of::<Node>()
+        );
+    }
+
+    #[test]
+    fn synthetic_100k_nodes_memory_report() {
+        use std::sync::Arc;
+
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("bench.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+        let edge = Edge::DirectCall {
+            scope: CallScope::IntraPackage,
+            location: loc.clone(),
+        };
+
+        let mut node_indices = Vec::with_capacity(100_000);
+
+        // 50K Procedure nodes
+        for i in 0..50_000 {
+            let node = Node::Procedure {
+                id: RoutineId {
+                    schema: Some("bench".to_string()),
+                    package: Some(format!("pkg_{}", i % 100)),
+                    name: format!("proc_{}", i),
+                    kind: RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+            };
+            node_indices.push(graph.add_node(node));
+        }
+
+        // 50K Table nodes
+        for i in 0..50_000 {
+            let node = Node::Table {
+                schema: Some("bench".to_string()),
+                name: format!("table_{}", i),
+                location: None,
+                columns: Box::new(vec![ColumnSummary {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    comment: None,
+                }]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            };
+            node_indices.push(graph.add_node(node));
+        }
+
+        // 200K edges between sequential nodes (bidirectional cycle)
+        for i in 0..100_000 {
+            let a = node_indices[i];
+            let b = node_indices[(i + 1) % 100_000];
+            graph.add_edge(a, b, edge.clone());
+            graph.add_edge(b, a, edge.clone());
+        }
+
+        let node_count = graph.node_count();
+        let edge_count = graph.edge_count();
+        eprintln!("Node size: {} bytes", std::mem::size_of::<Node>());
+        eprintln!("Edge size: {} bytes", std::mem::size_of::<Edge>());
+        eprintln!("node_count: {}", node_count);
+        eprintln!("edge_count: {}", edge_count);
+
+        assert_eq!(node_count, 100_000);
+        assert_eq!(edge_count, 200_000);
+
+        let store = crate::graph::store::GraphStore::from_graph("bench", graph);
+        let stats = store.stats();
+        eprintln!("GraphStore stats: {:?}", stats);
     }
 }

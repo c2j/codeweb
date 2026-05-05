@@ -119,7 +119,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Node::Event { name, .. } => (name.clone(), ("{{", "}}")),
             Node::Custom {
                 label, type_name, ..
-            } => (format!("{}:{}", type_name, label), ("[\"", "\"]")),
+            } => (format!("{}:{}", **type_name, **label), ("[\"", "\"]")),
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);

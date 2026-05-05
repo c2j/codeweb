@@ -36,6 +36,15 @@ pub struct GraphStore {
     reverse_deps: HashMap<PathBuf, HashSet<PathBuf>>,
 
     manifest: HashMap<PathBuf, FileRecord>,
+
+    /// Index: type tag → list of NodeIndex (e.g., "proc" → [idx1, idx2, ...])
+    type_tag_index: HashMap<String, Vec<NodeIndex>>,
+    /// Index: lowercase name → list of (NodeIndex, display_key) for prefix/substring search
+    name_index: Vec<(String, NodeIndex)>,
+    /// Index: schema name → list of NodeIndex
+    schema_index: HashMap<String, Vec<NodeIndex>>,
+    /// Index: EdgeCategory → list of EdgeIndex for fast edge-type filtering
+    edge_category_index: HashMap<String, Vec<petgraph::graph::EdgeIndex>>,
 }
 
 #[allow(dead_code)]
@@ -54,6 +63,10 @@ impl GraphStore {
             file_edges: HashMap::new(),
             reverse_deps: HashMap::new(),
             manifest: HashMap::new(),
+            type_tag_index: HashMap::new(),
+            name_index: Vec::new(),
+            schema_index: HashMap::new(),
+            edge_category_index: HashMap::new(),
         }
     }
 
@@ -96,6 +109,34 @@ impl GraphStore {
         let mut file_edges: HashMap<PathBuf, Vec<(NodeKey, NodeKey)>> = HashMap::new();
         let mut reverse_deps: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
+        // Build type_tag_index
+        let mut type_tag_index: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+        for idx in graph.node_indices() {
+            let tag = node_type_tag(&graph[idx]).to_string();
+            type_tag_index.entry(tag).or_default().push(idx);
+        }
+
+        // Build name_index (sorted by lowercase key for binary search)
+        let mut name_index: Vec<(String, NodeIndex)> = graph
+            .node_indices()
+            .map(|idx| {
+                let key = NodeKey::from_node(&graph[idx]);
+                (key.to_string().to_lowercase(), idx)
+            })
+            .collect();
+        name_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Build schema_index
+        let mut schema_index: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+        for idx in graph.node_indices() {
+            if let Some(schema) = extract_schema(&graph[idx]) {
+                schema_index
+                    .entry(schema.to_lowercase())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
         for edge_idx in graph.edge_indices() {
             let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
             let src_key = NodeKey::from_node(&graph[src]);
@@ -115,6 +156,23 @@ impl GraphStore {
             }
         }
 
+        let mut edge_category_index: HashMap<String, Vec<petgraph::graph::EdgeIndex>> =
+            HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            let cat = graph[edge_idx].category();
+            let key = match cat {
+                crate::graph::EdgeCategory::Call => "call",
+                crate::graph::EdgeCategory::Composition => "composition",
+                crate::graph::EdgeCategory::DataFlow => "dataflow",
+                crate::graph::EdgeCategory::Reference => "reference",
+                crate::graph::EdgeCategory::Inheritance => "inheritance",
+            };
+            edge_category_index
+                .entry(key.to_string())
+                .or_default()
+                .push(edge_idx);
+        }
+
         Self {
             version: 4,
             project_name: project_name.to_string(),
@@ -127,6 +185,10 @@ impl GraphStore {
             file_edges,
             reverse_deps,
             manifest: HashMap::new(),
+            type_tag_index,
+            name_index,
+            schema_index,
+            edge_category_index,
         }
     }
 
@@ -185,6 +247,49 @@ impl GraphStore {
         s.edges = self.graph.edge_count();
         s.files = self.manifest.len();
         s
+    }
+
+    pub fn nodes_by_type(&self, type_tag: &str) -> &[NodeIndex] {
+        self.type_tag_index
+            .get(type_tag)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn name_index(&self) -> &[(String, NodeIndex)] {
+        &self.name_index
+    }
+
+    pub fn schema_index(&self) -> &HashMap<String, Vec<NodeIndex>> {
+        &self.schema_index
+    }
+
+    pub fn edges_by_category(&self, category: &str) -> &[petgraph::graph::EdgeIndex] {
+        self.edge_category_index.get(category).map_or(&[], |v| v)
+    }
+
+    /// Search nodes by name using the sorted name_index.
+    /// Returns Vec of (NodeIndex, display_key) ranked by MatchRank (Exact > WordBoundary > Substring).
+    pub fn search_nodes(&self, query: &str) -> Vec<(NodeIndex, String)> {
+        use crate::graph::traverse::MatchRank;
+        let lower = query.to_lowercase();
+        let mut results: Vec<(NodeIndex, String, MatchRank)> = Vec::new();
+
+        for (key_lower, idx) in &self.name_index {
+            if !key_lower.contains(&lower) {
+                continue;
+            }
+            let display = crate::graph::key::NodeKey::from_node(&self.graph[*idx]).to_string();
+            if let Some(rank) = MatchRank::classify(&lower, key_lower) {
+                results.push((*idx, display, rank));
+            }
+        }
+
+        results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        results
+            .into_iter()
+            .map(|(idx, display, _)| (idx, display))
+            .collect()
     }
 
     pub fn update_manifest(&mut self, records: Vec<FileRecord>) {
@@ -354,8 +459,48 @@ impl GraphStore {
         }
 
         merged.rebuild_reverse_deps();
+        merged.rebuild_secondary_indexes();
         merged.touch();
         merged
+    }
+
+    fn rebuild_secondary_indexes(&mut self) {
+        self.type_tag_index.clear();
+        self.name_index.clear();
+        self.schema_index.clear();
+        self.edge_category_index.clear();
+
+        for idx in self.graph.node_indices() {
+            let tag = node_type_tag(&self.graph[idx]).to_string();
+            self.type_tag_index.entry(tag).or_default().push(idx);
+
+            let key = NodeKey::from_node(&self.graph[idx]);
+            self.name_index.push((key.to_string().to_lowercase(), idx));
+
+            if let Some(schema) = extract_schema(&self.graph[idx]) {
+                self.schema_index
+                    .entry(schema.to_lowercase())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+        self.name_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+        use crate::graph::EdgeCategory;
+        for edge_idx in self.graph.edge_indices() {
+            let cat = self.graph[edge_idx].category();
+            let key = match cat {
+                EdgeCategory::Call => "call",
+                EdgeCategory::Composition => "composition",
+                EdgeCategory::DataFlow => "dataflow",
+                EdgeCategory::Reference => "reference",
+                EdgeCategory::Inheritance => "inheritance",
+            };
+            self.edge_category_index
+                .entry(key.to_string())
+                .or_default()
+                .push(edge_idx);
+        }
     }
 
     fn rebuild_reverse_deps(&mut self) {
@@ -379,6 +524,63 @@ impl GraphStore {
                 }
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn dead_routines(&self) -> Vec<NodeIndex> {
+        self.nodes_by_type("proc")
+            .iter()
+            .chain(self.nodes_by_type("func").iter())
+            .filter(|&&idx| {
+                self.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .count()
+                    == 0
+                    && self
+                        .graph
+                        .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                        .count()
+                        == 0
+            })
+            .copied()
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn entry_points(&self) -> Vec<NodeIndex> {
+        self.graph
+            .node_indices()
+            .filter(|&idx| {
+                self.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming)
+                    .count()
+                    == 0
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn find_cycles(&self) -> Vec<Vec<NodeIndex>> {
+        petgraph::algo::kosaraju_scc(&self.graph)
+            .into_iter()
+            .filter(|scc| scc.len() > 1)
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn impact(&self, node: NodeIndex, max_depth: Option<usize>) -> Vec<NodeIndex> {
+        use crate::graph::query::filter::EdgeFilter;
+        use crate::graph::query::traversal::GraphTraversal;
+
+        let mut traversal = GraphTraversal::new(&self.graph, node)
+            .incoming()
+            .edge_filter(EdgeFilter::new());
+
+        if let Some(depth) = max_depth {
+            traversal = traversal.max_depth(depth);
+        }
+
+        traversal.collect_nodes()
     }
 
     fn merge_duplicate_table_access_edges(graph: &mut crate::graph::CodeGraph) {
@@ -438,6 +640,19 @@ impl GraphStore {
         for idx in edges_to_remove {
             graph.remove_edge(idx);
         }
+    }
+}
+
+pub(crate) fn extract_schema(node: &Node) -> Option<&str> {
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => id.schema.as_deref(),
+        Node::Table { schema, .. } | Node::View { schema, .. } => schema.as_deref(),
+        Node::Package { schema, .. } => schema.as_deref(),
+        Node::Type { schema, .. } => schema.as_deref(),
+        Node::Sequence { schema, .. } => schema.as_deref(),
+        Node::MaterializedView { schema, .. } => schema.as_deref(),
+        Node::Synonym { schema, .. } => schema.as_deref(),
+        _ => None,
     }
 }
 
@@ -552,7 +767,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -604,7 +819,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![],
+            columns: Box::new(vec![]),
             partition_by: None,
             distribute_by: None,
             tablespace: None,
@@ -649,10 +864,10 @@ mod tests {
         let mut props = std::collections::BTreeMap::new();
         props.insert("version".to_string(), serde_json::json!("2.0"));
         let node = crate::graph::Node::Custom {
-            type_name: "dubbo_service".to_string(),
-            label: "com.example.Svc".to_string(),
-            key_fields,
-            properties: crate::graph::JsonMap(props),
+            type_name: Box::new("dubbo_service".to_string()),
+            label: Box::new("com.example.Svc".to_string()),
+            key_fields: Box::new(key_fields),
+            properties: Box::new(crate::graph::JsonMap(props)),
             location: None,
         };
         graph.add_node(node);
@@ -675,7 +890,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: None,
-            columns: vec![
+            columns: Box::new(vec![
                 crate::graph::ColumnSummary {
                     name: "id".to_string(),
                     data_type: "BIGINT".to_string(),
@@ -692,14 +907,14 @@ mod tests {
                     default_value: Some("now()".to_string()),
                     comment: Some("creation time".to_string()),
                 },
-            ],
-            partition_by: Some(crate::graph::PartitionInfo::Range {
+            ]),
+            partition_by: Some(Box::new(crate::graph::PartitionInfo::Range {
                 columns: vec!["created_at".to_string()],
                 partitions: vec!["p_2024".to_string(), "p_2025".to_string()],
-            }),
-            distribute_by: Some(crate::graph::DistributeInfo::Hash {
+            })),
+            distribute_by: Some(Box::new(crate::graph::DistributeInfo::Hash {
                 columns: vec!["user_id".to_string()],
-            }),
+            })),
             tablespace: Some("pg_default".to_string()),
             temporary: false,
             unlogged: false,
@@ -759,5 +974,540 @@ mod tests {
             "Error should mention version: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn type_tag_index_returns_correct_nodes() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        for i in 0..3 {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: format!("proc{}", i),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+            });
+        }
+        for i in 0..2 {
+            graph.add_node(crate::graph::Node::Table {
+                schema: Some("public".to_string()),
+                name: format!("table{}", i),
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            });
+        }
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "my_func".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.nodes_by_type("proc").len(), 3);
+        assert_eq!(store.nodes_by_type("table").len(), 2);
+        assert_eq!(store.nodes_by_type("func").len(), 1);
+        assert_eq!(store.nodes_by_type("view").len(), 0);
+    }
+
+    #[test]
+    fn name_index_is_sorted_and_complete() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "zebra".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "apple".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "mango".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let name_index = store.name_index();
+        assert_eq!(name_index.len(), 3);
+        for i in 1..name_index.len() {
+            assert!(
+                name_index[i - 1].0 <= name_index[i].0,
+                "name_index should be sorted"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_index_groups_by_schema() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("schema_a".to_string()),
+                package: None,
+                name: "p1".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("schema_a".to_string()),
+            name: "t1".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("schema_b".to_string()),
+                package: None,
+                name: "f1".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::View {
+            schema: Some("schema_b".to_string()),
+            name: "v1".to_string(),
+            location: None,
+        });
+        graph.add_node(crate::graph::Node::Trigger {
+            name: "trig1".to_string(),
+            table: vec!["t1".to_string()],
+            location: loc.clone(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let schema_index = store.schema_index();
+        assert_eq!(schema_index.get("schema_a").map(|v| v.len()), Some(2));
+        assert_eq!(schema_index.get("schema_b").map(|v| v.len()), Some(2));
+        assert_eq!(schema_index.get("schema_c").map(|v| v.len()), None);
+    }
+
+    #[test]
+    fn search_nodes_finds_exact_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("do_work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "proc:public.do_work");
+    }
+
+    #[test]
+    fn search_nodes_finds_substring_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "calculate_total".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "get_total_amount".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("total");
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("total"));
+    }
+
+    #[test]
+    fn search_nodes_returns_empty_for_no_match() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("nonexistent");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn edge_category_index_groups_correctly() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        let proc_a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_a".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        let proc_b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_b".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        let table = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        graph.add_edge(
+            proc_a,
+            proc_b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::External,
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TriggersRoutine {
+                location: loc.clone(),
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+
+        let call_edges = store.edges_by_category("call");
+        assert_eq!(call_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[call_edges[0]],
+            crate::graph::Edge::DirectCall { .. }
+        ));
+
+        let dataflow_edges = store.edges_by_category("dataflow");
+        assert_eq!(dataflow_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[dataflow_edges[0]],
+            crate::graph::Edge::TableAccess { .. }
+        ));
+
+        let reference_edges = store.edges_by_category("reference");
+        assert_eq!(reference_edges.len(), 1);
+        assert!(matches!(
+            store.graph()[reference_edges[0]],
+            crate::graph::Edge::TriggersRoutine { .. }
+        ));
+
+        let composition_edges = store.edges_by_category("composition");
+        assert!(composition_edges.is_empty());
+    }
+
+    #[test]
+    fn dead_routines_finds_unreferenced_procs() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let called = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "called".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let orphan = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "orphan".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        let caller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "caller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 3,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            caller,
+            called,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 3,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let dead = store.dead_routines();
+        assert!(dead.contains(&orphan));
+        assert!(!dead.contains(&called));
+        assert!(
+            !dead.contains(&caller),
+            "caller has no incoming edges but it calls something"
+        );
+    }
+
+    #[test]
+    fn find_cycles_detects_mutual_calls() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "a".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "b".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 1,
+                },
+            },
+        );
+        graph.add_edge(
+            b,
+            a,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 2,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let cycles = store.find_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].len(), 2);
+    }
+
+    #[test]
+    fn impact_traces_backward() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let target = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "target".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 1,
+            },
+            partial: false,
+        });
+        let caller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "caller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 2,
+            },
+            partial: false,
+        });
+        let grandcaller = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "grandcaller".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: file.clone(),
+                line: 3,
+            },
+            partial: false,
+        });
+        graph.add_edge(
+            caller,
+            target,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 2,
+                },
+            },
+        );
+        graph.add_edge(
+            grandcaller,
+            caller,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: crate::graph::SourceLocation {
+                    file: file.clone(),
+                    line: 3,
+                },
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let impacted = store.impact(target, None);
+        assert_eq!(impacted.len(), 2);
+        assert!(impacted.contains(&caller));
+        assert!(impacted.contains(&grandcaller));
     }
 }

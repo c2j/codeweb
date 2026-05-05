@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use petgraph::graph::NodeIndex;
@@ -11,6 +11,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::graph::key::NodeKey;
 use crate::graph::node_type_tag;
+use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::CodeGraph;
 
@@ -25,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/nodes/:id/callers", get(node_callers))
         .route("/api/v1/nodes/:id/callees", get(node_callees))
         .route("/api/v1/trace", get(trace))
+        .route("/api/v1/query", post(execute_query))
         .route("/api/v1/export", get(export))
         .route("/api/v1/graph", get(graph_data))
         .layer(CorsLayer::permissive())
@@ -193,8 +195,9 @@ async fn trace(
     State(state): State<AppState>,
     Query(query): Query<TraceQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    let store = state.store();
+    let matches = store.search_nodes(&query.from);
     let graph = state.graph();
-    let matches = traverse::find_nodes_by_name(graph, &query.from);
 
     if matches.is_empty() {
         return Err(StatusCode::NOT_FOUND);
@@ -220,6 +223,17 @@ async fn trace(
     });
 
     Ok(Json(result))
+}
+
+async fn execute_query(
+    State(state): State<AppState>,
+    Json(spec): Json<QuerySpec>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let store = state.store();
+    match spec.execute(store) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 #[derive(serde::Deserialize)]

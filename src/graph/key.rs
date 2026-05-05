@@ -215,19 +215,19 @@ impl NodeKey {
                 line: *line,
             },
             super::Node::Unresolved { raw_expr, context } => NodeKey::Unresolved {
-                raw_expr: raw_expr.clone(),
-                context: context.clone(),
+                raw_expr: (**raw_expr).clone(),
+                context: (**context).clone(),
             },
             super::Node::Custom {
                 type_name,
                 key_fields,
                 ..
             } => {
-                let key = serde_json::to_string(key_fields)
+                let key = serde_json::to_string(&**key_fields)
                     .unwrap_or_default()
                     .to_string();
                 NodeKey::Custom {
-                    type_name: type_name.clone(),
+                    type_name: (**type_name).clone(),
                     key,
                 }
             }

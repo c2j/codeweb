@@ -207,7 +207,7 @@ impl CgefParser {
                     schema: key_get_str(key, "schema").map(String::from),
                     name: name.to_string(),
                     location: None,
-                    columns: vec![],
+                    columns: Box::new(vec![]),
                     partition_by: None,
                     distribute_by: None,
                     tablespace: None,
@@ -500,8 +500,8 @@ impl CgefParser {
                         field: "context".to_string(),
                     })?;
                 Ok(Node::Unresolved {
-                    raw_expr: raw_expr.to_string(),
-                    context: context.to_string(),
+                    raw_expr: Box::new(raw_expr.to_string()),
+                    context: Box::new(context.to_string()),
                 })
             }
             other => Err(ParseError::UnknownNodeType {
@@ -531,10 +531,10 @@ impl CgefParser {
         let location = cgef.location.as_ref().map(|l| self.make_source_location(l));
 
         Ok(Node::Custom {
-            type_name,
-            label,
-            key_fields,
-            properties: JsonMap(properties),
+            type_name: Box::new(type_name),
+            label: Box::new(label),
+            key_fields: Box::new(key_fields),
+            properties: Box::new(JsonMap(properties)),
             location,
         })
     }
@@ -896,8 +896,8 @@ mod tests {
             ..
         } = &result.graph[NodeIndex::new(0)]
         {
-            assert_eq!(type_name, "dubbo_service");
-            assert_eq!(label, "com.example.Svc");
+            assert_eq!(type_name.as_ref(), "dubbo_service");
+            assert_eq!(label.as_ref(), "com.example.Svc");
             assert_eq!(properties.0.get("version").unwrap().as_str(), Some("2.0"));
         } else {
             panic!("Expected Custom node");

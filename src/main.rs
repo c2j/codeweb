@@ -239,6 +239,21 @@ enum Commands {
         #[arg(short, long)]
         files: bool,
     },
+
+    /// Execute a JSON query spec against the graph
+    Query {
+        /// Path to JSON query spec file (use - for stdin)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Inline JSON query spec string
+        #[arg(short, long)]
+        spec: Option<String>,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 fn main() {
@@ -340,6 +355,11 @@ fn run() -> Result<()> {
             name,
             force,
         }) => cmd_import(&file, &output, prefix.as_deref(), name.as_deref(), force),
+        Some(Commands::Query {
+            file,
+            spec,
+            project,
+        }) => cmd_query(file.as_deref(), spec.as_deref(), &project),
         None => cmd_legacy(cli),
     }
 }
@@ -440,8 +460,8 @@ fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
 
+    let matches = store.search_nodes(from);
     let graph = store.graph();
-    let matches = graph::traverse::find_nodes_by_name(graph, from);
 
     if matches.is_empty() {
         eprintln!("No nodes matching '{}'", from);
@@ -561,7 +581,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
         Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
         Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
-        Node::Custom { type_name, .. } => std::borrow::Cow::Owned(type_name.clone()),
+        Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
     }
 }
 
@@ -583,7 +603,7 @@ fn cmd_nodes(
     let type_filter = node_type.map(|t| t.to_lowercase());
 
     let indices: Vec<petgraph::graph::NodeIndex> = if let Some(query) = search {
-        let matches = graph::traverse::find_nodes_by_name(graph, query);
+        let matches = store.search_nodes(query);
         if matches.is_empty() {
             eprintln!("No nodes matching '{}'", query);
             return Ok(());
@@ -676,7 +696,7 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
     let store = proj.load_store()?;
     let graph = store.graph();
 
-    let matches = graph::traverse::find_nodes_by_name(graph, name);
+    let matches = store.search_nodes(name);
 
     if matches.is_empty() {
         eprintln!("No nodes matching '{}'", name);
@@ -738,6 +758,52 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
     Ok(())
 }
 
+fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+
+    let json_str = match (file, spec_str) {
+        (Some(path), _) => {
+            if path.to_str() == Some("-") {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|source| error::CodeWebError::ExportError {
+                        message: source.to_string(),
+                    })?;
+                buf
+            } else {
+                std::fs::read_to_string(path).map_err(|source| error::CodeWebError::FileRead {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+            }
+        }
+        (None, Some(s)) => s.to_string(),
+        (None, None) => {
+            eprintln!("Error: provide --file or --spec");
+            std::process::exit(1);
+        }
+    };
+
+    let query_spec: crate::graph::query::spec::QuerySpec = serde_json::from_str(&json_str)
+        .map_err(|e| error::CodeWebError::ExportError {
+            message: format!("Invalid query spec: {}", e),
+        })?;
+
+    let result = query_spec
+        .execute(store)
+        .map_err(|e| error::CodeWebError::ExportError { message: e })?;
+
+    let output =
+        serde_json::to_string_pretty(&result).map_err(|e| error::CodeWebError::ExportError {
+            message: e.to_string(),
+        })?;
+    println!("{}", output);
+    Ok(())
+}
+
 fn print_node_details(node: &Node) {
     use graph::{DistributeInfo, PartitionInfo};
     if let Node::Table {
@@ -768,7 +834,7 @@ fn print_node_details(node: &Node) {
         }
         if !columns.is_empty() {
             println!("  columns ({}):", columns.len());
-            for col in columns {
+            for col in columns.iter() {
                 let pk = if col.is_primary_key { " [PK]" } else { "" };
                 let null = if col.nullable { "NULL" } else { "NOT NULL" };
                 let def = col
@@ -780,7 +846,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(part) = partition_by {
-            match part {
+            match part.as_ref() {
                 PartitionInfo::Range {
                     columns,
                     partitions,
@@ -816,7 +882,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(dist) = distribute_by {
-            match dist {
+            match dist.as_ref() {
                 DistributeInfo::Hash { columns } => {
                     println!("  distribute: HASH({})", columns.join(", "));
                 }
@@ -832,7 +898,7 @@ fn print_node_details(node: &Node) {
             }
         }
         if let Some(ddl) = ddl_source {
-            println!("  ddl: {}", ddl);
+            println!("  ddl: {}", ddl.as_ref());
         }
     }
 }

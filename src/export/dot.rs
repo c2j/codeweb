@@ -136,9 +136,11 @@ pub fn to_dot(graph: &CodeGraph) -> String {
                 (format!("{}→{}", label, target), "trapezium", "")
             }
             Node::Event { name, .. } => (name.clone(), "octagon", ""),
-            Node::Custom { label, .. } => {
-                (label.clone(), "box", ", style=filled, fillcolor=lightgray")
-            }
+            Node::Custom { label, .. } => (
+                (**label).clone(),
+                "box",
+                ", style=filled, fillcolor=lightgray",
+            ),
         };
         let escaped = dot_escape(&label);
         out.push_str(&format!(
