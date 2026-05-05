@@ -114,14 +114,20 @@ fn edge_label_for(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tree_dfs(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
     direction: Direction,
     ancestors: &mut HashSet<NodeIndex>,
     depth: usize,
+    max_depth: usize,
+    max_nodes: usize,
+    visited: &mut usize,
 ) -> Vec<TreeNode> {
-    let max_depth = 50;
+    if *visited >= max_nodes {
+        return Vec::new();
+    }
     if depth > max_depth {
         let key = crate::graph::key::NodeKey::from_node(&graph[start]);
         eprintln!(
@@ -138,13 +144,26 @@ fn build_tree_dfs(
         .collect();
 
     for neighbor in neighbors {
+        if *visited >= max_nodes {
+            break;
+        }
         let (from, to) = match direction {
             Direction::Outgoing => (start, neighbor),
             Direction::Incoming => (neighbor, start),
         };
         let edge_label = edge_label_for(graph, from, to);
         ancestors.insert(neighbor);
-        let children = build_tree_dfs(graph, neighbor, direction, ancestors, depth + 1);
+        *visited += 1;
+        let children = build_tree_dfs(
+            graph,
+            neighbor,
+            direction,
+            ancestors,
+            depth + 1,
+            max_depth,
+            max_nodes,
+            visited,
+        );
         ancestors.remove(&neighbor);
         roots.push(TreeNode {
             idx: neighbor,
@@ -155,20 +174,48 @@ fn build_tree_dfs(
     roots
 }
 
-pub fn trace_chain(graph: &crate::graph::CodeGraph, start: NodeIndex) -> CallChain {
+pub fn trace_chain(
+    graph: &crate::graph::CodeGraph,
+    start: NodeIndex,
+    max_depth: usize,
+    max_nodes: usize,
+) -> (CallChain, usize) {
+    let mut visited = 0usize;
+
     let mut caller_ancestors = HashSet::new();
     caller_ancestors.insert(start);
-    let callers = build_tree_dfs(graph, start, Direction::Incoming, &mut caller_ancestors, 0);
+    let callers = build_tree_dfs(
+        graph,
+        start,
+        Direction::Incoming,
+        &mut caller_ancestors,
+        0,
+        max_depth,
+        max_nodes,
+        &mut visited,
+    );
 
     let mut callee_ancestors = HashSet::new();
     callee_ancestors.insert(start);
-    let callees = build_tree_dfs(graph, start, Direction::Outgoing, &mut callee_ancestors, 0);
+    let callees = build_tree_dfs(
+        graph,
+        start,
+        Direction::Outgoing,
+        &mut callee_ancestors,
+        0,
+        max_depth,
+        max_nodes,
+        &mut visited,
+    );
 
-    CallChain {
-        target: start,
-        callers,
-        callees,
-    }
+    (
+        CallChain {
+            target: start,
+            callers,
+            callees,
+        },
+        visited,
+    )
 }
 
 /// Collect all unique source files involved in a call chain.

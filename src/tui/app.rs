@@ -186,7 +186,7 @@ impl App {
         }
         lines.push(Line::from(""));
 
-        let chain = traverse::trace_chain(graph, idx);
+        let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
         let chain_lines = match self.chain_style {
             traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
             traverse::ChainStyle::Path => {
@@ -595,7 +595,7 @@ impl App {
 
         // Preview panel: show call chain for selected node
         if let Some(idx) = self.selected_node() {
-            let chain = traverse::trace_chain(graph, idx);
+            let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
             let preview_lines = match self.chain_style {
                 traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
                 traverse::ChainStyle::Path => {
