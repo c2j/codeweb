@@ -1,3 +1,5 @@
+use crate::parser::ColumnAnalysis;
+
 pub mod builder;
 pub mod key;
 pub mod query;
@@ -445,6 +447,8 @@ pub enum Edge {
         modes: AccessMode,
         write_kinds: std::collections::HashSet<WriteKind>,
         location: SourceLocation,
+        #[serde(default)]
+        column_analysis: Option<Box<ColumnAnalysis>>,
     },
     DependsOn {
         location: SourceLocation,

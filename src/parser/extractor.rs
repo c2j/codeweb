@@ -1,11 +1,12 @@
 use crate::graph::{AccessMode, RoutineId, RoutineKind, SourceLocation, WriteKind};
 use ogsql_parser::ast::plpgsql::{PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::{
-    CallFuncStatement, DataType, Expr, Literal, ObjectName, SelectStatement, SequenceFunc,
-    Statement, TableRef as AstTableRef,
+    CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
+    ObjectName, SelectStatement, SelectTarget, SequenceFunc, Statement, TableRef as AstTableRef,
+    UpdateStatement, WhenClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -563,6 +564,915 @@ impl Visitor for TableAccessExtractor {
     }
 }
 
+// ── Column-level analysis ───────────────────────────────────
+
+/// Column-level analysis result from a single walk.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ColumnAnalysis {
+    /// Alias → (schema, table_name)
+    pub alias_map: BTreeMap<String, TableAlias>,
+    /// All column references (deduplicated).
+    pub column_refs: Vec<ColumnRef>,
+    /// Equi-join conditions (col = col).
+    pub join_conditions: Vec<JoinCondition>,
+    /// WHERE clause hard-coded filters (col = literal).
+    pub hard_filters: Vec<HardFilter>,
+    /// CASE/DECODE enum value mappings.
+    pub enum_mappings: Vec<EnumMapping>,
+    /// SELECT INTO variable assignments.
+    pub select_into: Vec<SelectIntoMapping>,
+    /// INSERT statement column lists.
+    pub insert_columns: Vec<InsertColumnInfo>,
+    /// UPDATE statement SET columns.
+    pub update_columns: Vec<UpdateColumnInfo>,
+}
+
+/// Table alias definition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableAlias {
+    pub schema: Option<String>,
+    pub table: String,
+}
+
+/// Column reference.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnRef {
+    /// Resolved table name (via alias_map). None if unresolvable or unprefixed.
+    pub resolved_table: Option<String>,
+    /// Original alias prefix (e.g. "t", "fi").
+    pub alias_prefix: Option<String>,
+    /// Column name.
+    pub column: String,
+    /// Contexts where this column appears.
+    pub contexts: Vec<ColumnContext>,
+}
+
+/// Where a column reference appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ColumnContext {
+    SelectTarget,
+    JoinCondition,
+    WhereClause,
+    OrderBy,
+    GroupBy,
+    Having,
+    CorrelatedSubquery,
+    InsertTarget,
+    UpdateSet,
+}
+
+/// Equi-join condition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JoinCondition {
+    pub left_table: String,
+    pub left_column: String,
+    pub right_table: String,
+    pub right_column: String,
+    pub join_type: JoinType,
+    pub source: JoinConditionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JoinConditionSource {
+    ImplicitWhere,
+    ExplicitOn,
+}
+
+/// WHERE clause hard-coded filter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HardFilter {
+    pub table: Option<String>,
+    pub column: String,
+    pub operator: FilterOperator,
+    pub value: FilterValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FilterOperator {
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Like,
+    NotLike,
+    In,
+    Between,
+    IsNull,
+    IsNotNull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FilterValue {
+    String(String),
+    Integer(i64),
+    Float(String),
+    Boolean(bool),
+    Null,
+    List(Vec<FilterValue>),
+    Expression(String),
+}
+
+/// CASE/DECODE enum value mapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnumMapping {
+    pub column: String,
+    pub table_alias: Option<String>,
+    pub values: Vec<(FilterValue, String)>,
+    pub has_else: bool,
+}
+
+/// SELECT INTO variable assignment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectIntoMapping {
+    pub column_expr: String,
+    pub into_variable: String,
+}
+
+/// INSERT column info.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InsertColumnInfo {
+    pub table: String,
+    pub columns: Vec<String>,
+}
+
+/// UPDATE SET column info.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpdateColumnInfo {
+    pub table: String,
+    pub set_columns: Vec<String>,
+}
+
+/// Column-level SQL dependency extractor.
+///
+/// Usage (same pattern as TableAccessExtractor):
+///   let mut ext = ColumnAccessExtractor::new();
+///   walk_statement(&mut ext, &statement);
+///   let analysis = ext.finish();
+pub struct ColumnAccessExtractor {
+    alias_map: BTreeMap<String, TableAlias>,
+    column_refs: Vec<ColumnRef>,
+    join_conditions: Vec<JoinCondition>,
+    hard_filters: Vec<HardFilter>,
+    enum_mappings: Vec<EnumMapping>,
+    select_into: Vec<SelectIntoMapping>,
+    insert_columns: Vec<InsertColumnInfo>,
+    update_columns: Vec<UpdateColumnInfo>,
+    clause_stack: Vec<ColumnContext>,
+}
+
+impl ColumnAccessExtractor {
+    pub fn new() -> Self {
+        Self {
+            alias_map: BTreeMap::new(),
+            column_refs: Vec::new(),
+            join_conditions: Vec::new(),
+            hard_filters: Vec::new(),
+            enum_mappings: Vec::new(),
+            select_into: Vec::new(),
+            insert_columns: Vec::new(),
+            update_columns: Vec::new(),
+            clause_stack: Vec::new(),
+        }
+    }
+
+    pub fn finish(self) -> ColumnAnalysis {
+        ColumnAnalysis {
+            column_refs: dedup_column_refs(self.column_refs),
+            alias_map: self.alias_map,
+            join_conditions: self.join_conditions,
+            hard_filters: self.hard_filters,
+            enum_mappings: self.enum_mappings,
+            select_into: self.select_into,
+            insert_columns: self.insert_columns,
+            update_columns: self.update_columns,
+        }
+    }
+
+    fn current_clause(&self) -> Option<ColumnContext> {
+        self.clause_stack.last().copied()
+    }
+
+    fn resolve_alias(&self, prefix: &str) -> Option<&TableAlias> {
+        self.alias_map.get(&prefix.to_lowercase())
+    }
+
+    fn add_column_ref(&mut self, names: &[String], extra_context: Option<ColumnContext>) {
+        let (alias_prefix, column) = if names.len() >= 2 {
+            (Some(names[0].clone()), names[names.len() - 1].clone())
+        } else {
+            (None, names[0].clone())
+        };
+        let resolved_table = alias_prefix
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone());
+        let ctx = extra_context.unwrap_or(ColumnContext::SelectTarget);
+        self.column_refs.push(ColumnRef {
+            resolved_table,
+            alias_prefix,
+            column,
+            contexts: vec![ctx],
+        });
+    }
+
+    fn collect_aliases_from_table_refs(&mut self, refs: &[AstTableRef]) {
+        for tr in refs {
+            match tr {
+                AstTableRef::Table { name, alias, .. } => {
+                    let (schema, table) = split_schema_table(name);
+                    if let Some(a) = alias {
+                        self.alias_map
+                            .insert(a.to_lowercase(), TableAlias { schema, table });
+                    } else {
+                        let table_lower = table.to_lowercase();
+                        self.alias_map
+                            .entry(table_lower)
+                            .or_insert(TableAlias { schema, table });
+                    }
+                }
+                AstTableRef::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    ..
+                } => {
+                    self.collect_aliases_from_table_refs(std::slice::from_ref(left));
+                    self.collect_aliases_from_table_refs(std::slice::from_ref(right));
+                    if let Some(cond) = condition {
+                        self.clause_stack.push(ColumnContext::JoinCondition);
+                        self.process_expr_for_joins_and_filters(cond, join_type, true);
+                        self.clause_stack.pop();
+                    }
+                }
+                AstTableRef::Subquery { .. } => {}
+                AstTableRef::FunctionCall { alias: Some(a), .. } => {
+                    self.alias_map.insert(
+                        a.to_lowercase(),
+                        TableAlias {
+                            schema: None,
+                            table: String::new(),
+                        },
+                    );
+                }
+                AstTableRef::FunctionCall { .. } => {}
+                _ => {}
+            }
+        }
+    }
+
+    /// Process an expression looking for equi-join conditions and hard filters.
+    fn process_expr_for_joins_and_filters(
+        &mut self,
+        expr: &Expr,
+        join_type: &AstJoinType,
+        is_explicit_on: bool,
+    ) {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                let op_trimmed = op.trim();
+                match op_trimmed {
+                    "=" => {
+                        if let (Some(l_names), Some(r_names)) =
+                            (as_column_ref(left), as_column_ref(right))
+                        {
+                            // Both sides are column refs → equi-join
+                            self.extract_join_condition(
+                                &l_names,
+                                &r_names,
+                                join_type,
+                                is_explicit_on,
+                            );
+                            self.extract_join_condition(
+                                &r_names,
+                                &l_names,
+                                join_type,
+                                is_explicit_on,
+                            );
+                            // Also add column refs in join context
+                            self.add_column_ref(&l_names, Some(ColumnContext::JoinCondition));
+                            self.add_column_ref(&r_names, Some(ColumnContext::JoinCondition));
+                        } else if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Eq, val);
+                            }
+                        } else if let Some(col_names) = as_column_ref(right) {
+                            if let Some(val) = literal_to_filter_value(left) {
+                                self.add_hard_filter(&col_names, FilterOperator::Eq, val);
+                            }
+                        }
+                    }
+                    "<>" | "!=" => {
+                        if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Neq, val);
+                            }
+                        } else if let Some(col_names) = as_column_ref(right) {
+                            if let Some(val) = literal_to_filter_value(left) {
+                                self.add_hard_filter(&col_names, FilterOperator::Neq, val);
+                            }
+                        }
+                    }
+                    ">" => {
+                        if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Gt, val);
+                            }
+                        }
+                    }
+                    ">=" => {
+                        if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Gte, val);
+                            }
+                        }
+                    }
+                    "<" => {
+                        if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Lt, val);
+                            }
+                        }
+                    }
+                    "<=" => {
+                        if let Some(col_names) = as_column_ref(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter(&col_names, FilterOperator::Lte, val);
+                            }
+                        }
+                    }
+                    "AND" => {
+                        self.process_expr_for_joins_and_filters(left, join_type, is_explicit_on);
+                        self.process_expr_for_joins_and_filters(right, join_type, is_explicit_on);
+                    }
+                    _ => {}
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
+                if let Some(col_names) = as_column_ref(expr) {
+                    if let Some(val) = literal_to_filter_value(pattern) {
+                        let op = if *negated {
+                            FilterOperator::NotLike
+                        } else {
+                            FilterOperator::Like
+                        };
+                        self.add_hard_filter(&col_names, op, val);
+                    }
+                }
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: _,
+            } => {
+                if let Some(col_names) = as_column_ref(expr) {
+                    if let (Some(lv), Some(hv)) =
+                        (literal_to_filter_value(low), literal_to_filter_value(high))
+                    {
+                        self.add_hard_filter(
+                            &col_names,
+                            FilterOperator::Between,
+                            FilterValue::List(vec![lv, hv]),
+                        );
+                    }
+                }
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated: _,
+            } => {
+                if let Some(col_names) = as_column_ref(expr) {
+                    let vals: Vec<FilterValue> =
+                        list.iter().filter_map(literal_to_filter_value).collect();
+                    if vals.len() == list.len() {
+                        self.add_hard_filter(
+                            &col_names,
+                            FilterOperator::In,
+                            FilterValue::List(vals),
+                        );
+                    }
+                }
+            }
+            Expr::IsNull { expr, negated } => {
+                if let Some(col_names) = as_column_ref(expr) {
+                    let op = if *negated {
+                        FilterOperator::IsNotNull
+                    } else {
+                        FilterOperator::IsNull
+                    };
+                    self.add_hard_filter(&col_names, op, FilterValue::Null);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_join_condition(
+        &mut self,
+        left_names: &[String],
+        right_names: &[String],
+        join_type: &AstJoinType,
+        is_explicit_on: bool,
+    ) {
+        let (left_alias, left_col) = split_alias_column(left_names);
+        let (right_alias, right_col) = split_alias_column(right_names);
+        let left_table = left_alias
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone())
+            .unwrap_or_default();
+        let right_table = right_alias
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone())
+            .unwrap_or_default();
+
+        let jt = match join_type {
+            AstJoinType::Inner => JoinType::Inner,
+            AstJoinType::Left => JoinType::Left,
+            AstJoinType::Right => JoinType::Right,
+            AstJoinType::Full => JoinType::Full,
+            AstJoinType::Cross => JoinType::Cross,
+        };
+        let source = if is_explicit_on {
+            JoinConditionSource::ExplicitOn
+        } else {
+            JoinConditionSource::ImplicitWhere
+        };
+
+        // Only add if not already present (avoid duplicates from bidirectional extraction)
+        let candidate = JoinCondition {
+            left_table: left_table.clone(),
+            left_column: left_col.clone(),
+            right_table: right_table.clone(),
+            right_column: right_col.clone(),
+            join_type: jt,
+            source,
+        };
+        // Check reverse doesn't already exist
+        let already_exists = self.join_conditions.iter().any(|existing| {
+            existing.left_table == right_table
+                && existing.left_column == right_col
+                && existing.right_table == left_table
+                && existing.right_column == left_col
+        });
+        if !already_exists && !left_table.is_empty() && !right_table.is_empty() {
+            self.join_conditions.push(candidate);
+        }
+    }
+
+    fn add_hard_filter(&mut self, col_names: &[String], op: FilterOperator, val: FilterValue) {
+        let (alias_prefix, column) = split_alias_column(col_names);
+        let table = alias_prefix
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone());
+        self.hard_filters.push(HardFilter {
+            table,
+            column,
+            operator: op,
+            value: val,
+        });
+    }
+
+    fn extract_enum_from_case(
+        &mut self,
+        operand: &Expr,
+        whens: &[WhenClause],
+        else_expr: Option<&Expr>,
+    ) {
+        let (table_alias, column) = match operand {
+            Expr::ColumnRef(names) => {
+                let (a, c) = split_alias_column(names);
+                (a, c)
+            }
+            _ => return,
+        };
+        let mut values = Vec::new();
+        for wc in whens {
+            if let Some(match_val) = literal_to_filter_value(&wc.condition) {
+                let label = literal_to_string(&wc.result).unwrap_or_default();
+                values.push((match_val, label));
+            }
+        }
+        self.enum_mappings.push(EnumMapping {
+            column,
+            table_alias,
+            values,
+            has_else: else_expr.is_some(),
+        });
+    }
+
+    fn extract_enum_from_decode(&mut self, args: &[Expr]) {
+        if args.is_empty() {
+            return;
+        }
+        let (table_alias, column) = match &args[0] {
+            Expr::ColumnRef(names) => split_alias_column(names),
+            _ => return,
+        };
+        let rest = &args[1..];
+        let mut values = Vec::new();
+        let mut has_else = false;
+        let chunks = rest.chunks(2);
+        for chunk in chunks {
+            if chunk.len() == 2 {
+                if let Some(match_val) = literal_to_filter_value(&chunk[0]) {
+                    let label = literal_to_string(&chunk[1]).unwrap_or_default();
+                    values.push((match_val, label));
+                }
+            } else if chunk.len() == 1 {
+                // Default value (odd argument)
+                has_else = true;
+            }
+        }
+        self.enum_mappings.push(EnumMapping {
+            column,
+            table_alias,
+            values,
+            has_else,
+        });
+    }
+}
+
+impl Visitor for ColumnAccessExtractor {
+    fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
+        // Collect aliases from FROM clause
+        self.collect_aliases_from_table_refs(&select.from);
+
+        // Handle SELECT INTO (PL/pgSQL SELECT col INTO var FROM ...)
+        if let Some(ref into_targets) = select.into_targets {
+            for (i, target) in select.targets.iter().enumerate() {
+                if i < into_targets.len() {
+                    let col_expr = format_select_target(target);
+                    let var_name = format_select_target(&into_targets[i]);
+                    self.select_into.push(SelectIntoMapping {
+                        column_expr: col_expr,
+                        into_variable: var_name,
+                    });
+                }
+            }
+        }
+
+        // Walk SELECT targets for column refs
+        self.clause_stack.push(ColumnContext::SelectTarget);
+        for target in &select.targets {
+            walk_select_target_exprs(self, target);
+        }
+        self.clause_stack.pop();
+
+        // Walk WHERE clause
+        if let Some(ref where_clause) = select.where_clause {
+            self.clause_stack.push(ColumnContext::WhereClause);
+            self.process_expr_for_joins_and_filters(where_clause, &AstJoinType::Inner, false);
+            self.walk_expr_for_column_refs(where_clause);
+            self.clause_stack.pop();
+        }
+
+        // Walk GROUP BY
+        for _item in &select.group_by {}
+
+        // Walk HAVING
+        if let Some(ref having) = select.having {
+            self.clause_stack.push(ColumnContext::Having);
+            self.walk_expr_for_column_refs(having);
+            self.clause_stack.pop();
+        }
+
+        // Walk ORDER BY
+        if !select.order_by.is_empty() {
+            self.clause_stack.push(ColumnContext::OrderBy);
+            for ob in &select.order_by {
+                self.walk_expr_for_column_refs(&ob.expr);
+            }
+            self.clause_stack.pop();
+        }
+
+        VisitorResult::Continue
+    }
+
+    fn visit_insert(&mut self, insert: &InsertStatement) -> VisitorResult {
+        let table_name = insert.table.last().cloned().unwrap_or_default();
+        self.insert_columns.push(InsertColumnInfo {
+            table: table_name,
+            columns: insert.columns.clone(),
+        });
+        VisitorResult::Continue
+    }
+
+    fn visit_update(&mut self, update: &UpdateStatement) -> VisitorResult {
+        // Collect aliases from update tables
+        for tr in &update.tables {
+            if let AstTableRef::Table {
+                name,
+                alias: Some(a),
+                ..
+            } = tr
+            {
+                let (schema, table) = split_schema_table(name);
+                self.alias_map
+                    .insert(a.to_lowercase(), TableAlias { schema, table });
+            }
+        }
+
+        let table_name = update
+            .tables
+            .first()
+            .and_then(|tr| {
+                if let AstTableRef::Table { name, .. } = tr {
+                    Some(name.last().cloned().unwrap_or_default())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let set_columns: Vec<String> = update
+            .assignments
+            .iter()
+            .map(|a| a.column.last().cloned().unwrap_or_default())
+            .collect();
+
+        if !table_name.is_empty() {
+            self.update_columns.push(UpdateColumnInfo {
+                table: table_name,
+                set_columns,
+            });
+        }
+
+        // Walk WHERE clause for column refs and filters
+        if let Some(ref where_clause) = update.where_clause {
+            self.clause_stack.push(ColumnContext::WhereClause);
+            self.process_expr_for_joins_and_filters(where_clause, &AstJoinType::Inner, false);
+            self.walk_expr_for_column_refs(where_clause);
+            self.clause_stack.pop();
+        }
+
+        VisitorResult::Continue
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
+        match expr {
+            Expr::ColumnRef(names) if !names.is_empty() => {
+                let ctx = self.current_clause().unwrap_or(ColumnContext::SelectTarget);
+                self.add_column_ref(names, Some(ctx));
+            }
+            Expr::Case {
+                operand: Some(ref op),
+                whens,
+                else_expr,
+            } => {
+                self.extract_enum_from_case(op, whens, else_expr.as_ref().map(|e| e.as_ref()));
+            }
+            Expr::Case { .. } => {}
+            Expr::FunctionCall { name, args, .. } => {
+                if let Some(func_name) = name.last() {
+                    if func_name.eq_ignore_ascii_case("decode") && args.len() >= 3 {
+                        self.extract_enum_from_decode(args);
+                    }
+                }
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+}
+
+// ── Column analysis helpers ────────────────────────────────
+
+impl ColumnAccessExtractor {
+    fn walk_expr_for_column_refs(&mut self, expr: &Expr) {
+        match expr {
+            Expr::ColumnRef(names) if !names.is_empty() => {
+                let ctx = self.current_clause().unwrap_or(ColumnContext::SelectTarget);
+                self.add_column_ref(names, Some(ctx));
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.walk_expr_for_column_refs(left);
+                self.walk_expr_for_column_refs(right);
+            }
+            Expr::UnaryOp { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.walk_expr_for_column_refs(expr);
+                self.walk_expr_for_column_refs(pattern);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.walk_expr_for_column_refs(expr);
+                self.walk_expr_for_column_refs(low);
+                self.walk_expr_for_column_refs(high);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.walk_expr_for_column_refs(expr);
+                for item in list {
+                    self.walk_expr_for_column_refs(item);
+                }
+            }
+            Expr::IsNull { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.walk_expr_for_column_refs(arg);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(ref op) = operand {
+                    self.walk_expr_for_column_refs(op);
+                }
+                for wc in whens {
+                    self.walk_expr_for_column_refs(&wc.condition);
+                    self.walk_expr_for_column_refs(&wc.result);
+                }
+                if let Some(ref e) = else_expr {
+                    self.walk_expr_for_column_refs(e);
+                }
+            }
+            Expr::Exists(subquery) | Expr::Subquery(subquery) => {
+                // Don't recurse into subqueries to avoid alias pollution (P2 scope isolation)
+                let _ = subquery;
+            }
+            Expr::InSubquery { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+            }
+            Expr::TypeCast { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+            }
+            Expr::Parenthesized(inner) => {
+                self.walk_expr_for_column_refs(inner);
+            }
+            Expr::FieldAccess { object, .. } => {
+                self.walk_expr_for_column_refs(object);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_select_target_exprs(extractor: &mut ColumnAccessExtractor, target: &SelectTarget) {
+    match target {
+        SelectTarget::Expr(expr, _) => {
+            extractor.walk_expr_for_column_refs(expr);
+        }
+        SelectTarget::Star(_) => {}
+    }
+}
+
+fn format_select_target(target: &SelectTarget) -> String {
+    match target {
+        SelectTarget::Expr(expr, alias) => {
+            let base = format_expr_short(expr);
+            match alias {
+                Some(a) => format!("{} AS {}", base, a),
+                None => base,
+            }
+        }
+        SelectTarget::Star(alias) => match alias {
+            Some(a) => format!("{}.*", a),
+            None => "*".to_string(),
+        },
+    }
+}
+
+fn format_expr_short(expr: &Expr) -> String {
+    match expr {
+        Expr::ColumnRef(names) => names.join("."),
+        Expr::PlVariable(names) => names.join("."),
+        Expr::Literal(lit) => format_literal_short(lit),
+        Expr::FunctionCall { name, args, .. } => {
+            let fname = name.last().cloned().unwrap_or_default();
+            let arg_strs: Vec<String> = args.iter().map(format_expr_short).collect();
+            format!("{}({})", fname, arg_strs.join(", "))
+        }
+        _ => format!("{:?}", expr),
+    }
+}
+
+fn format_literal_short(lit: &Literal) -> String {
+    match lit {
+        Literal::String(s) => format!("'{}'", s),
+        Literal::Integer(i) => i.to_string(),
+        Literal::Float(f) => f.clone(),
+        Literal::Boolean(b) => b.to_string(),
+        Literal::Null => "NULL".to_string(),
+        _ => format!("{:?}", lit),
+    }
+}
+
+fn split_alias_column(names: &[String]) -> (Option<String>, String) {
+    if names.len() >= 2 {
+        (Some(names[0].clone()), names[names.len() - 1].clone())
+    } else {
+        (None, names[0].clone())
+    }
+}
+
+fn split_schema_table(name: &ObjectName) -> (Option<String>, String) {
+    if name.len() == 1 {
+        (None, name[0].clone())
+    } else {
+        (
+            Some(name[..name.len() - 1].join(".")),
+            name[name.len() - 1].clone(),
+        )
+    }
+}
+
+/// Check if an expression is a ColumnRef and return the names.
+fn as_column_ref(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::ColumnRef(names) => Some(names.clone()),
+        _ => None,
+    }
+}
+
+/// Convert a Literal expression to FilterValue. Returns None for non-literal (PL variables, etc).
+fn literal_to_filter_value(expr: &Expr) -> Option<FilterValue> {
+    match expr {
+        Expr::Literal(lit) => Some(literal_to_fv(lit)),
+        Expr::TypeCast { expr, .. } => literal_to_filter_value(expr),
+        Expr::UnaryOp { op, expr } if op == "-" => literal_to_filter_value(expr).map(|v| match v {
+            FilterValue::Integer(i) => FilterValue::Integer(-i),
+            FilterValue::Float(f) => FilterValue::Float(format!("-{}", f)),
+            other => other,
+        }),
+        _ => None,
+    }
+}
+
+fn literal_to_fv(lit: &Literal) -> FilterValue {
+    match lit {
+        Literal::String(s) => FilterValue::String(s.clone()),
+        Literal::Integer(i) => FilterValue::Integer(*i),
+        Literal::Float(f) => FilterValue::Float(f.clone()),
+        Literal::Boolean(b) => FilterValue::Boolean(*b),
+        Literal::Null => FilterValue::Null,
+        Literal::EscapeString(s) => FilterValue::String(s.clone()),
+        _ => FilterValue::Expression(format!("{:?}", lit)),
+    }
+}
+
+fn literal_to_string(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(s)) => Some(s.clone()),
+        Expr::Literal(Literal::Integer(i)) => Some(i.to_string()),
+        Expr::Literal(Literal::Float(f)) => Some(f.clone()),
+        Expr::Literal(Literal::Boolean(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn dedup_column_refs(refs: Vec<ColumnRef>) -> Vec<ColumnRef> {
+    let mut seen: BTreeMap<(Option<String>, String), Vec<ColumnContext>> = BTreeMap::new();
+    let mut result: Vec<ColumnRef> = Vec::new();
+    for cr in refs {
+        let key = (cr.resolved_table.clone(), cr.column.clone());
+        if let Some(existing_contexts) = seen.get_mut(&key) {
+            for ctx in &cr.contexts {
+                if !existing_contexts.contains(ctx) {
+                    existing_contexts.push(*ctx);
+                }
+            }
+        } else {
+            seen.insert(key.clone(), cr.contexts.clone());
+            result.push(cr);
+        }
+    }
+    // Update contexts in result
+    for cr in &mut result {
+        let key = (cr.resolved_table.clone(), cr.column.clone());
+        if let Some(contexts) = seen.get(&key) {
+            cr.contexts = contexts.clone();
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,5 +2014,305 @@ mod tests {
             type_refs
         );
         assert_eq!(type_refs[0].type_name, "my_custom_type");
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use ogsql_parser::{walk_statement, Tokenizer};
+
+    fn extract_column_analysis(sql: &str) -> Vec<ColumnAnalysis> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut results = Vec::new();
+        for info in &stmts {
+            let mut extractor = ColumnAccessExtractor::new();
+            walk_statement(&mut extractor, &info.statement);
+            results.push(extractor.finish());
+        }
+        results
+    }
+
+    fn find_column_ref<'a>(refs: &'a [ColumnRef], col: &str) -> Option<&'a ColumnRef> {
+        refs.iter().find(|r| r.column == col)
+    }
+
+    fn find_hard_filter<'a>(filters: &'a [HardFilter], col: &str) -> Option<&'a HardFilter> {
+        filters.iter().find(|f| f.column == col)
+    }
+
+    #[test]
+    fn test_simple_select_no_where() {
+        let sql = "SELECT id, name FROM users";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(a.hard_filters.is_empty());
+        assert!(a.join_conditions.is_empty());
+
+        let id = find_column_ref(&a.column_refs, "id").expect("id column");
+        assert_eq!(id.alias_prefix, None);
+        let name = find_column_ref(&a.column_refs, "name").expect("name column");
+        assert_eq!(name.alias_prefix, None);
+    }
+
+    #[test]
+    fn test_join_with_alias_and_hard_filter() {
+        let sql = "SELECT a.id, a.name, b.amount FROM table_a a LEFT JOIN table_b b ON a.id = b.a_id WHERE a.status = 'active'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.alias_map.len(), 2);
+        assert_eq!(a.alias_map.get("a").unwrap().table, "table_a");
+        assert_eq!(a.alias_map.get("b").unwrap().table, "table_b");
+
+        assert_eq!(a.join_conditions.len(), 1);
+        let jc = &a.join_conditions[0];
+        assert_eq!(jc.left_table, "table_a");
+        assert_eq!(jc.left_column, "id");
+        assert_eq!(jc.right_table, "table_b");
+        assert_eq!(jc.right_column, "a_id");
+        assert_eq!(jc.join_type, JoinType::Left);
+        assert_eq!(jc.source, JoinConditionSource::ExplicitOn);
+
+        let hf = find_hard_filter(&a.hard_filters, "status").expect("status filter");
+        assert_eq!(hf.table, Some("table_a".to_string()));
+        assert_eq!(hf.operator, FilterOperator::Eq);
+        assert_eq!(&hf.value, &FilterValue::String("active".to_string()));
+    }
+
+    #[test]
+    fn test_insert_columns() {
+        let sql = "INSERT INTO t_log(product_id, delta, reason) VALUES (1, -5, 'RESERVE')";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert_eq!(a.insert_columns.len(), 1);
+        assert_eq!(a.insert_columns[0].table, "t_log");
+        assert_eq!(
+            a.insert_columns[0].columns,
+            vec!["product_id", "delta", "reason"]
+        );
+    }
+
+    #[test]
+    fn test_update_set_columns() {
+        let sql = "UPDATE t_products SET stock_qty = stock_qty - 5 WHERE id = 1";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert_eq!(a.update_columns.len(), 1);
+        assert_eq!(a.update_columns[0].table, "t_products");
+        assert_eq!(a.update_columns[0].set_columns, vec!["stock_qty"]);
+    }
+
+    #[test]
+    fn test_implicit_join_from_where() {
+        let sql = "SELECT t.client_acnt_id, t.accno FROM v_par_client_acnt_info_noflag t, v_acnt_check_base_rule e WHERE e.client_acnt_id = t.client_acnt_id AND t.if_inter_bank = '2'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.alias_map.len(), 2);
+        assert_eq!(
+            a.alias_map.get("t").unwrap().table,
+            "v_par_client_acnt_info_noflag"
+        );
+        assert_eq!(
+            a.alias_map.get("e").unwrap().table,
+            "v_acnt_check_base_rule"
+        );
+
+        assert_eq!(a.join_conditions.len(), 1);
+        let jc = &a.join_conditions[0];
+        assert_eq!(jc.left_table, "v_acnt_check_base_rule");
+        assert_eq!(jc.left_column, "client_acnt_id");
+        assert_eq!(jc.right_table, "v_par_client_acnt_info_noflag");
+        assert_eq!(jc.right_column, "client_acnt_id");
+        assert_eq!(jc.join_type, JoinType::Inner);
+        assert_eq!(jc.source, JoinConditionSource::ImplicitWhere);
+
+        let hf = find_hard_filter(&a.hard_filters, "if_inter_bank").expect("filter");
+        assert_eq!(hf.value, FilterValue::String("2".to_string()));
+    }
+
+    #[test]
+    fn test_pl_variable_not_hard_filter() {
+        let sql = "SELECT stock_qty INTO v_available FROM t_products WHERE id = p_product_id";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(
+            a.hard_filters.is_empty(),
+            "col = PL_variable should NOT be hard_filter, got: {:?}",
+            a.hard_filters
+        );
+    }
+
+    #[test]
+    fn test_same_table_different_aliases() {
+        let sql = "SELECT um1.message_value, um2.message_value FROM usermessage um1, usermessage um2 WHERE um1.user_id = um2.user_id AND um1.message_id = '001'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.alias_map.len(), 2);
+        assert_eq!(a.alias_map.get("um1").unwrap().table, "usermessage");
+        assert_eq!(a.alias_map.get("um2").unwrap().table, "usermessage");
+
+        let hf = find_hard_filter(&a.hard_filters, "message_id").expect("filter");
+        assert_eq!(hf.value, FilterValue::String("001".to_string()));
+    }
+
+    #[test]
+    fn test_case_enum_extraction() {
+        let sql = "SELECT CASE sys_flag WHEN '1' THEN '系统内' WHEN '2' THEN '系统外' ELSE '' END AS flag FROM temp";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.enum_mappings.len(), 1);
+        let em = &a.enum_mappings[0];
+        assert_eq!(em.column, "sys_flag");
+        assert!(em.has_else);
+        assert_eq!(em.values.len(), 2);
+        assert_eq!(em.values[0].0, FilterValue::String("1".to_string()));
+        assert_eq!(em.values[0].1, "系统内");
+        assert_eq!(em.values[1].0, FilterValue::String("2".to_string()));
+        assert_eq!(em.values[1].1, "系统外");
+    }
+
+    #[test]
+    fn test_decode_enum_extraction() {
+        let sql = "SELECT decode(cnt_flag, '1', '正常', '2', '冻结') AS status FROM temp";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.enum_mappings.len(), 1);
+        let em = &a.enum_mappings[0];
+        assert_eq!(em.column, "cnt_flag");
+        assert!(!em.has_else);
+        assert_eq!(em.values.len(), 2);
+        assert_eq!(em.values[0].0, FilterValue::String("1".to_string()));
+        assert_eq!(em.values[0].1, "正常");
+        assert_eq!(em.values[1].0, FilterValue::String("2".to_string()));
+        assert_eq!(em.values[1].1, "冻结");
+    }
+
+    #[test]
+    fn test_is_null_hard_filter() {
+        let sql = "SELECT id FROM orders WHERE deleted_at IS NULL";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let hf = find_hard_filter(&analyses[0].hard_filters, "deleted_at").expect("filter");
+        assert_eq!(hf.operator, FilterOperator::IsNull);
+        assert_eq!(hf.value, FilterValue::Null);
+    }
+
+    #[test]
+    fn test_in_list_hard_filter() {
+        let sql = "SELECT id FROM orders WHERE status IN ('active', 'pending', 'shipped')";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let hf = find_hard_filter(&analyses[0].hard_filters, "status").expect("filter");
+        assert_eq!(hf.operator, FilterOperator::In);
+        if let FilterValue::List(vals) = &hf.value {
+            assert_eq!(vals.len(), 3);
+        } else {
+            panic!("expected List, got {:?}", hf.value);
+        }
+    }
+
+    #[test]
+    fn test_between_hard_filter() {
+        let sql = "SELECT id FROM orders WHERE amount BETWEEN 100 AND 500";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let hf = find_hard_filter(&analyses[0].hard_filters, "amount").expect("filter");
+        assert_eq!(hf.operator, FilterOperator::Between);
+    }
+
+    #[test]
+    fn test_insert_select_columns() {
+        let sql = "INSERT INTO t_reconciliation(date, total_amount, total_count) SELECT p_date, SUM(amount), COUNT(*) FROM t_payments WHERE status = 'PAID'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert_eq!(a.insert_columns.len(), 1);
+        assert_eq!(a.insert_columns[0].table, "t_reconciliation");
+        assert_eq!(
+            a.insert_columns[0].columns,
+            vec!["date", "total_amount", "total_count"]
+        );
+
+        let hf = find_hard_filter(&a.hard_filters, "status").expect("filter");
+        assert_eq!(hf.value, FilterValue::String("PAID".to_string()));
+    }
+
+    #[test]
+    fn test_comparison_operators() {
+        let sql = "SELECT id FROM t WHERE level > 3 AND score >= 80 AND age < 65 AND weight <= 100";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert_eq!(a.hard_filters.len(), 4);
+
+        let level = find_hard_filter(&a.hard_filters, "level").unwrap();
+        assert_eq!(level.operator, FilterOperator::Gt);
+        assert_eq!(level.value, FilterValue::Integer(3));
+
+        let score = find_hard_filter(&a.hard_filters, "score").unwrap();
+        assert_eq!(score.operator, FilterOperator::Gte);
+        assert_eq!(score.value, FilterValue::Integer(80));
+
+        let age = find_hard_filter(&a.hard_filters, "age").unwrap();
+        assert_eq!(age.operator, FilterOperator::Lt);
+
+        let weight = find_hard_filter(&a.hard_filters, "weight").unwrap();
+        assert_eq!(weight.operator, FilterOperator::Lte);
+    }
+
+    #[test]
+    fn test_no_filter_on_col_eq_col() {
+        let sql = "SELECT a.id FROM t1 a, t2 b WHERE a.id = b.id";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(
+            a.hard_filters.is_empty(),
+            "col = col should be join, not filter"
+        );
+        assert_eq!(a.join_conditions.len(), 1);
+    }
+
+    #[test]
+    fn test_dedup_column_refs() {
+        let sql = "SELECT a.id, a.name FROM t a WHERE a.id > 0 ORDER BY a.id";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        let id_refs: Vec<&ColumnRef> = a.column_refs.iter().filter(|r| r.column == "id").collect();
+        assert_eq!(
+            id_refs.len(),
+            1,
+            "id should be deduplicated, got: {:?}",
+            id_refs
+        );
+        assert!(
+            id_refs[0].contexts.contains(&ColumnContext::SelectTarget),
+            "should have SelectTarget context"
+        );
+        assert!(
+            id_refs[0].contexts.contains(&ColumnContext::WhereClause),
+            "should have WhereClause context"
+        );
+        assert!(
+            id_refs[0].contexts.contains(&ColumnContext::OrderBy),
+            "should have OrderBy context"
+        );
     }
 }
