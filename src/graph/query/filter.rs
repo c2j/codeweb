@@ -144,6 +144,7 @@ mod tests {
                 file: Arc::new(PathBuf::from("test.sql")),
                 line: 1,
             },
+            column_analysis: None,
         };
         let filter = EdgeFilter::calls_only();
         assert!(filter.matches(&call_edge));

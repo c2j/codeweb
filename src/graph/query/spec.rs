@@ -350,6 +350,7 @@ mod tests {
                     file: make_file(),
                     line: 5,
                 },
+                column_analysis: None,
             },
         );
 

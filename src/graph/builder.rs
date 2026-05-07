@@ -1650,6 +1650,18 @@ impl GraphBuilder {
         for info in statements {
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
+
+            let mut column_extractor = crate::parser::ColumnAccessExtractor::new();
+            walk_statement(&mut column_extractor, &info.statement);
+            let column_analysis = column_extractor.finish();
+            let has_column_data = !column_analysis.column_refs.is_empty()
+                || !column_analysis.join_conditions.is_empty()
+                || !column_analysis.hard_filters.is_empty()
+                || !column_analysis.enum_mappings.is_empty()
+                || !column_analysis.insert_columns.is_empty()
+                || !column_analysis.update_columns.is_empty()
+                || !column_analysis.select_into.is_empty();
+
             for access in &extractor.accesses {
                 let key = normalize_table_key(access.schema.as_deref(), &access.name);
                 let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
@@ -1682,6 +1694,11 @@ impl GraphBuilder {
                         location: SourceLocation {
                             file: file_path.clone(),
                             line: info.start_line,
+                        },
+                        column_analysis: if has_column_data {
+                            Some(Box::new(column_analysis.clone()))
+                        } else {
+                            None
                         },
                     },
                 );
@@ -1820,32 +1837,44 @@ impl GraphBuilder {
                 continue;
             }
             let keep = edge_indices.remove(0);
-            let (mut merged_modes, mut merged_kinds) =
-                if let Edge::TableAccess {
-                    modes, write_kinds, ..
-                } = &graph[keep]
-                {
-                    (*modes, write_kinds.clone())
-                } else {
-                    continue;
-                };
+            let (mut merged_modes, mut merged_kinds, mut merged_col) = if let Edge::TableAccess {
+                modes,
+                write_kinds,
+                column_analysis,
+                ..
+            } = &graph[keep]
+            {
+                (*modes, write_kinds.clone(), column_analysis.clone())
+            } else {
+                continue;
+            };
             for &remove_idx in &edge_indices {
                 if let Edge::TableAccess {
-                    modes, write_kinds, ..
+                    modes,
+                    write_kinds,
+                    column_analysis,
+                    ..
                 } = &graph[remove_idx]
                 {
                     merged_modes |= *modes;
                     for wk in write_kinds {
                         merged_kinds.insert(*wk);
                     }
+                    if merged_col.is_none() && column_analysis.is_some() {
+                        merged_col = column_analysis.clone();
+                    }
                 }
             }
             if let Edge::TableAccess {
-                modes, write_kinds, ..
+                modes,
+                write_kinds,
+                column_analysis,
+                ..
             } = &mut graph[keep]
             {
                 *modes = merged_modes;
                 *write_kinds = merged_kinds;
+                *column_analysis = merged_col;
             }
             edges_to_remove.extend(edge_indices);
         }
@@ -1879,9 +1908,7 @@ impl GraphBuilder {
             let qualified_lower = routine_id.to_string().to_lowercase();
             // First registration wins (prefer real nodes over unresolved that
             // may have been inserted into proc_index during edge creation).
-            lower_qualified
-                .entry(qualified_lower)
-                .or_insert(idx);
+            lower_qualified.entry(qualified_lower).or_insert(idx);
 
             bare_name_lower
                 .entry(routine_id.name.to_lowercase())
@@ -1925,9 +1952,12 @@ impl GraphBuilder {
             }
 
             // ── Try to resolve ──
-            if let Some(target_idx) =
-                try_resolve_routine(raw_expr, &lower_qualified, &bare_name_lower, &pkg_member_lower)
-            {
+            if let Some(target_idx) = try_resolve_routine(
+                raw_expr,
+                &lower_qualified,
+                &bare_name_lower,
+                &pkg_member_lower,
+            ) {
                 if target_idx == *unres_idx {
                     continue; // shouldn't happen, but guard
                 }
@@ -2372,7 +2402,9 @@ fn try_resolve_routine(
     if let Some(dot_pos) = raw_name.rfind('.') {
         let pkg_part = &raw_name[..dot_pos];
         let name_part = &raw_name[dot_pos + 1..];
-        if let Some(&idx) = pkg_member_lower.get(&(pkg_part.to_lowercase(), name_part.to_lowercase())) {
+        if let Some(&idx) =
+            pkg_member_lower.get(&(pkg_part.to_lowercase(), name_part.to_lowercase()))
+        {
             return Some(idx);
         }
     }
@@ -3234,11 +3266,21 @@ mod tests {
             .edge_indices()
             .filter(|e| matches!(&graph[*e], Edge::DirectCall { .. }))
             .collect();
-        assert_eq!(call_edges.len(), 1, "Expected 1 DirectCall edge from procedure to function");
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "Expected 1 DirectCall edge from procedure to function"
+        );
 
         let (src, dst) = graph.edge_endpoints(call_edges[0]).unwrap();
-        assert_eq!(src, proc_nodes[0], "Call should originate from prc_trd_ej_listquery_zh");
-        assert_eq!(dst, func_nodes[0], "Call should target get_par_fund_info_a function");
+        assert_eq!(
+            src, proc_nodes[0],
+            "Call should originate from prc_trd_ej_listquery_zh"
+        );
+        assert_eq!(
+            dst, func_nodes[0],
+            "Call should target get_par_fund_info_a function"
+        );
     }
 
     #[test]
@@ -3277,7 +3319,9 @@ mod tests {
 
         let proc_create: Vec<_> = graph
             .node_indices()
-            .filter(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "MT_541_CREATE"))
+            .filter(
+                |i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "MT_541_CREATE"),
+            )
             .collect();
         assert_eq!(proc_create.len(), 1, "Expected MT_541_CREATE procedure");
     }
@@ -3296,8 +3340,10 @@ mod tests {
 
         let unresolved: Vec<_> = graph
             .node_indices()
-            .filter(|i| matches!(&graph[*i], Node::Unresolved { raw_expr, .. }
-                if raw_expr.contains("SELF.")))
+            .filter(|i| {
+                matches!(&graph[*i], Node::Unresolved { raw_expr, .. }
+                if raw_expr.contains("SELF."))
+            })
             .collect();
         assert!(
             unresolved.is_empty(),

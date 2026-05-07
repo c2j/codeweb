@@ -278,6 +278,7 @@ mod tests {
                     file: make_file(),
                     line: 1,
                 },
+                column_analysis: None,
             },
         );
 
@@ -309,6 +310,7 @@ mod tests {
                     file: make_file(),
                     line: 1,
                 },
+                column_analysis: None,
             },
         );
         graph.add_edge(
@@ -326,6 +328,7 @@ mod tests {
                     file: make_file(),
                     line: 1,
                 },
+                column_analysis: None,
             },
         );
 
@@ -460,6 +463,7 @@ mod tests {
                     file: make_file(),
                     line: 1,
                 },
+                column_analysis: None,
             },
         );
 

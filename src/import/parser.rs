@@ -601,6 +601,7 @@ impl CgefParser {
                     modes,
                     write_kinds,
                     location: location.unwrap_or_else(dummy_location),
+                    column_analysis: None,
                 })
             }
             "depends_on" => Ok(Edge::DependsOn {

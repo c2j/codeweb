@@ -788,6 +788,7 @@ mod tests {
                     file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
                     line: 5,
                 },
+                column_analysis: None,
             },
         );
 
@@ -841,6 +842,7 @@ mod tests {
                     file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
                     line: 5,
                 },
+                column_analysis: None,
             },
         );
 
@@ -1277,6 +1279,7 @@ mod tests {
                 modes: crate::graph::AccessMode::Read,
                 write_kinds: std::collections::HashSet::new(),
                 location: loc.clone(),
+                column_analysis: None,
             },
         );
         graph.add_edge(

@@ -8,8 +8,10 @@ pub mod scanner;
 
 #[allow(unused_imports)]
 pub use extractor::{
-    CallEdge, CallExtractor, SequenceRef, SequenceRefVia, TableAccessExtractor, TypeRef,
-    TypeSequenceRefExtractor,
+    CallEdge, CallExtractor, ColumnAccessExtractor, ColumnAnalysis, ColumnContext, ColumnRef,
+    EnumMapping, FilterOperator, FilterValue, HardFilter, InsertColumnInfo, JoinCondition,
+    JoinConditionSource, JoinType, SelectIntoMapping, SequenceRef, SequenceRefVia,
+    TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
 };
 #[allow(unused_imports)]
 pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
