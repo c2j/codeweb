@@ -105,6 +105,7 @@ impl GraphBuilder {
         );
         Self::dedup_table_view_nodes(&mut graph);
         Self::merge_table_access_edges(&mut graph);
+        Self::resolve_unresolved_nodes(&mut graph);
 
         graph
     }
@@ -1853,6 +1854,106 @@ impl GraphBuilder {
         }
     }
 
+    /// Post-processing pass: resolve unresolved nodes against the complete graph.
+    ///
+    /// After all nodes and edges are created, some unresolved nodes may actually
+    /// correspond to existing procedure/function nodes that weren't matched during
+    /// edge creation (e.g. due to kind mismatch Procedure↔Function, case differences,
+    /// or missing caller context). This pass attempts to resolve them and rewire edges.
+    ///
+    /// Also removes noise unresolved nodes whose `raw_expr` is an AST debug string
+    /// (PlVariable, BinaryOp, FunctionCall, Literal) or a known non-routine pattern
+    /// (SELF.xxx, collection methods .EXTEND/.TRIM/.DELETE, system packages).
+    fn resolve_unresolved_nodes(graph: &mut CodeGraph) {
+        // ── Build comprehensive resolution indexes ──
+        let mut lower_qualified: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut bare_name_lower: HashMap<String, Vec<petgraph::graph::NodeIndex>> = HashMap::new();
+        let mut pkg_member_lower: HashMap<(String, String), petgraph::graph::NodeIndex> =
+            HashMap::new();
+
+        for idx in graph.node_indices() {
+            let routine_id = match &graph[idx] {
+                Node::Procedure { id, .. } | Node::Function { id, .. } => id,
+                _ => continue,
+            };
+            let qualified_lower = routine_id.to_string().to_lowercase();
+            // First registration wins (prefer real nodes over unresolved that
+            // may have been inserted into proc_index during edge creation).
+            lower_qualified
+                .entry(qualified_lower)
+                .or_insert(idx);
+
+            bare_name_lower
+                .entry(routine_id.name.to_lowercase())
+                .or_default()
+                .push(idx);
+
+            if let Some(ref pkg) = routine_id.package {
+                pkg_member_lower
+                    .entry((pkg.to_lowercase(), routine_id.name.to_lowercase()))
+                    .or_insert(idx);
+            }
+            // For schema-qualified standalone routines, also index as if
+            // schema were a package name (schema-as-package fallback).
+            if let Some(ref schema) = routine_id.schema {
+                if routine_id.package.is_none() {
+                    pkg_member_lower
+                        .entry((schema.to_lowercase(), routine_id.name.to_lowercase()))
+                        .or_insert(idx);
+                }
+            }
+        }
+
+        // ── Collect unresolved nodes ──
+        let unresolved: Vec<(petgraph::graph::NodeIndex, String, String)> = graph
+            .node_indices()
+            .filter_map(|idx| match &graph[idx] {
+                Node::Unresolved { raw_expr, context } => {
+                    Some((idx, (**raw_expr).clone(), (**context).clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut to_remove: Vec<petgraph::graph::NodeIndex> = Vec::new();
+
+        for (unres_idx, raw_expr, _context) in &unresolved {
+            // ── Noise filtering: skip clearly non-routine patterns ──
+            if is_noise_unresolved(raw_expr) {
+                to_remove.push(*unres_idx);
+                continue;
+            }
+
+            // ── Try to resolve ──
+            if let Some(target_idx) =
+                try_resolve_routine(raw_expr, &lower_qualified, &bare_name_lower, &pkg_member_lower)
+            {
+                if target_idx == *unres_idx {
+                    continue; // shouldn't happen, but guard
+                }
+                // Rewire all edges pointing to/from the unresolved node
+                let sources: Vec<_> = graph
+                    .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
+                    .collect();
+                for src in sources {
+                    let weights: Vec<_> = graph
+                        .edges_connecting(src, *unres_idx)
+                        .map(|e| e.weight().clone())
+                        .collect();
+                    for weight in weights {
+                        graph.add_edge(src, target_idx, weight);
+                    }
+                }
+                to_remove.push(*unres_idx);
+            }
+        }
+
+        // ── Remove resolved/filtered nodes (reverse order not needed, slot-based) ──
+        for idx in to_remove {
+            graph.remove_node(idx);
+        }
+    }
+
     fn add_java_method_nodes_from_parsed(
         java_results: &[crate::parser::java_method::JavaParseResult],
         graph: &mut CodeGraph,
@@ -2134,6 +2235,158 @@ fn names_match(field_name: &str, class_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if an unresolved node's `raw_expr` is clearly not a routine name.
+///
+/// Filters out AST debug strings from dynamic SQL (PlVariable, BinaryOp,
+/// FunctionCall, Literal), object member access (SELF.xxx), PL/SQL collection
+/// methods (.EXTEND, .TRIM, .DELETE), and known system packages/functions.
+fn is_noise_unresolved(raw_expr: &str) -> bool {
+    let trimmed = raw_expr.trim();
+
+    // AST debug strings from EXECUTE IMMEDIATE with non-literal expressions
+    if trimmed.starts_with("PlVariable(")
+        || trimmed.starts_with("BinaryOp ")
+        || trimmed.starts_with("BinaryOp{")
+        || trimmed.starts_with("FunctionCall ")
+        || trimmed.starts_with("FunctionCall{")
+        || trimmed.starts_with("Literal(")
+        || trimmed.starts_with("ColumnRef(")
+    {
+        return true;
+    }
+
+    // Object member access (SELF.xxx) — not a procedure call
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("SELF.") {
+        return true;
+    }
+
+    // PL/SQL collection methods
+    if upper.ends_with(".EXTEND")
+        || upper.ends_with(".TRIM")
+        || upper.ends_with(".DELETE")
+        || upper.ends_with(".COUNT")
+        || upper.ends_with(".FIRST")
+        || upper.ends_with(".LAST")
+        || upper.ends_with(".NEXT")
+        || upper.ends_with(".PRIOR")
+        || upper.ends_with(".EXISTS")
+    {
+        return true;
+    }
+
+    // Known system packages and built-in functions in openGauss/GaussDB
+    if is_known_system_call(trimmed) {
+        return true;
+    }
+
+    false
+}
+
+/// Known system packages and functions that are never user-defined routines.
+fn is_known_system_call(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    let system_prefixes = [
+        "DBE_SCHEDULER.",
+        "DBE_OUTPUT.",
+        "DBE_UTILITY.",
+        "DBE_STATS.",
+        "DBE_SQL.",
+        "DBE_LOB.",
+        "DBE_RAW.",
+        "DBE_DESCRIBE.",
+        "DBE_ASSERT.",
+        "DBE_PROFILER.",
+        "DBE_PLDEBUGGER.",
+        "DBE_PLDEVELOPER.",
+        "DBE_TASK.",
+        "DBE_FILE.",
+        "DBE_PERF.",
+        "DBE_SESSION.",
+        "DBE_APPLICATION_INFO.",
+        "PG_",
+        "DBMS_",
+    ];
+    let system_functions = [
+        "PG_SLEEP",
+        "PG_SLEEP_FOR",
+        "PG_SLEEP_UNTIL",
+        "RAISE_NOTICE",
+        "RAISE_WARNING",
+        "RAISE_EXCEPTION",
+        "RAISE_INFO",
+        "RAISE_LOG",
+        "RAISE_DEBUG",
+        "RAISE",
+        "DBE_OUTPUT.PRINT",
+        "DBE_OUTPUT.PRINT_LINE",
+        "DBE_OUTPUT.PRINTF",
+        "PRINT",
+    ];
+
+    for prefix in &system_prefixes {
+        if upper.starts_with(prefix) {
+            return true;
+        }
+    }
+    for func in &system_functions {
+        if upper == *func || upper.starts_with(&format!("{}(", func)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Multi-strategy routine resolution for unresolved nodes.
+fn try_resolve_routine(
+    raw_name: &str,
+    lower_qualified: &HashMap<String, petgraph::graph::NodeIndex>,
+    bare_name_lower: &HashMap<String, Vec<petgraph::graph::NodeIndex>>,
+    pkg_member_lower: &HashMap<(String, String), petgraph::graph::NodeIndex>,
+) -> Option<petgraph::graph::NodeIndex> {
+    let name_lower = raw_name.to_lowercase();
+
+    // Strategy 1: Case-insensitive exact match (handles Procedure↔Function implicitly
+    // because lower_qualified is keyed by display string which doesn't include kind)
+    if let Some(&idx) = lower_qualified.get(&name_lower) {
+        return Some(idx);
+    }
+
+    // Strategy 2: If raw_name is "schema.name", try bare name in bare_name_lower
+    // (this handles cases where the schema prefix differs from what's stored)
+    if let Some(dot_pos) = raw_name.rfind('.') {
+        let bare = &raw_name[dot_pos + 1..];
+        let bare_lower = bare.to_lowercase();
+
+        // Try case-insensitive bare name (single unambiguous match)
+        if let Some(matches) = bare_name_lower.get(&bare_lower) {
+            if matches.len() == 1 {
+                return Some(matches[0]);
+            }
+        }
+    }
+
+    // Strategy 3: Schema-as-package: treat the prefix as a package name
+    if let Some(dot_pos) = raw_name.rfind('.') {
+        let pkg_part = &raw_name[..dot_pos];
+        let name_part = &raw_name[dot_pos + 1..];
+        if let Some(&idx) = pkg_member_lower.get(&(pkg_part.to_lowercase(), name_part.to_lowercase())) {
+            return Some(idx);
+        }
+    }
+
+    // Strategy 4: Unqualified bare name — single unambiguous match
+    if !raw_name.contains('.') {
+        if let Some(matches) = bare_name_lower.get(&name_lower) {
+            if matches.len() == 1 {
+                return Some(matches[0]);
+            }
+        }
+    }
+
+    None
 }
 
 /// Normalize a table/view name for case-insensitive lookup in `table_index`.
@@ -2928,5 +3181,148 @@ mod tests {
                 "merged node should have location from CREATE TABLE"
             );
         }
+    }
+
+    #[test]
+    fn unresolved_call_to_function_resolved_via_kind_swap() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION BIGFUND.get_par_fund_info_a(p_id INT)
+            RETURNS VARCHAR AS $$
+            BEGIN
+                RETURN 'test';
+            END;
+            $$;
+
+            CREATE OR REPLACE PACKAGE BODY BIGFUND.PKG_TRD_BALANCE_ACCRUAL AS
+                PROCEDURE prc_trd_ej_listquery_zh IS
+                BEGIN
+                    BIGFUND.get_par_fund_info_a(1);
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { .. }))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "Expected no unresolved nodes, but found: {:?}",
+            unresolved
+                .iter()
+                .map(|i| match &graph[*i] {
+                    Node::Unresolved { raw_expr, .. } => (**raw_expr).clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let func_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name == "get_par_fund_info_a"))
+            .collect();
+        assert_eq!(func_nodes.len(), 1, "Expected exactly 1 Function node");
+
+        let proc_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "prc_trd_ej_listquery_zh"))
+            .collect();
+        assert_eq!(proc_nodes.len(), 1, "Expected exactly 1 Procedure node");
+
+        let call_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::DirectCall { .. }))
+            .collect();
+        assert_eq!(call_edges.len(), 1, "Expected 1 DirectCall edge from procedure to function");
+
+        let (src, dst) = graph.edge_endpoints(call_edges[0]).unwrap();
+        assert_eq!(src, proc_nodes[0], "Call should originate from prc_trd_ej_listquery_zh");
+        assert_eq!(dst, func_nodes[0], "Call should target get_par_fund_info_a function");
+    }
+
+    #[test]
+    fn unresolved_call_case_insensitive_resolved() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE BIGFUND.MT_541_CREATE AS $$
+            BEGIN
+                NULL;
+            END;
+            $$;
+
+            CREATE OR REPLACE PACKAGE BODY BIGFUND.PKG_INST_CONTROL AS
+                PROCEDURE proc_inst_mt_gen IS
+                BEGIN
+                    mt_541_create;
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { .. }))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "Expected no unresolved nodes (case-insensitive match should resolve), found: {:?}",
+            unresolved
+                .iter()
+                .map(|i| match &graph[*i] {
+                    Node::Unresolved { raw_expr, .. } => (**raw_expr).clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let proc_create: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "MT_541_CREATE"))
+            .collect();
+        assert_eq!(proc_create.len(), 1, "Expected MT_541_CREATE procedure");
+    }
+
+    #[test]
+    fn noise_unresolved_self_reference_removed() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY BIGFUND.OBJ_ACCOUNT_RECORDSET2 AS
+                PROCEDURE add_set_member IS
+                BEGIN
+                    SELF.account_record_entries(1);
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { raw_expr, .. }
+                if raw_expr.contains("SELF.")))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "SELF.xxx unresolved nodes should be filtered as noise"
+        );
+    }
+
+    #[test]
+    fn noise_unresolved_system_function_removed() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE BIGFUND.JOB_MAP_OBJECT.submit_by_scheduler AS $$
+            BEGIN
+                DBE_SCHEDULER.enable('my_job');
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { .. }))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "DBE_SCHEDULER.enable unresolved node should be filtered as system call"
+        );
     }
 }
