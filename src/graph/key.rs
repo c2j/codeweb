@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[allow(dead_code)]
@@ -143,7 +144,14 @@ impl fmt::Display for NodeKey {
             NodeKey::Unresolved { raw_expr, context } => {
                 write!(f, "unresolved:{} (in {})", raw_expr, context)
             }
-            NodeKey::Custom { type_name, key } => write!(f, "custom:{}:{}", type_name, key),
+            NodeKey::Custom { type_name, key } => {
+                if let Ok(map) = serde_json::from_str::<BTreeMap<String, String>>(key) {
+                    let vals: Vec<&str> = map.values().map(|s| s.as_str()).collect();
+                    write!(f, "{}:{}", type_name, vals.join(":"))
+                } else {
+                    write!(f, "custom:{}:{}", type_name, key)
+                }
+            }
         }
     }
 }
