@@ -390,19 +390,55 @@ impl GraphStore {
 
     /// Merge multiple stores into one, deduplicating shared nodes by NodeKey.
     /// Edges pointing to the same semantic entity are consolidated.
+    ///
+    /// Uses two-phase matching for Procedure/Function nodes:
+    ///   Phase 1 — exact NodeKey match (schema + package + name)
+    ///   Phase 2 — relaxed match (package + name, ignoring schema)
+    /// This handles the case where SQL analysis produces `proc:BIGFUND.PKG_FOO.sp`
+    /// but CGEF import produces `proc:pkg_foo.sp` (no schema).
     pub fn merge(stores: Vec<Self>, merged_name: &str) -> Self {
         let mut merged = GraphStore::new(merged_name);
 
         for store in &stores {
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
+            // Build a reverse-relaxed index: maps relaxed(key) → existing index
+            // for nodes that have schema. Allows matching incoming schema-less
+            // nodes against existing schema-qualified nodes.
+            let relaxed_reverse: HashMap<NodeKey, NodeIndex> = merged
+                .node_key_index
+                .iter()
+                .filter_map(|(key, &idx)| key.relaxed().map(|rk| (rk, idx)))
+                .collect();
+
             for old_idx in store.graph.node_indices() {
                 let key = NodeKey::from_node(&store.graph[old_idx]);
-                let new_idx = merged
-                    .node_key_index
-                    .entry(key.clone())
-                    .or_insert_with(|| merged.graph.add_node(store.graph[old_idx].clone()));
-                idx_map.insert(old_idx, *new_idx);
+
+                // Phase 1: exact NodeKey match
+                if let Some(&existing) = merged.node_key_index.get(&key) {
+                    idx_map.insert(old_idx, existing);
+                    continue;
+                }
+
+                // Phase 2a: incoming has schema → try relaxed (drop schema)
+                if let Some(ref rk) = key.relaxed() {
+                    if let Some(&existing) = merged.node_key_index.get(rk) {
+                        idx_map.insert(old_idx, existing);
+                        continue;
+                    }
+                }
+
+                // Phase 2b: incoming has no schema → check if a schema-qualified
+                // version already exists via the reverse-relaxed index
+                if let Some(&existing) = relaxed_reverse.get(&key) {
+                    idx_map.insert(old_idx, existing);
+                    continue;
+                }
+
+                // No match — add as new node
+                let new_idx = merged.graph.add_node(store.graph[old_idx].clone());
+                merged.node_key_index.insert(key.clone(), new_idx);
+                idx_map.insert(old_idx, new_idx);
             }
 
             let mut seen_edges: HashSet<(NodeKey, NodeKey, String)> = HashSet::new();
@@ -1512,5 +1548,177 @@ mod tests {
         assert_eq!(impacted.len(), 2);
         assert!(impacted.contains(&caller));
         assert!(impacted.contains(&grandcaller));
+    }
+
+    fn make_proc(schema: Option<&str>, package: Option<&str>, name: &str) -> crate::graph::Node {
+        crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: schema.map(String::from),
+                package: package.map(String::from),
+                name: name.to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn merge_relaxed_match_schema_vs_no_schema() {
+        // Store A: SQL analysis produces procedures WITH schema
+        let mut graph_a = CodeGraph::new();
+        let p1 = graph_a.add_node(make_proc(
+            Some("BIGFUND"),
+            Some("PKG_IMPORT_EXCEL"),
+            "PROC_IMPORT_EXCEL",
+        ));
+        let p2 = graph_a.add_node(make_proc(
+            Some("BIGFUND"),
+            Some("PKG_SQS_CASH_MANAGE"),
+            "PROC_UPDATE_TRAN_STATUS",
+        ));
+        graph_a.add_edge(
+            p1,
+            p2,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::CrossPackage,
+                location: crate::graph::SourceLocation {
+                    file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+                    line: 10,
+                },
+            },
+        );
+        let store_a = GraphStore::from_graph("sql-analysis", graph_a);
+
+        // Store B: CGEF import produces procedures WITHOUT schema
+        let mut graph_b = CodeGraph::new();
+        let p3 = graph_b.add_node(make_proc(
+            None,
+            Some("pkg_import_excel"),
+            "proc_import_excel",
+        ));
+        let table = graph_b.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "t_orders".to_string(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_b.add_edge(
+            p3,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: std::collections::HashSet::new(),
+                location: crate::graph::SourceLocation {
+                    file: std::sync::Arc::new(std::path::PathBuf::from("lineage/excel")),
+                    line: 0,
+                },
+                column_analysis: None,
+            },
+        );
+        let store_b = GraphStore::from_graph("cgef-import", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        // PROC_IMPORT_EXCEL should have been merged into one node (schema-relaxed match)
+        assert_eq!(
+            merged.graph().node_count(),
+            3,
+            "expected 3 nodes (2 procs + 1 table), got {}",
+            merged.graph().node_count()
+        );
+        assert_eq!(
+            merged.graph().edge_count(),
+            2,
+            "expected 2 edges (call + table_access), got {}",
+            merged.graph().edge_count()
+        );
+
+        // Verify the table access edge points from the merged procedure to the table
+        let proc_nodes: Vec<_> = merged
+            .graph()
+            .node_indices()
+            .filter(|i| matches!(merged.graph()[*i], crate::graph::Node::Procedure { .. }))
+            .collect();
+        let import_excel_nodes: Vec<_> = proc_nodes
+            .iter()
+            .filter(|&&i| {
+                let key = crate::graph::key::NodeKey::from_node(&merged.graph()[i]);
+                key.to_string().contains("import_excel")
+            })
+            .collect();
+        assert_eq!(
+            import_excel_nodes.len(),
+            1,
+            "PROC_IMPORT_EXCEL should be a single merged node"
+        );
+    }
+
+    #[test]
+    fn merge_case_insensitive_procedure_keys() {
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("BIGFUND"), Some("PKG_FOO"), "DO_WORK"));
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("bigfund"), Some("pkg_foo"), "do_work"));
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert_eq!(
+            merged.graph().node_count(),
+            1,
+            "same procedure with different case should deduplicate to 1 node"
+        );
+    }
+
+    #[test]
+    fn merge_no_schema_matches_schema_qualified() {
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(
+            Some("bigfund"),
+            Some("pkg_import_excel"),
+            "proc_import_excel",
+        ));
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(None, Some("pkg_import_excel"), "proc_import_excel"));
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert_eq!(
+            merged.graph().node_count(),
+            1,
+            "no-schema procedure should match schema-qualified via relaxed key"
+        );
+    }
+
+    #[test]
+    fn merge_different_procedures_stay_separate() {
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("bigfund"), Some("pkg_foo"), "proc_a"));
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(None, Some("pkg_bar"), "proc_b"));
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert_eq!(
+            merged.graph().node_count(),
+            2,
+            "different procedures should remain separate"
+        );
     }
 }

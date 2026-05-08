@@ -8,6 +8,7 @@ lib/codeweb-complex-demo/.codeweb/
 lib/codeweb-complex-demo/codeweb.toml
 lib/aas-lineage.cgef.json
 lib/lineage-20260507.xlsx
+lib/lineage
 codeweb.toml
 .codeweb
 .DS_Store

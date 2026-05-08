@@ -161,14 +161,14 @@ impl NodeKey {
     pub fn from_node(node: &super::Node) -> Self {
         match node {
             super::Node::Procedure { id, .. } => NodeKey::Procedure {
-                schema: id.schema.clone(),
-                package: id.package.clone(),
-                name: id.name.clone(),
+                schema: id.schema.as_ref().map(|s| s.to_lowercase()),
+                package: id.package.as_ref().map(|p| p.to_lowercase()),
+                name: id.name.to_lowercase(),
             },
             super::Node::Function { id, .. } => NodeKey::Function {
-                schema: id.schema.clone(),
-                package: id.package.clone(),
-                name: id.name.clone(),
+                schema: id.schema.as_ref().map(|s| s.to_lowercase()),
+                package: id.package.as_ref().map(|p| p.to_lowercase()),
+                name: id.name.to_lowercase(),
             },
             super::Node::MappedStatement {
                 namespace,
@@ -239,6 +239,38 @@ impl NodeKey {
                     key,
                 }
             }
+        }
+    }
+
+    /// Return a "relaxed" key that ignores the schema field.
+    ///
+    /// Used during merge to match nodes where one side has schema information
+    /// (e.g. from SQL analysis: `proc:BIGFUND.PKG_IMPORT_EXCEL.proc_import_excel`)
+    /// and the other does not (e.g. from CGEF import: `proc:pkg_import_excel.proc_import_excel`).
+    ///
+    /// Returns `None` for variants where schema is not part of the key,
+    /// or when the key already has no schema.
+    pub fn relaxed(&self) -> Option<NodeKey> {
+        match self {
+            NodeKey::Procedure {
+                schema: Some(_),
+                package,
+                name,
+            } => Some(NodeKey::Procedure {
+                schema: None,
+                package: package.clone(),
+                name: name.clone(),
+            }),
+            NodeKey::Function {
+                schema: Some(_),
+                package,
+                name,
+            } => Some(NodeKey::Function {
+                schema: None,
+                package: package.clone(),
+                name: name.clone(),
+            }),
+            _ => None,
         }
     }
 }
