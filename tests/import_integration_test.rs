@@ -3,10 +3,17 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn codeweb_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("codeweb")
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    // When --target is specified, cargo places artifacts under target/<triple>/
+    // Try the target-specific path first, then fall back to the plain path.
+    let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
+    for entry in entries.flatten() {
+        let p = entry.path().join("debug").join("codeweb");
+        if p.exists() {
+            return p;
+        }
+    }
+    base.join("debug").join("codeweb")
 }
 
 fn run(args: &[&str]) -> std::process::Output {
