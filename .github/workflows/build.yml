@@ -16,10 +16,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            artifact: codeweb-x86_64-unknown-linux-gnu
+            executable: codeweb
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            artifact: codeweb-aarch64-unknown-linux-gnu
+            executable: codeweb
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact: codeweb-x86_64-pc-windows-msvc
+            executable: codeweb.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -43,10 +49,47 @@ jobs:
       - name: Run tests
         run: cargo test --features full --target ${{ matrix.target }} -- --skip test_path_mapping_applied --skip test_serve_
 
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.executable }} dist/
+          cp README.md dist/ 2>/dev/null || true
+          cp LICENSE dist/ 2>/dev/null || true
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: codeweb-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/codeweb*
-            !target/${{ matrix.target }}/release/*.*
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Create archives
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            if [ "$name" = "codeweb-x86_64-pc-windows-msvc" ]; then
+              7z a "${name}.zip" "./${name}/"
+            else
+              tar czf "${name}.tar.gz" -C "${name}" .
+            fi
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.tar.gz
