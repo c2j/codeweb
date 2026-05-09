@@ -17,10 +17,11 @@ impl AppState {
     pub fn new(project: Project) -> Self {
         let name = project.name().to_string();
         let root = project.root().to_path_buf();
-        let store = project
+        let mut store = project
             .store()
             .cloned()
             .unwrap_or_else(|| GraphStore::new(&name));
+        store.ensure_consistency();
         Self {
             project_name: name,
             project_root: root,

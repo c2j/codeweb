@@ -196,6 +196,18 @@ impl GraphStore {
         &self.graph
     }
 
+    pub fn ensure_consistency(&mut self) {
+        let expected = self.graph.node_count();
+        if self.node_summaries.len() != expected {
+            eprintln!(
+                "store: stale indexes (node_summaries {}/{}), rebuilding...",
+                self.node_summaries.len(),
+                expected,
+            );
+            self.rebuild_secondary_indexes();
+        }
+    }
+
     pub fn node_summaries(&self) -> &[NodeSummary] {
         &self.node_summaries
     }
@@ -1822,5 +1834,41 @@ mod tests {
         assert_eq!(stats.procedures, 1);
         assert_eq!(stats.functions, 1);
         assert_eq!(stats.tables, 1);
+    }
+
+    #[test]
+    fn ensure_consistency_rebuilds_stale_indexes() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_proc(Some("public"), None, "do_work"));
+        graph.add_node(make_proc(Some("public"), None, "other"));
+        let mut store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(store.node_summaries().len(), 2);
+        assert_eq!(store.name_index().len(), 2);
+
+        store.node_summaries.clear();
+        store.name_index.clear();
+        store.type_tag_index.clear();
+        assert!(store.node_summaries().is_empty());
+
+        store.ensure_consistency();
+
+        assert_eq!(store.node_summaries().len(), 2, "node_summaries rebuilt");
+        assert_eq!(store.name_index().len(), 2, "name_index rebuilt");
+        assert_eq!(
+            store.type_tag_index.get("proc").map(|v| v.len()),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn ensure_consistency_noop_when_consistent() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_proc(Some("public"), None, "do_work"));
+        let mut store = GraphStore::from_graph("test", graph);
+
+        let summaries_before = store.node_summaries().len();
+        store.ensure_consistency();
+        assert_eq!(store.node_summaries().len(), summaries_before);
     }
 }
