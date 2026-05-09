@@ -32,6 +32,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Windows: enable long paths to handle ogsql-parser submodules
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
       - name: Build
         run: cargo build --release --features full --target ${{ matrix.target }}
 
