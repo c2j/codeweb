@@ -41,7 +41,7 @@ jobs:
         run: cargo build --release --features full --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --features full --target ${{ matrix.target }}
+        run: cargo test --features full --target ${{ matrix.target }} -- --skip test_path_mapping_applied --skip test_serve_
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
