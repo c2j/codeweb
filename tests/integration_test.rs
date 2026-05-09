@@ -2,10 +2,19 @@ use std::fs;
 use tempfile::TempDir;
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
-    let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("codeweb");
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    // When --target is specified, cargo places artifacts under target/<triple>/
+    let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
+    for entry in entries.flatten() {
+        let p = entry.path().join("debug").join("codeweb");
+        if p.exists() {
+            return std::process::Command::new(p)
+                .args(args)
+                .output()
+                .expect("failed to run codeweb");
+        }
+    }
+    let bin = base.join("debug").join("codeweb");
     std::process::Command::new(bin)
         .args(args)
         .output()
