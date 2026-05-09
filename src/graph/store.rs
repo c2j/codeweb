@@ -505,13 +505,16 @@ impl GraphStore {
         self.name_index.clear();
         self.schema_index.clear();
         self.edge_category_index.clear();
+        self.node_summaries.clear();
 
         for idx in self.graph.node_indices() {
             let tag = node_type_tag(&self.graph[idx]).to_string();
-            self.type_tag_index.entry(tag).or_default().push(idx);
+            self.type_tag_index.entry(tag.clone()).or_default().push(idx);
 
             let key = NodeKey::from_node(&self.graph[idx]);
-            self.name_index.push((key.to_string().to_lowercase(), idx));
+            let key_str = key.to_string();
+            let key_lower = key_str.to_lowercase();
+            self.name_index.push((key_lower.clone(), idx));
 
             if let Some(schema) = extract_schema(&self.graph[idx]) {
                 self.schema_index
@@ -519,6 +522,23 @@ impl GraphStore {
                     .or_default()
                     .push(idx);
             }
+
+            let in_deg = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
+            self.node_summaries.push(NodeSummary {
+                id: idx.index(),
+                key: key_str,
+                key_lower,
+                type_tag: tag,
+                in_degree: in_deg,
+                out_degree: out_deg,
+            });
         }
         self.name_index.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1720,5 +1740,87 @@ mod tests {
             2,
             "different procedures should remain separate"
         );
+    }
+
+    #[test]
+    fn merge_populates_node_summaries() {
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_a = graph_a.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("s1".into()),
+                package: None,
+                name: "proc_a".into(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+        });
+        let table = graph_a.add_node(crate::graph::Node::Table {
+            schema: Some("public".into()),
+            name: "orders".into(),
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_a.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("s2".into()),
+                package: None,
+                name: "func_b".into(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc,
+            partial: false,
+        });
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        assert_eq!(merged.graph().node_count(), 3);
+
+        let summaries = merged.node_summaries();
+        assert_eq!(summaries.len(), 3, "merge must rebuild node_summaries");
+
+        let proc_summary = summaries.iter().find(|s| s.key.contains("proc_a")).unwrap();
+        assert_eq!(proc_summary.type_tag, "proc");
+        assert_eq!(proc_summary.out_degree, 1);
+        assert_eq!(proc_summary.in_degree, 0);
+
+        let table_summary = summaries.iter().find(|s| s.key.contains("orders")).unwrap();
+        assert_eq!(table_summary.type_tag, "table");
+        assert_eq!(table_summary.in_degree, 1);
+        assert_eq!(table_summary.out_degree, 0);
+
+        let func_summary = summaries.iter().find(|s| s.key.contains("func_b")).unwrap();
+        assert_eq!(func_summary.type_tag, "func");
+        assert_eq!(func_summary.in_degree, 0);
+        assert_eq!(func_summary.out_degree, 0);
+
+        let stats = merged.stats();
+        assert_eq!(stats.procedures, 1);
+        assert_eq!(stats.functions, 1);
+        assert_eq!(stats.tables, 1);
     }
 }

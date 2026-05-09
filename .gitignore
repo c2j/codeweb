@@ -10,6 +10,6 @@ lib/aas-lineage.cgef.json
 lib/lineage-20260507.xlsx
 lib/lineage
 codeweb.toml
-.codeweb
+.codeweb/
 .DS_Store
 .worktrees
