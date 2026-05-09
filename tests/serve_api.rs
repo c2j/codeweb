@@ -5,14 +5,15 @@ mod tests {
 
     fn codeweb_bin() -> std::path::PathBuf {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let bin_name = if cfg!(windows) { "codeweb.exe" } else { "codeweb" };
         let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
         for entry in entries.flatten() {
-            let p = entry.path().join("debug").join("codeweb");
+            let p = entry.path().join("debug").join(bin_name);
             if p.exists() {
                 return p;
             }
         }
-        base.join("debug").join("codeweb")
+        base.join("debug").join(bin_name)
     }
 
     fn start_server(port: u16) -> Child {
