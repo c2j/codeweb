@@ -3,13 +3,20 @@ mod tests {
     use std::process::{Child, Command};
     use std::time::Duration;
 
-    fn start_server(port: u16) -> Child {
-        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("codeweb");
+    fn codeweb_bin() -> std::path::PathBuf {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
+        for entry in entries.flatten() {
+            let p = entry.path().join("debug").join("codeweb");
+            if p.exists() {
+                return p;
+            }
+        }
+        base.join("debug").join("codeweb")
+    }
 
-        let child = Command::new(bin)
+    fn start_server(port: u16) -> Child {
+        let child = Command::new(codeweb_bin())
             .args([
                 "serve",
                 "--project",
@@ -98,6 +105,6 @@ mod tests {
 
         assert_eq!(status, 200);
         assert!(body.contains("codeweb"));
-        assert!(body.contains("cytoscape"));
+        assert!(body.contains("app.js"));
     }
 }
