@@ -1,11 +1,10 @@
-let cy = null;
 let allNodes = [];
 let allNodesTotal = 0;
 let selectedNodeId = null;
+let currentTraceKey = null;
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
-const TRACE_GRAPH_THRESHOLD = 300;
 
 const TAG_COLORS = {
   proc: '#4caf50', 'proc*': '#388e3c', func: '#8bc34a', 'func*': '#689f38',
@@ -33,7 +32,6 @@ async function init() {
   ].map(s => '<span>' + s + '</span>').join('');
 
   await loadNodes();
-  initGraph();
 
   const si = document.getElementById('search-input');
   let t;
@@ -45,6 +43,13 @@ async function init() {
   });
 
   document.getElementById('detail-close').addEventListener('click', hideDetail);
+
+  document.getElementById('detail-panel').addEventListener('click', function(e) {
+    const treeNode = e.target.closest('.tree-node');
+    if (treeNode && treeNode.dataset.key) {
+      navigateTo(treeNode.dataset.key);
+    }
+  });
 }
 
 async function loadNodes(search) {
@@ -94,145 +99,92 @@ function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>
 
 async function selectNode(id) {
   selectedNodeId = id;
-  renderVirtualList();
   const node = allNodes.find(n => n.id === id);
-  if (!node) return;
-
-  const trace = await api('/trace?from=' + encodeURIComponent(node.key));
-  renderTraceGraph(trace);
-
-  const detail = await api('/nodes/' + id);
-  showDetail(detail);
+  if (!node) { renderVirtualList(); return; }
+  await navigateTo(node.key);
 }
 
-function initGraph() {
-  cy = cytoscape({
-    container: document.getElementById('cy'),
-    style: [
-      { selector: 'node', style: {
-        'label': 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
-        'font-size': '10px', 'color': '#e0e0e0', 'background-color': 'data(color)',
-        'width': 24, 'height': 24, 'text-wrap': 'ellipsis', 'text-max-width': '80px',
-      }},
-      { selector: 'node.target', style: { 'border-width': 3, 'border-color': '#e94560', 'width': 32, 'height': 32 }},
-      { selector: 'edge', style: {
-        'width': 1.5, 'line-color': '#555', 'target-arrow-color': '#555',
-        'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.8,
-      }},
-      { selector: '.caller-edge', style: { 'line-color': '#2196f3', 'target-arrow-color': '#2196f3' }},
-      { selector: '.callee-edge', style: { 'line-color': '#4caf50', 'target-arrow-color': '#4caf50' }},
-    ],
-    layout: { name: 'preset' },
-  });
-  cy.on('tap', 'node', e => selectNode(parseInt(e.target.id())));
+async function navigateTo(key) {
+  const node = allNodes.find(n => n.key === key);
+  selectedNodeId = node ? node.id : null;
+  renderVirtualList();
+
+  currentTraceKey = key;
+  const trace = await api('/trace?from=' + encodeURIComponent(key) + '&depth=50&max_nodes=500');
+  if (currentTraceKey !== key) return;
+  showDetail(trace);
 }
 
-function renderTraceGraph(trace) {
-  if (!cy) return;
-  cy.elements().remove();
-  const totalCount = (trace.caller_count || 0) + (trace.callee_count || 0);
-  if (totalCount > TRACE_GRAPH_THRESHOLD) {
-    document.getElementById('cy').innerHTML =
-      '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#a0a0a0;text-align:center;padding:20px;">' +
-      '<div style="font-size:48px;font-weight:700;color:#e94560;margin-bottom:12px;">' + totalCount + '</div>' +
-      '<div style="font-size:14px;">upstream/downstream nodes — graph view hidden for large counts. Use the detail panel to browse.</div>' +
-      '</div>';
-    return;
-  }
-  document.getElementById('cy').innerHTML = '';
-  const els = [];
-  const seen = new Set();
+function showDetail(trace) {
+  const target = trace.target;
+  const inDeg = trace.caller_count;
+  const outDeg = trace.callee_count;
 
-  els.push({ data: { id: String(trace.target.id), label: trace.target.key, color: TAG_COLORS[trace.target.type] || '#999' }, classes: 'target' });
-  seen.add(trace.target.id);
+  document.getElementById('detail-title').textContent = target.type + ' ' + target.key;
 
-  function addTree(nodes, parentId, dir) {
-    for (const n of nodes) {
-      if (!seen.has(n.id)) {
-        els.push({ data: { id: String(n.id), label: n.key, color: TAG_COLORS[n.type] || '#999' }});
-        seen.add(n.id);
-      }
-      if (dir === 'caller') {
-        els.push({ data: { source: String(n.id), target: String(parentId) }, classes: 'caller-edge' });
-      } else {
-        els.push({ data: { source: String(parentId), target: String(n.id) }, classes: 'callee-edge' });
-      }
-      addTree(n.children || [], n.id, dir);
-    }
-  }
-
-  addTree(trace.callers || [], trace.target.id, 'caller');
-  addTree(trace.callees || [], trace.target.id, 'callee');
-
-  cy.add(els);
-  cy.layout({ name: 'dagre', rankDir: 'TB', spacingFactor: 1.2, nodeSep: 30, rankSep: 60 }).run();
-  cy.fit(undefined, 40);
-}
-
-function showDetail(d) {
-  document.getElementById('detail-title').textContent = d.type + ' ' + d.key;
   let h = '<div class="section-title first">Degree</div>';
-  h += '<div>in:' + d.in_degree + ' out:' + d.out_degree + ' total:' + (d.in_degree + d.out_degree) + '</div>';
-  h += '<div class="section-title">Callers (' + d.in_degree + ')</div>';
-  h += '<div id="callers-list" class="neighbor-list"><div class="loading">Loading...</div></div>';
-  h += '<div class="section-title">Callees (' + d.out_degree + ')</div>';
-  h += '<div id="callees-list" class="neighbor-list"><div class="loading">Loading...</div></div>';
+  h += '<div>in:' + inDeg + ' out:' + outDeg + ' total:' + (inDeg + outDeg) + '</div>';
+
+  h += '<div class="section-title">Callers (' + inDeg + ')</div>';
+  h += '<div class="tree-list">';
+  h += renderTreeHtml(trace.callers);
+  h += '</div>';
+
+  h += '<div class="section-title">Callees (' + outDeg + ')</div>';
+  h += '<div class="tree-list">';
+  h += renderTreeHtml(trace.callees);
+  h += '</div>';
+
+  if (trace.truncated) {
+    h += '<div class="truncated">Results truncated \u2014 too many nodes</div>';
+  }
+
   document.getElementById('detail-content').innerHTML = h;
   document.getElementById('detail-panel').classList.remove('hidden');
-  loadNeighbors(d.id, 'callers', 0);
-  loadNeighbors(d.id, 'callees', 0);
-  requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
 }
 
-async function loadNeighbors(id, dir, offset) {
-  const container = document.getElementById(dir + '-list');
-  if (!container) return;
-  if (offset === 0) container.innerHTML = '<div class="loading">Loading...</div>';
+function renderTreeHtml(nodes, prefixes) {
+  if (!nodes || nodes.length === 0) return '<div class="tree-empty">(none)</div>';
+  prefixes = prefixes || [];
+  let html = '';
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const isLast = i === nodes.length - 1;
+    const connector = isLast ? '\u2514\u2500\u2500 ' : '\u251c\u2500\u2500 ';
+    const prefix = prefixes.join('');
+    const label = n.edge_label ? ' <span class="edge-label">' + esc(n.edge_label) + '</span>' : '';
 
-  const data = await api('/nodes/' + id + '/' + dir + '?limit=50&offset=' + offset);
-  const nodes = data.nodes || [];
-  const total = data.total || 0;
+    html += '<div class="tree-node" data-key="' + esc(n.key) + '">';
+    html += '<span class="tree-prefix">' + esc(prefix + connector) + '</span>';
+    html += '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>';
+    html += '<span class="tree-key">' + esc(n.key) + '</span>';
+    html += label;
+    html += '</div>';
 
-  if (offset === 0) container.innerHTML = '';
-
-  for (const n of nodes) {
-    const el = document.createElement('div');
-    el.className = 'detail-node';
-    el.innerHTML = '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span> ' + esc(n.key);
-    el.onclick = () => selectNode(n.id);
-    container.appendChild(el);
+    if (n.children && n.children.length > 0) {
+      const childPrefix = isLast ? '    ' : '\u2502   ';
+      html += renderTreeHtml(n.children, prefixes.concat([childPrefix]));
+    }
   }
-
-  const remaining = total - (offset + nodes.length);
-  const existingLoadMore = container.querySelector('.load-more');
-  if (existingLoadMore) existingLoadMore.remove();
-
-  if (remaining > 0) {
-    const btn = document.createElement('div');
-    btn.className = 'load-more';
-    btn.textContent = 'Load more (' + remaining + ' remaining)';
-    btn.onclick = () => loadNeighbors(id, dir, offset + nodes.length);
-    container.appendChild(btn);
-  }
+  return html;
 }
 
 function hideDetail() {
   document.getElementById('detail-panel').classList.add('hidden');
   selectedNodeId = null;
+  currentTraceKey = null;
   renderVirtualList();
-  requestAnimationFrame(() => { if (cy) { cy.resize(); cy.fit(undefined, 40); } });
 }
 
 document.getElementById('node-list').addEventListener('scroll', renderVirtualList);
 
 document.querySelectorAll('.panel-divider').forEach(divider => {
-  let startX, startLeftWidth, leftPanel, rightPanel;
+  let startX, startLeftWidth, leftPanel;
 
   divider.addEventListener('mousedown', e => {
     e.preventDefault();
     leftPanel = document.getElementById(divider.dataset.left);
-    rightPanel = document.getElementById(divider.dataset.right);
-    if (!leftPanel || !rightPanel) return;
+    if (!leftPanel) return;
     startX = e.clientX;
     startLeftWidth = leftPanel.getBoundingClientRect().width;
     divider.classList.add('active');
@@ -245,7 +197,6 @@ document.querySelectorAll('.panel-divider').forEach(divider => {
     const newWidth = Math.max(parseInt(getComputedStyle(leftPanel).minWidth) || 150, startLeftWidth + dx);
     leftPanel.style.width = newWidth + 'px';
     leftPanel.style.minWidth = newWidth + 'px';
-    if (cy) cy.resize();
   }
 
   function onStop() {

@@ -17,10 +17,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .node-tag{width:60px;font-size:11px;font-weight:700;margin-right:8px;text-transform:uppercase}
 .node-key{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .node-degree{font-size:11px;color:#666;margin-left:8px}
-#graph-panel{flex:1;min-width:0;position:relative}
-#cy{width:100%;height:100%}
-#detail-panel{width:400px;min-width:200px;background:#16213e;border-left:1px solid #0f3460;overflow-y:auto;transition:width .2s,min-width .2s,opacity .2s}
-#detail-panel.hidden{width:0;min-width:0;opacity:0;overflow:hidden;padding:0}
+#detail-panel{flex:1;min-width:0;background:#16213e;border-left:1px solid #0f3460;overflow-y:auto;transition:opacity .2s}
+#detail-panel.hidden{opacity:0;overflow:hidden;padding:0;pointer-events:none}
 #detail-header{display:flex;align-items:center;padding:12px 16px;background:#0f3460}
 #detail-close{background:none;border:none;color:#e94560;font-size:20px;cursor:pointer;margin-right:12px}
 #detail-title{font-weight:700}
@@ -32,7 +30,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 #stats-bar{display:flex;gap:16px;padding:4px 16px;background:#16213e;border-top:1px solid #0f3460;font-size:12px;color:#a0a0a0}
 .panel-divider{width:4px;background:#0f3460;cursor:col-resize;flex-shrink:0;transition:background .15s}
 .panel-divider:hover,.panel-divider.active{background:#e94560}
-.neighbor-list{max-height:300px;overflow-y:auto}
-.load-more{padding:8px;text-align:center;color:#e94560;cursor:pointer;font-size:12px}
-.load-more:hover{text-decoration:underline}
-.loading{padding:8px;color:#666;font-size:12px}
+.tree-list{overflow-y:auto}
+.tree-node{display:flex;align-items:baseline;padding:1px 0;cursor:pointer;font-size:13px;white-space:nowrap}
+.tree-node:hover{background:#1a1a5e}
+.tree-prefix{font-family:'Cascadia Code',Consolas,monospace;color:#555;flex-shrink:0;user-select:none;font-size:12px}
+.tree-key{overflow:hidden;text-overflow:ellipsis}
+.edge-label{color:#666;font-size:11px}
+.tree-empty{padding:4px 0;color:#666;font-size:12px;font-style:italic}
+.truncated{padding:8px;color:#e94560;font-size:12px;text-align:center}
