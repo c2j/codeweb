@@ -17,6 +17,31 @@ use std::sync::Arc;
 
 pub struct GraphBuilder;
 
+/// Accumulated indexing state for incremental graph building across chunks.
+pub struct GraphBuildContext {
+    pub graph: CodeGraph,
+    pub proc_index: HashMap<RoutineId, petgraph::graph::NodeIndex>,
+    pub package_index: HashMap<String, petgraph::graph::NodeIndex>,
+    pub mapper_index: HashMap<String, petgraph::graph::NodeIndex>,
+    pub table_index: HashMap<String, petgraph::graph::NodeIndex>,
+    pub type_index: HashMap<String, petgraph::graph::NodeIndex>,
+    pub sequence_index: HashMap<String, petgraph::graph::NodeIndex>,
+}
+
+impl GraphBuildContext {
+    pub fn new() -> Self {
+        Self {
+            graph: CodeGraph::new(),
+            proc_index: HashMap::new(),
+            package_index: HashMap::new(),
+            mapper_index: HashMap::new(),
+            table_index: HashMap::new(),
+            type_index: HashMap::new(),
+            sequence_index: HashMap::new(),
+        }
+    }
+}
+
 impl GraphBuilder {
     pub fn new() -> Self {
         Self
@@ -52,62 +77,65 @@ impl GraphBuilder {
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         java_method_results: &[crate::parser::java_method::JavaParseResult],
     ) -> CodeGraph {
-        let mut graph = CodeGraph::new();
-        let mut proc_index: HashMap<RoutineId, petgraph::graph::NodeIndex> = HashMap::new();
-        let mut package_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
-        let mut mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
-        let mut table_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
-        let mut type_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
-        let mut sequence_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut ctx = GraphBuildContext::new();
 
-        // Pass 1: Create all SQL nodes (single file iteration)
-        Self::create_sql_nodes(
-            sql_files,
-            &mut graph,
-            &mut proc_index,
-            &mut package_index,
-            &mut table_index,
-            &mut type_index,
-            &mut sequence_index,
-        );
-
-        // Pass 2: Create all SQL edges + table access (single file iteration)
-        Self::create_sql_edges(sql_files, &mut graph, &mut proc_index, &mut table_index);
-
-        Self::create_object_ref_edges(
-            sql_files,
-            &mut graph,
-            &proc_index,
-            &type_index,
-            &sequence_index,
-        );
-
-        // Single-pass for other file types
+        Self::build_sql_chunk(&mut ctx, sql_files);
         Self::add_ibatis_nodes_from_parsed(
             ibatis_files,
-            &mut graph,
-            &mut proc_index,
-            &mut mapper_index,
-            &mut table_index,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
         );
         Self::add_java_nodes_from_parsed(
             java_files,
-            &mut graph,
-            &mut proc_index,
-            &mapper_index,
-            &mut table_index,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
         );
         Self::add_java_method_nodes_from_parsed(
             java_method_results,
-            &mut graph,
-            &mut proc_index,
-            &mapper_index,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
         );
-        Self::dedup_table_view_nodes(&mut graph);
-        Self::merge_table_access_edges(&mut graph);
-        Self::resolve_unresolved_nodes(&mut graph);
+        Self::dedup_table_view_nodes(&mut ctx.graph);
+        Self::merge_table_access_edges(&mut ctx.graph);
+        Self::resolve_unresolved_nodes(&mut ctx.graph);
 
-        graph
+        ctx.graph
+    }
+
+    /// Process a single chunk of parsed SQL files into the accumulating context.
+    /// The context's indices are updated so that subsequent chunks can
+    /// reference nodes created in earlier chunks.
+    pub fn build_sql_chunk(ctx: &mut GraphBuildContext, sql_files: &[ParsedFile]) {
+        Self::create_sql_nodes(
+            sql_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.package_index,
+            &mut ctx.table_index,
+            &mut ctx.type_index,
+            &mut ctx.sequence_index,
+        );
+        Self::create_sql_edges(sql_files, &mut ctx.graph, &mut ctx.proc_index, &mut ctx.table_index);
+        Self::create_object_ref_edges(
+            sql_files,
+            &mut ctx.graph,
+            &ctx.proc_index,
+            &ctx.type_index,
+            &ctx.sequence_index,
+        );
+    }
+
+    /// Finalize the graph after all files are processed.
+    /// Must be called exactly once after all chunks and non-SQL files are added.
+    pub fn finalize_graph(ctx: &mut GraphBuildContext) {
+        Self::dedup_table_view_nodes(&mut ctx.graph);
+        Self::merge_table_access_edges(&mut ctx.graph);
+        Self::resolve_unresolved_nodes(&mut ctx.graph);
     }
 
     // ── Pass 1: Create all SQL nodes ─────────────────────────────
@@ -1409,7 +1437,7 @@ impl GraphBuilder {
         }
     }
 
-    fn add_ibatis_nodes_from_parsed(
+    pub(crate) fn add_ibatis_nodes_from_parsed(
         ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
@@ -1479,7 +1507,7 @@ impl GraphBuilder {
         }
     }
 
-    fn add_java_nodes_from_parsed(
+    pub(crate) fn add_java_nodes_from_parsed(
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
@@ -1984,7 +2012,7 @@ impl GraphBuilder {
         }
     }
 
-    fn add_java_method_nodes_from_parsed(
+    pub(crate) fn add_java_method_nodes_from_parsed(
         java_results: &[crate::parser::java_method::JavaParseResult],
         graph: &mut CodeGraph,
         _proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,

@@ -1,7 +1,7 @@
 pub mod config;
 
 use crate::error::{CodeWebError, Result};
-use crate::graph::builder::GraphBuilder;
+use crate::graph::builder::{GraphBuildContext, GraphBuilder};
 use crate::graph::store::GraphStore;
 use crate::parser;
 use crate::parser::fingerprint::{compute_changes, FileChangeSet, FileRecord, FileType};
@@ -174,20 +174,23 @@ impl Project {
             });
         }
 
-        // Collect all scanned paths once (avoid re-scanning per input)
+        // Split scanned files by type (no re-scanning — reuse Phase 1 results)
         let mut all_sql_paths: Vec<PathBuf> = Vec::new();
         let mut all_java_paths: Vec<PathBuf> = Vec::new();
         let mut all_xml_paths: Vec<PathBuf> = Vec::new();
-        for input in &input_paths {
-            let scanned = parser::scan_directory(input);
-            all_sql_paths.extend(scanned.sql_files);
-            all_java_paths.extend(scanned.java_files);
-            all_xml_paths.extend(scanned.xml_files);
+        for (path, file_type) in &current_files {
+            match file_type {
+                FileType::Sql => all_sql_paths.push(path.clone()),
+                FileType::Java => all_java_paths.push(path.clone()),
+                FileType::Xml => all_xml_paths.push(path.clone()),
+            }
         }
 
         let total = all_sql_paths.len() + all_java_paths.len() + all_xml_paths.len();
 
-        // Phase 3: Parse files with progress
+        // Phase 3-4: Chunked parsing + streaming graph building
+        // SQL files are parsed in chunks to bound peak memory. Each chunk's
+        // parsed AST is dropped before the next chunk begins.
         let pb = indicatif::ProgressBar::new(total as u64);
         pb.set_style(
             indicatif::ProgressStyle::with_template(
@@ -197,11 +200,34 @@ impl Project {
             .progress_chars("━━╾─"),
         );
 
-        pb.set_message("Parsing SQL...");
-        let sql_files = parser::parse_sql_files(&all_sql_paths);
-        pb.inc(all_sql_paths.len() as u64);
+        const SQL_CHUNK_SIZE: usize = 500;
+        let total_sql = all_sql_paths.len();
+        let sql_chunks = total_sql.div_ceil(SQL_CHUNK_SIZE);
 
-        pb.set_message("Parsing Java (single-pass)...");
+        let mut ctx = GraphBuildContext::new();
+        let mut all_hashes: Vec<(PathBuf, String, parser::fingerprint::FileType)> = Vec::new();
+
+        pb.set_message(format!("Parsing SQL (1/{})...", sql_chunks));
+        for (chunk_idx, chunk) in all_sql_paths.chunks(SQL_CHUNK_SIZE).enumerate() {
+            pb.set_message(format!(
+                "Parsing SQL ({}/{})...",
+                chunk_idx + 1,
+                sql_chunks
+            ));
+            let parsed = parser::parse_sql_files(chunk);
+            pb.inc(chunk.len() as u64);
+
+            // Collect lightweight hashes before dropping parsed data
+            for pf in &parsed {
+                all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Sql));
+            }
+
+            GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+            // parsed dropped here — AST memory freed
+        }
+
+        // Java (typically fewer files, parse all at once)
+        pb.set_message("Parsing Java...");
         let java_combined = parser::java_loader::load_java_files_combined(&all_java_paths);
         pb.inc(all_java_paths.len() as u64);
 
@@ -219,49 +245,62 @@ impl Project {
             })
             .unzip();
 
+        // Collect Java hashes
+        for pf in &java_files {
+            all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Java));
+        }
+
+        // XML (typically fewer files)
         pb.set_message("Parsing XML mappers...");
         let ibatis_files = parser::ibatis_loader::load_ibatis_files_from_paths(&all_xml_paths);
         pb.inc(all_xml_paths.len() as u64);
 
         pb.finish_with_message(format!(
             "Parsed {} files ({} SQL, {} Java, {} XML)",
-            sql_files.len() + java_files.len() + ibatis_files.len(),
-            sql_files.len(),
+            total_sql + java_files.len() + ibatis_files.len(),
+            total_sql,
             java_files.len(),
             ibatis_files.len(),
         ));
 
-        let all_files = parser::AllParsedFiles {
-            sql_files,
-            java_files,
-            ibatis_files,
-            java_method_results,
-        };
-
-        // Phase 4: Build graph
+        // Phase 5: Add non-SQL nodes to graph
         eprintln!("  Building graph...");
-        let builder = GraphBuilder::new();
-        let mut new_store = builder.build_store(&all_files, &self.config.project.name);
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            &ibatis_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+        GraphBuilder::add_java_nodes_from_parsed(
+            &java_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+        GraphBuilder::add_java_method_nodes_from_parsed(
+            &java_method_results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+        );
+        GraphBuilder::finalize_graph(&mut ctx);
 
-        // Phase 5: Build manifest from inline content hashes (no re-reading files)
+        // Collect XML hashes (no AST to drop — ibatis_files is lightweight)
+        for pf in &ibatis_files {
+            all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Xml));
+        }
+
+        // Phase 6: Build store
+        let mut new_store =
+            GraphStore::from_graph(&self.config.project.name, ctx.graph);
+
+        // Build manifest from collected hashes (no re-reading files)
         let mut new_records = Vec::new();
-        for pf in &all_files.sql_files {
+        for (path, hash, file_type) in &all_hashes {
             if let Some(record) =
-                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Sql)
-            {
-                new_records.push(record);
-            }
-        }
-        for pf in &all_files.java_files {
-            if let Some(record) =
-                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Java)
-            {
-                new_records.push(record);
-            }
-        }
-        for pf in &all_files.ibatis_files {
-            if let Some(record) =
-                FileRecord::from_parts(pf.path.clone(), pf.content_hash.clone(), FileType::Xml)
+                FileRecord::from_parts(path.clone(), hash.clone(), *file_type)
             {
                 new_records.push(record);
             }
