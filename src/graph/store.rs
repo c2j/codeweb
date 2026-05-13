@@ -321,21 +321,39 @@ impl GraphStore {
     }
 }
 
-/// Check if `sql_text` (lowercased) matches `query_lower` which may contain `?` as a wildcard
-/// matching any non-empty sequence of characters (e.g. a concrete parameter name).
+fn normalize_ws(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+            if !in_ws && !result.is_empty() {
+                result.push(' ');
+                in_ws = true;
+            }
+        } else {
+            result.push(ch);
+            in_ws = false;
+        }
+    }
+    result.trim_end().to_string()
+}
+
+/// Check if `sql_text` matches `query` (case-insensitive, whitespace-normalised).
+/// The query may contain `?` as a wildcard matching any non-empty sequence of characters.
 ///
 /// First tries direct substring match; if the query contains `?` and direct match fails,
 /// splits the query on `?` and verifies each segment appears in order in the SQL text.
-fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
-    let sql_lower = sql_text.to_lowercase();
-    if sql_lower.contains(query_lower) {
+fn sql_text_matches(sql_text: &str, query: &str) -> bool {
+    let sql_norm = normalize_ws(&sql_text.to_lowercase());
+    let query_norm = normalize_ws(&query.to_lowercase());
+    if sql_norm.contains(&query_norm) {
         return true;
     }
-    if !query_lower.contains('?') {
+    if !query_norm.contains('?') {
         return false;
     }
     // Relaxed: split query on `?`, check each segment appears in order
-    let parts: Vec<&str> = query_lower.split('?').collect();
+    let parts: Vec<&str> = query_norm.split('?').collect();
     if parts.len() <= 1 {
         return false;
     }
@@ -344,7 +362,7 @@ fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
         if part.is_empty() {
             continue;
         }
-        match sql_lower[pos..].find(part) {
+        match sql_norm[pos..].find(part) {
             Some(p) => pos += p + part.len(),
             None => return false,
         }
@@ -1947,5 +1965,73 @@ mod tests {
         let summaries_before = store.node_summaries().len();
         store.ensure_consistency();
         assert_eq!(store.node_summaries().len(), summaries_before);
+    }
+
+    #[test]
+    fn normalize_ws_collapses_whitespace() {
+        assert_eq!(normalize_ws("select   to_char"), "select to_char");
+        assert_eq!(normalize_ws("select\tto_char"), "select to_char");
+        assert_eq!(normalize_ws("select\nto_char"), "select to_char");
+        assert_eq!(normalize_ws("select\r\nto_char"), "select to_char");
+        assert_eq!(normalize_ws("  select  to_char  "), "select to_char");
+        assert_eq!(normalize_ws("select to_char"), "select to_char");
+    }
+
+    #[test]
+    fn sql_text_matches_whitespace_tolerant() {
+        let stored = "select to_char(sys_date,'yyyymmdd') from sys_dummy";
+
+        assert!(sql_text_matches(stored, "select to_char"));
+        assert!(sql_text_matches(stored, "select  to_char"));
+        assert!(sql_text_matches(stored, "select\tto_char"));
+        assert!(sql_text_matches(stored, "select\nto_char"));
+        assert!(sql_text_matches(stored, "  select  to_char  "));
+        assert!(sql_text_matches(stored, "SELECT TO_CHAR"));
+        assert!(sql_text_matches(stored, "SELECT\n\n  to_char"));
+
+        assert!(!sql_text_matches(stored, "insert to_char"));
+    }
+
+    #[test]
+    fn sql_text_matches_multiline_sql() {
+        let stored = "select\n  a.col1,\n  b.col2\nfrom table_a a\njoin table_b b on a.id = b.id\nwhere a.status = 1";
+
+        assert!(sql_text_matches(stored, "select a.col1"));
+        assert!(sql_text_matches(stored, "from table_a a join table_b"));
+        assert!(sql_text_matches(stored, "where a.status"));
+    }
+
+    #[test]
+    fn sql_text_matches_wildcard_whitespace() {
+        let stored = "CALL pkg.sync_from_supplier(__XML_PARAM_supplierId__)";
+
+        assert!(sql_text_matches(stored, "CALL pkg.sync_from_supplier(?)"));
+        assert!(sql_text_matches(stored, "call  pkg.sync_from_supplier(?)"));
+    }
+
+    #[test]
+    fn search_by_sql_finds_across_whitespace() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(Node::MappedStatement {
+            namespace: "ns".to_string(),
+            statement_id: "stmt".to_string(),
+            kind: "select".to_string(),
+            xml_file: PathBuf::from("mapper.xml"),
+            line: 1,
+            sql: Some("select\n  to_char(sys_date,'yyyymmdd')\nfrom\n  sys_dummy".to_string()),
+        });
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("select to_char");
+        assert_eq!(results.len(), 1);
+
+        let results = store.search_by_sql("SELECT  TO_CHAR");
+        assert_eq!(results.len(), 1);
+
+        let results = store.search_by_sql("from sys_dummy");
+        assert_eq!(results.len(), 1);
+
+        let results = store.search_by_sql("insert to_char");
+        assert!(results.is_empty());
     }
 }
