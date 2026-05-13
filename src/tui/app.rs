@@ -908,121 +908,178 @@ fn format_node_attributes_full(node: &Node) -> Vec<String> {
 fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
     use crate::graph::{DistributeInfo, PartitionInfo};
     let mut attrs = Vec::new();
-    if let Node::Table {
-        location,
-        columns,
-        partition_by,
-        distribute_by,
-        tablespace,
-        temporary,
-        unlogged,
-        ddl_source,
-        ..
-    } = node
-    {
-        if let Some(loc) = location {
-            attrs.push(format!("file: {}:{}", loc.file.to_string_lossy(), loc.line));
-        } else {
-            attrs.push("file: (implicit)".to_string());
-        }
-        if *temporary {
-            attrs.push("temporary".to_string());
-        }
-        if *unlogged {
-            attrs.push("unlogged".to_string());
-        }
-        if let Some(ts) = tablespace {
-            attrs.push(format!("tablespace: {}", ts));
-        }
-        if !columns.is_empty() {
-            attrs.push(format!("columns ({}):", columns.len()));
-            let display_cols = if compact {
-                columns.iter().take(5)
+    match node {
+        Node::Table {
+            location,
+            columns,
+            partition_by,
+            distribute_by,
+            tablespace,
+            temporary,
+            unlogged,
+            ddl_source,
+            ..
+        } => {
+            if let Some(loc) = location {
+                attrs.push(format!("file: {}:{}", loc.file.to_string_lossy(), loc.line));
             } else {
-                columns.iter().take(50)
-            };
-            for col in display_cols {
-                let pk = if col.is_primary_key { " [PK]" } else { "" };
-                let null = if col.nullable { "NULL" } else { "NOT NULL" };
-                let def = col
-                    .default_value
-                    .as_deref()
-                    .map(|d| format!(" DEFAULT {}", d))
-                    .unwrap_or_default();
-                attrs.push(format!(
-                    "  {} {} {}{}{}",
-                    col.name, col.data_type, null, pk, def
-                ));
+                attrs.push("file: (implicit)".to_string());
             }
-            if columns.len() > 5 && compact {
-                attrs.push(format!("  ... +{} more", columns.len() - 5));
+            if *temporary {
+                attrs.push("temporary".to_string());
             }
-        }
-        if let Some(part) = partition_by {
-            match part.as_ref() {
-                PartitionInfo::Range {
-                    columns,
-                    partitions,
-                } => {
+            if *unlogged {
+                attrs.push("unlogged".to_string());
+            }
+            if let Some(ts) = tablespace {
+                attrs.push(format!("tablespace: {}", ts));
+            }
+            if !columns.is_empty() {
+                attrs.push(format!("columns ({}):", columns.len()));
+                let display_cols = if compact {
+                    columns.iter().take(5)
+                } else {
+                    columns.iter().take(50)
+                };
+                for col in display_cols {
+                    let pk = if col.is_primary_key { " [PK]" } else { "" };
+                    let null = if col.nullable { "NULL" } else { "NOT NULL" };
+                    let def = col
+                        .default_value
+                        .as_deref()
+                        .map(|d| format!(" DEFAULT {}", d))
+                        .unwrap_or_default();
                     attrs.push(format!(
-                        "partition: RANGE({}) [{} partitions]",
-                        columns.join(", "),
-                        partitions.len()
+                        "  {} {} {}{}{}",
+                        col.name, col.data_type, null, pk, def
                     ));
-                    if !compact && !partitions.is_empty() {
-                        for p in partitions {
-                            attrs.push(format!("  {}", p));
+                }
+                if columns.len() > 5 && compact {
+                    attrs.push(format!("  ... +{} more", columns.len() - 5));
+                }
+            }
+            if let Some(part) = partition_by {
+                match part.as_ref() {
+                    PartitionInfo::Range {
+                        columns,
+                        partitions,
+                    } => {
+                        attrs.push(format!(
+                            "partition: RANGE({}) [{} partitions]",
+                            columns.join(", "),
+                            partitions.len()
+                        ));
+                        if !compact && !partitions.is_empty() {
+                            for p in partitions {
+                                attrs.push(format!("  {}", p));
+                            }
                         }
                     }
-                }
-                PartitionInfo::List {
-                    columns,
-                    partitions,
-                } => {
-                    attrs.push(format!(
-                        "partition: LIST({}) [{} partitions]",
-                        columns.join(", "),
-                        partitions.len()
-                    ));
-                    if !compact && !partitions.is_empty() {
-                        for p in partitions {
-                            attrs.push(format!("  {}", p));
+                    PartitionInfo::List {
+                        columns,
+                        partitions,
+                    } => {
+                        attrs.push(format!(
+                            "partition: LIST({}) [{} partitions]",
+                            columns.join(", "),
+                            partitions.len()
+                        ));
+                        if !compact && !partitions.is_empty() {
+                            for p in partitions {
+                                attrs.push(format!("  {}", p));
+                            }
                         }
                     }
+                    PartitionInfo::Hash {
+                        columns,
+                        partitions_count,
+                    } => {
+                        attrs.push(format!(
+                            "partition: HASH({}) [{}]",
+                            columns.join(", "),
+                            partitions_count
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "auto".to_string())
+                        ));
+                    }
                 }
-                PartitionInfo::Hash {
-                    columns,
-                    partitions_count,
-                } => {
-                    attrs.push(format!(
-                        "partition: HASH({}) [{}]",
-                        columns.join(", "),
-                        partitions_count
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| "auto".to_string())
-                    ));
+            }
+            if let Some(dist) = distribute_by {
+                match dist.as_ref() {
+                    DistributeInfo::Hash { columns } => {
+                        attrs.push(format!("distribute: HASH({})", columns.join(", ")));
+                    }
+                    DistributeInfo::Replication => {
+                        attrs.push("distribute: REPLICATION".to_string());
+                    }
+                    DistributeInfo::RoundRobin { columns } => {
+                        attrs.push(format!("distribute: ROUNDROBIN({})", columns.join(", ")));
+                    }
+                    DistributeInfo::Modulo { columns } => {
+                        attrs.push(format!("distribute: MODULO({})", columns.join(", ")));
+                    }
+                }
+            }
+            if let Some(ddl) = ddl_source {
+                attrs.push(format!("ddl: {}", ddl.as_ref()));
+            }
+        }
+        Node::JavaSql {
+            class_name,
+            method_name,
+            extraction_method,
+            java_file,
+            line,
+            sql,
+            ..
+        } => {
+            attrs.push(format!("file: {}:{}", java_file.to_string_lossy(), line));
+            if let (Some(c), Some(m)) = (class_name, method_name) {
+                attrs.push(format!("method: {}.{}", c, m));
+            } else if let Some(c) = class_name {
+                attrs.push(format!("class: {}", c));
+            } else if let Some(m) = method_name {
+                attrs.push(format!("method: {}", m));
+            }
+            attrs.push(format!("extraction: {}", extraction_method));
+            if let Some(sql_text) = sql {
+                let line_limit = if compact { 3 } else { 20 };
+                for (i, line) in sql_text.lines().enumerate() {
+                    if i >= line_limit {
+                        attrs.push(format!(
+                            "  ... +{} more lines",
+                            sql_text.lines().count() - i
+                        ));
+                        break;
+                    }
+                    attrs.push(format!("  {}", line));
                 }
             }
         }
-        if let Some(dist) = distribute_by {
-            match dist.as_ref() {
-                DistributeInfo::Hash { columns } => {
-                    attrs.push(format!("distribute: HASH({})", columns.join(", ")));
-                }
-                DistributeInfo::Replication => {
-                    attrs.push("distribute: REPLICATION".to_string());
-                }
-                DistributeInfo::RoundRobin { columns } => {
-                    attrs.push(format!("distribute: ROUNDROBIN({})", columns.join(", ")));
-                }
-                DistributeInfo::Modulo { columns } => {
-                    attrs.push(format!("distribute: MODULO({})", columns.join(", ")));
+        Node::MappedStatement {
+            kind,
+            xml_file,
+            line,
+            sql,
+            ..
+        } => {
+            attrs.push(format!("file: {}:{}", xml_file.to_string_lossy(), line));
+            attrs.push(format!("kind: {}", kind));
+            if let Some(sql_text) = sql {
+                let line_limit = if compact { 3 } else { 20 };
+                for (i, line) in sql_text.lines().enumerate() {
+                    if i >= line_limit {
+                        attrs.push(format!(
+                            "  ... +{} more lines",
+                            sql_text.lines().count() - i
+                        ));
+                        break;
+                    }
+                    attrs.push(format!("  {}", line));
                 }
             }
         }
-        if let Some(ddl) = ddl_source {
-            attrs.push(format!("ddl: {}", ddl.as_ref()));
-        }
+        _ => {}
     }
     attrs
 }

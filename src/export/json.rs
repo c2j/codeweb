@@ -51,6 +51,7 @@ enum NodeKindJson {
         kind: String,
         file: String,
         line: usize,
+        sql: Option<String>,
     },
     JavaSql {
         class_name: Option<String>,
@@ -58,6 +59,7 @@ enum NodeKindJson {
         extraction_method: String,
         file: String,
         line: usize,
+        sql: Option<String>,
     },
     JavaMethod {
         fqn: String,
@@ -280,6 +282,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 kind,
                 xml_file,
                 line,
+                sql,
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::MappedStatement {
@@ -288,6 +291,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     kind: kind.clone(),
                     file: xml_file.to_string_lossy().to_string(),
                     line: *line,
+                    sql: sql.clone(),
                 },
             },
             Node::JavaSql {
@@ -296,6 +300,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 extraction_method,
                 java_file,
                 line,
+                sql,
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::JavaSql {
@@ -304,6 +309,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     extraction_method: extraction_method.clone(),
                     file: java_file.to_string_lossy().to_string(),
                     line: *line,
+                    sql: sql.clone(),
                 },
             },
             Node::JavaMethod {
