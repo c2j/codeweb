@@ -21,6 +21,28 @@ mod tui;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Like `println_stdout!` but handles `BrokenPipe` gracefully (exit 0 instead of panic).
+macro_rules! println_stdout {
+    () => {{
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        match writeln!(handle) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) => panic!("{e}"),
+            Ok(_) => {}
+        }
+    }};
+    ($($arg:tt)*) => {{
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        match writeln!(handle, $($arg)*) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) => panic!("{e}"),
+            Ok(_) => {}
+        }
+    }};
+}
+
 use clap::{Parser, Subcommand};
 use error::Result;
 use graph::Node;
@@ -503,7 +525,7 @@ fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
 
     let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
-    println!(
+    println_stdout!(
         "{}",
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
@@ -515,32 +537,32 @@ fn cmd_stats(project: &Path) -> Result<()> {
     let store = proj.load_store()?;
     let stats = store.stats();
 
-    println!("Project: {}", proj.name());
-    println!();
-    println!("  {:>12}  procedures", stats.procedures,);
-    println!("  {:>12}  functions", stats.functions,);
-    println!("  {:>12}  packages", stats.packages,);
-    println!("  {:>12}  triggers", stats.triggers,);
-    println!("  {:>12}  types", stats.types,);
-    println!("  {:>12}  sequences", stats.sequences,);
-    println!("  {:>12}  indexes", stats.indexes,);
-    println!("  {:>12}  views", stats.views,);
-    println!("  {:>12}  materialized views", stats.materialized_views,);
-    println!("  {:>12}  synonyms", stats.synonyms,);
-    println!("  {:>12}  events", stats.events,);
-    println!("  {:>12}  tables", stats.tables,);
-    println!("  {:>12}  mappers", stats.mappers,);
-    println!("  {:>12}  java methods", stats.java_methods,);
-    println!("  {:>12}  java classes", stats.java_classes,);
+    println_stdout!("Project: {}", proj.name());
+    println_stdout!();
+    println_stdout!("  {:>12}  procedures", stats.procedures,);
+    println_stdout!("  {:>12}  functions", stats.functions,);
+    println_stdout!("  {:>12}  packages", stats.packages,);
+    println_stdout!("  {:>12}  triggers", stats.triggers,);
+    println_stdout!("  {:>12}  types", stats.types,);
+    println_stdout!("  {:>12}  sequences", stats.sequences,);
+    println_stdout!("  {:>12}  indexes", stats.indexes,);
+    println_stdout!("  {:>12}  views", stats.views,);
+    println_stdout!("  {:>12}  materialized views", stats.materialized_views,);
+    println_stdout!("  {:>12}  synonyms", stats.synonyms,);
+    println_stdout!("  {:>12}  events", stats.events,);
+    println_stdout!("  {:>12}  tables", stats.tables,);
+    println_stdout!("  {:>12}  mappers", stats.mappers,);
+    println_stdout!("  {:>12}  java methods", stats.java_methods,);
+    println_stdout!("  {:>12}  java classes", stats.java_classes,);
     if stats.unresolved > 0 {
-        println!("  {:>12}  unresolved", stats.unresolved,);
+        println_stdout!("  {:>12}  unresolved", stats.unresolved,);
     }
     if stats.custom_nodes > 0 {
-        println!("  {:>12}  custom nodes", stats.custom_nodes,);
+        println_stdout!("  {:>12}  custom nodes", stats.custom_nodes,);
     }
-    println!();
-    println!("  {:>12}  edges", stats.edges,);
-    println!("  {:>12}  files", stats.files,);
+    println_stdout!();
+    println_stdout!("  {:>12}  edges", stats.edges,);
+    println_stdout!("  {:>12}  files", stats.files,);
 
     Ok(())
 }
@@ -556,7 +578,7 @@ fn cmd_files(project: &Path) -> Result<()> {
         let mut entries: Vec<_> = manifest.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
 
-        println!("{:<4} {:>5}  PATH", "TYPE", "NODES");
+        println_stdout!("{:<4} {:>5}  PATH", "TYPE", "NODES");
         for (path, record) in &entries {
             let rel = path.strip_prefix(&root).unwrap_or(path);
             let type_tag = match record.file_type {
@@ -568,15 +590,15 @@ fn cmd_files(project: &Path) -> Result<()> {
                 .get(path as &std::path::Path)
                 .map(|v| v.len())
                 .unwrap_or(0);
-            println!(
+            println_stdout!(
                 "{:<4} {:>5}  {}",
                 type_tag,
                 node_count,
                 rel.to_string_lossy()
             );
         }
-        println!();
-        println!("{} files total", entries.len());
+        println_stdout!();
+        println_stdout!("{} files total", entries.len());
     } else {
         let report = proj.analyze()?;
         print_analyze_report(&report);
@@ -687,23 +709,27 @@ fn cmd_nodes(
 
     if let Some(max) = max_degree {
         let label = if orphan { "orphan" } else { "low-degree" };
-        println!("{} (degree ≤ {}, {} shown)", label, max, filtered.len(),);
-        println!();
+        println_stdout!("{} (degree ≤ {}, {} shown)", label, max, filtered.len(),);
+        println_stdout!();
     }
 
-    println!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
+    println_stdout!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
     for (idx, in_deg, out_deg, total) in &filtered {
         let tag = node_type_tag(&graph[*idx]);
         let key = graph::key::NodeKey::from_node(&graph[*idx]);
-        println!(
+        println_stdout!(
             "{:<8} {:>3} {:>3} {:>3}  {}",
-            tag, in_deg, out_deg, total, key
+            tag,
+            in_deg,
+            out_deg,
+            total,
+            key
         );
     }
 
     if !filtered.is_empty() {
-        println!();
-        println!("{} nodes", filtered.len());
+        println_stdout!();
+        println_stdout!("{} nodes", filtered.len());
     }
 
     Ok(())
@@ -746,35 +772,35 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
         .neighbors_directed(*start_idx, petgraph::Direction::Outgoing)
         .count();
 
-    println!("  {} {}", tag, start_name);
+    println_stdout!("  {} {}", tag, start_name);
     if is_partial(&graph[*start_idx]) {
-        println!("  ⚠ partial node — body implementation could not be parsed");
+        println_stdout!("  ⚠ partial node — body implementation could not be parsed");
     }
-    println!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
+    println_stdout!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
     print_node_details(&graph[*start_idx]);
-    println!();
+    println_stdout!();
 
     let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
-    println!(
+    println_stdout!(
         "{}",
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
 
     if show_files {
         let chain_files = graph::traverse::collect_chain_files(&chain, graph);
-        println!();
-        println!("── FILES ({}) ──", chain_files.len());
+        println_stdout!();
+        println_stdout!("── FILES ({}) ──", chain_files.len());
         if chain_files.is_empty() {
-            println!("  (none)");
+            println_stdout!("  (none)");
         } else {
             for (file, nodes) in &chain_files {
-                println!("  {:>3}  {}", nodes.len(), file.to_string_lossy());
+                println_stdout!("  {:>3}  {}", nodes.len(), file.to_string_lossy());
                 for node_label in nodes.iter().take(8) {
-                    println!("       {}", node_label);
+                    println_stdout!("       {}", node_label);
                 }
                 if nodes.len() > 8 {
-                    println!("       ... +{} more", nodes.len() - 8);
+                    println_stdout!("       ... +{} more", nodes.len() - 8);
                 }
             }
         }
@@ -830,9 +856,9 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
         return Ok(());
     }
 
-    println!("SQL fragment: '{}'", fragment);
-    println!("Found {} matching node(s)", matches.len());
-    println!();
+    println_stdout!("SQL fragment: '{}'", fragment);
+    println_stdout!("Found {} matching node(s)", matches.len());
+    println_stdout!();
 
     for (idx, _) in &matches {
         let node = &graph[*idx];
@@ -846,15 +872,15 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 sql: Some(sql_text),
                 ..
             } => {
-                println!("  MappedStatement: {}.{}", namespace, statement_id);
-                println!("    kind:  {}", kind);
-                println!("    file:  {}:{}", xml_file.to_string_lossy(), line);
+                println_stdout!("  MappedStatement: {}.{}", namespace, statement_id);
+                println_stdout!("    kind:  {}", kind);
+                println_stdout!("    file:  {}:{}", xml_file.to_string_lossy(), line);
                 for l in sql_text.lines().take(5) {
-                    println!("    sql:   {}", l);
+                    println_stdout!("    sql:   {}", l);
                 }
                 let line_count = sql_text.lines().count();
                 if line_count > 5 {
-                    println!("    sql:   ... +{} more lines", line_count - 5);
+                    println_stdout!("    sql:   ... +{} more lines", line_count - 5);
                 }
 
                 let callers: Vec<petgraph::graph::NodeIndex> = graph
@@ -869,18 +895,22 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     .collect();
 
                 if !java_methods.is_empty() {
-                    println!("    invoked by:");
+                    println_stdout!("    invoked by:");
                     for caller in &java_methods {
                         if let Node::JavaMethod {
                             fqn, file, line, ..
                         } = caller
                         {
-                            println!("      JavaMethod: {}", fqn);
-                            println!("        file:     {}:{}", file.to_string_lossy(), line);
+                            println_stdout!("      JavaMethod: {}", fqn);
+                            println_stdout!(
+                                "        file:     {}:{}",
+                                file.to_string_lossy(),
+                                line
+                            );
                         }
                     }
                 }
-                println!();
+                println_stdout!();
             }
             Node::JavaSql {
                 class_name,
@@ -897,16 +927,16 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     (None, Some(m)) => m.clone(),
                     (None, None) => "?".to_string(),
                 };
-                println!("  JavaSql: {} ({})", ctx, extraction_method);
-                println!("    file:  {}:{}", java_file.to_string_lossy(), line);
+                println_stdout!("  JavaSql: {} ({})", ctx, extraction_method);
+                println_stdout!("    file:  {}:{}", java_file.to_string_lossy(), line);
                 for l in sql_text.lines().take(5) {
-                    println!("    sql:   {}", l);
+                    println_stdout!("    sql:   {}", l);
                 }
                 let line_count = sql_text.lines().count();
                 if line_count > 5 {
-                    println!("    sql:   ... +{} more lines", line_count - 5);
+                    println_stdout!("    sql:   ... +{} more lines", line_count - 5);
                 }
-                println!();
+                println_stdout!();
             }
             _ => {}
         }
@@ -957,7 +987,7 @@ fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Res
         serde_json::to_string_pretty(&result).map_err(|e| error::CodeWebError::ExportError {
             message: e.to_string(),
         })?;
-    println!("{}", output);
+    println_stdout!("{}", output);
     Ok(())
 }
 
@@ -976,21 +1006,21 @@ fn print_node_details(node: &Node) {
             ..
         } => {
             if let Some(loc) = location {
-                println!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
+                println_stdout!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
             } else {
-                println!("  file: (implicit)");
+                println_stdout!("  file: (implicit)");
             }
             if *temporary {
-                println!("  temporary: true");
+                println_stdout!("  temporary: true");
             }
             if *unlogged {
-                println!("  unlogged: true");
+                println_stdout!("  unlogged: true");
             }
             if let Some(ts) = tablespace {
-                println!("  tablespace: {}", ts);
+                println_stdout!("  tablespace: {}", ts);
             }
             if !columns.is_empty() {
-                println!("  columns ({}):", columns.len());
+                println_stdout!("  columns ({}):", columns.len());
                 for col in columns.iter() {
                     let pk = if col.is_primary_key { " [PK]" } else { "" };
                     let null = if col.nullable { "NULL" } else { "NOT NULL" };
@@ -999,7 +1029,7 @@ fn print_node_details(node: &Node) {
                         .as_deref()
                         .map(|d| format!(" DEFAULT {}", d))
                         .unwrap_or_default();
-                    println!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
+                    println_stdout!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
                 }
             }
             if let Some(part) = partition_by {
@@ -1008,7 +1038,7 @@ fn print_node_details(node: &Node) {
                         columns,
                         partitions,
                     } => {
-                        println!(
+                        println_stdout!(
                             "  partition: RANGE({}) [{} partitions]",
                             columns.join(", "),
                             partitions.len()
@@ -1018,7 +1048,7 @@ fn print_node_details(node: &Node) {
                         columns,
                         partitions,
                     } => {
-                        println!(
+                        println_stdout!(
                             "  partition: LIST({}) [{} partitions]",
                             columns.join(", "),
                             partitions.len()
@@ -1028,7 +1058,7 @@ fn print_node_details(node: &Node) {
                         columns,
                         partitions_count,
                     } => {
-                        println!(
+                        println_stdout!(
                             "  partition: HASH({}) [{}]",
                             columns.join(", "),
                             partitions_count
@@ -1041,21 +1071,21 @@ fn print_node_details(node: &Node) {
             if let Some(dist) = distribute_by {
                 match dist.as_ref() {
                     DistributeInfo::Hash { columns } => {
-                        println!("  distribute: HASH({})", columns.join(", "));
+                        println_stdout!("  distribute: HASH({})", columns.join(", "));
                     }
                     DistributeInfo::Replication => {
-                        println!("  distribute: REPLICATION");
+                        println_stdout!("  distribute: REPLICATION");
                     }
                     DistributeInfo::RoundRobin { columns } => {
-                        println!("  distribute: ROUNDROBIN({})", columns.join(", "));
+                        println_stdout!("  distribute: ROUNDROBIN({})", columns.join(", "));
                     }
                     DistributeInfo::Modulo { columns } => {
-                        println!("  distribute: MODULO({})", columns.join(", "));
+                        println_stdout!("  distribute: MODULO({})", columns.join(", "));
                     }
                 }
             }
             if let Some(ddl) = ddl_source {
-                println!("  ddl: {}", ddl.as_ref());
+                println_stdout!("  ddl: {}", ddl.as_ref());
             }
         }
         Node::JavaSql {
@@ -1067,18 +1097,18 @@ fn print_node_details(node: &Node) {
             sql,
             ..
         } => {
-            println!("  file: {}:{}", java_file.to_string_lossy(), line);
+            println_stdout!("  file: {}:{}", java_file.to_string_lossy(), line);
             if let (Some(c), Some(m)) = (class_name, method_name) {
-                println!("  method: {}.{}", c, m);
+                println_stdout!("  method: {}.{}", c, m);
             } else if let Some(c) = class_name {
-                println!("  class: {}", c);
+                println_stdout!("  class: {}", c);
             } else if let Some(m) = method_name {
-                println!("  method: {}", m);
+                println_stdout!("  method: {}", m);
             }
-            println!("  extraction: {}", extraction_method);
+            println_stdout!("  extraction: {}", extraction_method);
             if let Some(sql_text) = sql {
                 for line in sql_text.lines() {
-                    println!("  sql: {}", line);
+                    println_stdout!("  sql: {}", line);
                 }
             }
         }
@@ -1089,11 +1119,11 @@ fn print_node_details(node: &Node) {
             sql,
             ..
         } => {
-            println!("  file: {}:{}", xml_file.to_string_lossy(), line);
-            println!("  kind: {}", kind);
+            println_stdout!("  file: {}:{}", xml_file.to_string_lossy(), line);
+            println_stdout!("  kind: {}", kind);
             if let Some(sql_text) = sql {
                 for line in sql_text.lines() {
-                    println!("  sql: {}", line);
+                    println_stdout!("  sql: {}", line);
                 }
             }
         }
