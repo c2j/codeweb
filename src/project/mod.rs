@@ -209,11 +209,7 @@ impl Project {
 
         pb.set_message(format!("Parsing SQL (1/{})...", sql_chunks));
         for (chunk_idx, chunk) in all_sql_paths.chunks(SQL_CHUNK_SIZE).enumerate() {
-            pb.set_message(format!(
-                "Parsing SQL ({}/{})...",
-                chunk_idx + 1,
-                sql_chunks
-            ));
+            pb.set_message(format!("Parsing SQL ({}/{})...", chunk_idx + 1, sql_chunks));
             let parsed = parser::parse_sql_files(chunk);
             pb.inc(chunk.len() as u64);
 
@@ -265,19 +261,31 @@ impl Project {
 
         // Phase 5: Add non-SQL nodes to graph
         eprintln!("  Building graph...");
-        GraphBuilder::add_ibatis_nodes_from_parsed(
+        let source_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
+            vec![self.root.clone()]
+        } else {
+            self.config
+                .analysis
+                .paths
+                .iter()
+                .map(|p| self.root.join(p))
+                .collect()
+        };
+        GraphBuilder::add_ibatis_nodes_from_parsed_with_source_paths(
             &ibatis_files,
             &mut ctx.graph,
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &source_paths,
         );
-        GraphBuilder::add_java_nodes_from_parsed(
+        GraphBuilder::add_java_nodes_from_parsed_with_source_paths(
             &java_files,
             &mut ctx.graph,
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &source_paths,
         );
         GraphBuilder::add_java_method_nodes_from_parsed(
             &java_method_results,
@@ -293,15 +301,12 @@ impl Project {
         }
 
         // Phase 6: Build store
-        let mut new_store =
-            GraphStore::from_graph(&self.config.project.name, ctx.graph);
+        let mut new_store = GraphStore::from_graph(&self.config.project.name, ctx.graph);
 
         // Build manifest from collected hashes (no re-reading files)
         let mut new_records = Vec::new();
         for (path, hash, file_type) in &all_hashes {
-            if let Some(record) =
-                FileRecord::from_parts(path.clone(), hash.clone(), *file_type)
-            {
+            if let Some(record) = FileRecord::from_parts(path.clone(), hash.clone(), *file_type) {
                 new_records.push(record);
             }
         }
