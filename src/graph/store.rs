@@ -280,6 +280,79 @@ impl GraphStore {
         self.edge_category_index.get(category).map_or(&[], |v| v)
     }
 
+    /// Search nodes by SQL text content (substring match, case-insensitive).
+    /// Checks MappedStatement.sql and JavaSql.sql fields.
+    /// Returns Vec of (NodeIndex, display_key).
+    pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String)> {
+        let lower = query.to_lowercase();
+        let mut results = Vec::new();
+        for idx in self.graph.node_indices() {
+            match &self.graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => {
+                    if sql_text_matches(sql_text, &lower) {
+                        results.push((idx, format!("mapper:{}.{}", namespace, statement_id)));
+                    }
+                }
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    ..
+                } => {
+                    if sql_text_matches(sql_text, &lower) {
+                        let ctx = match (class_name, method_name) {
+                            (Some(c), Some(m)) => format!("{}.{}", c, m),
+                            (Some(c), None) => c.clone(),
+                            (None, Some(m)) => m.clone(),
+                            (None, None) => "?".to_string(),
+                        };
+                        results.push((idx, format!("javasql:{}", ctx)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        results
+    }
+}
+
+/// Check if `sql_text` (lowercased) matches `query_lower` which may contain `?` as a wildcard
+/// matching any non-empty sequence of characters (e.g. a concrete parameter name).
+///
+/// First tries direct substring match; if the query contains `?` and direct match fails,
+/// splits the query on `?` and verifies each segment appears in order in the SQL text.
+fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
+    let sql_lower = sql_text.to_lowercase();
+    if sql_lower.contains(query_lower) {
+        return true;
+    }
+    if !query_lower.contains('?') {
+        return false;
+    }
+    // Relaxed: split query on `?`, check each segment appears in order
+    let parts: Vec<&str> = query_lower.split('?').collect();
+    if parts.len() <= 1 {
+        return false;
+    }
+    let mut pos = 0;
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        match sql_lower[pos..].find(part) {
+            Some(p) => pos += p + part.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+impl GraphStore {
     /// Search nodes by name using the sorted name_index.
     /// Returns Vec of (NodeIndex, display_key) ranked by MatchRank (Exact > WordBoundary > Substring).
     pub fn search_nodes(&self, query: &str) -> Vec<(NodeIndex, String)> {

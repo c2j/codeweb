@@ -1450,7 +1450,12 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         Self::add_ibatis_nodes_from_parsed_with_source_paths(
-            ibatis_files, graph, proc_index, mapper_index, table_index, &[],
+            ibatis_files,
+            graph,
+            proc_index,
+            mapper_index,
+            table_index,
+            &[],
         )
     }
 
@@ -1464,9 +1469,8 @@ impl GraphBuilder {
         source_paths: &[PathBuf],
     ) {
         for ibatis_file in ibatis_files {
-            let full_path = PathBuf::from(
-                ibatis_file.result.file_path.as_deref().unwrap_or_default(),
-            );
+            let full_path =
+                PathBuf::from(ibatis_file.result.file_path.as_deref().unwrap_or_default());
             let rel_path = source_paths
                 .iter()
                 .filter_map(|sp| full_path.strip_prefix(sp).ok())
@@ -1548,7 +1552,14 @@ impl GraphBuilder {
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        Self::add_java_nodes_from_parsed_with_source_paths(java_files, graph, proc_index, mapper_index, table_index, &[])
+        Self::add_java_nodes_from_parsed_with_source_paths(
+            java_files,
+            graph,
+            proc_index,
+            mapper_index,
+            table_index,
+            &[],
+        )
     }
 
     /// Like `add_java_nodes_from_parsed` but accepts `source_paths` (absolute analysis source dirs)
@@ -2557,7 +2568,7 @@ mod tests {
     use crate::graph::builder::GraphBuilder;
     use crate::graph::{Edge, Node};
     use crate::parser::ParsedFile;
-use std::path::PathBuf;
+    use std::path::PathBuf;
 
     fn parse_sql(sql: &str) -> Vec<ogsql_parser::StatementInfo> {
         let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();

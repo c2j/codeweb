@@ -240,6 +240,17 @@ enum Commands {
         files: bool,
     },
 
+    /// Search MappedStatement and JavaSql nodes by SQL fragment, then
+    /// trace back to the invoking Java methods (via InvokesMapper edges).
+    TraceSql {
+        /// SQL fragment to search for (substring match, case-insensitive)
+        sql: String,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
     /// Execute a JSON query spec against the graph
     Query {
         /// Path to JSON query spec file (use - for stdin)
@@ -355,6 +366,7 @@ fn run() -> Result<()> {
             name,
             force,
         }) => cmd_import(&file, &output, prefix.as_deref(), name.as_deref(), force),
+        Some(Commands::TraceSql { sql, project }) => cmd_trace_sql(&sql, &project),
         Some(Commands::Query {
             file,
             spec,
@@ -755,6 +767,106 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
                     println!("       ... +{} more", nodes.len() - 8);
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_trace_sql(sql: &str, project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    let matches = store.search_by_sql(sql);
+
+    if matches.is_empty() {
+        eprintln!(
+            "No MappedStatement or JavaSql nodes contain the SQL fragment: '{}'",
+            sql
+        );
+        return Ok(());
+    }
+
+    println!("SQL fragment: '{}'", sql);
+    println!("Found {} matching node(s)", matches.len());
+    println!();
+
+    for (idx, _) in &matches {
+        let node = &graph[*idx];
+        match node {
+            Node::MappedStatement {
+                namespace,
+                statement_id,
+                kind,
+                xml_file,
+                line,
+                sql: Some(sql_text),
+                ..
+            } => {
+                println!("  MappedStatement: {}.{}", namespace, statement_id);
+                println!("    kind:  {}", kind);
+                println!("    file:  {}:{}", xml_file.to_string_lossy(), line);
+                for l in sql_text.lines().take(5) {
+                    println!("    sql:   {}", l);
+                }
+                let line_count = sql_text.lines().count();
+                if line_count > 5 {
+                    println!("    sql:   ... +{} more lines", line_count - 5);
+                }
+
+                let callers: Vec<petgraph::graph::NodeIndex> = graph
+                    .neighbors_directed(*idx, petgraph::Direction::Incoming)
+                    .collect();
+                let java_methods: Vec<&Node> = callers
+                    .iter()
+                    .filter_map(|ci| match &graph[*ci] {
+                        n @ Node::JavaMethod { .. } => Some(n),
+                        _ => None,
+                    })
+                    .collect();
+
+                if !java_methods.is_empty() {
+                    println!("    invoked by:");
+                    for caller in &java_methods {
+                        if let Node::JavaMethod {
+                            fqn, file, line, ..
+                        } = caller
+                        {
+                            println!("      JavaMethod: {}", fqn);
+                            println!("        file:     {}:{}", file.to_string_lossy(), line);
+                        }
+                    }
+                }
+                println!();
+            }
+            Node::JavaSql {
+                class_name,
+                method_name,
+                extraction_method,
+                java_file,
+                line,
+                sql: Some(sql_text),
+                ..
+            } => {
+                let ctx = match (class_name, method_name) {
+                    (Some(c), Some(m)) => format!("{}.{}", c, m),
+                    (Some(c), None) => c.clone(),
+                    (None, Some(m)) => m.clone(),
+                    (None, None) => "?".to_string(),
+                };
+                println!("  JavaSql: {} ({})", ctx, extraction_method);
+                println!("    file:  {}:{}", java_file.to_string_lossy(), line);
+                for l in sql_text.lines().take(5) {
+                    println!("    sql:   {}", l);
+                }
+                let line_count = sql_text.lines().count();
+                if line_count > 5 {
+                    println!("    sql:   ... +{} more lines", line_count - 5);
+                }
+                println!();
+            }
+            _ => {}
         }
     }
 
