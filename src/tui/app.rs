@@ -19,6 +19,7 @@ pub struct App {
     // Explorer: search + node list
     search_query: String,
     search_mode: bool,
+    sql_search_mode: bool,
     nodes: Vec<NodeIndex>,
     list_state: ListState,
 
@@ -32,6 +33,7 @@ pub struct App {
 
     // Options
     chain_style: traverse::ChainStyle,
+    show_attributes: bool,
     filter_low_degree: bool,
     filter_threshold: usize,
     locale_idx: usize,
@@ -55,6 +57,7 @@ impl App {
             should_quit: false,
             search_query: String::new(),
             search_mode: false,
+            sql_search_mode: false,
             nodes: Vec::new(),
             list_state,
             detail_node_idx: None,
@@ -62,6 +65,7 @@ impl App {
             detail_scroll: 0,
             info_scroll: 0,
             chain_style: traverse::ChainStyle::default(),
+            show_attributes: true,
             filter_low_degree: false,
             filter_threshold: 0,
             locale_idx: 0,
@@ -118,6 +122,12 @@ impl App {
             } else {
                 self.nodes = graph.node_indices().collect();
             }
+        } else if self.sql_search_mode {
+            self.nodes = store
+                .search_by_sql(&self.search_query)
+                .into_iter()
+                .map(|(idx, _)| idx)
+                .collect();
         } else {
             self.nodes = traverse::find_nodes_by_name(graph, &self.search_query)
                 .into_iter()
@@ -177,14 +187,16 @@ impl App {
         )));
         lines.push(Line::from(""));
 
-        let attr_lines = format_node_attributes_full(node);
-        for attr_line in attr_lines {
-            lines.push(Line::from(Span::styled(
-                attr_line,
-                Style::default().fg(Color::White),
-            )));
+        if self.show_attributes {
+            let attr_lines = format_node_attributes_full(node);
+            for attr_line in attr_lines {
+                lines.push(Line::from(Span::styled(
+                    attr_line,
+                    Style::default().fg(Color::White),
+                )));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
 
         let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
         let chain_lines = match self.chain_style {
@@ -266,6 +278,12 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.search_mode = false;
                 }
+                KeyCode::Char('/') => {
+                    self.sql_search_mode = !self.sql_search_mode;
+                    self.search_query.clear();
+                    self.list_state.select(Some(0));
+                    self.refresh_node_list();
+                }
                 KeyCode::Backspace => {
                     self.search_query.pop();
                     self.list_state.select(Some(0));
@@ -300,6 +318,9 @@ impl App {
                     traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
                     traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
                 };
+            }
+            KeyCode::Char('v') => {
+                self.show_attributes = !self.show_attributes;
             }
             KeyCode::Char('l') => {
                 self.filter_low_degree = !self.filter_low_degree;
@@ -446,6 +467,7 @@ impl App {
             traverse::ChainStyle::Tree => t!("style.tree").to_string(),
             traverse::ChainStyle::Path => t!("style.path").to_string(),
         };
+        let attr_indicator = if self.show_attributes { "Attr" } else { "attr" };
 
         let hints: String = if self.search_mode && self.screen == Screen::Explorer {
             t!("statusbar.explorer_search",
@@ -503,7 +525,7 @@ impl App {
                 .to_string(),
             }
         };
-        let bar = Paragraph::new(format!(" {}", hints))
+        let bar = Paragraph::new(format!(" {}  [{}]", hints, attr_indicator))
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         f.render_widget(bar, area);
     }
@@ -515,16 +537,25 @@ impl App {
             .split(area);
 
         // Search bar
+        let mode_tag = if self.sql_search_mode {
+            "[SQL] "
+        } else {
+            "[Name] "
+        };
         let cursor = if self.search_mode { "▏" } else { "_" };
         let prompt = if self.search_mode {
-            format!("> {}{}", self.search_query, cursor)
+            format!("> {}{}{}", mode_tag, self.search_query, cursor)
         } else if self.search_query.is_empty() {
-            format!("> {}", t!("hint.search_hint"))
+            format!("> {}{}", mode_tag, t!("hint.search_hint"))
         } else {
-            format!("> {}{}", self.search_query, cursor)
+            format!("> {}{}{}", mode_tag, self.search_query, cursor)
         };
         let border_style = if self.search_mode {
-            Style::default().fg(Color::Cyan)
+            if self.sql_search_mode {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::Cyan)
+            }
         } else {
             Style::default()
         };

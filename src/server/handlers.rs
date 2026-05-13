@@ -13,7 +13,7 @@ use crate::graph::key::NodeKey;
 use crate::graph::node_type_tag;
 use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
-use crate::graph::CodeGraph;
+use crate::graph::{CodeGraph, Node};
 
 use super::state::AppState;
 
@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/nodes/:id", get(node_detail))
         .route("/api/v1/nodes/:id/callers", get(node_callers))
         .route("/api/v1/nodes/:id/callees", get(node_callees))
+        .route("/api/v1/nodes/search-sql", get(search_sql))
         .route("/api/v1/trace", get(trace))
         .route("/api/v1/query", post(execute_query))
         .route("/api/v1/export", get(export))
@@ -127,6 +128,34 @@ async fn nodes(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct SearchSqlQuery {
+    q: String,
+}
+
+async fn search_sql(
+    State(state): State<AppState>,
+    Query(query): Query<SearchSqlQuery>,
+) -> impl IntoResponse {
+    let results = state.store().search_by_sql(&query.q);
+    let nodes: Vec<Value> = results
+        .into_iter()
+        .map(|(idx, display_key)| {
+            let node = &state.graph()[idx];
+            let detail = node_type_tag(node);
+            serde_json::json!({
+                "id": idx.index(),
+                "key": display_key,
+                "type": detail,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "total": nodes.len(),
+        "nodes": nodes,
+    }))
+}
+
 async fn node_detail(
     State(state): State<AppState>,
     Path(id): Path<usize>,
@@ -171,6 +200,132 @@ async fn node_detail(
         .collect();
 
     let key = NodeKey::from_node(node);
+    let mut properties: Vec<Value> = Vec::new();
+    match node {
+        Node::MappedStatement {
+            namespace,
+            statement_id,
+            kind,
+            xml_file,
+            line,
+            sql,
+            ..
+        } => {
+            properties.push(serde_json::json!({"label": "namespace", "value": namespace}));
+            properties.push(serde_json::json!({"label": "statement_id", "value": statement_id}));
+            properties.push(serde_json::json!({"label": "kind", "value": kind}));
+            properties
+                .push(serde_json::json!({"label": "file", "value": xml_file.to_string_lossy()}));
+            properties.push(serde_json::json!({"label": "line", "value": line}));
+            if let Some(sql_text) = sql {
+                properties.push(serde_json::json!({"label": "sql", "value": sql_text}));
+            }
+        }
+        Node::JavaSql {
+            class_name,
+            method_name,
+            extraction_method,
+            java_file,
+            line,
+            sql,
+            ..
+        } => {
+            properties
+                .push(serde_json::json!({"label": "file", "value": java_file.to_string_lossy()}));
+            properties.push(serde_json::json!({"label": "line", "value": line}));
+            if let Some(c) = class_name {
+                properties.push(serde_json::json!({"label": "class", "value": c}));
+            }
+            if let Some(m) = method_name {
+                properties.push(serde_json::json!({"label": "method", "value": m}));
+            }
+            properties.push(serde_json::json!({"label": "extraction", "value": extraction_method}));
+            if let Some(sql_text) = sql {
+                properties.push(serde_json::json!({"label": "sql", "value": sql_text}));
+            }
+        }
+        Node::Table {
+            schema,
+            name,
+            location,
+            columns,
+            tablespace,
+            temporary,
+            unlogged,
+            ddl_source,
+            ..
+        } => {
+            if let Some(s) = schema {
+                properties.push(serde_json::json!({"label": "schema", "value": s}));
+            }
+            properties.push(serde_json::json!({"label": "name", "value": name}));
+            if let Some(loc) = location {
+                properties.push(
+                    serde_json::json!({"label": "file", "value": loc.file.to_string_lossy()}),
+                );
+                properties.push(serde_json::json!({"label": "line", "value": loc.line}));
+            }
+            if !columns.is_empty() {
+                let col_summary: Vec<Value> = columns.iter().map(|c| {
+                    serde_json::json!({"name": c.name, "type": c.data_type, "nullable": c.nullable, "pk": c.is_primary_key})
+                }).collect();
+                properties.push(serde_json::json!({"label": "columns", "value": col_summary}));
+            }
+            if *temporary {
+                properties.push(serde_json::json!({"label": "temporary", "value": "true"}));
+            }
+            if *unlogged {
+                properties.push(serde_json::json!({"label": "unlogged", "value": "true"}));
+            }
+            if let Some(ts) = tablespace {
+                properties.push(serde_json::json!({"label": "tablespace", "value": ts}));
+            }
+            if let Some(ddl) = ddl_source {
+                properties.push(serde_json::json!({"label": "ddl", "value": ddl.as_ref()}));
+            }
+        }
+        Node::Procedure {
+            id,
+            location,
+            partial,
+            ..
+        }
+        | Node::Function {
+            id,
+            location,
+            partial,
+            ..
+        } => {
+            properties.push(serde_json::json!({"label": "schema", "value": id.schema}));
+            properties.push(serde_json::json!({"label": "package", "value": id.package}));
+            properties.push(serde_json::json!({"label": "name", "value": id.name}));
+            properties.push(
+                serde_json::json!({"label": "file", "value": location.file.to_string_lossy()}),
+            );
+            properties.push(serde_json::json!({"label": "line", "value": location.line}));
+            if *partial {
+                properties.push(serde_json::json!({"label": "partial", "value": "true"}));
+            }
+        }
+        Node::JavaMethod {
+            fqn,
+            class_fqn,
+            name,
+            signature,
+            file,
+            line,
+            ..
+        } => {
+            properties.push(serde_json::json!({"label": "fqn", "value": fqn}));
+            properties.push(serde_json::json!({"label": "class_fqn", "value": class_fqn}));
+            properties.push(serde_json::json!({"label": "name", "value": name}));
+            properties.push(serde_json::json!({"label": "signature", "value": signature}));
+            properties.push(serde_json::json!({"label": "file", "value": file.to_string_lossy()}));
+            properties.push(serde_json::json!({"label": "line", "value": line}));
+        }
+        _ => {}
+    }
+
     let result = serde_json::json!({
         "id": idx.index(),
         "key": key.to_string(),
@@ -179,6 +334,7 @@ async fn node_detail(
         "out_degree": out_deg,
         "callers": callers,
         "callees": callees,
+        "properties": properties,
     });
 
     Ok(Json(result))

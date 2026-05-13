@@ -264,9 +264,17 @@ enum Commands {
 
     /// Search MappedStatement and JavaSql nodes by SQL fragment, then
     /// trace back to the invoking Java methods (via InvokesMapper edges).
+    ///
+    /// Use --file to read the SQL fragment from a file (avoids shell quoting issues).
     TraceSql {
-        /// SQL fragment to search for (substring match, case-insensitive)
-        sql: String,
+        /// SQL fragment to search for (substring match, case-insensitive).
+        /// Omit this and use --file to read from a file instead.
+        sql: Option<String>,
+
+        /// Read the SQL fragment from a file (use - for stdin).
+        /// This avoids shell quoting issues with SQL containing quotes.
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -388,7 +396,9 @@ fn run() -> Result<()> {
             name,
             force,
         }) => cmd_import(&file, &output, prefix.as_deref(), name.as_deref(), force),
-        Some(Commands::TraceSql { sql, project }) => cmd_trace_sql(&sql, &project),
+        Some(Commands::TraceSql { sql, file, project }) => {
+            cmd_trace_sql(sql.as_deref(), file.as_deref(), &project)
+        }
         Some(Commands::Query {
             file,
             spec,
@@ -709,7 +719,11 @@ fn cmd_nodes(
         let key = graph::key::NodeKey::from_node(&graph[*idx]);
         println_stdout!(
             "{:<8} {:>3} {:>3} {:>3}  {}",
-            tag, in_deg, out_deg, total, key
+            tag,
+            in_deg,
+            out_deg,
+            total,
+            key
         );
     }
 
@@ -795,22 +809,54 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
     Ok(())
 }
 
-fn cmd_trace_sql(sql: &str, project: &Path) -> Result<()> {
+fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Result<()> {
+    let fragment = match (sql, file) {
+        (Some(s), None) => s.to_string(),
+        (None, Some(f)) => {
+            if f.to_str() == Some("-") {
+                let mut buf = String::new();
+                use std::io::Read;
+                std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                    error::CodeWebError::ExportError {
+                        message: format!("read stdin: {}", e),
+                    }
+                })?;
+                buf
+            } else {
+                std::fs::read_to_string(f).map_err(|e| error::CodeWebError::FileRead {
+                    path: f.to_path_buf(),
+                    source: e,
+                })?
+            }
+        }
+        (None, None) => {
+            eprintln!(
+                "error: provide a SQL fragment as argument or use --file to read from a file"
+            );
+            std::process::exit(1);
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("error: provide either a SQL fragment argument OR --file, not both");
+            std::process::exit(1);
+        }
+    };
+    let fragment = fragment.trim();
+
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
     let graph = store.graph();
 
-    let matches = store.search_by_sql(sql);
+    let matches = store.search_by_sql(fragment);
 
     if matches.is_empty() {
         eprintln!(
             "No MappedStatement or JavaSql nodes contain the SQL fragment: '{}'",
-            sql
+            fragment
         );
         return Ok(());
     }
 
-    println_stdout!("SQL fragment: '{}'", sql);
+    println_stdout!("SQL fragment: '{}'", fragment);
     println_stdout!("Found {} matching node(s)", matches.len());
     println_stdout!();
 
@@ -856,7 +902,11 @@ fn cmd_trace_sql(sql: &str, project: &Path) -> Result<()> {
                         } = caller
                         {
                             println_stdout!("      JavaMethod: {}", fqn);
-                            println_stdout!("        file:     {}:{}", file.to_string_lossy(), line);
+                            println_stdout!(
+                                "        file:     {}:{}",
+                                file.to_string_lossy(),
+                                line
+                            );
                         }
                     }
                 }
