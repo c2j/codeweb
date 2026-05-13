@@ -266,6 +266,8 @@ pub enum Node {
         kind: String,
         xml_file: PathBuf,
         line: usize,
+        #[serde(default)]
+        sql: Option<String>,
     },
 
     /// SQL extracted from Java source (annotations, JDBC calls, constants).
@@ -275,6 +277,8 @@ pub enum Node {
         extraction_method: String,
         java_file: PathBuf,
         line: usize,
+        #[serde(default)]
+        sql: Option<String>,
     },
 
     /// A Java method declaration.
