@@ -253,12 +253,14 @@ impl CgefParser {
                     });
                 let line = key_get_usize(key, "line")
                     .unwrap_or_else(|| cgef.location.as_ref().map(|l| l.line).unwrap_or(0));
+                let sql = key_get_str(key, "sql").map(String::from);
                 Ok(Node::MappedStatement {
                     namespace: namespace.to_string(),
                     statement_id: statement_id.to_string(),
                     kind,
                     xml_file,
                     line,
+                    sql,
                 })
             }
             "java_method" => {
@@ -333,12 +335,14 @@ impl CgefParser {
                     .unwrap_or_default();
                 let line = key_get_usize(key, "line")
                     .unwrap_or_else(|| cgef.location.as_ref().map(|l| l.line).unwrap_or(0));
+                let sql = key_get_str(key, "sql").map(String::from);
                 Ok(Node::JavaSql {
                     class_name,
                     method_name,
                     extraction_method: extraction_method.to_string(),
                     java_file,
                     line,
+                    sql,
                 })
             }
             "package" => {

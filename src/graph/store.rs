@@ -52,7 +52,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 4,
+            version: 5,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -174,7 +174,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 4,
+            version: 5,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -345,10 +345,10 @@ impl GraphStore {
             bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
             })?;
-        if store.version != 4 {
+        if store.version != 5 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 4 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 5 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });
@@ -385,10 +385,10 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 4 {
+        if store.version != 5 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 4 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 5 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });
@@ -521,7 +521,10 @@ impl GraphStore {
 
         for idx in self.graph.node_indices() {
             let tag = node_type_tag(&self.graph[idx]).to_string();
-            self.type_tag_index.entry(tag.clone()).or_default().push(idx);
+            self.type_tag_index
+                .entry(tag.clone())
+                .or_default()
+                .push(idx);
 
             let key = NodeKey::from_node(&self.graph[idx]);
             let key_str = key.to_string();
@@ -1725,7 +1728,11 @@ mod tests {
         let store_a = GraphStore::from_graph("a", graph_a);
 
         let mut graph_b = CodeGraph::new();
-        graph_b.add_node(make_proc(None, Some("pkg_import_excel"), "proc_import_excel"));
+        graph_b.add_node(make_proc(
+            None,
+            Some("pkg_import_excel"),
+            "proc_import_excel",
+        ));
         let store_b = GraphStore::from_graph("b", graph_b);
 
         let merged = GraphStore::merge(vec![store_a, store_b], "combined");
@@ -1855,10 +1862,7 @@ mod tests {
 
         assert_eq!(store.node_summaries().len(), 2, "node_summaries rebuilt");
         assert_eq!(store.name_index().len(), 2, "name_index rebuilt");
-        assert_eq!(
-            store.type_tag_index.get("proc").map(|v| v.len()),
-            Some(2),
-        );
+        assert_eq!(store.type_tag_index.get("proc").map(|v| v.len()), Some(2),);
     }
 
     #[test]

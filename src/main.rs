@@ -513,6 +513,9 @@ fn cmd_stats(project: &Path) -> Result<()> {
     if stats.unresolved > 0 {
         println!("  {:>12}  unresolved", stats.unresolved,);
     }
+    if stats.custom_nodes > 0 {
+        println!("  {:>12}  custom nodes", stats.custom_nodes,);
+    }
     println!();
     println!("  {:>12}  edges", stats.edges,);
     println!("  {:>12}  files", stats.files,);
@@ -806,100 +809,141 @@ fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Res
 
 fn print_node_details(node: &Node) {
     use graph::{DistributeInfo, PartitionInfo};
-    if let Node::Table {
-        location,
-        columns,
-        partition_by,
-        distribute_by,
-        tablespace,
-        temporary,
-        unlogged,
-        ddl_source,
-        ..
-    } = node
-    {
-        if let Some(loc) = location {
-            println!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
-        } else {
-            println!("  file: (implicit)");
-        }
-        if *temporary {
-            println!("  temporary: true");
-        }
-        if *unlogged {
-            println!("  unlogged: true");
-        }
-        if let Some(ts) = tablespace {
-            println!("  tablespace: {}", ts);
-        }
-        if !columns.is_empty() {
-            println!("  columns ({}):", columns.len());
-            for col in columns.iter() {
-                let pk = if col.is_primary_key { " [PK]" } else { "" };
-                let null = if col.nullable { "NULL" } else { "NOT NULL" };
-                let def = col
-                    .default_value
-                    .as_deref()
-                    .map(|d| format!(" DEFAULT {}", d))
-                    .unwrap_or_default();
-                println!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
+    match node {
+        Node::Table {
+            location,
+            columns,
+            partition_by,
+            distribute_by,
+            tablespace,
+            temporary,
+            unlogged,
+            ddl_source,
+            ..
+        } => {
+            if let Some(loc) = location {
+                println!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
+            } else {
+                println!("  file: (implicit)");
             }
-        }
-        if let Some(part) = partition_by {
-            match part.as_ref() {
-                PartitionInfo::Range {
-                    columns,
-                    partitions,
-                } => {
-                    println!(
-                        "  partition: RANGE({}) [{} partitions]",
-                        columns.join(", "),
-                        partitions.len()
-                    );
-                }
-                PartitionInfo::List {
-                    columns,
-                    partitions,
-                } => {
-                    println!(
-                        "  partition: LIST({}) [{} partitions]",
-                        columns.join(", "),
-                        partitions.len()
-                    );
-                }
-                PartitionInfo::Hash {
-                    columns,
-                    partitions_count,
-                } => {
-                    println!(
-                        "  partition: HASH({}) [{}]",
-                        columns.join(", "),
-                        partitions_count
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| "auto".to_string())
-                    );
+            if *temporary {
+                println!("  temporary: true");
+            }
+            if *unlogged {
+                println!("  unlogged: true");
+            }
+            if let Some(ts) = tablespace {
+                println!("  tablespace: {}", ts);
+            }
+            if !columns.is_empty() {
+                println!("  columns ({}):", columns.len());
+                for col in columns.iter() {
+                    let pk = if col.is_primary_key { " [PK]" } else { "" };
+                    let null = if col.nullable { "NULL" } else { "NOT NULL" };
+                    let def = col
+                        .default_value
+                        .as_deref()
+                        .map(|d| format!(" DEFAULT {}", d))
+                        .unwrap_or_default();
+                    println!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
                 }
             }
+            if let Some(part) = partition_by {
+                match part.as_ref() {
+                    PartitionInfo::Range {
+                        columns,
+                        partitions,
+                    } => {
+                        println!(
+                            "  partition: RANGE({}) [{} partitions]",
+                            columns.join(", "),
+                            partitions.len()
+                        );
+                    }
+                    PartitionInfo::List {
+                        columns,
+                        partitions,
+                    } => {
+                        println!(
+                            "  partition: LIST({}) [{} partitions]",
+                            columns.join(", "),
+                            partitions.len()
+                        );
+                    }
+                    PartitionInfo::Hash {
+                        columns,
+                        partitions_count,
+                    } => {
+                        println!(
+                            "  partition: HASH({}) [{}]",
+                            columns.join(", "),
+                            partitions_count
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "auto".to_string())
+                        );
+                    }
+                }
+            }
+            if let Some(dist) = distribute_by {
+                match dist.as_ref() {
+                    DistributeInfo::Hash { columns } => {
+                        println!("  distribute: HASH({})", columns.join(", "));
+                    }
+                    DistributeInfo::Replication => {
+                        println!("  distribute: REPLICATION");
+                    }
+                    DistributeInfo::RoundRobin { columns } => {
+                        println!("  distribute: ROUNDROBIN({})", columns.join(", "));
+                    }
+                    DistributeInfo::Modulo { columns } => {
+                        println!("  distribute: MODULO({})", columns.join(", "));
+                    }
+                }
+            }
+            if let Some(ddl) = ddl_source {
+                println!("  ddl: {}", ddl.as_ref());
+            }
         }
-        if let Some(dist) = distribute_by {
-            match dist.as_ref() {
-                DistributeInfo::Hash { columns } => {
-                    println!("  distribute: HASH({})", columns.join(", "));
-                }
-                DistributeInfo::Replication => {
-                    println!("  distribute: REPLICATION");
-                }
-                DistributeInfo::RoundRobin { columns } => {
-                    println!("  distribute: ROUNDROBIN({})", columns.join(", "));
-                }
-                DistributeInfo::Modulo { columns } => {
-                    println!("  distribute: MODULO({})", columns.join(", "));
+        Node::JavaSql {
+            class_name,
+            method_name,
+            extraction_method,
+            java_file,
+            line,
+            sql,
+            ..
+        } => {
+            println!("  file: {}:{}", java_file.to_string_lossy(), line);
+            if let (Some(c), Some(m)) = (class_name, method_name) {
+                println!("  method: {}.{}", c, m);
+            } else if let Some(c) = class_name {
+                println!("  class: {}", c);
+            } else if let Some(m) = method_name {
+                println!("  method: {}", m);
+            }
+            println!("  extraction: {}", extraction_method);
+            if let Some(sql_text) = sql {
+                for line in sql_text.lines() {
+                    println!("  sql: {}", line);
                 }
             }
         }
-        if let Some(ddl) = ddl_source {
-            println!("  ddl: {}", ddl.as_ref());
+        Node::MappedStatement {
+            kind,
+            xml_file,
+            line,
+            sql,
+            ..
+        } => {
+            println!("  file: {}:{}", xml_file.to_string_lossy(), line);
+            println!("  kind: {}", kind);
+            if let Some(sql_text) = sql {
+                for line in sql_text.lines() {
+                    println!("  sql: {}", line);
+                }
+            }
         }
+        _ => {}
     }
 }
 
@@ -1128,6 +1172,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut synonyms = 0usize;
     let mut events = 0usize;
     let mut partial = 0usize;
+    let mut custom_nodes = 0usize;
 
     for idx in graph.node_indices() {
         match &graph[idx] {
@@ -1156,7 +1201,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::MaterializedView { .. } => materialized_views += 1,
             Node::Synonym { .. } => synonyms += 1,
             Node::Event { .. } => events += 1,
-            Node::Custom { .. } => {}
+            Node::Custom { .. } => custom_nodes += 1,
         }
     }
 
@@ -1164,13 +1209,13 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} unresolved, {} edges",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, unresolved, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} edges",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, edges
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} edges",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} edges",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, edges
         );
     }
     if partial > 0 {

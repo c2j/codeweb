@@ -120,7 +120,12 @@ impl GraphBuilder {
             &mut ctx.type_index,
             &mut ctx.sequence_index,
         );
-        Self::create_sql_edges(sql_files, &mut ctx.graph, &mut ctx.proc_index, &mut ctx.table_index);
+        Self::create_sql_edges(
+            sql_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.table_index,
+        );
         Self::create_object_ref_edges(
             sql_files,
             &mut ctx.graph,
@@ -1444,20 +1449,49 @@ impl GraphBuilder {
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
+        Self::add_ibatis_nodes_from_parsed_with_source_paths(
+            ibatis_files, graph, proc_index, mapper_index, table_index, &[],
+        )
+    }
+
+    /// Like `add_ibatis_nodes_from_parsed` but accepts `source_paths` to make stored paths relative.
+    pub(crate) fn add_ibatis_nodes_from_parsed_with_source_paths(
+        ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
+        graph: &mut CodeGraph,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
+        mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        source_paths: &[PathBuf],
+    ) {
         for ibatis_file in ibatis_files {
-            let xml_path = Arc::new(PathBuf::from(
+            let full_path = PathBuf::from(
                 ibatis_file.result.file_path.as_deref().unwrap_or_default(),
-            ));
+            );
+            let rel_path = source_paths
+                .iter()
+                .filter_map(|sp| full_path.strip_prefix(sp).ok())
+                .next()
+                .unwrap_or(&full_path);
+            let xml_path = Arc::new(rel_path.to_path_buf());
             let namespace = &ibatis_file.result.namespace;
 
             for stmt in &ibatis_file.result.statements {
                 let kind_label = crate::parser::ibatis_loader::statement_kind_label(&stmt.kind);
+                let sql_text = {
+                    let trimmed = stmt.flat_sql.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
                 let node = Node::MappedStatement {
                     namespace: namespace.clone(),
                     statement_id: stmt.id.clone(),
                     kind: kind_label.to_string(),
                     xml_file: (*xml_path).clone(),
                     line: stmt.line,
+                    sql: sql_text,
                 };
                 let node_idx = graph.add_node(node);
 
@@ -1514,18 +1548,46 @@ impl GraphBuilder {
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
+        Self::add_java_nodes_from_parsed_with_source_paths(java_files, graph, proc_index, mapper_index, table_index, &[])
+    }
+
+    /// Like `add_java_nodes_from_parsed` but accepts `source_paths` (absolute analysis source dirs)
+    /// so that stored Java file paths are relative to the matching analysis path.
+    pub(crate) fn add_java_nodes_from_parsed_with_source_paths(
+        java_files: &[crate::parser::java_loader::JavaParsedFile],
+        graph: &mut CodeGraph,
+        proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
+        mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        source_paths: &[PathBuf],
+    ) {
         for java_file in java_files {
-            let java_path = Arc::new(PathBuf::from(&java_file.result.file_path));
+            let full_path = PathBuf::from(&java_file.result.file_path);
+            let rel_path = source_paths
+                .iter()
+                .filter_map(|sp| full_path.strip_prefix(sp).ok())
+                .next()
+                .unwrap_or(&full_path);
+            let java_path = Arc::new(rel_path.to_path_buf());
 
             for extraction in &java_file.result.extractions {
                 let method_label =
                     crate::parser::java_loader::extraction_method_label(&extraction.origin.method);
+                let sql_text = {
+                    let trimmed = extraction.sql.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
                 let node = Node::JavaSql {
                     class_name: extraction.origin.class_name.clone(),
                     method_name: extraction.origin.method_name.clone(),
                     extraction_method: method_label.to_string(),
                     java_file: (*java_path).clone(),
                     line: extraction.origin.line,
+                    sql: sql_text,
                 };
                 let node_idx = graph.add_node(node);
 
@@ -2495,7 +2557,7 @@ mod tests {
     use crate::graph::builder::GraphBuilder;
     use crate::graph::{Edge, Node};
     use crate::parser::ParsedFile;
-    use std::path::PathBuf;
+use std::path::PathBuf;
 
     fn parse_sql(sql: &str) -> Vec<ogsql_parser::StatementInfo> {
         let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();

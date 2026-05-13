@@ -4,7 +4,11 @@ use tempfile::TempDir;
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
     // When --target is specified, cargo places artifacts under target/<triple>/
-    let bin_name = if cfg!(windows) { "codeweb.exe" } else { "codeweb" };
+    let bin_name = if cfg!(windows) {
+        "codeweb.exe"
+    } else {
+        "codeweb"
+    };
     let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
     for entry in entries.flatten() {
         let p = entry.path().join("debug").join(bin_name);
