@@ -12,7 +12,11 @@
       <span id="title">codeweb</span>
       <span id="project-name"></span>
       <div id="search-bar">
-        <input type="text" id="search-input" placeholder="Search nodes... (press /)">
+        <div id="search-mode-tabs">
+          <span class="search-mode-tab active" data-mode="name" id="tab-name">Name</span>
+          <span class="search-mode-tab" data-mode="sql" id="tab-sql">SQL</span>
+        </div>
+        <input type="text" id="search-input" placeholder="Search by name... (press /)">
         <span id="node-count"></span>
       </div>
     </div>

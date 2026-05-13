@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/nodes/:id", get(node_detail))
         .route("/api/v1/nodes/:id/callers", get(node_callers))
         .route("/api/v1/nodes/:id/callees", get(node_callees))
+        .route("/api/v1/nodes/search-sql", get(search_sql))
         .route("/api/v1/trace", get(trace))
         .route("/api/v1/query", post(execute_query))
         .route("/api/v1/export", get(export))
@@ -124,6 +125,34 @@ async fn nodes(
         "limit": limit_val,
         "offset": offset_val,
         "nodes": result,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct SearchSqlQuery {
+    q: String,
+}
+
+async fn search_sql(
+    State(state): State<AppState>,
+    Query(query): Query<SearchSqlQuery>,
+) -> impl IntoResponse {
+    let results = state.store().search_by_sql(&query.q);
+    let nodes: Vec<Value> = results
+        .into_iter()
+        .map(|(idx, display_key)| {
+            let node = &state.graph()[idx];
+            let detail = node_type_tag(node);
+            serde_json::json!({
+                "id": idx.index(),
+                "key": display_key,
+                "type": detail,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "total": nodes.len(),
+        "nodes": nodes,
     }))
 }
 

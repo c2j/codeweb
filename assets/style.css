@@ -5,6 +5,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 #title{font-weight:700;font-size:16px;color:#e94560;margin-right:12px}
 #project-name{color:#a0a0a0;font-size:14px;margin-right:20px}
 #search-bar{flex:1;display:flex;align-items:center;gap:8px}
+#search-mode-tabs{display:flex;gap:2px;background:#0f3460;border-radius:4px;padding:2px}
+.search-mode-tab{padding:4px 10px;font-size:12px;cursor:pointer;border-radius:3px;color:#a0a0a0;user-select:none}
+.search-mode-tab.active{background:#e94560;color:#fff}
+.search-mode-tab:hover:not(.active){background:#1a1a5e}
 #search-input{width:300px;padding:6px 10px;background:#0f3460;border:1px solid #1a1a5e;border-radius:4px;color:#e0e0e0;font-size:14px}
 #search-input:focus{outline:none;border-color:#e94560}
 #node-count{color:#a0a0a0;font-size:12px}

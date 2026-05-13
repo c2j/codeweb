@@ -2,6 +2,7 @@ let allNodes = [];
 let allNodesTotal = 0;
 let selectedNodeId = null;
 let currentTraceKey = null;
+let searchMode = 'name'; // 'name' or 'sql'
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -44,6 +45,17 @@ async function init() {
 
   document.getElementById('detail-close').addEventListener('click', hideDetail);
 
+  document.querySelectorAll('.search-mode-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.search-mode-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      searchMode = tab.dataset.mode;
+      si.placeholder = searchMode === 'sql' ? 'Search SQL content...' : 'Search by name... (press /)';
+      si.value = '';
+      loadNodes();
+    });
+  });
+
   document.getElementById('detail-panel').addEventListener('click', function(e) {
     const treeNode = e.target.closest('.tree-node');
     if (treeNode && treeNode.dataset.key) {
@@ -53,9 +65,21 @@ async function init() {
 }
 
 async function loadNodes(search) {
-  const data = await api('/nodes?limit=100&offset=0' + (search ? '&search=' + encodeURIComponent(search) : ''));
-  allNodes = data.nodes;
-  allNodesTotal = data.total;
+  const q = search || document.getElementById('search-input').value;
+  let data;
+  if (searchMode === 'sql' && q) {
+    data = await api('/nodes/search-sql?q=' + encodeURIComponent(q));
+    allNodes = data.nodes;
+    allNodesTotal = data.total;
+  } else if (q) {
+    data = await api('/nodes?limit=100&offset=0&search=' + encodeURIComponent(q));
+    allNodes = data.nodes;
+    allNodesTotal = data.total;
+  } else {
+    data = await api('/nodes?limit=100&offset=0');
+    allNodes = data.nodes;
+    allNodesTotal = data.total;
+  }
   renderVirtualList();
   updateNodeCount();
 }

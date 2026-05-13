@@ -19,6 +19,7 @@ pub struct App {
     // Explorer: search + node list
     search_query: String,
     search_mode: bool,
+    sql_search_mode: bool,
     nodes: Vec<NodeIndex>,
     list_state: ListState,
 
@@ -55,6 +56,7 @@ impl App {
             should_quit: false,
             search_query: String::new(),
             search_mode: false,
+            sql_search_mode: false,
             nodes: Vec::new(),
             list_state,
             detail_node_idx: None,
@@ -118,6 +120,12 @@ impl App {
             } else {
                 self.nodes = graph.node_indices().collect();
             }
+        } else if self.sql_search_mode {
+            self.nodes = store
+                .search_by_sql(&self.search_query)
+                .into_iter()
+                .map(|(idx, _)| idx)
+                .collect();
         } else {
             self.nodes = traverse::find_nodes_by_name(graph, &self.search_query)
                 .into_iter()
@@ -265,6 +273,12 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.search_mode = false;
+                }
+                KeyCode::Char('/') => {
+                    self.sql_search_mode = !self.sql_search_mode;
+                    self.search_query.clear();
+                    self.list_state.select(Some(0));
+                    self.refresh_node_list();
                 }
                 KeyCode::Backspace => {
                     self.search_query.pop();
@@ -515,16 +529,25 @@ impl App {
             .split(area);
 
         // Search bar
+        let mode_tag = if self.sql_search_mode {
+            "[SQL] "
+        } else {
+            "[Name] "
+        };
         let cursor = if self.search_mode { "▏" } else { "_" };
         let prompt = if self.search_mode {
-            format!("> {}{}", self.search_query, cursor)
+            format!("> {}{}{}", mode_tag, self.search_query, cursor)
         } else if self.search_query.is_empty() {
-            format!("> {}", t!("hint.search_hint"))
+            format!("> {}{}", mode_tag, t!("hint.search_hint"))
         } else {
-            format!("> {}{}", self.search_query, cursor)
+            format!("> {}{}{}", mode_tag, self.search_query, cursor)
         };
         let border_style = if self.search_mode {
-            Style::default().fg(Color::Cyan)
+            if self.sql_search_mode {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::Cyan)
+            }
         } else {
             Style::default()
         };
