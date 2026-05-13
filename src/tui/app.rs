@@ -33,6 +33,7 @@ pub struct App {
 
     // Options
     chain_style: traverse::ChainStyle,
+    show_attributes: bool,
     filter_low_degree: bool,
     filter_threshold: usize,
     locale_idx: usize,
@@ -64,6 +65,7 @@ impl App {
             detail_scroll: 0,
             info_scroll: 0,
             chain_style: traverse::ChainStyle::default(),
+            show_attributes: true,
             filter_low_degree: false,
             filter_threshold: 0,
             locale_idx: 0,
@@ -185,14 +187,16 @@ impl App {
         )));
         lines.push(Line::from(""));
 
-        let attr_lines = format_node_attributes_full(node);
-        for attr_line in attr_lines {
-            lines.push(Line::from(Span::styled(
-                attr_line,
-                Style::default().fg(Color::White),
-            )));
+        if self.show_attributes {
+            let attr_lines = format_node_attributes_full(node);
+            for attr_line in attr_lines {
+                lines.push(Line::from(Span::styled(
+                    attr_line,
+                    Style::default().fg(Color::White),
+                )));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
 
         let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
         let chain_lines = match self.chain_style {
@@ -314,6 +318,9 @@ impl App {
                     traverse::ChainStyle::Tree => traverse::ChainStyle::Path,
                     traverse::ChainStyle::Path => traverse::ChainStyle::Tree,
                 };
+            }
+            KeyCode::Char('v') => {
+                self.show_attributes = !self.show_attributes;
             }
             KeyCode::Char('l') => {
                 self.filter_low_degree = !self.filter_low_degree;
@@ -460,6 +467,7 @@ impl App {
             traverse::ChainStyle::Tree => t!("style.tree").to_string(),
             traverse::ChainStyle::Path => t!("style.path").to_string(),
         };
+        let attr_indicator = if self.show_attributes { "Attr" } else { "attr" };
 
         let hints: String = if self.search_mode && self.screen == Screen::Explorer {
             t!("statusbar.explorer_search",
@@ -517,7 +525,7 @@ impl App {
                 .to_string(),
             }
         };
-        let bar = Paragraph::new(format!(" {}", hints))
+        let bar = Paragraph::new(format!(" {}  [{}]", hints, attr_indicator))
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         f.render_widget(bar, area);
     }

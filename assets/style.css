@@ -41,4 +41,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .tree-key{overflow:hidden;text-overflow:ellipsis}
 .edge-label{color:#666;font-size:11px}
 .tree-empty{padding:4px 0;color:#666;font-size:12px;font-style:italic}
+.prop-list{padding:2px 0}
+.prop-entry{padding:2px 0;font-size:12px}
+.prop-label{color:#e94560;font-weight:700;margin-right:6px}
+.prop-val{color:#e0e0e0}
+.prop-col{padding:1px 0 1px 16px;font-size:12px}
+.prop-col-name{color:#8bc34a}
+.prop-col-type{color:#a0a0a0;margin-left:6px}
+.prop-pk{color:#ff9800;font-size:10px;font-weight:700;margin-left:4px}
+.prop-sql{background:#0f3460;padding:6px 8px;border-radius:4px;font-size:12px;font-family:'Cascadia Code',Consolas,monospace;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:4px 0;color:#e0e0e0}
+.dim{color:#555;font-style:italic}
 .truncated{padding:8px;color:#e94560;font-size:12px;text-align:center}

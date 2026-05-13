@@ -3,6 +3,7 @@ let allNodesTotal = 0;
 let selectedNodeId = null;
 let currentTraceKey = null;
 let searchMode = 'name'; // 'name' or 'sql'
+let showProperties = false;
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -134,20 +135,70 @@ async function navigateTo(key) {
   renderVirtualList();
 
   currentTraceKey = key;
-  const trace = await api('/trace?from=' + encodeURIComponent(key) + '&depth=50&max_nodes=500');
+  const [trace, detail] = await Promise.all([
+    api('/trace?from=' + encodeURIComponent(key) + '&depth=50&max_nodes=500'),
+    selectedNodeId !== null ? api('/nodes/' + selectedNodeId) : Promise.resolve(null),
+  ]);
   if (currentTraceKey !== key) return;
-  showDetail(trace);
+  showDetail(trace, detail);
 }
 
-function showDetail(trace) {
+function toggleProperties() {
+  showProperties = !showProperties;
+  const el = document.getElementById('prop-content');
+  if (el) el.style.display = showProperties ? '' : 'none';
+  document.getElementById('prop-toggle').textContent = showProperties ? '[-]' : '[+]';
+}
+      if (p.value.length > 10) {
+        h += '<div class="prop-col dim">... +' + (p.value.length - 10) + ' more</div>';
+      }
+    } else if (p.label === 'sql') {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span></div>';
+      h += '<pre class="prop-sql">' + esc(p.value) + '</pre>';
+    } else {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> <span class="prop-val">' + esc(String(p.value)) + '</span></div>';
+    }
+  }
+  h += '</div>';
+  return h;
+}
+
+function renderPropertiesHtml(detail) {
+  if (!detail || !detail.properties || detail.properties.length === 0) return '';
+  let h = '<div class="section-title" style="cursor:pointer" onclick="toggleProperties()">Properties <span id="prop-toggle">[+]</span></div>';
+  h += '<div id="prop-content" style="display:none"><div class="prop-list">';
+  for (const p of detail.properties) {
+    if (Array.isArray(p.value)) {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> (' + p.value.length + ')</div>';
+      for (const col of p.value.slice(0, 10)) {
+        h += '<div class="prop-col"><span class="prop-col-name">' + esc(col.name) + '</span> <span class="prop-col-type">' + esc(col.type) + '</span>' + (col.pk ? ' <span class="prop-pk">PK</span>' : '') + '</div>';
+      }
+      if (p.value.length > 10) {
+        h += '<div class="prop-col dim">... +' + (p.value.length - 10) + ' more</div>';
+      }
+    } else if (p.label === 'sql') {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span></div>';
+      h += '<pre class="prop-sql">' + esc(p.value) + '</pre>';
+    } else {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> <span class="prop-val">' + esc(String(p.value)) + '</span></div>';
+    }
+  }
+  h += '</div></div>';
+  return h;
+}
+
+function showDetail(trace, detail) {
   const target = trace.target;
   const inDeg = trace.caller_count;
   const outDeg = trace.callee_count;
 
+  showProperties = false;
   document.getElementById('detail-title').textContent = target.type + ' ' + target.key;
 
   let h = '<div class="section-title first">Degree</div>';
   h += '<div>in:' + inDeg + ' out:' + outDeg + ' total:' + (inDeg + outDeg) + '</div>';
+
+  h += renderPropertiesHtml(detail);
 
   h += '<div class="section-title">Callers (' + inDeg + ')</div>';
   h += '<div class="tree-list">';
