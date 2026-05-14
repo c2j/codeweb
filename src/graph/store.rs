@@ -321,21 +321,49 @@ impl GraphStore {
     }
 }
 
+/// Collapse consecutive whitespace (spaces, tabs, newlines, carriage returns) into a single space.
+/// Collapse consecutive whitespace into single spaces, then remove spaces around
+/// SQL operators, parentheses, and commas so that formatting differences don't
+/// prevent a match (e.g. `user_id = ?` vs `user_id=?`, `TO_CHAR( x , y )` vs `TO_CHAR(x,y)`).
+fn normalize_for_matching(s: &str) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Comparison operators (longest first to avoid partial matches)
+    s.replace(" >= ", ">=")
+        .replace(" <= ", "<=")
+        .replace(" <> ", "<>")
+        .replace(" != ", "!=")
+        .replace(" = ", "=")
+        .replace(" > ", ">")
+        .replace(" < ", "<")
+        .replace(" - ", "-")
+        .replace(" + ", "+")
+        .replace(" * ", "*")
+        // Parentheses and commas
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(" ,", ",")
+        .replace(", ", ",")
+}
+
 /// Check if `sql_text` (lowercased) matches `query_lower` which may contain `?` as a wildcard
 /// matching any non-empty sequence of characters (e.g. a concrete parameter name).
 ///
 /// First tries direct substring match; if the query contains `?` and direct match fails,
 /// splits the query on `?` and verifies each segment appears in order in the SQL text.
+///
+/// Both the SQL text and the query are normalized before comparison:
+/// whitespace collapsed, spaces around comparison operators removed.
 fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
-    let sql_lower = sql_text.to_lowercase();
-    if sql_lower.contains(query_lower) {
+    let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
+    let query_normalized = normalize_for_matching(query_lower);
+    if sql_lower.contains(&query_normalized) {
         return true;
     }
-    if !query_lower.contains('?') {
+    if !query_normalized.contains('?') {
         return false;
     }
     // Relaxed: split query on `?`, check each segment appears in order
-    let parts: Vec<&str> = query_lower.split('?').collect();
+    let parts: Vec<&str> = query_normalized.split('?').collect();
     if parts.len() <= 1 {
         return false;
     }
@@ -1947,5 +1975,167 @@ mod tests {
         let summaries_before = store.node_summaries().len();
         store.ensure_consistency();
         assert_eq!(store.node_summaries().len(), summaries_before);
+    }
+
+    #[test]
+    fn sql_text_matches_multiline() {
+        let sql = "DELETE FROM bigfund.dat_batch_task_aspect_log\n        WHERE data_date < TO_CHAR(TRUNC(SYSDATE) - 15, 'YYYYMMDD')";
+        let query = "delete from bigfund.dat_batch_task_aspect_log where data_date";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match across line break"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_multiline_with_wildcard() {
+        let sql = "SELECT *\nFROM   my_table\nWHERE  id = ?";
+        let query = "select * from my_table where id = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match with normalized whitespace"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_tabs_and_spaces() {
+        let sql = "SELECT\t*\tFROM\tmy_table  WHERE\tx = 1";
+        let query = "select * from my_table where x = 1";
+        assert!(
+            sql_text_matches(sql, query),
+            "should normalize tabs and multiple spaces"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_no_false_positive() {
+        let sql = "SELECT FROM_TABLE FROM my_table";
+        let query = "from table from my";
+        assert!(
+            !sql_text_matches(sql, query),
+            "should not match unrelated fragments"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_exact_no_change() {
+        let sql = "SELECT * FROM my_table WHERE id = 1";
+        let query = "select * from my_table";
+        assert!(
+            sql_text_matches(sql, query),
+            "exact match should still work"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_carriage_return() {
+        let sql = "DELETE FROM table\r\nWHERE id = 1";
+        let query = "delete from table where id = 1";
+        assert!(
+            sql_text_matches(sql, query),
+            "should handle CRLF line endings"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_operator_spacing() {
+        let sql =
+            "SELECT * FROM t_orders WHERE user_id = __XML_PARAM_userId__ AND status = 'CREATED'";
+        let query = "select * from t_orders where user_id=?";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match despite different spacing around ="
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_operator_no_space_query() {
+        let sql = "SELECT * FROM t_orders WHERE user_id = ? AND status = 'CREATED'";
+        let query = "select   * from   t_orders where user_id=?";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match with extra spaces in query and no space around ="
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_greater_than_operator() {
+        let sql = "SELECT * FROM logs WHERE created_at >= ? AND type = 'ERROR'";
+        let query = "select * from logs where created_at>=?";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match >= operator with different spacing"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_paren_spacing() {
+        let sql = "SELECT TO_CHAR( TRUNC(SYSDATE) - 15 , 'YYYYMMDD' ) FROM dual";
+        let query = "select to_char(trunc(sysdate)-?,'yyyymmdd') from dual";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match despite different paren/comma spacing"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_nested_paren_spacing() {
+        let sql = "DELETE FROM t WHERE dt < TO_CHAR( TRUNC( SYSDATE ) - ? , ? )";
+        let query = "delete from t where dt < to_char(trunc(sysdate)-?,?)";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match nested function calls with extra spaces around parens"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_comma_list_spacing() {
+        let sql = "SELECT MAX( id ) , MIN( name ) FROM t";
+        let query = "select max(id),min(name) from t";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match comma-separated list with different spacing"
+        );
+    }
+
+    #[test]
+    fn test_bincode_roundtrip_with_non_utf8_path() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::sync::Arc;
+
+            let raw = std::ffi::OsStr::from_bytes(b"/some/\xff\xfe/path.sql");
+            let raw_path = std::path::PathBuf::from(raw);
+            let sanitized = crate::parser::scanner::sanitize_path(&raw_path);
+            assert!(sanitized.to_str().is_some(), "sanitized should be UTF-8");
+
+            let mut graph = CodeGraph::new();
+            let proc = crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: None,
+                    package: None,
+                    name: "test_proc".to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: crate::graph::SourceLocation {
+                    file: Arc::new(sanitized),
+                    line: 1,
+                },
+                partial: false,
+            };
+            graph.add_node(proc);
+
+            let store = GraphStore::from_graph("test", graph);
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("test.bincode");
+
+            store
+                .save_bincode(&path)
+                .expect("bincode serialize should succeed with sanitized path");
+
+            let loaded = GraphStore::load_bincode(&path).unwrap();
+            assert_eq!(loaded.graph().node_count(), 1);
+        }
     }
 }
