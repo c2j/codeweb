@@ -26,4 +26,4 @@ pub use java_method::{
 };
 pub use loader::{load_all_files, load_sql_files, parse_sql_files, AllParsedFiles, ParsedFile};
 #[allow(unused_imports)]
-pub use scanner::{scan_directory, ScannedFiles};
+pub use scanner::{build_exclude_matcher, scan_directory, ScannedFiles};

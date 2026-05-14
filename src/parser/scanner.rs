@@ -8,23 +8,49 @@ pub struct ScannedFiles {
     pub xml_files: Vec<PathBuf>,
 }
 
-/// Ensure path is UTF-8 representable by lossy-converting non-UTF-8 bytes.
-/// This guarantees bincode serialization (which requires PathBuf.to_str() to succeed) never fails.
 pub fn sanitize_path(p: &Path) -> PathBuf {
     PathBuf::from(p.to_string_lossy().into_owned())
 }
 
-pub fn scan_directory(input: &Path) -> ScannedFiles {
+/// Build a globset matcher from exclude patterns. Returns `None` if patterns is empty.
+pub fn build_exclude_matcher(
+    patterns: &[String],
+) -> Option<globset::GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(glob) = globset::Glob::new(pat) {
+            builder.add(glob);
+        }
+    }
+    builder.build().ok()
+}
+
+/// Scan a directory recursively for SQL, Java, and XML files.
+/// `exclude` patterns are matched against each path relative to `input`.
+pub fn scan_directory(input: &Path, exclude: &[String]) -> ScannedFiles {
     if input.is_file() {
         return scan_single_file(input);
     }
 
+    let matcher = build_exclude_matcher(exclude);
     let mut sql_files = Vec::new();
     let mut java_files = Vec::new();
     let mut xml_files = Vec::new();
 
     for entry in WalkDir::new(input).into_iter().filter_map(|e| e.ok()) {
         let path = sanitize_path(&entry.into_path());
+
+        if let Some(ref m) = matcher {
+            if let Ok(rel) = path.strip_prefix(input) {
+                if m.is_match(rel) {
+                    continue;
+                }
+            }
+        }
+
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "sql" => sql_files.push(path),
