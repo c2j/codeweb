@@ -47,6 +47,21 @@ use clap::{Parser, Subcommand};
 use error::Result;
 use graph::Node;
 
+const LOGO: &str = r#" ██████╗  ██████╗  ██████╗  ███████╗ ██╗    ██╗ ███████╗ ██████╗ 
+ ██╔════╝ ██╔═══██╗ ██╔══██╗ ██╔════╝ ██║    ██║ ██╔════╝ ██╔══██╗
+ ██║      ██║   ██║ ██║  ██║ ███████╗ ██║ █╗ ██║ ███████╗ ██████╔╝
+ ██║      ██║   ██║ ██║  ██║ ██╔═══╝  ██║███╗██║ ██╔═══╝  ██╔══██╗
+╚██████╗ ╚██████╔╝ ██████╔╝ ███████╗ ╚███╔███╔╝ ███████╗ ██████╔╝
+ ╚═════╝  ╚═════╝  ╚═════╝  ╚══════╝  ╚══╝╚══╝  ╚══════╝ ╚═════╝"#;
+
+fn print_banner() {
+    println_stdout!("{}", LOGO);
+    println_stdout!();
+    println_stdout!("  codeweb v{}", env!("CARGO_PKG_VERSION"));
+    println_stdout!("  Semantic code graph analyzer");
+    println_stdout!();
+}
+
 #[derive(Parser)]
 #[command(
     name = "codeweb",
@@ -335,9 +350,26 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let show_banner =
+        args.len() == 1 || args.contains(&"--help".to_string()) || args.contains(&"-h".to_string());
+
+    if show_banner {
+        print_banner();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
+        None => {
+            if cli.input.is_none() {
+                println_stdout!("Usage: codeweb <COMMAND>");
+                println_stdout!();
+                println_stdout!("Run `codeweb --help` for more information.");
+                return Ok(());
+            }
+            cmd_legacy(cli)
+        }
         Some(Commands::Init { name, dir }) => cmd_init(&name, &dir),
         Some(Commands::Analyze { project }) => cmd_analyze(&project),
         Some(Commands::Diff { project }) => cmd_diff(&project),
@@ -404,7 +436,6 @@ fn run() -> Result<()> {
             spec,
             project,
         }) => cmd_query(file.as_deref(), spec.as_deref(), &project),
-        None => cmd_legacy(cli),
     }
 }
 

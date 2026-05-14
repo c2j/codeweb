@@ -3,7 +3,7 @@ let allNodesTotal = 0;
 let selectedNodeId = null;
 let currentTraceKey = null;
 let searchMode = 'name'; // 'name' or 'sql'
-let showProperties = false;
+let showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -145,6 +145,7 @@ async function navigateTo(key) {
 
 function toggleProperties() {
   showProperties = !showProperties;
+  localStorage.setItem('codeweb-props-expanded', showProperties);
   const el = document.getElementById('prop-content');
   if (el) el.style.display = showProperties ? '' : 'none';
   document.getElementById('prop-toggle').textContent = showProperties ? '[-]' : '[+]';
@@ -152,8 +153,9 @@ function toggleProperties() {
 
 function renderPropertiesHtml(detail) {
   if (!detail || !detail.properties || detail.properties.length === 0) return '';
-  let h = '<div class="section-title" style="cursor:pointer" onclick="toggleProperties()">Properties <span id="prop-toggle">[+]</span></div>';
-  h += '<div id="prop-content" style="display:none"><div class="prop-list">';
+  const expanded = showProperties;
+  let h = '<div class="section-title" style="cursor:pointer" onclick="toggleProperties()">Properties <span id="prop-toggle">' + (expanded ? '[-]' : '[+]') + '</span></div>';
+  h += '<div id="prop-content" style="display:' + (expanded ? 'block' : 'none') + '"><div class="prop-list">';
   for (const p of detail.properties) {
     if (Array.isArray(p.value)) {
       h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> (' + p.value.length + ')</div>';
@@ -179,7 +181,7 @@ function showDetail(trace, detail) {
   const inDeg = trace.caller_count;
   const outDeg = trace.callee_count;
 
-  showProperties = false;
+  showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
   document.getElementById('detail-title').textContent = target.type + ' ' + target.key;
 
   let h = '<div class="section-title first">Degree</div>';
