@@ -284,7 +284,7 @@ impl GraphStore {
     /// Checks MappedStatement.sql and JavaSql.sql fields.
     /// Returns Vec of (NodeIndex, display_key).
     pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String)> {
-        let lower = query.to_lowercase();
+        let prepared = PreparedQuery::new(query);
         let mut results = Vec::new();
         for idx in self.graph.node_indices() {
             match &self.graph[idx] {
@@ -294,7 +294,7 @@ impl GraphStore {
                     statement_id,
                     ..
                 } => {
-                    if sql_text_matches(sql_text, &lower) {
+                    if prepared.matches(sql_text) {
                         results.push((idx, format!("mapper:{}.{}", namespace, statement_id)));
                     }
                 }
@@ -304,7 +304,7 @@ impl GraphStore {
                     method_name,
                     ..
                 } => {
-                    if sql_text_matches(sql_text, &lower) {
+                    if prepared.matches(sql_text) {
                         let ctx = match (class_name, method_name) {
                             (Some(c), Some(m)) => format!("{}.{}", c, m),
                             (Some(c), None) => c.clone(),
@@ -321,12 +321,66 @@ impl GraphStore {
     }
 }
 
-/// Collapse consecutive whitespace (spaces, tabs, newlines, carriage returns) into a single space.
-/// Collapse consecutive whitespace into single spaces, then remove spaces around
-/// SQL operators, parentheses, and commas so that formatting differences don't
+/// Query normalized and pre-computed once, then reused for every node comparison.
+struct PreparedQuery {
+    normalized: String,
+    has_wildcard: bool,
+    segments: Vec<String>,
+}
+
+impl PreparedQuery {
+    fn new(query: &str) -> Self {
+        let lower = query.to_lowercase();
+        let normalized = normalize_for_matching(&lower);
+        let has_wildcard = normalized.contains('?');
+        let segments: Vec<String> = if has_wildcard {
+            normalized
+                .split('?')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            normalized,
+            has_wildcard,
+            segments,
+        }
+    }
+
+    fn matches(&self, sql_text: &str) -> bool {
+        let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
+
+        if sql_lower.contains(&self.normalized) {
+            return true;
+        }
+
+        let sql_has_wc = sql_lower.contains('?');
+
+        if !sql_has_wc && !self.has_wildcard {
+            return false;
+        }
+
+        if self.has_wildcard && find_query_segments_in_sql(&sql_lower, &self.segments) {
+            return true;
+        }
+
+        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized) {
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Collapse consecutive whitespace into single spaces, replace ogsql-parser internal
+/// placeholder markers (`__XML_PARAM_*__`, `__XML_RAW_*__`) with `?`, then remove spaces
+/// around SQL operators, parentheses, and commas so that formatting differences don't
 /// prevent a match (e.g. `user_id = ?` vs `user_id=?`, `TO_CHAR( x , y )` vs `TO_CHAR(x,y)`).
 fn normalize_for_matching(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = replace_xml_placeholders(&s);
     // Comparison operators (longest first to avoid partial matches)
     s.replace(" >= ", ">=")
         .replace(" <= ", "<=")
@@ -345,39 +399,109 @@ fn normalize_for_matching(s: &str) -> String {
         .replace(", ", ",")
 }
 
-/// Check if `sql_text` (lowercased) matches `query_lower` which may contain `?` as a wildcard
-/// matching any non-empty sequence of characters (e.g. a concrete parameter name).
+/// Replace ogsql-parser internal placeholder markers with `?` for search matching.
+/// Handles both `__XML_PARAM_*__` (parameter placeholders from `#{}`) and
+/// `__XML_RAW_*__` (text-substitution placeholders from `${}`), including
+/// variants with embedded type hints like `__XML_RAW_STRING_col__`.
+/// Input is expected to be already lowercased.
+fn replace_xml_placeholders(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut pos = 0;
+
+    while pos < s.len() {
+        let remaining = &s[pos..];
+
+        let (prefix, prefix_len) = if remaining.starts_with("__xml_param_") {
+            ("__xml_param_", 12)
+        } else if remaining.starts_with("__xml_raw_") {
+            ("__xml_raw_", 10)
+        } else {
+            let c = remaining.chars().next().unwrap();
+            result.push(c);
+            pos += c.len_utf8();
+            continue;
+        };
+
+        let after_prefix = &s[pos + prefix_len..];
+        if let Some(end) = after_prefix.find("__") {
+            result.push('?');
+            pos += prefix_len + end + 2;
+        } else {
+            result.push_str(prefix);
+            pos += prefix_len;
+        }
+    }
+
+    result
+}
+
+/// Check if `sql_text` (lowercased) matches `query_lower` where `?` in **either** side
+/// acts as a wildcard matching any non-empty sequence of characters.
 ///
-/// First tries direct substring match; if the query contains `?` and direct match fails,
-/// splits the query on `?` and verifies each segment appears in order in the SQL text.
+/// Matching strategy (tried in order, first success wins):
+/// 1. Direct substring match after normalization.
+/// 2. Query has `?` → split query on `?`, verify each segment appears in order in SQL.
+/// 3. SQL has `?` → split SQL on `?`, verify at least 2 consecutive concrete segments
+///    appear in order in the query (the `?` gaps absorb any characters).
 ///
-/// Both the SQL text and the query are normalized before comparison:
-/// whitespace collapsed, spaces around comparison operators removed.
+/// Both sides are normalized before comparison: whitespace collapsed, `__XML_PARAM_*__`
+/// and `__XML_RAW_*__` replaced with `?`, spaces around operators removed.
+#[cfg(test)]
 fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
-    let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
-    let query_normalized = normalize_for_matching(query_lower);
-    if sql_lower.contains(&query_normalized) {
-        return true;
-    }
-    if !query_normalized.contains('?') {
-        return false;
-    }
-    // Relaxed: split query on `?`, check each segment appears in order
-    let parts: Vec<&str> = query_normalized.split('?').collect();
-    if parts.len() <= 1 {
+    let prepared = PreparedQuery::new(query_lower);
+    prepared.matches(sql_text)
+}
+
+/// Verify each pre-split query segment appears in order in `sql`.
+fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
+    if segments.is_empty() {
         return false;
     }
     let mut pos = 0;
-    for part in parts {
-        if part.is_empty() {
-            continue;
-        }
-        match sql_lower[pos..].find(part) {
+    for part in segments {
+        match sql[pos..].find(part.as_str()) {
             Some(p) => pos += p + part.len(),
             None => return false,
         }
     }
     true
+}
+
+/// Split `sql` on `?`, check if at least 2 consecutive concrete segments
+/// appear in order in `query` (the `?` gaps between SQL segments absorb
+/// any characters in the query).
+fn find_sql_segments_in_query(sql: &str, query: &str) -> bool {
+    let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
+    if sql_parts.is_empty() {
+        return true;
+    }
+    if sql_parts.len() == 1 {
+        return query.contains(sql_parts[0]);
+    }
+
+    for start in 0..sql_parts.len() {
+        let mut pos = 0;
+        let mut count = 0;
+
+        for part in &sql_parts[start..] {
+            match query[pos..].find(*part) {
+                Some(p) => {
+                    if count > 0 && p == 0 {
+                        break; // `?` between SQL parts must match at least 1 char
+                    }
+                    pos += p + part.len();
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+
+        if count >= 2 {
+            return true;
+        }
+    }
+
+    false
 }
 
 impl GraphStore {
@@ -2095,6 +2219,76 @@ mod tests {
         assert!(
             sql_text_matches(sql, query),
             "should match comma-separated list with different spacing"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_placeholder_as_wildcard() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.req_host_ip = __XML_PARAM_hostIp__, t.file_type = __XML_PARAM_fileType__ WHERE t.data_date = __XML_PARAM_dataDate__";
+        let query = "update ? t set t.req_host_ip = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "__XML_RAW__ and __XML_PARAM__ should be normalized to ? so query ? wildcard matches"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_with_query_wildcard() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.status = '1'";
+        let query = "update ? t set t.status='1'";
+        assert!(
+            sql_text_matches(sql, query),
+            "? wildcard in query should match __XML_RAW__ placeholder in SQL"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_param_chain() {
+        let sql = "SELECT * FROM orders WHERE user_id = __XML_PARAM_userId__ AND status = __XML_PARAM_status__";
+        let query = "select * from orders where user_id=? and status=?";
+        assert!(
+            sql_text_matches(sql, query),
+            "should match multiple __XML_PARAM__ placeholders with ? wildcards"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_with_type_hint() {
+        let sql = "SELECT __XML_RAW_STRING_column__ FROM users";
+        let query = "select ? from users";
+        assert!(
+            sql_text_matches(sql, query),
+            "__XML_RAW_STRING_*__ should be normalized to ? so query ? wildcard matches"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_generic_pattern_matches_concrete() {
+        let sql = "SELECT __XML_RAW_tableName__ FROM users";
+        let query = "select orders from users";
+        assert!(
+            sql_text_matches(sql, query),
+            "generic ${{tableName}} pattern should match concrete table name via bidirectional wildcard"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_concrete_value_in_query() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.req_host_ip = __XML_PARAM_hostIp__, t.file_type = __XML_PARAM_fileType__ WHERE t.data_date = __XML_PARAM_dataDate__";
+        let query = "update dat_mdb_text t set t.req_host_ip = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "concrete table name in query should match __XML_RAW__ via bidirectional wildcard"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_xml_raw_concrete_without_query_wildcard() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.status = '1'";
+        let query = "update dat_mdb_text t set t.status='1'";
+        assert!(
+            sql_text_matches(sql, query),
+            "concrete table name should match __XML_RAW__ even without query ? wildcard"
         );
     }
 

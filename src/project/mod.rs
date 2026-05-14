@@ -136,7 +136,7 @@ impl Project {
                 .unwrap(),
         );
         pb.set_message("Scanning files...");
-        let current_files = scan_with_fingerprints(&input_paths);
+        let current_files = scan_with_fingerprints(&input_paths, &self.config.analysis.exclude);
         let files_scanned = current_files.len();
         pb.finish_with_message(format!("Scanned {} files", files_scanned));
 
@@ -224,7 +224,12 @@ impl Project {
 
         // Java (typically fewer files, parse all at once)
         pb.set_message("Parsing Java...");
-        let java_combined = parser::java_loader::load_java_files_combined(&all_java_paths);
+        let java_config = ogsql_parser::java::JavaExtractConfig {
+            extra_sql_methods: self.config.analysis.java.extra_sql_methods.clone(),
+            extra_sql_var_patterns: self.config.analysis.java.extra_sql_var_patterns.clone(),
+        };
+        let java_combined =
+            parser::java_loader::load_java_files_combined_with_config(&all_java_paths, &java_config);
         pb.inc(all_java_paths.len() as u64);
 
         let (java_files, java_method_results): (Vec<_>, Vec<_>) = java_combined
@@ -347,7 +352,7 @@ impl Project {
                 .collect()
         };
 
-        let current_files = scan_with_fingerprints(&input_paths);
+        let current_files = scan_with_fingerprints(&input_paths, &self.config.analysis.exclude);
         let existing_manifest: HashMap<PathBuf, FileRecord> = self
             .try_load_store()
             .map(|s| s.manifest().clone())
@@ -415,10 +420,13 @@ impl Project {
     }
 }
 
-fn scan_with_fingerprints(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
+fn scan_with_fingerprints(
+    paths: &[PathBuf],
+    exclude: &[String],
+) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
     for path in paths {
-        let scanned = parser::scan_directory(path);
+        let scanned = parser::scan_directory(path, exclude);
         for p in &scanned.sql_files {
             files.push((p.clone(), FileType::Sql));
         }

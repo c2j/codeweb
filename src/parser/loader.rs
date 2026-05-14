@@ -16,7 +16,7 @@ pub struct AllParsedFiles {
 }
 
 pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
-    let scanned = crate::parser::scanner::scan_directory(input);
+    let scanned = crate::parser::scanner::scan_directory(input, &[]);
 
     if scanned.sql_files.is_empty() && scanned.java_files.is_empty() && scanned.xml_files.is_empty()
     {
@@ -41,7 +41,7 @@ pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
 }
 
 pub fn load_sql_files(input: &Path) -> Result<Vec<ParsedFile>> {
-    let scanned = crate::parser::scanner::scan_directory(input);
+    let scanned = crate::parser::scanner::scan_directory(input, &[]);
     if scanned.sql_files.is_empty() {
         return Err(CodeWebError::NoFilesFound {
             path: input.to_path_buf(),

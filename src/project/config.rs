@@ -25,6 +25,28 @@ pub struct AnalysisConfig {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub encoding: HashMap<String, String>,
+    #[serde(default)]
+    pub java: JavaConfig,
+}
+
+/// Java SQL extraction tuning.
+///
+/// ```toml
+/// [analysis.java]
+/// extra_sql_methods = ["doQuery", "runSql"]
+/// extra_sql_var_patterns = ["QUERY", "CMD", "STMT"]
+/// ```
+#[derive(Debug, Default, Deserialize)]
+pub struct JavaConfig {
+    /// Additional method names whose first string argument is treated as SQL.
+    /// Appended to ogsql-parser's built-in list (prepareStatement, createNativeQuery, etc.).
+    #[serde(default)]
+    pub extra_sql_methods: Vec<String>,
+
+    /// Additional variable-name substrings (case-insensitive) that signal SQL content.
+    /// The built-in pattern "SQL" is always active; these are appended to it.
+    #[serde(default)]
+    pub extra_sql_var_patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +102,11 @@ name = "{}"
 
 [analysis]
 paths = [{}]
+# exclude = ["**/test/**", "**/generated/**"]
+
+# [analysis.java]
+# extra_sql_methods = []
+# extra_sql_var_patterns = []
 
 [store]
 path = ".codeweb/store.bincode"
