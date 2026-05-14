@@ -149,19 +149,6 @@ function toggleProperties() {
   if (el) el.style.display = showProperties ? '' : 'none';
   document.getElementById('prop-toggle').textContent = showProperties ? '[-]' : '[+]';
 }
-      if (p.value.length > 10) {
-        h += '<div class="prop-col dim">... +' + (p.value.length - 10) + ' more</div>';
-      }
-    } else if (p.label === 'sql') {
-      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span></div>';
-      h += '<pre class="prop-sql">' + esc(p.value) + '</pre>';
-    } else {
-      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> <span class="prop-val">' + esc(String(p.value)) + '</span></div>';
-    }
-  }
-  h += '</div>';
-  return h;
-}
 
 function renderPropertiesHtml(detail) {
   if (!detail || !detail.properties || detail.properties.length === 0) return '';
