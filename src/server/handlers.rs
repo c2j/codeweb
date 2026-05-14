@@ -137,16 +137,25 @@ async fn search_sql(
     State(state): State<AppState>,
     Query(query): Query<SearchSqlQuery>,
 ) -> impl IntoResponse {
+    let graph = state.graph();
     let results = state.store().search_by_sql(&query.q);
     let nodes: Vec<Value> = results
         .into_iter()
         .map(|(idx, display_key)| {
-            let node = &state.graph()[idx];
+            let node = &graph[idx];
             let detail = node_type_tag(node);
+            let in_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
             serde_json::json!({
                 "id": idx.index(),
                 "key": display_key,
                 "type": detail,
+                "in_degree": in_deg,
+                "out_degree": out_deg,
             })
         })
         .collect();
