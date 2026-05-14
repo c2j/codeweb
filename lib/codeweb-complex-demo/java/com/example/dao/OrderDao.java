@@ -4,6 +4,7 @@ import java.util.List;
 
 public interface OrderDao {
     List<?> findByUserId(Long userId);
+    List<?> findByUserIdA(String tableName, Long userId);
     int createOrder(Long userId, Long productId, int qty);
     int cancelOrder(Long orderId);
     Object findOrderDetail(Long orderId);

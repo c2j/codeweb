@@ -1,10 +1,11 @@
 package com.example.service;
 
+import com.example.dao.InventoryDao;
 import com.example.dao.OrderDao;
 import com.example.dao.PaymentDao;
-import com.example.dao.InventoryDao;
 
 public class OrderService extends BaseService {
+
     private OrderDao orderDao;
     private PaymentDao paymentDao;
     private InventoryDao inventoryDao;
@@ -15,7 +16,9 @@ public class OrderService extends BaseService {
 
     public void createOrder(Long userId, Long productId, int qty) {
         inventoryDao.checkStock(productId, qty);
+
         orderDao.createOrder(userId, productId, qty);
+        orderDao.findByUserIdA("t_orders", userId);
         logAction("ORDER", "CREATE");
     }
 
