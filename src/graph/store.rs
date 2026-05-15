@@ -198,11 +198,17 @@ impl GraphStore {
 
     pub fn ensure_consistency(&mut self) {
         let expected = self.graph.node_count();
-        if self.node_summaries.len() != expected {
+        let needs_rebuild = self.node_summaries.len() != expected
+            || self.name_index.len() != expected
+            || self.type_tag_index.values().map(|v| v.len()).sum::<usize>() != expected;
+
+        if needs_rebuild {
             eprintln!(
-                "store: stale indexes (node_summaries {}/{}), rebuilding...",
+                "store: stale indexes (node_summaries {}/{}, name_index {}, type_tag_index total {}), rebuilding...",
                 self.node_summaries.len(),
                 expected,
+                self.name_index.len(),
+                self.type_tag_index.values().map(|v| v.len()).sum::<usize>(),
             );
             self.rebuild_secondary_indexes();
         }
