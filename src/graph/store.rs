@@ -473,7 +473,7 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
 fn find_sql_segments_in_query(sql: &str, query: &str) -> bool {
     let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
     if sql_parts.is_empty() {
-        return true;
+        return false;
     }
     if sql_parts.len() == 1 {
         return query.contains(sql_parts[0]);
@@ -2289,6 +2289,26 @@ mod tests {
         assert!(
             sql_text_matches(sql, query),
             "concrete table name should match __XML_RAW__ even without query ? wildcard"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_fully_dynamic_sql_is_excluded() {
+        let sql = "__XML_RAW_I_am_Free_SQL__";
+        let query = "select * from a where user_id=?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "fully dynamic SQL (normalizes to all ?) must not match specific queries"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_fully_dynamic_sql_no_match_without_query_wildcard() {
+        let sql = "__XML_RAW_anything__";
+        let query = "select * from orders";
+        assert!(
+            !sql_text_matches(sql, query),
+            "fully dynamic SQL must not match even without query wildcard"
         );
     }
 
