@@ -228,8 +228,10 @@ impl Project {
             extra_sql_methods: self.config.analysis.java.extra_sql_methods.clone(),
             extra_sql_var_patterns: self.config.analysis.java.extra_sql_var_patterns.clone(),
         };
-        let java_combined =
-            parser::java_loader::load_java_files_combined_with_config(&all_java_paths, &java_config);
+        let java_combined = parser::java_loader::load_java_files_combined_with_config(
+            &all_java_paths,
+            &java_config,
+        );
         pb.inc(all_java_paths.len() as u64);
 
         let (java_files, java_method_results): (Vec<_>, Vec<_>) = java_combined
@@ -420,10 +422,7 @@ impl Project {
     }
 }
 
-fn scan_with_fingerprints(
-    paths: &[PathBuf],
-    exclude: &[String],
-) -> Vec<(PathBuf, FileType)> {
+fn scan_with_fingerprints(paths: &[PathBuf], exclude: &[String]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
     for path in paths {
         let scanned = parser::scan_directory(path, exclude);
