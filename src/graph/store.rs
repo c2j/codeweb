@@ -366,7 +366,7 @@ impl PreparedQuery {
             return true;
         }
 
-        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized) {
+        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized, self.has_wildcard) {
             return true;
         }
 
@@ -470,7 +470,11 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
 /// Split `sql` on `?`, check if at least 2 consecutive concrete segments
 /// appear in order in `query` (the `?` gaps between SQL segments absorb
 /// any characters in the query).
-fn find_sql_segments_in_query(sql: &str, query: &str) -> bool {
+///
+/// When `query_has_wildcard` is true, the match is only accepted if the
+/// query tail after the last matched position (excluding leading `?`) is empty.
+/// This prevents queries with extra conditions not present in the SQL from matching.
+fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) -> bool {
     let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
     if sql_parts.is_empty() {
         return false;
@@ -487,7 +491,7 @@ fn find_sql_segments_in_query(sql: &str, query: &str) -> bool {
             match query[pos..].find(*part) {
                 Some(p) => {
                     if count > 0 && p == 0 {
-                        break; // `?` between SQL parts must match at least 1 char
+                        break;
                     }
                     pos += p + part.len();
                     count += 1;
@@ -497,7 +501,14 @@ fn find_sql_segments_in_query(sql: &str, query: &str) -> bool {
         }
 
         if count >= 2 {
-            return true;
+            if query_has_wildcard {
+                let tail = query[pos..].trim_start_matches('?').trim();
+                if tail.is_empty() {
+                    return true;
+                }
+            } else {
+                return true;
+            }
         }
     }
 
@@ -2309,6 +2320,46 @@ mod tests {
         assert!(
             !sql_text_matches(sql, query),
             "fully dynamic SQL must not match even without query wildcard"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_query_with_wildcard_subset_ok() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE user_id = __XML_PARAM_userId__ AND status = 'CREATED'";
+        let query = "select * from a where user_id=?";
+        assert!(
+            sql_text_matches(sql, query),
+            "query ending with ? should match SQL with extra conditions absorbed by the wildcard"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_query_with_extra_condition_rejected() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE user_id = __XML_PARAM_userId__ AND status = 'CREATED'";
+        let query = "select * from a where user_id=? and q=t";
+        assert!(
+            !sql_text_matches(sql, query),
+            "query with extra conditions not in SQL must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_query_with_multiple_extra_conditions_rejected() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE user_id = __XML_PARAM_userId__ AND status = 'CREATED'";
+        let query = "select * from a where user_id=? and q=t and ttt is true";
+        assert!(
+            !sql_text_matches(sql, query),
+            "query with multiple extra conditions not in SQL must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_query_no_wildcard_value_in_tail_ok() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE user_id = __XML_PARAM_userId__ AND status = 'CREATED'";
+        let query = "select * from orders where user_id=123";
+        assert!(
+            sql_text_matches(sql, query),
+            "query without ? should match even if tail has parameter value for SQL ?"
         );
     }
 
