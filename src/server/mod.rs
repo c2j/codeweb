@@ -1,3 +1,4 @@
+pub mod access_log;
 pub mod assets;
 pub mod handlers;
 pub mod state;
@@ -9,9 +10,32 @@ use crate::error::Result;
 use crate::project::Project;
 
 pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner} {msg}")
+            .unwrap(),
+    );
+
+    pb.set_message("Finding project...");
     let mut proj = Project::find(project_path)?;
-    let _ = proj.load_store()?;
+
+    let codeweb_dir = proj.root().join(".codeweb");
+    access_log::init(&codeweb_dir);
+
+    pb.set_message("Loading graph store...");
+    let store_result = proj.load_store();
+    if let Err(e) = &store_result {
+        pb.finish_with_message(format!("Failed to load store: {}", e));
+        return store_result.map(|_| ());
+    }
+
+    pb.set_message("Initializing server state...");
     let state = state::AppState::new(proj);
+
+    let node_count = state.store().graph().node_count();
+    let edge_count = state.store().graph().edge_count();
+    pb.finish_with_message(format!("Loaded {} nodes, {} edges", node_count, edge_count));
 
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| crate::error::CodeWebError::ExportError {

@@ -13,9 +13,7 @@ pub fn sanitize_path(p: &Path) -> PathBuf {
 }
 
 /// Build a globset matcher from exclude patterns. Returns `None` if patterns is empty.
-pub fn build_exclude_matcher(
-    patterns: &[String],
-) -> Option<globset::GlobSet> {
+pub fn build_exclude_matcher(patterns: &[String]) -> Option<globset::GlobSet> {
     if patterns.is_empty() {
         return None;
     }

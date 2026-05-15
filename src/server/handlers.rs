@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -15,6 +16,7 @@ use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::{CodeGraph, Node};
 
+use super::access_log;
 use super::state::AppState;
 
 pub fn router(state: AppState) -> Router {
@@ -31,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/export", get(export))
         .route("/api/v1/graph", get(graph_data))
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(access_log::access_log_middleware))
         .fallback(super::assets::serve_asset)
         .with_state(state)
 }
