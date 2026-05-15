@@ -327,6 +327,63 @@ impl GraphStore {
     }
 }
 
+/// Returns `Some("?")` for dynamic templates, `Some("table_name")` for concrete,
+/// or `None` if no table reference is found. The caller treats `"?"` as wildcard.
+fn extract_table_name(normalized: &str) -> Option<&str> {
+    if let Some(rest) = normalized.strip_prefix("update ") {
+        if let Some(end) = rest.find(" set ") {
+            let table_part = &rest[..end];
+            return Some(table_part.split_whitespace().next().unwrap_or(""));
+        }
+    }
+    if let Some(rest) = normalized.strip_prefix("delete from ") {
+        let table_part = if let Some(end) = rest.find(" where ") {
+            &rest[..end]
+        } else {
+            rest
+        };
+        return Some(table_part.split_whitespace().next().unwrap_or(""));
+    }
+    if let Some(rest) = normalized.strip_prefix("insert into ") {
+        let table_part = if let Some(end) = rest.find(" values") {
+            &rest[..end]
+        } else if let Some(end) = rest.find('(') {
+            &rest[..end]
+        } else if let Some(end) = rest.find(" select") {
+            &rest[..end]
+        } else {
+            rest
+        };
+        return Some(table_part.split_whitespace().next().unwrap_or(""));
+    }
+    if let Some(rest) = normalized.strip_prefix("merge into ") {
+        if let Some(end) = rest.find(" using ") {
+            let table_part = &rest[..end];
+            return Some(table_part.split_whitespace().next().unwrap_or(""));
+        }
+    }
+    if let Some(pos) = normalized.find(" from ") {
+        let after_from = &normalized[pos + 6..];
+        let table_part = if let Some(end) = after_from.find(" where ") {
+            &after_from[..end]
+        } else if let Some(end) = after_from.find(" group ") {
+            &after_from[..end]
+        } else if let Some(end) = after_from.find(" order ") {
+            &after_from[..end]
+        } else if let Some(end) = after_from.find(" having ") {
+            &after_from[..end]
+        } else if let Some(end) = after_from.find(" limit ") {
+            &after_from[..end]
+        } else if let Some(end) = after_from.find(" union ") {
+            &after_from[..end]
+        } else {
+            after_from
+        };
+        return Some(table_part.split_whitespace().next().unwrap_or(""));
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SqlKeyword {
     Select,
@@ -367,12 +424,27 @@ impl SqlKeyword {
     }
 }
 
+fn tables_compatible(query_table: &Option<String>, sql_normalized: &str) -> bool {
+    let query_table = match query_table {
+        Some(t) => t.as_str(),
+        None => return true,
+    };
+    if query_table == "?" {
+        return true;
+    }
+    match extract_table_name(sql_normalized) {
+        None | Some("?") => true,
+        Some(sql_table) => sql_table == query_table,
+    }
+}
+
 /// Query normalized and pre-computed once, then reused for every node comparison.
 struct PreparedQuery {
     normalized: String,
     has_wildcard: bool,
     segments: Vec<String>,
     keyword: SqlKeyword,
+    table: Option<String>,
 }
 
 impl PreparedQuery {
@@ -390,11 +462,13 @@ impl PreparedQuery {
             Vec::new()
         };
         let keyword = SqlKeyword::extract(&normalized);
+        let table = extract_table_name(&normalized).map(String::from);
         Self {
             normalized,
             has_wildcard,
             segments,
             keyword,
+            table,
         }
     }
 
@@ -408,6 +482,10 @@ impl PreparedQuery {
 
         if sql_lower.contains(&self.normalized) {
             return true;
+        }
+
+        if !tables_compatible(&self.table, &sql_lower) {
+            return false;
         }
 
         let sql_has_wc = sql_lower.contains('?');
@@ -541,22 +619,28 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
         return query.contains(sql_parts[0]);
     }
 
-    for start in 0..sql_parts.len() {
+    let sig_parts: Vec<&str> = sql_parts.into_iter().filter(|p| p.len() >= MIN_PART_LEN).collect();
+    if sig_parts.is_empty() {
+        return false;
+    }
+    if sig_parts.len() == 1 {
+        return sig_parts[0].len() >= SOLO_MIN_LEN && query.contains(sig_parts[0]);
+    }
+
+    for start in 0..sig_parts.len() {
         let mut pos = 0;
         let mut count = 0;
         let mut solo_len: usize = 0;
 
-        for part in &sql_parts[start..] {
+        for part in &sig_parts[start..] {
             match query[pos..].find(*part) {
                 Some(p) => {
                     if count > 0 && p == 0 {
                         break;
                     }
                     pos += p + part.len();
-                    if part.len() >= MIN_PART_LEN {
-                        solo_len = part.len();
-                        count += 1;
-                    }
+                    solo_len = part.len();
+                    count += 1;
                 }
                 None => break,
             }
@@ -2619,6 +2703,78 @@ mod tests {
         assert!(
             !sql_text_matches(sql, query),
             "different column names must not match"
+        );
+    }
+
+    // --- Table name gate tests ---
+
+    #[test]
+    fn sql_text_matches_update_different_concrete_table_rejected() {
+        let sql = "UPDATE dat_ftp_text t SET t.req_status = __XML_PARAM_status__, t.req_file_content = __XML_PARAM_content__ WHERE t.seq_no = __XML_PARAM_seqNo__ AND t.data_date = __XML_PARAM_dataDate__ AND t.req_file_name = __XML_PARAM_fileName__";
+        let query = "UPDATE DAT_MDB_TEXT t SET t.req_host_ip = ?, t.file_type = ? WHERE t.data_date = ? AND t.req_file_name = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE on different concrete table must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_select_different_concrete_view_rejected() {
+        let sql = "SELECT * FROM V_ACCTBALBOOK WHERE fund_code = __XML_PARAM_fundCode__ AND accountdate = __XML_PARAM_date__";
+        let query = "SELECT t.fund_code FROM V_JK_RCS_ACCTBALBOOK t WHERE accountdate = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "SELECT from different concrete view must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_select_unrelated_table_rejected() {
+        let sql = "SELECT DISTINCT (t.e2) e2, t.e3 FROM tmp_trd_pre_acctdata t WHERE fund_code = __XML_PARAM_fundCode__ AND accountdate = __XML_PARAM_date__";
+        let query = "SELECT t.fund_code FROM V_JK_RCS_ACCTBALBOOK t WHERE accountdate = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "SELECT from completely unrelated table must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_dynamic_table_template_accepts_concrete() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.status = __XML_PARAM_status__ WHERE t.id = __XML_PARAM_id__";
+        let query = "update orders t set t.status = ? where t.id = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "dynamic table template (?) must accept any concrete table"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_dynamic_from_template_accepts_concrete() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE id = __XML_PARAM_id__";
+        let query = "select * from users where id = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "dynamic FROM template (?) must accept any concrete table"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_same_concrete_table_different_columns_ok() {
+        let sql = "UPDATE orders SET status = __XML_PARAM_status__ WHERE id = __XML_PARAM_id__";
+        let query = "update orders set name = ? where id = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "same concrete table should proceed to fragment matching"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_case2_full_scenario() {
+        let sql = "SELECT ROW_NUMBER() OVER (ORDER BY __XML_RAW_sortColumnName__) AS DATA_ORDER, __XML_RAW_columnNameSql__ FROM __XML_RAW_tableName__ WHERE __XML_RAW_tradeDateName__ = __XML_PARAM_tradeDate__";
+        let query = "SELECT t.FUND_CODE || ? || t.ACCOUNTDATE || ? FROM V_JK_RCS_ACCTBALBOOK t WHERE ACCOUNTDATE = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "fully dynamic SELECT template must not match specific SELECT on different view"
         );
     }
 
