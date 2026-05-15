@@ -198,11 +198,17 @@ impl GraphStore {
 
     pub fn ensure_consistency(&mut self) {
         let expected = self.graph.node_count();
-        if self.node_summaries.len() != expected {
+        let needs_rebuild = self.node_summaries.len() != expected
+            || self.name_index.len() != expected
+            || self.type_tag_index.values().map(|v| v.len()).sum::<usize>() != expected;
+
+        if needs_rebuild {
             eprintln!(
-                "store: stale indexes (node_summaries {}/{}), rebuilding...",
+                "store: stale indexes (node_summaries {}/{}, name_index {}, type_tag_index total {}), rebuilding...",
                 self.node_summaries.len(),
                 expected,
+                self.name_index.len(),
+                self.type_tag_index.values().map(|v| v.len()).sum::<usize>(),
             );
             self.rebuild_secondary_indexes();
         }
@@ -321,11 +327,52 @@ impl GraphStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlKeyword {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Merge,
+    With,
+    Other,
+    Empty,
+}
+
+impl SqlKeyword {
+    fn extract(normalized: &str) -> Self {
+        let first_word = normalized
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        match first_word {
+            "select" => Self::Select,
+            "insert" => Self::Insert,
+            "update" => Self::Update,
+            "delete" => Self::Delete,
+            "merge" => Self::Merge,
+            "with" => Self::With,
+            "" => Self::Empty,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_compatible(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Select | Self::With, Self::Select | Self::With) => true,
+            (Self::Other | Self::Empty, _) | (_, Self::Other | Self::Empty) => true,
+            _ if self == other => true,
+            _ => false,
+        }
+    }
+}
+
 /// Query normalized and pre-computed once, then reused for every node comparison.
 struct PreparedQuery {
     normalized: String,
     has_wildcard: bool,
     segments: Vec<String>,
+    keyword: SqlKeyword,
 }
 
 impl PreparedQuery {
@@ -342,15 +389,22 @@ impl PreparedQuery {
         } else {
             Vec::new()
         };
+        let keyword = SqlKeyword::extract(&normalized);
         Self {
             normalized,
             has_wildcard,
             segments,
+            keyword,
         }
     }
 
     fn matches(&self, sql_text: &str) -> bool {
         let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
+
+        let sql_kw = SqlKeyword::extract(&sql_lower);
+        if !self.keyword.is_compatible(&sql_kw) {
+            return false;
+        }
 
         if sql_lower.contains(&self.normalized) {
             return true;
@@ -366,7 +420,8 @@ impl PreparedQuery {
             return true;
         }
 
-        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized, self.has_wildcard) {
+        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized, self.has_wildcard)
+        {
             return true;
         }
 
@@ -467,7 +522,7 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
     true
 }
 
-/// Split `sql` on `?`, check if at least 2 consecutive concrete segments
+/// Split `sql` on `?`, check if enough consecutive concrete segments
 /// appear in order in `query` (the `?` gaps between SQL segments absorb
 /// any characters in the query).
 ///
@@ -475,6 +530,9 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
 /// query tail after the last matched position (excluding leading `?`) is empty.
 /// This prevents queries with extra conditions not present in the SQL from matching.
 fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) -> bool {
+    const MIN_PART_LEN: usize = 4;
+    const SOLO_MIN_LEN: usize = 6;
+
     let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
     if sql_parts.is_empty() {
         return false;
@@ -486,6 +544,7 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
     for start in 0..sql_parts.len() {
         let mut pos = 0;
         let mut count = 0;
+        let mut solo_len: usize = 0;
 
         for part in &sql_parts[start..] {
             match query[pos..].find(*part) {
@@ -494,13 +553,17 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
                         break;
                     }
                     pos += p + part.len();
-                    count += 1;
+                    if part.len() >= MIN_PART_LEN {
+                        solo_len = part.len();
+                        count += 1;
+                    }
                 }
                 None => break,
             }
         }
 
-        if count >= 2 {
+        let threshold = if count == 1 { solo_len >= SOLO_MIN_LEN } else { count >= 2 };
+        if threshold {
             if query_has_wildcard {
                 let tail = query[pos..].trim_start_matches('?').trim();
                 if tail.is_empty() {
@@ -2360,6 +2423,202 @@ mod tests {
         assert!(
             sql_text_matches(sql, query),
             "query without ? should match even if tail has parameter value for SQL ?"
+        );
+    }
+
+    // --- Statement type gate tests (E series) ---
+
+    #[test]
+    fn sql_text_matches_update_query_rejects_select_sql() {
+        let sql = "SELECT ROW_NUMBER() OVER (ORDER BY __XML_RAW_sortColumnName__) AS DATA_ORDER, __XML_RAW_columnNameSql__ FROM __XML_RAW_tableName__ WHERE __XML_RAW_tradeDateName__ = __XML_PARAM_tradeDate__ and __XML_RAW_fundCodeName__ = __XML_PARAM_fundCode__";
+        let query = "UPDATE DAT_MDB_TEXT t SET t.req_host_ip = ?, t.file_type = ?, t.interface_type = ? WHERE t.data_date = ? AND t.req_file_name = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE query must not match SELECT SQL"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_update_query_rejects_select_sql_short() {
+        let sql = "SELECT * FROM __XML_RAW_table__ WHERE __XML_RAW_cond__ = __XML_PARAM_val__";
+        let query = "update orders set status = ? where id = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE query must not match SELECT SQL even with short templates"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_update_query_rejects_select_dynamic() {
+        let sql = "SELECT __XML_RAW_col__ FROM __XML_RAW_table__ WHERE __XML_RAW_cond__ = __XML_PARAM_val__";
+        let query = "update ? set ?=? where ?=?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE query must not match fully dynamic SELECT template"
+        );
+    }
+
+    // --- Same table, different operation (F series) ---
+
+    #[test]
+    fn sql_text_matches_select_vs_delete_same_table() {
+        let sql = "SELECT * FROM orders WHERE id = ?";
+        let query = "delete from orders where id = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "DELETE query must not match SELECT SQL even on same table"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_insert_vs_update_same_table() {
+        let sql = "INSERT INTO users (id, name) VALUES (?, ?)";
+        let query = "update users set name = ? where id = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE query must not match INSERT SQL on same table"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_select_vs_update_different_table() {
+        let sql = "SELECT a, b FROM table_x WHERE c = ? AND d = ?";
+        let query = "update table_y set e = ? where f = ? and g = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "UPDATE query must not match SELECT SQL on different tables"
+        );
+    }
+
+    // --- K5 series: short segment patterns ---
+
+    #[test]
+    fn sql_text_matches_select_two_placeholders() {
+        let sql = "SELECT ?, ?";
+        let query = "select 1, 2";
+        assert!(
+            sql_text_matches(sql, query),
+            "SELECT ?,? should match select 1, 2"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_select_three_placeholders() {
+        let sql = "SELECT ?, ?, ?";
+        let query = "select 1, 2, 3";
+        assert!(
+            sql_text_matches(sql, query),
+            "SELECT ?,?,? should match select 1, 2, 3"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_values_placeholders() {
+        let sql = "INSERT INTO t VALUES (?, ?, ?)";
+        let query = "insert into t values (1, 2, 3)";
+        assert!(
+            sql_text_matches(sql, query),
+            "VALUES(?,?,?) should match concrete values"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_single_placeholder_segment() {
+        let sql = "SELECT * FROM ?";
+        let query = "select * from orders";
+        assert!(
+            sql_text_matches(sql, query),
+            "SELECT * FROM ? should match concrete table"
+        );
+    }
+
+    // --- Correct UPDATE-to-UPDATE match (D series) ---
+
+    #[test]
+    fn sql_text_matches_update_template_to_concrete() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.req_host_ip = __XML_PARAM_hostIp__, t.file_type = __XML_PARAM_fileType__ WHERE t.data_date = __XML_PARAM_dataDate__";
+        let query = "UPDATE DAT_MDB_TEXT t SET t.req_host_ip = ?, t.file_type = ? WHERE t.data_date = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "UPDATE template should match UPDATE query with same structure"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_update_template_partial() {
+        let sql = "UPDATE __XML_RAW_tableName__ t SET t.req_host_ip = __XML_PARAM_hostIp__, t.file_type = __XML_PARAM_fileType__ WHERE t.data_date = __XML_PARAM_dataDate__";
+        let query = "update dat_mdb_text t set t.req_host_ip = ?";
+        assert!(
+            sql_text_matches(sql, query),
+            "partial UPDATE query should still match UPDATE template"
+        );
+    }
+
+    // --- Extra conditions rejected (H series) ---
+
+    #[test]
+    fn sql_text_matches_query_extra_condition_rejected() {
+        let sql = "SELECT * FROM __XML_RAW_tableName__ WHERE user_id = __XML_PARAM_userId__";
+        let query = "select * from a where user_id=? and q=t";
+        assert!(
+            !sql_text_matches(sql, query),
+            "query with extra conditions not in SQL must not match"
+        );
+    }
+
+    // --- WITH CTE compatibility (K1) ---
+
+    #[test]
+    fn sql_text_matches_with_cte_select_body() {
+        let sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
+        let query = "select * from cte";
+        assert!(
+            sql_text_matches(sql, query),
+            "WITH...SELECT should be compatible with SELECT query"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_with_cte_vs_update_rejected() {
+        let sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
+        let query = "update cte set x = 1";
+        assert!(
+            !sql_text_matches(sql, query),
+            "WITH...SELECT must not match UPDATE query"
+        );
+    }
+
+    // --- MERGE statement ---
+
+    #[test]
+    fn sql_text_matches_merge_to_merge() {
+        let sql = "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val";
+        let query = "merge into target t using source s on (t.id = s.id)";
+        assert!(
+            sql_text_matches(sql, query),
+            "MERGE query should match MERGE SQL"
+        );
+    }
+
+    // --- Completely unrelated SQL (J series) ---
+
+    #[test]
+    fn sql_text_matches_unrelated_sql_rejected() {
+        let sql = "SELECT id, name FROM users WHERE status = 'ACTIVE'";
+        let query = "update orders set total = 100 where order_id = 5";
+        assert!(
+            !sql_text_matches(sql, query),
+            "completely unrelated SQL must not match"
+        );
+    }
+
+    #[test]
+    fn sql_text_matches_different_columns_rejected() {
+        let sql = "SELECT user_id FROM orders WHERE user_id = ?";
+        let query = "select user_name from orders where user_name = ?";
+        assert!(
+            !sql_text_matches(sql, query),
+            "different column names must not match"
         );
     }
 
