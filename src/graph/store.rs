@@ -625,6 +625,12 @@ fn normalize_for_matching(s: &str) -> String {
         .replace(" )", ")")
         .replace(" ,", ",")
         .replace(", ", ",")
+        .replace(" =", "=")
+        .replace("= ", "=")
+        .replace(" >", ">")
+        .replace("> ", ">")
+        .replace(" <", "<")
+        .replace("< ", "<")
 }
 
 /// Replace ogsql-parser internal placeholder markers with `?` for search matching.
