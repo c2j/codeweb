@@ -24,13 +24,9 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
     access_log::init(&codeweb_dir);
 
     pb.set_message("Loading graph store...");
-    let store_result = proj.load_store();
-    if let Err(e) = &store_result {
-        pb.finish_with_message(format!("Failed to load store: {}", e));
-        return store_result.map(|_| ());
-    }
+    let _ = proj.load_store()?;
 
-    pb.set_message("Initializing server state...");
+    pb.set_message("Preparing server (checking indexes)...");
     let state = state::AppState::new(proj);
 
     let node_count = state.store().graph().node_count();

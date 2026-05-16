@@ -14,14 +14,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(project: Project) -> Self {
+    pub fn new(mut project: Project) -> Self {
         let name = project.name().to_string();
         let root = project.root().to_path_buf();
         let mut store = project
-            .store()
-            .cloned()
+            .take_store()
             .unwrap_or_else(|| GraphStore::new(&name));
-        store.ensure_consistency();
+        store.ensure_consistency_with_progress();
         Self {
             project_name: name,
             project_root: root,
