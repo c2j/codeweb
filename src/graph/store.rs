@@ -600,6 +600,52 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
     true
 }
 
+const MIN_PART_LEN: usize = 4;
+const SOLO_MIN_LEN: usize = 6;
+
+fn try_stripped_part(query: &str, pos: usize, part: &str) -> Option<(usize, usize)> {
+    let stripped = strip_sql_segment(part);
+    if stripped.len() >= MIN_PART_LEN && stripped.len() < part.len() {
+        if let Some(p) = query[pos..].find(stripped) {
+            return Some((p, stripped.len()));
+        }
+    }
+    None
+}
+
+/// Strip trailing non-semantic content from a SQL segment for fuzzy matching.
+/// Removes: trailing operators/punctuation, trailing quoted strings, then operators again.
+fn strip_sql_segment(part: &str) -> &str {
+    let s = strip_trailing_quoted(part);
+    let s = s.trim_end_matches(|c: char| !c.is_ascii_alphabetic() && c != '_' && c != '.');
+    if s.len() >= part.len() {
+        return part;
+    }
+    s
+}
+
+/// Strip a trailing single-quoted SQL string literal (e.g. `'created'`, `'CREATED'`).
+fn strip_trailing_quoted(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        match bytes[i - 1] {
+            b'\'' => {
+                if let Some(open) = s[..i - 1].rfind('\'') {
+                    i = open;
+                } else {
+                    break;
+                }
+            }
+            b' ' | b')' | b',' => {
+                i -= 1;
+            }
+            _ => break,
+        }
+    }
+    if i < s.len() { &s[..i] } else { s }
+}
+
 /// Split `sql` on `?`, check if enough consecutive concrete segments
 /// appear in order in `query` (the `?` gaps between SQL segments absorb
 /// any characters in the query).
@@ -608,9 +654,6 @@ fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
 /// query tail after the last matched position (excluding leading `?`) is empty.
 /// This prevents queries with extra conditions not present in the SQL from matching.
 fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) -> bool {
-    const MIN_PART_LEN: usize = 4;
-    const SOLO_MIN_LEN: usize = 6;
-
     let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
     if sql_parts.is_empty() {
         return false;
@@ -624,7 +667,12 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
         return false;
     }
     if sig_parts.len() == 1 {
-        return sig_parts[0].len() >= SOLO_MIN_LEN && query.contains(sig_parts[0]);
+        let p = sig_parts[0];
+        if p.len() >= SOLO_MIN_LEN && query.contains(p) {
+            return true;
+        }
+        let stripped = strip_sql_segment(p);
+        return stripped.len() >= SOLO_MIN_LEN && stripped.len() < p.len() && query.contains(stripped);
     }
 
     for start in 0..sig_parts.len() {
@@ -633,13 +681,17 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
         let mut solo_len: usize = 0;
 
         for part in &sig_parts[start..] {
-            match query[pos..].find(*part) {
-                Some(p) => {
+            let matched = match query[pos..].find(*part) {
+                Some(p) => Some((p, part.len())),
+                None => try_stripped_part(query, pos, part),
+            };
+            match matched {
+                Some((p, len)) => {
                     if count > 0 && p == 0 {
                         break;
                     }
-                    pos += p + part.len();
-                    solo_len = part.len();
+                    pos += p + len;
+                    solo_len = len;
                     count += 1;
                 }
                 None => break,
@@ -650,6 +702,11 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
         if threshold {
             if query_has_wildcard {
                 let tail = query[pos..].trim_start_matches('?').trim();
+                if tail.is_empty() {
+                    return true;
+                }
+            } else if count == 1 {
+                let tail = query[pos..].trim();
                 if tail.is_empty() {
                     return true;
                 }
