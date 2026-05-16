@@ -779,48 +779,46 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
             && query.contains(stripped);
     }
 
-    for start in 0..sig_parts.len() {
-        let mut pos = 0;
-        let mut count = 0;
-        let mut solo_len: usize = 0;
+    let mut pos = 0;
+    let mut count = 0;
+    let mut solo_len: usize = 0;
 
-        for part in &sig_parts[start..] {
-            let matched = match query[pos..].find(*part) {
-                Some(p) => Some((p, part.len())),
-                None => try_stripped_part(query, pos, part),
-            };
-            match matched {
-                Some((p, len)) => {
-                    if count > 0 && p == 0 {
-                        break;
-                    }
-                    pos += p + len;
-                    solo_len = len;
-                    count += 1;
-                }
-                None => break,
-            }
-        }
-
-        let threshold = if count == 1 {
-            solo_len >= SOLO_MIN_LEN
-        } else {
-            count >= 2
+    for part in &sig_parts {
+        let matched = match query[pos..].find(*part) {
+            Some(p) => Some((p, part.len())),
+            None => try_stripped_part(query, pos, part),
         };
-        if threshold {
-            if query_has_wildcard {
-                let tail = query[pos..].trim_start_matches('?').trim();
-                if tail.is_empty() {
-                    return true;
+        match matched {
+            Some((p, len)) => {
+                if count > 0 && p == 0 {
+                    break;
                 }
-            } else if count == 1 {
-                let tail = query[pos..].trim();
-                if tail.is_empty() {
-                    return true;
-                }
-            } else {
+                pos += p + len;
+                solo_len = len;
+                count += 1;
+            }
+            None => break,
+        }
+    }
+
+    let threshold = if count == 1 {
+        solo_len >= SOLO_MIN_LEN
+    } else {
+        count >= 2
+    };
+    if threshold {
+        if query_has_wildcard {
+            let tail = query[pos..].trim_start_matches('?').trim();
+            if tail.is_empty() {
                 return true;
             }
+        } else if count == 1 {
+            let tail = query[pos..].trim();
+            if tail.is_empty() {
+                return true;
+            }
+        } else {
+            return true;
         }
     }
 
@@ -2925,12 +2923,12 @@ mod tests {
     }
 
     #[test]
-    fn sql_text_matches_same_concrete_table_different_columns_ok() {
+    fn sql_text_matches_same_concrete_table_different_first_set_col_rejected() {
         let sql = "UPDATE orders SET status = __XML_PARAM_status__ WHERE id = __XML_PARAM_id__";
         let query = "update orders set name = ? where id = ?";
         assert!(
-            sql_text_matches(sql, query),
-            "same concrete table should proceed to fragment matching"
+            !sql_text_matches(sql, query),
+            "different first SET column should not match"
         );
     }
 
