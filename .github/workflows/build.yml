@@ -80,13 +80,15 @@ jobs:
 
       - name: Create archives
         run: |
+          VERSION="${{ github.ref_name }}"
           cd artifacts
           for dir in */; do
             name="${dir%/}"
+            archive_name="codeweb-${VERSION}-${name#codeweb-}"
             if [ "$name" = "codeweb-x86_64-pc-windows-msvc" ]; then
-              7z a "${name}.zip" "./${name}/"
+              7z a "${archive_name}.zip" "./${name}/"
             else
-              tar czf "${name}.tar.gz" -C "${name}" .
+              tar czf "${archive_name}.tar.gz" -C "${name}" .
             fi
           done
 
