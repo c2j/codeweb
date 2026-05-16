@@ -367,6 +367,12 @@ impl Project {
         self.store.as_ref()
     }
 
+    /// Take ownership of the loaded store, avoiding an expensive deep clone.
+    /// Returns `None` if no store has been loaded yet.
+    pub fn take_store(&mut self) -> Option<GraphStore> {
+        self.store.take()
+    }
+
     pub fn load_store(&mut self) -> Result<&GraphStore> {
         let store_path = self.store_path();
         if self.store.is_none() && store_path.exists() {

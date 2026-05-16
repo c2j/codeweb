@@ -214,6 +214,101 @@ impl GraphStore {
         }
     }
 
+    pub fn ensure_consistency_with_progress(&mut self) {
+        let expected = self.graph.node_count();
+        let needs_rebuild = self.node_summaries.len() != expected
+            || self.name_index.len() != expected
+            || self.type_tag_index.values().map(|v| v.len()).sum::<usize>() != expected;
+
+        if !needs_rebuild {
+            return;
+        }
+
+        let pb = indicatif::ProgressBar::new(expected as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  {spinner} Rebuilding indexes {bar:40.cyan/blue} {pos}/{len} {msg}",
+            )
+            .unwrap()
+            .progress_chars("━━╾─"),
+        );
+        pb.set_message("node indexes...");
+
+        self.type_tag_index.clear();
+        self.name_index.clear();
+        self.schema_index.clear();
+        self.edge_category_index.clear();
+        self.node_summaries.clear();
+
+        for idx in self.graph.node_indices() {
+            let tag = node_type_tag(&self.graph[idx]).to_string();
+            self.type_tag_index
+                .entry(tag.clone())
+                .or_default()
+                .push(idx);
+
+            let key = NodeKey::from_node(&self.graph[idx]);
+            let key_str = key.to_string();
+            let key_lower = key_str.to_lowercase();
+            self.name_index.push((key_lower.clone(), idx));
+
+            if let Some(schema) = extract_schema(&self.graph[idx]) {
+                self.schema_index
+                    .entry(schema.to_lowercase())
+                    .or_default()
+                    .push(idx);
+            }
+
+            let in_deg = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .count();
+            let out_deg = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count();
+            self.node_summaries.push(NodeSummary {
+                id: idx.index(),
+                key: key_str,
+                key_lower,
+                type_tag: tag,
+                in_degree: in_deg,
+                out_degree: out_deg,
+            });
+
+            pb.inc(1);
+        }
+
+        pb.set_message("sorting...");
+        self.name_index.sort_by(|a, b| a.0.cmp(&b.0));
+
+        pb.set_style(
+            indicatif::ProgressStyle::with_template("  {spinner} Rebuilding edge indexes...")
+                .unwrap(),
+        );
+        use crate::graph::EdgeCategory;
+        for edge_idx in self.graph.edge_indices() {
+            let cat = self.graph[edge_idx].category();
+            let key = match cat {
+                EdgeCategory::Call => "call",
+                EdgeCategory::Composition => "composition",
+                EdgeCategory::DataFlow => "dataflow",
+                EdgeCategory::Reference => "reference",
+                EdgeCategory::Inheritance => "inheritance",
+            };
+            self.edge_category_index
+                .entry(key.to_string())
+                .or_default()
+                .push(edge_idx);
+        }
+
+        pb.finish_with_message(format!(
+            "Indexes rebuilt ({} nodes, {} edges)",
+            expected,
+            self.graph.edge_count()
+        ));
+    }
+
     pub fn node_summaries(&self) -> &[NodeSummary] {
         &self.node_summaries
     }
@@ -643,7 +738,11 @@ fn strip_trailing_quoted(s: &str) -> &str {
             _ => break,
         }
     }
-    if i < s.len() { &s[..i] } else { s }
+    if i < s.len() {
+        &s[..i]
+    } else {
+        s
+    }
 }
 
 /// Split `sql` on `?`, check if enough consecutive concrete segments
@@ -662,7 +761,10 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
         return query.contains(sql_parts[0]);
     }
 
-    let sig_parts: Vec<&str> = sql_parts.into_iter().filter(|p| p.len() >= MIN_PART_LEN).collect();
+    let sig_parts: Vec<&str> = sql_parts
+        .into_iter()
+        .filter(|p| p.len() >= MIN_PART_LEN)
+        .collect();
     if sig_parts.is_empty() {
         return false;
     }
@@ -672,7 +774,9 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
             return true;
         }
         let stripped = strip_sql_segment(p);
-        return stripped.len() >= SOLO_MIN_LEN && stripped.len() < p.len() && query.contains(stripped);
+        return stripped.len() >= SOLO_MIN_LEN
+            && stripped.len() < p.len()
+            && query.contains(stripped);
     }
 
     for start in 0..sig_parts.len() {
@@ -698,7 +802,11 @@ fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) 
             }
         }
 
-        let threshold = if count == 1 { solo_len >= SOLO_MIN_LEN } else { count >= 2 };
+        let threshold = if count == 1 {
+            solo_len >= SOLO_MIN_LEN
+        } else {
+            count >= 2
+        };
         if threshold {
             if query_has_wildcard {
                 let tail = query[pos..].trim_start_matches('?').trim();
@@ -2678,7 +2786,8 @@ mod tests {
     #[test]
     fn sql_text_matches_update_template_to_concrete() {
         let sql = "UPDATE __XML_RAW_tableName__ t SET t.req_host_ip = __XML_PARAM_hostIp__, t.file_type = __XML_PARAM_fileType__ WHERE t.data_date = __XML_PARAM_dataDate__";
-        let query = "UPDATE DAT_MDB_TEXT t SET t.req_host_ip = ?, t.file_type = ? WHERE t.data_date = ?";
+        let query =
+            "UPDATE DAT_MDB_TEXT t SET t.req_host_ip = ?, t.file_type = ? WHERE t.data_date = ?";
         assert!(
             sql_text_matches(sql, query),
             "UPDATE template should match UPDATE query with same structure"
