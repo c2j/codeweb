@@ -256,6 +256,8 @@ impl Project {
         // XML (typically fewer files)
         pb.set_message("Parsing XML mappers...");
         let ibatis_files = parser::ibatis_loader::load_ibatis_files_from_paths(&all_xml_paths);
+        let structured_ibatis_files =
+            parser::ibatis_loader::load_ibatis_structured_files_from_paths(&all_xml_paths);
         pb.inc(all_xml_paths.len() as u64);
 
         pb.finish_with_message(format!(
@@ -302,6 +304,13 @@ impl Project {
         );
         GraphBuilder::finalize_graph(&mut ctx);
 
+        // Expand dynamic SQL variants for fingerprint index
+        let variant_map = GraphBuilder::add_ibatis_structured_variants(
+            &structured_ibatis_files,
+            &ctx.mapper_index,
+            &source_paths,
+        );
+
         // Collect XML hashes (no AST to drop — ibatis_files is lightweight)
         for pf in &ibatis_files {
             all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Xml));
@@ -309,6 +318,7 @@ impl Project {
 
         // Phase 6: Build store
         let mut new_store = GraphStore::from_graph(&self.config.project.name, ctx.graph);
+        new_store.enrich_fingerprint_index_with_variants(&variant_map);
 
         // Build manifest from collected hashes (no re-reading files)
         let mut new_records = Vec::new();

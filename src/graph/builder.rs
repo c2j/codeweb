@@ -1545,6 +1545,53 @@ impl GraphBuilder {
         }
     }
 
+    pub(crate) fn add_ibatis_structured_variants(
+        structured_files: &[crate::parser::ibatis_loader::IbatisStructuredFile],
+        mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        _source_paths: &[PathBuf],
+    ) -> HashMap<petgraph::graph::NodeIndex, Vec<String>> {
+        use ogsql_parser::ibatis::{ExpandConfig, IfExpandStrategy, PlaceholderStrategy};
+
+        let mut variant_map: HashMap<petgraph::graph::NodeIndex, Vec<String>> = HashMap::new();
+
+        let config = ExpandConfig {
+            max_depth: 8,
+            max_variants: 100,
+            foreach_sizes: vec![1, 3],
+            if_strategy: IfExpandStrategy::Both,
+            placeholder: PlaceholderStrategy::PreserveInternalMarkers,
+            generate_parse_results: false,
+        };
+
+        for structured_file in structured_files {
+            let namespace = &structured_file.result.namespace;
+
+            for stmt in &structured_file.result.statements {
+                if !stmt.has_dynamic_elements {
+                    continue;
+                }
+
+                let mapper_key = format!("{}.{}", namespace, stmt.id);
+                let Some(&node_idx) = mapper_index.get(&mapper_key) else {
+                    continue;
+                };
+
+                let variants = stmt.expand_variants(&config);
+                let variant_sqls: Vec<String> = variants
+                    .into_iter()
+                    .map(|v| v.sql)
+                    .filter(|sql| !sql.trim().is_empty())
+                    .collect();
+
+                if !variant_sqls.is_empty() {
+                    variant_map.insert(node_idx, variant_sqls);
+                }
+            }
+        }
+
+        variant_map
+    }
+
     pub(crate) fn add_java_nodes_from_parsed(
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
