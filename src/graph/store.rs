@@ -606,10 +606,105 @@ impl PreparedQuery {
 /// placeholder markers (`__XML_PARAM_*__`, `__XML_RAW_*__`) with `?`, then remove spaces
 /// around SQL operators, parentheses, and commas so that formatting differences don't
 /// prevent a match (e.g. `user_id = ?` vs `user_id=?`, `TO_CHAR( x , y )` vs `TO_CHAR(x,y)`).
-fn normalize_for_matching(s: &str) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = replace_xml_placeholders(&s);
-    // Comparison operators (longest first to avoid partial matches)
+fn strip_line_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        if let Some(pos) = line.find("--") {
+            result.push_str(line[..pos].trim_end());
+        } else {
+            result.push_str(line);
+        }
+        result.push(' ');
+    }
+    result.trim_end().to_string()
+}
+
+fn strip_block_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut pos = 0;
+    while pos < s.len() {
+        let remaining = &s[pos..];
+        if let Some(start) = remaining.find("/*") {
+            result.push_str(&remaining[..start]);
+            let after_start = &remaining[start + 2..];
+            if let Some(end) = after_start.find("*/") {
+                pos += start + 2 + end + 2;
+            } else {
+                pos = s.len();
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result
+}
+
+fn replace_string_literals(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            result.push('?');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    i += 1;
+                    if i < chars.len() && chars[i] == '\'' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+fn replace_number_literals(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            if i > 0 && (chars[i - 1].is_ascii_alphabetic() || chars[i - 1] == '_') {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            result.push('?');
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+fn strip_where_one_equals_one(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let patterns = ["where 1=1 and ", "where 1 = 1 and "];
+    for pat in &patterns {
+        if let Some(pos) = lower.find(pat) {
+            let prefix = &s[..pos];
+            let rest = &s[pos + pat.len()..];
+            return format!("{}where {}", prefix, rest.trim_start());
+        }
+    }
+    s.to_string()
+}
+
+fn collapse_operator_spaces(s: &str) -> String {
     s.replace(" >= ", ">=")
         .replace(" <= ", "<=")
         .replace(" <> ", "<>")
@@ -620,7 +715,6 @@ fn normalize_for_matching(s: &str) -> String {
         .replace(" - ", "-")
         .replace(" + ", "+")
         .replace(" * ", "*")
-        // Parentheses and commas
         .replace("( ", "(")
         .replace(" )", ")")
         .replace(" ,", ",")
@@ -631,6 +725,18 @@ fn normalize_for_matching(s: &str) -> String {
         .replace("> ", ">")
         .replace(" <", "<")
         .replace("< ", "<")
+}
+
+fn normalize_for_matching(s: &str) -> String {
+    let s = strip_line_comments(s);
+    let s = strip_block_comments(&s);
+    let s = strip_where_one_equals_one(&s);
+    let s = replace_string_literals(&s);
+    let s = replace_number_literals(&s);
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_end_matches(';').to_string();
+    let s = replace_xml_placeholders(&s);
+    collapse_operator_spaces(&s)
 }
 
 /// Replace ogsql-parser internal placeholder markers with `?` for search matching.
