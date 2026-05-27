@@ -15,6 +15,7 @@ full = ["cli", "tui", "serve"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
 serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
+search-sql-v2 = []
 
 [dependencies]
 ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", rev = "388aeaae", features = ["ibatis", "java"] }

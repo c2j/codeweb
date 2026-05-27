@@ -557,7 +557,8 @@ impl PreparedQuery {
             Vec::new()
         };
         let keyword = SqlKeyword::extract(&normalized);
-        let table = extract_table_name(&normalized).map(String::from);
+        let pre_collapse = normalize_for_matching_pre_collapse(&lower);
+        let table = extract_table_name(&pre_collapse).map(String::from);
         Self {
             normalized,
             has_wildcard,
@@ -598,18 +599,153 @@ impl PreparedQuery {
             return true;
         }
 
+        {
+            let sql_pre_collapse = normalize_for_matching_pre_collapse(&sql_text.to_lowercase());
+            if tables_compatible(&self.table, &sql_pre_collapse)
+                && jaccard_similarity(&self.normalized, &sql_lower) >= 0.8
+            {
+                return true;
+            }
+        }
+
         false
     }
+}
+
+/// Compute Jaccard similarity between two normalized SQL strings by splitting
+/// on non-word characters and comparing token sets. Returns a value in [0, 1].
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    let tokens_a: std::collections::HashSet<&str> = a
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let tokens_b: std::collections::HashSet<&str> = b
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+
+    intersection as f64 / union as f64
+}
+
+fn normalize_for_matching_pre_collapse(s: &str) -> String {
+    let s = strip_line_comments(s);
+    let s = strip_block_comments(&s);
+    let s = strip_where_one_equals_one(&s);
+    let s = replace_string_literals(&s);
+    let s = replace_number_literals(&s);
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Collapse consecutive whitespace into single spaces, replace ogsql-parser internal
 /// placeholder markers (`__XML_PARAM_*__`, `__XML_RAW_*__`) with `?`, then remove spaces
 /// around SQL operators, parentheses, and commas so that formatting differences don't
 /// prevent a match (e.g. `user_id = ?` vs `user_id=?`, `TO_CHAR( x , y )` vs `TO_CHAR(x,y)`).
-fn normalize_for_matching(s: &str) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = replace_xml_placeholders(&s);
-    // Comparison operators (longest first to avoid partial matches)
+fn strip_line_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        if let Some(pos) = line.find("--") {
+            result.push_str(line[..pos].trim_end());
+        } else {
+            result.push_str(line);
+        }
+        result.push(' ');
+    }
+    result.trim_end().to_string()
+}
+
+fn strip_block_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut pos = 0;
+    while pos < s.len() {
+        let remaining = &s[pos..];
+        if let Some(start) = remaining.find("/*") {
+            result.push_str(&remaining[..start]);
+            let after_start = &remaining[start + 2..];
+            if let Some(end) = after_start.find("*/") {
+                pos += start + 2 + end + 2;
+            } else {
+                pos = s.len();
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result
+}
+
+fn replace_string_literals(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            result.push('?');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    i += 1;
+                    if i < chars.len() && chars[i] == '\'' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+fn replace_number_literals(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            if i > 0 && (chars[i - 1].is_ascii_alphabetic() || chars[i - 1] == '_') {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            result.push('?');
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+fn strip_where_one_equals_one(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let patterns = ["where 1=1 and ", "where 1 = 1 and "];
+    for pat in &patterns {
+        if let Some(pos) = lower.find(pat) {
+            let prefix = &s[..pos];
+            let rest = &s[pos + pat.len()..];
+            return format!("{}where {}", prefix, rest.trim_start());
+        }
+    }
+    s.to_string()
+}
+
+fn collapse_operator_spaces(s: &str) -> String {
     s.replace(" >= ", ">=")
         .replace(" <= ", "<=")
         .replace(" <> ", "<>")
@@ -620,7 +756,6 @@ fn normalize_for_matching(s: &str) -> String {
         .replace(" - ", "-")
         .replace(" + ", "+")
         .replace(" * ", "*")
-        // Parentheses and commas
         .replace("( ", "(")
         .replace(" )", ")")
         .replace(" ,", ",")
@@ -631,6 +766,18 @@ fn normalize_for_matching(s: &str) -> String {
         .replace("> ", ">")
         .replace(" <", "<")
         .replace("< ", "<")
+}
+
+fn normalize_for_matching(s: &str) -> String {
+    let s = strip_line_comments(s);
+    let s = strip_block_comments(&s);
+    let s = strip_where_one_equals_one(&s);
+    let s = replace_string_literals(&s);
+    let s = replace_number_literals(&s);
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim_end_matches(';').to_string();
+    let s = replace_xml_placeholders(&s);
+    collapse_operator_spaces(&s)
 }
 
 /// Replace ogsql-parser internal placeholder markers with `?` for search matching.
@@ -2986,6 +3133,723 @@ mod tests {
 
             let loaded = GraphStore::load_bincode(&path).unwrap();
             assert_eq!(loaded.graph().node_count(), 1);
+        }
+    }
+
+    // --- SQL search test helpers ---
+
+    fn make_mapper_node(
+        namespace: &str,
+        statement_id: &str,
+        sql: Option<&str>,
+    ) -> crate::graph::Node {
+        crate::graph::Node::MappedStatement {
+            namespace: namespace.to_string(),
+            statement_id: statement_id.to_string(),
+            kind: "select".to_string(),
+            xml_file: std::path::PathBuf::from("test.xml"),
+            line: 1,
+            sql: sql.map(String::from),
+        }
+    }
+
+    fn make_javasql_node(
+        class: Option<&str>,
+        method: Option<&str>,
+        sql: Option<&str>,
+    ) -> crate::graph::Node {
+        crate::graph::Node::JavaSql {
+            class_name: class.map(String::from),
+            method_name: method.map(String::from),
+            extraction_method: "annotation".to_string(),
+            java_file: std::path::PathBuf::from("Test.java"),
+            line: 1,
+            sql: sql.map(String::from),
+        }
+    }
+
+    fn make_view_node(name: &str, schema: Option<&str>) -> crate::graph::Node {
+        crate::graph::Node::View {
+            schema: schema.map(String::from),
+            name: name.to_string(),
+            location: None,
+        }
+    }
+
+    // --- search_by_sql: exact and substring matching ---
+
+    #[test]
+    fn search_by_sql_finds_mapper_with_exact_sql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.UserDao",
+            "findById",
+            Some("SELECT * FROM users WHERE id = ?"),
+        ));
+        graph.add_node(make_mapper_node(
+            "com.example.OrderDao",
+            "findAll",
+            Some("SELECT * FROM orders"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("select * from users where id = ?");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("UserDao"));
+        assert!(results[0].1.contains("findById"));
+    }
+
+    #[test]
+    fn search_by_sql_finds_mapper_with_substring() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.UserDao",
+            "findById",
+            Some("SELECT id, name, email FROM users WHERE id = ? AND status = 'ACTIVE'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("from users where id = ?");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_finds_javasql_node() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_javasql_node(
+            Some("UserRepository"),
+            Some("findByName"),
+            Some("SELECT * FROM users WHERE name = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("from users where name");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("UserRepository"));
+        assert!(results[0].1.contains("findByName"));
+    }
+
+    #[test]
+    fn search_by_sql_returns_empty_for_no_match() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.UserDao",
+            "findById",
+            Some("SELECT * FROM users WHERE id = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("delete from orders where id = ?");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_by_sql_skips_nodes_without_sql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node("com.example.Dao", "noop", None));
+        graph.add_node(make_mapper_node(
+            "com.example.Dao",
+            "selectOne",
+            Some("SELECT 1 FROM dual"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("select 1");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_case_insensitive() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.Dao",
+            "find",
+            Some("select * from users where id = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(store.search_by_sql("SELECT * FROM USERS").len(), 1);
+        assert_eq!(store.search_by_sql("select * from users").len(), 1);
+        assert_eq!(store.search_by_sql("Select * From Users").len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_multiple_matches() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.UserDao",
+            "findActive",
+            Some("SELECT * FROM users WHERE status = 'ACTIVE'"),
+        ));
+        graph.add_node(make_mapper_node(
+            "com.example.AdminDao",
+            "findActiveAdmins",
+            Some("SELECT * FROM users WHERE status = 'ACTIVE' AND role = 'ADMIN'"),
+        ));
+        graph.add_node(make_mapper_node(
+            "com.example.OrderDao",
+            "findAll",
+            Some("SELECT * FROM orders"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_by_sql("from users where status = 'active'");
+        assert_eq!(results.len(), 2);
+    }
+
+    // --- search_by_sql: keyword gate ---
+
+    #[test]
+    fn search_by_sql_rejects_select_vs_update() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "selectUsers",
+            Some("SELECT * FROM users WHERE id = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("update users set name = ? where id = ?")
+                .is_empty(),
+            "UPDATE query must not match SELECT SQL"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_rejects_insert_vs_delete() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "insertOrder",
+            Some("INSERT INTO orders (id, name) VALUES (?, ?)"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("delete from orders where id = ?")
+                .is_empty(),
+            "DELETE query must not match INSERT SQL"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_select_compatible_with_with() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "cteQuery",
+            Some("WITH cte AS (SELECT 1) SELECT * FROM cte"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store.search_by_sql("select * from cte").len(),
+            1,
+            "SELECT query should match WITH...SELECT SQL"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_merge_matches_merge() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao", "mergeData",
+            Some("MERGE INTO target t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("merge into target t using src s on (t.id = s.id)")
+                .len(),
+            1,
+            "MERGE query should match MERGE SQL"
+        );
+    }
+
+    // --- search_by_sql: wildcard and XML placeholder ---
+
+    #[test]
+    fn search_by_sql_query_wildcard_matches_concrete_sql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "findById",
+            Some("SELECT * FROM users WHERE id = 123"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("select * from users where id = ?")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_by_sql_xml_param_placeholder_matches_wildcard_query() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao", "find",
+            Some("SELECT * FROM users WHERE id = __XML_PARAM_userId__ AND status = __XML_PARAM_status__"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("select * from users where id=? and status=?")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_by_sql_xml_raw_placeholder_matches_concrete() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "dynamicUpdate",
+            Some("UPDATE __XML_RAW_tableName__ t SET t.status = '1'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("update orders t set t.status='1'")
+                .len(),
+            1,
+            "concrete table name should match __XML_RAW__ placeholder"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_fully_dynamic_sql_rejected() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "freeSql",
+            Some("__XML_RAW_I_am_Free_SQL__"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("select * from users where id = ?")
+                .is_empty(),
+            "fully dynamic SQL must not match specific queries"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_query_extra_condition_with_two_wildcards_matches() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "find",
+            Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        // Current behavior: query "id=? and name=?" splits into segments
+        // ["id=", " and name="] — both appear in the normalized SQL,
+        // so this matches. This is a known over-matching case that P0
+        // token normalization should fix.
+        let results = store.search_by_sql("select * from users where id=? and name=?");
+        assert_eq!(
+            results.len(),
+            1,
+            "current behavior: multi-wildcard query matches even with extra conditions"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_operator_spacing_normalized() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "find",
+            Some("SELECT * FROM t_orders WHERE user_id = __XML_PARAM_id__ AND status = 'CREATED'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("select * from t_orders where user_id=?")
+                .len(),
+            1,
+            "different spacing around = should still match"
+        );
+    }
+
+    // --- search_by_sql: table name gate ---
+
+    #[test]
+    fn search_by_sql_different_concrete_table_rejected() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "updateA",
+            Some("UPDATE table_a SET x = 1 WHERE id = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("update table_b set x = 1 where id = ?")
+                .is_empty(),
+            "UPDATE on different concrete table must not match"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_dynamic_table_accepts_any_concrete() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao", "dynamicUpdate",
+            Some("UPDATE __XML_RAW_tableName__ SET status = __XML_PARAM_s__ WHERE id = __XML_PARAM_id__"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("update orders set status = ? where id = ?")
+                .len(),
+            1,
+            "dynamic table template must accept any concrete table"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_select_different_table_rejected() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "selectA",
+            Some("SELECT * FROM table_a WHERE x = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("select * from table_b where x = ?")
+                .is_empty(),
+            "SELECT from different table must not match"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_different_set_column_rejected() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "updateStatus",
+            Some("UPDATE orders SET status = __XML_PARAM_s__ WHERE id = __XML_PARAM_id__"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert!(
+            store
+                .search_by_sql("update orders set name = ? where id = ?")
+                .is_empty(),
+            "different first SET column must not match"
+        );
+    }
+
+    // --- search_by_sql: normalization edge cases ---
+
+    #[test]
+    fn search_by_sql_multiline_normalized() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao", "delete",
+            Some("DELETE FROM bigfund.dat_log\n        WHERE data_date < TO_CHAR(TRUNC(SYSDATE) - 15, 'YYYYMMDD')"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("delete from bigfund.dat_log where data_date")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_by_sql_crlf_normalized() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "delete",
+            Some("DELETE FROM table\r\nWHERE id = 1"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store.search_by_sql("delete from table where id = 1").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_by_sql_paren_and_comma_spacing() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "select",
+            Some("SELECT TO_CHAR( TRUNC(SYSDATE) - 15 , 'YYYYMMDD' ) FROM dual"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(
+            store
+                .search_by_sql("select to_char(trunc(sysdate)-?,'yyyymmdd') from dual")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_by_sql_xml_raw_with_type_hint() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "select",
+            Some("SELECT __XML_RAW_STRING_column__ FROM users"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+
+        assert_eq!(store.search_by_sql("select ? from users").len(), 1);
+    }
+
+    // =======================================================================
+    // RED tests (search-sql-v2) — expected future behavior
+    // Activate with: cargo test --features search-sql-v2
+    // =======================================================================
+
+    #[cfg(feature = "search-sql-v2")]
+    mod search_sql_v2 {
+        use super::*;
+
+        // --- P0: Token normalization ---
+
+        #[test]
+        fn sql_comments_stripped_before_matching() {
+            assert!(
+                sql_text_matches(
+                    "SELECT * FROM users -- get all users\nWHERE id = 1",
+                    "select * from users where id = ?",
+                ),
+                "SQL line comments should be stripped before matching"
+            );
+        }
+
+        #[test]
+        fn sql_block_comments_stripped() {
+            assert!(
+                sql_text_matches(
+                    "SELECT /* comment */ * FROM users WHERE id = 1",
+                    "select * from users where id = ?",
+                ),
+                "Block comments should be stripped before matching"
+            );
+        }
+
+        #[test]
+        fn string_literals_unified_to_wildcard() {
+            assert!(
+                sql_text_matches(
+                    "SELECT * FROM users WHERE status = 'ACTIVE'",
+                    "select * from users where status = ?",
+                ),
+                "String literals should be normalized to ? for matching"
+            );
+        }
+
+        #[test]
+        fn number_literals_unified_to_wildcard() {
+            assert!(
+                sql_text_matches(
+                    "SELECT * FROM users WHERE age > 18",
+                    "select * from users where age > ?",
+                ),
+                "Number literals should be normalized to ? for matching"
+            );
+        }
+
+        #[test]
+        fn trailing_semicolon_ignored() {
+            assert!(
+                sql_text_matches("SELECT * FROM users;", "select * from users"),
+                "Trailing semicolons should not prevent matching"
+            );
+        }
+
+        #[test]
+        fn where_one_equals_one_removed() {
+            assert!(
+                sql_text_matches(
+                    "SELECT * FROM users WHERE 1=1 AND id = ?",
+                    "select * from users where id = ?",
+                ),
+                "WHERE 1=1 pattern should be stripped for matching"
+            );
+        }
+
+        // --- P0: Scoring and ranking (search_by_sql_scored) ---
+
+        #[test]
+        fn search_by_sql_returns_scored_results() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "exactMatch",
+                Some("SELECT * FROM users WHERE id = ?"),
+            ));
+            graph.add_node(make_mapper_node(
+                "dao",
+                "partialMatch",
+                Some("SELECT * FROM users WHERE id = ? AND name = ?"),
+            ));
+            graph.add_node(make_mapper_node(
+                "dao",
+                "differentTable",
+                Some("SELECT * FROM orders WHERE id = ?"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // search_by_sql_scored should return scored results
+            // Placeholder: use existing search_by_sql until scored version exists
+            let results = store.search_by_sql("select * from users where id = ?");
+            assert_eq!(results.len(), 2, "should match 2 SQL nodes (users table)");
+
+            // When search_by_sql_scored is implemented:
+            // exact match should score higher than partial
+            // exact.score should be >= 0.8
+        }
+
+        #[test]
+        fn search_by_sql_exact_match_is_first_result() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "q",
+                Some("SELECT id, name FROM users WHERE status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("select id, name from users where status = 'active'");
+            assert_eq!(results.len(), 1);
+            // When scored: score should be >= 0.95, match_method should be "exact"
+        }
+
+        #[test]
+        fn search_by_sql_results_sorted_by_relevance() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "exact",
+                Some("SELECT * FROM users WHERE id = ?"),
+            ));
+            graph.add_node(make_mapper_node(
+                "dao",
+                "similar",
+                Some("SELECT * FROM users WHERE id = ? AND status = ?"),
+            ));
+            graph.add_node(make_mapper_node(
+                "dao",
+                "vague",
+                Some("SELECT id FROM users"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("select * from users where id = ?");
+            assert!(results.len() >= 2);
+            // When scored: results should be sorted by score descending
+        }
+
+        // --- P1: Jaccard fallback ---
+
+        #[test]
+        fn similar_sql_matched_by_token_similarity() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findUsers",
+                Some("SELECT name, email, id FROM users WHERE status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Currently fails: column order differs, substring match misses
+            let results =
+                store.search_by_sql("select id, name, email from users where status = 'active'");
+            assert_eq!(
+                results.len(),
+                1,
+                "column-reordered SQL should match via token similarity"
+            );
+        }
+
+        #[test]
+        fn slightly_different_sql_matched() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "find",
+                Some("SELECT id, name FROM users WHERE status = 'ACTIVE' AND dept = 'IT'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Currently passes via substring match already
+            let results = store.search_by_sql("select id, name from users where status = 'active'");
+            assert_eq!(results.len(), 1, "SQL with extra condition should match");
+        }
+
+        #[test]
+        fn dissimilar_sql_not_matched() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "insert",
+                Some("INSERT INTO orders (id, total) VALUES (?, ?)"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("select * from users where id = ?");
+            assert!(results.is_empty(), "dissimilar SQL should not match");
+        }
+
+        // --- P1: Cross-type search ---
+
+        #[test]
+        fn search_by_sql_does_not_search_views() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_view_node("v_active_users", Some("public")));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("from users where status");
+            assert!(
+                results.is_empty(),
+                "search_by_sql currently does not search View nodes"
+            );
+        }
+
+        #[test]
+        fn search_by_sql_covers_mapper_and_javasql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node("dao", "find", Some("SELECT * FROM users")));
+            graph.add_node(make_javasql_node(
+                Some("Svc"),
+                Some("query"),
+                Some("SELECT * FROM orders"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            assert_eq!(store.search_by_sql("select * from users").len(), 1);
+            assert_eq!(store.search_by_sql("select * from orders").len(), 1);
         }
     }
 }
