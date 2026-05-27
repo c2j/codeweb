@@ -14,7 +14,10 @@ pub use extractor::{
     TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
 };
 #[allow(unused_imports)]
-pub use ibatis_loader::{load_ibatis_files_from_paths, IbatisParsedFile};
+pub use ibatis_loader::{
+    load_ibatis_files_from_paths, load_ibatis_structured_files_from_paths, IbatisParsedFile,
+    IbatisStructuredFile,
+};
 #[allow(unused_imports)]
 pub use java_loader::{
     load_java_files_combined, load_java_files_from_paths, JavaCombinedResult, JavaParsedFile,
