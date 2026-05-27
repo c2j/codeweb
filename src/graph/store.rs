@@ -557,7 +557,8 @@ impl PreparedQuery {
             Vec::new()
         };
         let keyword = SqlKeyword::extract(&normalized);
-        let table = extract_table_name(&normalized).map(String::from);
+        let pre_collapse = normalize_for_matching_pre_collapse(&lower);
+        let table = extract_table_name(&pre_collapse).map(String::from);
         Self {
             normalized,
             has_wildcard,
@@ -598,8 +599,48 @@ impl PreparedQuery {
             return true;
         }
 
+        {
+            let sql_pre_collapse = normalize_for_matching_pre_collapse(&sql_text.to_lowercase());
+            if tables_compatible(&self.table, &sql_pre_collapse)
+                && jaccard_similarity(&self.normalized, &sql_lower) >= 0.8
+            {
+                return true;
+            }
+        }
+
         false
     }
+}
+
+/// Compute Jaccard similarity between two normalized SQL strings by splitting
+/// on non-word characters and comparing token sets. Returns a value in [0, 1].
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    let tokens_a: std::collections::HashSet<&str> = a
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let tokens_b: std::collections::HashSet<&str> = b
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = tokens_a.intersection(&tokens_b).count();
+    let union = tokens_a.union(&tokens_b).count();
+
+    intersection as f64 / union as f64
+}
+
+fn normalize_for_matching_pre_collapse(s: &str) -> String {
+    let s = strip_line_comments(s);
+    let s = strip_block_comments(&s);
+    let s = strip_where_one_equals_one(&s);
+    let s = replace_string_literals(&s);
+    let s = replace_number_literals(&s);
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Collapse consecutive whitespace into single spaces, replace ogsql-parser internal
