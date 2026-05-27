@@ -112,4 +112,34 @@ mod tests {
         assert!(body.contains("codeweb"));
         assert!(body.contains("app.js"));
     }
+
+    #[test]
+    fn test_serve_search_sql_endpoint() {
+        let port = 19881;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/nodes/search-sql?q=select");
+        child.kill().ok();
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["nodes"].is_array());
+        assert!(json["total"].is_number());
+    }
+
+    #[test]
+    fn test_serve_search_sql_empty_for_unrelated() {
+        let port = 19882;
+        let mut child = start_server(port);
+
+        let (status, body) = get(
+            port,
+            "/api/v1/nodes/search-sql?q=DROP+TABLE+nonexistent_xyz",
+        );
+        child.kill().ok();
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["total"], 0);
+    }
 }
