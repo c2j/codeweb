@@ -1208,7 +1208,7 @@ impl Visitor for ColumnAccessExtractor {
         let set_columns: Vec<String> = update
             .assignments
             .iter()
-            .map(|a| a.column.last().cloned().unwrap_or_default())
+            .filter_map(|a| a.columns.first()?.last().cloned())
             .collect();
 
         if !table_name.is_empty() {

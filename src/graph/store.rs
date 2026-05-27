@@ -45,6 +45,10 @@ pub struct GraphStore {
     schema_index: HashMap<String, Vec<NodeIndex>>,
     /// Index: EdgeCategory → list of EdgeIndex for fast edge-type filtering
     edge_category_index: HashMap<String, Vec<petgraph::graph::EdgeIndex>>,
+    /// Index: normalized SQL fingerprint → list of (NodeIndex, display_key)
+    /// Built from MappedStatement and JavaSql nodes for O(1) lookup.
+    #[serde(default)]
+    sql_fingerprint_index: HashMap<String, Vec<(NodeIndex, String)>>,
 }
 
 #[allow(dead_code)]
@@ -67,6 +71,7 @@ impl GraphStore {
             name_index: Vec::new(),
             schema_index: HashMap::new(),
             edge_category_index: HashMap::new(),
+            sql_fingerprint_index: HashMap::new(),
         }
     }
 
@@ -173,6 +178,45 @@ impl GraphStore {
                 .push(edge_idx);
         }
 
+        let mut sql_fingerprint_index: HashMap<String, Vec<(NodeIndex, String)>> = HashMap::new();
+        for idx in graph.node_indices() {
+            match &graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let display_key = format!("mapper:{}.{}", namespace, statement_id);
+                    sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    let display_key = format!("javasql:{}", ctx);
+                    sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                _ => {}
+            }
+        }
+
         Self {
             version: 5,
             project_name: project_name.to_string(),
@@ -189,6 +233,7 @@ impl GraphStore {
             name_index,
             schema_index,
             edge_category_index,
+            sql_fingerprint_index,
         }
     }
 
@@ -302,6 +347,46 @@ impl GraphStore {
                 .push(edge_idx);
         }
 
+        pb.set_message("fingerprint index...");
+        self.sql_fingerprint_index.clear();
+        for idx in self.graph.node_indices() {
+            match &self.graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let display_key = format!("mapper:{}.{}", namespace, statement_id);
+                    self.sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    let display_key = format!("javasql:{}", ctx);
+                    self.sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                _ => {}
+            }
+        }
+
         pb.finish_with_message(format!(
             "Indexes rebuilt ({} nodes, {} edges)",
             expected,
@@ -381,10 +466,50 @@ impl GraphStore {
         self.edge_category_index.get(category).map_or(&[], |v| v)
     }
 
+    pub fn sql_fingerprint_index(&self) -> &HashMap<String, Vec<(NodeIndex, String)>> {
+        &self.sql_fingerprint_index
+    }
+
+    /// Enrich the SQL fingerprint index with expanded dynamic SQL variants.
+    /// For each mapper node that has dynamic elements, expands all possible SQL variants
+    /// and adds their fingerprints to the index.
+    pub fn enrich_fingerprint_index_with_variants(
+        &mut self,
+        variant_map: &HashMap<NodeIndex, Vec<String>>,
+    ) {
+        for (node_idx, variant_sqls) in variant_map {
+            let display_key = match &self.graph[*node_idx] {
+                Node::MappedStatement {
+                    namespace,
+                    statement_id,
+                    ..
+                } => {
+                    format!("mapper:{}.{}", namespace, statement_id)
+                }
+                _ => continue,
+            };
+            for variant_sql in variant_sqls {
+                let fp = sql_fingerprint(variant_sql);
+                self.sql_fingerprint_index
+                    .entry(fp)
+                    .or_default()
+                    .push((*node_idx, display_key.clone()));
+            }
+        }
+    }
+
     /// Search nodes by SQL text content (substring match, case-insensitive).
     /// Checks MappedStatement.sql and JavaSql.sql fields.
     /// Returns Vec of (NodeIndex, display_key).
     pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String)> {
+        let normalized = normalize_for_matching(&query.to_lowercase());
+        let fp = blake3::hash(normalized.as_bytes()).to_hex().to_string();
+        if let Some(hits) = self.sql_fingerprint_index.get(&fp) {
+            if !hits.is_empty() {
+                return hits.clone();
+            }
+        }
+
         let prepared = PreparedQuery::new(query);
         let mut results = Vec::new();
         for idx in self.graph.node_indices() {
@@ -778,6 +903,11 @@ fn normalize_for_matching(s: &str) -> String {
     let s = s.trim_end_matches(';').to_string();
     let s = replace_xml_placeholders(&s);
     collapse_operator_spaces(&s)
+}
+
+fn sql_fingerprint(sql: &str) -> String {
+    let normalized = normalize_for_matching(&sql.to_lowercase());
+    blake3::hash(normalized.as_bytes()).to_hex().to_string()
 }
 
 /// Replace ogsql-parser internal placeholder markers with `?` for search matching.
@@ -1270,6 +1400,45 @@ impl GraphStore {
                 .entry(key.to_string())
                 .or_default()
                 .push(edge_idx);
+        }
+
+        self.sql_fingerprint_index.clear();
+        for idx in self.graph.node_indices() {
+            match &self.graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let display_key = format!("mapper:{}.{}", namespace, statement_id);
+                    self.sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    ..
+                } => {
+                    let fp = sql_fingerprint(sql_text);
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    let display_key = format!("javasql:{}", ctx);
+                    self.sql_fingerprint_index
+                        .entry(fp)
+                        .or_default()
+                        .push((idx, display_key));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3850,6 +4019,690 @@ mod tests {
 
             assert_eq!(store.search_by_sql("select * from users").len(), 1);
             assert_eq!(store.search_by_sql("select * from orders").len(), 1);
+        }
+
+        // --- SQL fingerprint index ---
+
+        #[test]
+        fn fingerprint_index_built_for_mapper_sql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // The fingerprint index should have at least one entry
+            assert!(!store.sql_fingerprint_index().is_empty());
+        }
+
+        #[test]
+        fn fingerprint_index_built_for_javasql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_javasql_node(
+                Some("Svc"),
+                Some("query"),
+                Some("SELECT * FROM orders WHERE status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            assert!(!store.sql_fingerprint_index().is_empty());
+        }
+
+        #[test]
+        fn fingerprint_fast_path_hits_exact_match() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Searching by SQL should find it via fingerprint fast-path
+            let results = store.search_by_sql("SELECT * FROM users WHERE id = ?");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].1, "mapper:dao.findById");
+        }
+
+        #[test]
+        fn fingerprint_miss_falls_back_to_matching() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__ AND status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Partial query won't match fingerprint, but should match via fallback
+            let results = store.search_by_sql("from users where id");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_index_empty_for_graph_without_sql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node("dao", "findById", None));
+            let store = GraphStore::from_graph("test", graph);
+
+            assert!(store.sql_fingerprint_index().is_empty());
+        }
+
+        #[test]
+        fn enrich_fingerprint_index_adds_variant_sqls() {
+            let mut graph = CodeGraph::new();
+            let idx = graph.add_node(make_mapper_node(
+                "dao",
+                "dynamicQuery",
+                Some("SELECT * FROM users WHERE 1=1"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            // Before enrichment, only the flat_sql fingerprint exists
+            let before_count = store.sql_fingerprint_index().len();
+
+            // Enrich with a variant SQL
+            let mut variant_map = std::collections::HashMap::new();
+            variant_map.insert(
+                idx,
+                vec![
+                    "SELECT * FROM users WHERE 1=1 AND status = ?".to_string(),
+                    "SELECT * FROM users WHERE 1=1 AND name = ?".to_string(),
+                ],
+            );
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // After enrichment, more fingerprints should exist
+            let after_count = store.sql_fingerprint_index().len();
+            assert!(
+                after_count > before_count,
+                "expected more fingerprints after enrichment, got {} before, {} after",
+                before_count,
+                after_count
+            );
+        }
+
+        #[test]
+        fn enriched_variant_searchable_via_fast_path() {
+            let mut graph = CodeGraph::new();
+            let idx = graph.add_node(make_mapper_node(
+                "dao",
+                "search",
+                Some("SELECT * FROM users WHERE 1=1"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            // Enrich with variant SQL
+            let mut variant_map = std::collections::HashMap::new();
+            variant_map.insert(
+                idx,
+                vec!["SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string()],
+            );
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // The variant should be findable via search_by_sql (fingerprint fast-path)
+            let results = store.search_by_sql("SELECT * FROM users WHERE 1=1 AND status = ?");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].1, "mapper:dao.search");
+        }
+
+        // --- SQL fingerprint index: backward compatibility ---
+
+        #[test]
+        fn fingerprint_bincode_roundtrip_preserves_index() {
+            let dir = TempDir::new().unwrap();
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            assert!(!store.sql_fingerprint_index().is_empty());
+            let fp_count = store.sql_fingerprint_index().len();
+
+            let path = dir.path().join("test.bincode");
+            store.save_bincode(&path).unwrap();
+            let loaded = GraphStore::load_bincode(&path).unwrap();
+
+            assert_eq!(loaded.sql_fingerprint_index().len(), fp_count);
+            // Fast-path should still work after round-trip
+            let results = loaded.search_by_sql("SELECT * FROM users WHERE id = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_backward_compat_empty_index_fallback() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            // Simulate old cache: manually clear the fingerprint index
+            store.sql_fingerprint_index.clear();
+
+            // search_by_sql should still work via fallback (PreparedQuery)
+            let results = store.search_by_sql("SELECT * FROM users WHERE id = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        // --- SQL fingerprint index: index rebuild ---
+
+        #[test]
+        fn fingerprint_index_rebuilt_by_ensure_consistency() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "find",
+                Some("SELECT * FROM users WHERE status = 'ACTIVE'"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            assert!(!store.sql_fingerprint_index().is_empty());
+            let fp_before = store.sql_fingerprint_index().clone();
+
+            // Clear core secondary indexes AND fingerprint index
+            store.node_summaries.clear();
+            store.name_index.clear();
+            store.type_tag_index.clear();
+            store.sql_fingerprint_index.clear();
+
+            assert!(store.sql_fingerprint_index().is_empty());
+
+            // ensure_consistency rebuilds all indexes including fingerprint index
+            store.ensure_consistency();
+
+            // Core indexes are rebuilt
+            assert!(!store.node_summaries.is_empty());
+            assert!(!store.name_index.is_empty());
+
+            // Fingerprint index is also rebuilt
+            assert!(!store.sql_fingerprint_index().is_empty());
+            assert_eq!(store.sql_fingerprint_index().len(), fp_before.len());
+        }
+
+        // --- SQL fingerprint index: multi-hit scenarios ---
+
+        #[test]
+        fn fingerprint_multiple_mappers_same_sql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findActive",
+                Some("SELECT * FROM users WHERE status = 'ACTIVE'"),
+            ));
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findActiveCopy",
+                Some("SELECT * FROM users WHERE status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Same SQL → same fingerprint → both in same bucket
+            let results = store.search_by_sql("SELECT * FROM users WHERE status = ?");
+            assert_eq!(
+                results.len(),
+                2,
+                "both mappers with identical SQL should be found"
+            );
+
+            let keys: Vec<&str> = results.iter().map(|(_, k)| k.as_str()).collect();
+            assert!(keys.contains(&"mapper:dao.findActive"));
+            assert!(keys.contains(&"mapper:dao.findActiveCopy"));
+        }
+
+        #[test]
+        fn fingerprint_mixed_mapper_and_javasql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findUser",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            graph.add_node(make_javasql_node(
+                Some("UserService"),
+                Some("getOrders"),
+                Some("SELECT * FROM orders WHERE user_id = ?"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            assert_eq!(store.sql_fingerprint_index().len(), 2);
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE id = ?")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM orders WHERE user_id = ?")
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn fingerprint_no_results_for_unrelated_query() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "dao",
+                "findUser",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("DELETE FROM products WHERE category = ?");
+            assert!(results.is_empty());
+        }
+
+        // --- SQL fingerprint index: enrich edge cases ---
+
+        #[test]
+        fn enrich_empty_variant_map_no_crash() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node("dao", "find", Some("SELECT 1")));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            let empty_map: HashMap<NodeIndex, Vec<String>> = HashMap::new();
+            store.enrich_fingerprint_index_with_variants(&empty_map);
+
+            // No crash, fingerprint count unchanged
+            assert_eq!(store.sql_fingerprint_index().len(), 1);
+        }
+
+        #[test]
+        fn enrich_skips_non_mapper_node_index() {
+            let mut graph = CodeGraph::new();
+            // Add a procedure node (not a mapper)
+            let proc_idx = graph.add_node(make_proc(Some("public"), None, "do_work"));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            let before_count = store.sql_fingerprint_index().len();
+
+            // Try to enrich with a non-mapper NodeIndex
+            let mut variant_map = HashMap::new();
+            variant_map.insert(proc_idx, vec!["SELECT 1".to_string()]);
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // Should be skipped — no new entries
+            assert_eq!(store.sql_fingerprint_index().len(), before_count);
+        }
+
+        #[test]
+        fn enrich_variant_sql_same_as_primary_adds_to_bucket() {
+            let mut graph = CodeGraph::new();
+            let idx = graph.add_node(make_mapper_node(
+                "dao",
+                "search",
+                Some("SELECT * FROM users"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            // Primary SQL already fingerprinted
+            let results_before = store.search_by_sql("SELECT * FROM users");
+            assert_eq!(results_before.len(), 1);
+
+            // Enrich with the SAME SQL as a variant
+            let mut variant_map = HashMap::new();
+            variant_map.insert(idx, vec!["SELECT * FROM users".to_string()]);
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // Same fingerprint, but now 2 entries in the bucket
+            let results_after = store.search_by_sql("SELECT * FROM users");
+            assert_eq!(results_after.len(), 2, "duplicate variant adds to bucket");
+        }
+
+        #[test]
+        fn enrich_multiple_variants_for_same_node() {
+            let mut graph = CodeGraph::new();
+            let idx = graph.add_node(make_mapper_node(
+                "dao",
+                "dynamicSearch",
+                Some("SELECT * FROM users WHERE 1=1"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            let mut variant_map = HashMap::new();
+            variant_map.insert(
+                idx,
+                vec![
+                    "SELECT * FROM users WHERE 1=1 AND status = ?".to_string(),
+                    "SELECT * FROM users WHERE 1=1 AND role = ?".to_string(),
+                    "SELECT * FROM users WHERE 1=1 AND dept = ?".to_string(),
+                ],
+            );
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // All 3 variants + 1 primary = 4 findable SQLs
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND status = ?")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND role = ?")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND dept = ?")
+                    .len(),
+                1
+            );
+        }
+
+        // --- SQL fingerprint index: SQL complexity ---
+
+        #[test]
+        fn fingerprint_multi_table_join() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "getUserWithOrders",
+                Some(
+                    "SELECT u.id, u.name, o.total \
+                     FROM users u \
+                     JOIN orders o ON u.id = o.user_id \
+                     WHERE u.status = __XML_PARAM_status__ \
+                     AND o.created > __XML_PARAM_date__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql(
+                "SELECT u.id, u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.status = ? AND o.created > ?"
+            );
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_subquery() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "findRecent",
+                Some(
+                    "SELECT * FROM orders WHERE user_id IN \
+                     (SELECT id FROM users WHERE status = __XML_PARAM_status__)",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql(
+                "SELECT * FROM orders WHERE user_id IN (SELECT id FROM users WHERE status = ?)",
+            );
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_case_when_expression() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "categorize",
+                Some(
+                    "SELECT id, \
+                     CASE WHEN score >= 90 THEN 'A' \
+                          WHEN score >= 80 THEN 'B' \
+                          ELSE 'C' END AS grade \
+                     FROM students \
+                     WHERE class_id = __XML_PARAM_classId__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql(
+                "SELECT id, CASE WHEN score >= ? THEN ? WHEN score >= ? THEN ? ELSE ? END AS grade FROM students WHERE class_id = ?"
+            );
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_group_by_having() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "salesReport",
+                Some(
+                    "SELECT region, SUM(amount) as total \
+                     FROM sales \
+                     WHERE year = __XML_PARAM_year__ \
+                     GROUP BY region \
+                     HAVING SUM(amount) > __XML_PARAM_threshold__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql(
+                "SELECT region, SUM(amount) as total FROM sales WHERE year = ? GROUP BY region HAVING SUM(amount) > ?"
+            );
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_update_with_set() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "updateStatus",
+                Some(
+                    "UPDATE users \
+                     SET status = __XML_PARAM_status__, updated_at = __XML_PARAM_now__ \
+                     WHERE id = __XML_PARAM_id__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results =
+                store.search_by_sql("UPDATE users SET status = ?, updated_at = ? WHERE id = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_delete_with_conditions() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "cleanOld",
+                Some(
+                    "DELETE FROM logs \
+                     WHERE created < __XML_PARAM_cutoff__ \
+                     AND level = __XML_PARAM_level__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results = store.search_by_sql("DELETE FROM logs WHERE created < ? AND level = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_insert_with_values() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "insertUser",
+                Some(
+                    "INSERT INTO users (name, email, status) \
+                     VALUES (__XML_PARAM_name__, __XML_PARAM_email__, 'ACTIVE')",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            let results =
+                store.search_by_sql("INSERT INTO users (name, email, status) VALUES (?, ?, ?)");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_xml_raw_placeholder() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "dynamicSort",
+                Some(
+                    "SELECT * FROM users \
+                     WHERE status = __XML_PARAM_status__ \
+                     ORDER BY __XML_RAW_sortColumn__",
+                ),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // __XML_RAW_*__ is also replaced with ? in normalize_for_matching
+            let results = store.search_by_sql("SELECT * FROM users WHERE status = ? ORDER BY ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_where_one_equals_one_stripped() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "search",
+                Some("SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // normalize_for_matching strips "WHERE 1=1", so the fingerprint
+            // should match a query without it
+            let results = store.search_by_sql("SELECT * FROM users WHERE status = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn fingerprint_comment_stripped() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(make_mapper_node(
+                "mapper",
+                "findActive",
+                Some("SELECT * FROM users /* active only */ WHERE status = 'ACTIVE'"),
+            ));
+            let store = GraphStore::from_graph("test", graph);
+
+            // Comments are stripped in normalize_for_matching
+            let results = store.search_by_sql("SELECT * FROM users WHERE status = ?");
+            assert_eq!(results.len(), 1);
+        }
+
+        // --- SQL fingerprint index: integration (builder + store) ---
+
+        #[test]
+        fn fingerprint_integration_builder_structured_variants() {
+            // Simulate what project/mod.rs does: build graph, create store, enrich
+            let mut graph = CodeGraph::new();
+            let mut _mapper_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+
+            // Add a static mapper
+            let static_idx = graph.add_node(make_mapper_node(
+                "dao",
+                "findById",
+                Some("SELECT * FROM users WHERE id = __XML_PARAM_id__"),
+            ));
+            _mapper_index.insert("dao.findById".to_string(), static_idx);
+
+            // Add a dynamic mapper (simulating what builder creates)
+            let dynamic_idx = graph.add_node(make_mapper_node(
+                "dao",
+                "search",
+                Some("SELECT * FROM users WHERE 1=1"),
+            ));
+            _mapper_index.insert("dao.search".to_string(), dynamic_idx);
+
+            // Build store (primary fingerprints built here)
+            let mut store = GraphStore::from_graph("test", graph);
+            assert_eq!(store.sql_fingerprint_index().len(), 2);
+
+            // Simulate variant expansion result from builder
+            let mut variant_map = HashMap::new();
+            variant_map.insert(
+                dynamic_idx,
+                vec![
+                    "SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string(),
+                    "SELECT * FROM users WHERE 1=1 AND role = __XML_PARAM_role__".to_string(),
+                    "SELECT * FROM users WHERE 1=1 AND dept = __XML_PARAM_dept__ AND status = __XML_PARAM_status__".to_string(),
+                ],
+            );
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // Static mapper: found via primary fingerprint
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE id = ?")
+                    .len(),
+                1
+            );
+
+            // Dynamic variants: found via enriched fingerprints
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND status = ?")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND role = ?")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND dept = ? AND status = ?")
+                    .len(),
+                1
+            );
+
+            // Original flat_sql still findable
+            assert_eq!(
+                store.search_by_sql("SELECT * FROM users WHERE 1=1").len(),
+                1
+            );
+        }
+
+        #[test]
+        fn fingerprint_integration_roundtrip_with_variants() {
+            let dir = TempDir::new().unwrap();
+
+            let mut graph = CodeGraph::new();
+            let idx = graph.add_node(make_mapper_node(
+                "dao",
+                "search",
+                Some("SELECT * FROM users WHERE 1=1"),
+            ));
+            let mut store = GraphStore::from_graph("test", graph);
+
+            let mut variant_map = HashMap::new();
+            variant_map.insert(
+                idx,
+                vec!["SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string()],
+            );
+            store.enrich_fingerprint_index_with_variants(&variant_map);
+
+            // Save + reload
+            let path = dir.path().join("test.bincode");
+            store.save_bincode(&path).unwrap();
+            let loaded = GraphStore::load_bincode(&path).unwrap();
+
+            // Both primary and variant fingerprints survive
+            assert_eq!(
+                loaded.search_by_sql("SELECT * FROM users WHERE 1=1").len(),
+                1
+            );
+            assert_eq!(
+                loaded
+                    .search_by_sql("SELECT * FROM users WHERE 1=1 AND status = ?")
+                    .len(),
+                1
+            );
         }
     }
 }
