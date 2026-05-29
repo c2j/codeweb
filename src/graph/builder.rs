@@ -1489,18 +1489,18 @@ impl GraphBuilder {
                         Some(trimmed.to_string())
                     }
                 };
-                let node = Node::MappedStatement {
-                    namespace: namespace.clone(),
-                    statement_id: stmt.id.clone(),
-                    kind: kind_label.to_string(),
-                    xml_file: (*xml_path).clone(),
-                    line: stmt.line,
-                    sql: sql_text,
-                };
-                let node_idx = graph.add_node(node);
-
                 let mapper_key = format!("{}.{}", namespace, stmt.id);
-                mapper_index.insert(mapper_key, node_idx);
+                let node_idx = *mapper_index.entry(mapper_key.clone()).or_insert_with(|| {
+                    let node = Node::MappedStatement {
+                        namespace: namespace.clone(),
+                        statement_id: stmt.id.clone(),
+                        kind: kind_label.to_string(),
+                        xml_file: (*xml_path).clone(),
+                        line: stmt.line,
+                        sql: sql_text,
+                    };
+                    graph.add_node(node)
+                });
 
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
@@ -1619,6 +1619,7 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         source_paths: &[PathBuf],
     ) {
+        let mut javasql_seen: HashSet<(PathBuf, usize)> = HashSet::new();
         for java_file in java_files {
             let full_path = PathBuf::from(&java_file.result.file_path);
             let rel_path = source_paths
@@ -1629,6 +1630,9 @@ impl GraphBuilder {
             let java_path = Arc::new(rel_path.to_path_buf());
 
             for extraction in &java_file.result.extractions {
+                if !javasql_seen.insert(((*java_path).clone(), extraction.origin.line)) {
+                    continue;
+                }
                 let method_label =
                     crate::parser::java_loader::extraction_method_label(&extraction.origin.method);
                 let sql_text = {
@@ -2169,19 +2173,20 @@ impl GraphBuilder {
 
         for result in java_results {
             for class in &result.classes {
-                let node = Node::JavaClass {
-                    fqn: class.fqn.clone(),
-                    name: class.name.clone(),
-                    package: if class.package.is_empty() {
-                        None
-                    } else {
-                        Some(class.package.clone())
-                    },
-                    file: class.file.clone(),
-                    line: class.line,
-                };
-                let idx = graph.add_node(node);
-                class_index.insert(class.fqn.clone(), idx);
+                class_index.entry(class.fqn.clone()).or_insert_with(|| {
+                    let node = Node::JavaClass {
+                        fqn: class.fqn.clone(),
+                        name: class.name.clone(),
+                        package: if class.package.is_empty() {
+                            None
+                        } else {
+                            Some(class.package.clone())
+                        },
+                        file: class.file.clone(),
+                        line: class.line,
+                    };
+                    graph.add_node(node)
+                });
             }
         }
 
@@ -2234,16 +2239,17 @@ impl GraphBuilder {
         for result in java_results {
             for method in &result.methods {
                 let method_fqn = format!("{}.{}", method.class_fqn, method.name);
-                let node = Node::JavaMethod {
-                    fqn: method_fqn.clone(),
-                    class_fqn: method.class_fqn.clone(),
-                    name: method.name.clone(),
-                    signature: method.signature.clone(),
-                    file: method.file.clone(),
-                    line: method.line,
-                };
-                let method_idx = graph.add_node(node);
-                method_index.insert(method_fqn, method_idx);
+                let method_idx = *method_index.entry(method_fqn.clone()).or_insert_with(|| {
+                    let node = Node::JavaMethod {
+                        fqn: method_fqn.clone(),
+                        class_fqn: method.class_fqn.clone(),
+                        name: method.name.clone(),
+                        signature: method.signature.clone(),
+                        file: method.file.clone(),
+                        line: method.line,
+                    };
+                    graph.add_node(node)
+                });
 
                 if let Some(&class_idx) = class_index.get(&method.class_fqn) {
                     graph.add_edge(class_idx, method_idx, Edge::ContainsMethod);
@@ -3517,6 +3523,263 @@ mod tests {
         assert!(
             unresolved.is_empty(),
             "DBE_SCHEDULER.enable unresolved node should be filtered as system call"
+        );
+    }
+
+    #[test]
+    fn duplicate_ibatis_files_produce_single_mapper_node() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        let stmt = ParsedStatement {
+            id: "findById".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: "SELECT * FROM users WHERE id = #{id}".to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: None,
+        };
+
+        let make_parsed_file = |path_str: &str| crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from(path_str),
+            result: ParsedMapper {
+                file_path: Some(path_str.to_string()),
+                namespace: "com.example.UserMapper".to_string(),
+                statements: vec![stmt.clone()],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let ibatis_files = vec![
+            make_parsed_file("/a/UserMapper.xml"),
+            make_parsed_file("/b/UserMapper.xml"),
+        ];
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            &ibatis_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+
+        let mapper_nodes: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &ctx.graph[*i],
+                    Node::MappedStatement { statement_id, namespace, .. }
+                    if *statement_id == "findById" && *namespace == "com.example.UserMapper"
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            mapper_nodes.len(),
+            1,
+            "duplicate ibatis files with same namespace.statement_id should produce exactly 1 MappedStatement node, got {}",
+            mapper_nodes.len()
+        );
+    }
+
+    #[test]
+    fn duplicate_java_files_produce_single_javasql_node() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::java::{
+            ExtractedSql, ExtractionMethod, JavaExtractResult, ParameterStyle, SqlKind, SqlOrigin,
+        };
+
+        let extraction = ExtractedSql {
+            sql: "SELECT * FROM users".to_string(),
+            origin: SqlOrigin {
+                method: ExtractionMethod::Annotation,
+                class_name: Some("UserDao".to_string()),
+                method_name: Some("findAll".to_string()),
+                annotation_name: None,
+                api_method_name: None,
+                variable_name: None,
+                line: 10,
+                column: 0,
+            },
+            sql_kind: SqlKind::NativeSql,
+            parameter_style: ParameterStyle::None,
+            is_concatenated: false,
+            is_text_block: false,
+            parse_result: None,
+        };
+
+        let make_java_file =
+            |path_str: &str, file_path: &str| crate::parser::java_loader::JavaParsedFile {
+                path: PathBuf::from(path_str),
+                result: JavaExtractResult {
+                    file_path: file_path.to_string(),
+                    extractions: vec![extraction.clone()],
+                    errors: vec![],
+                },
+                content_hash: "abc".to_string(),
+            };
+
+        // Same file_path inside result — simulates same file scanned twice via overlapping dirs
+        let java_files = vec![
+            make_java_file("/a/UserDao.java", "/src/UserDao.java"),
+            make_java_file("/b/UserDao.java", "/src/UserDao.java"),
+        ];
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_java_nodes_from_parsed(
+            &java_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+
+        let javasql_nodes: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &ctx.graph[*i],
+                    Node::JavaSql { class_name, method_name, line, .. }
+                    if *class_name == Some("UserDao".to_string())
+                        && *method_name == Some("findAll".to_string())
+                        && *line == 10
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            javasql_nodes.len(),
+            1,
+            "duplicate Java extractions with same file+line should produce exactly 1 JavaSql node, got {}",
+            javasql_nodes.len()
+        );
+    }
+
+    #[test]
+    fn duplicate_java_classes_produce_single_class_node() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::java_method::{JavaClassInfo, JavaParseResult};
+
+        let class = JavaClassInfo {
+            fqn: "com.example.UserDao".to_string(),
+            name: "UserDao".to_string(),
+            package: "com.example".to_string(),
+            extends: None,
+            implements: vec![],
+            file: PathBuf::from("/a/UserDao.java"),
+            line: 3,
+        };
+
+        let make_result = |path_str: &str| JavaParseResult {
+            file: PathBuf::from(path_str),
+            package: "com.example".to_string(),
+            imports: vec![],
+            classes: vec![class.clone()],
+            methods: vec![],
+            content_hash: "abc".to_string(),
+        };
+
+        let results = vec![
+            make_result("/a/UserDao.java"),
+            make_result("/b/UserDao.java"),
+        ];
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_java_method_nodes_from_parsed(
+            &results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+        );
+
+        let class_nodes: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &ctx.graph[*i],
+                    Node::JavaClass { fqn, .. } if fqn == "com.example.UserDao"
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            class_nodes.len(),
+            1,
+            "duplicate JavaClassInfo with same FQN should produce exactly 1 JavaClass node, got {}",
+            class_nodes.len()
+        );
+    }
+
+    #[test]
+    fn duplicate_java_methods_produce_single_method_node() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::java_method::{JavaClassInfo, JavaMethodInfo, JavaParseResult};
+
+        let class = JavaClassInfo {
+            fqn: "com.example.UserDao".to_string(),
+            name: "UserDao".to_string(),
+            package: "com.example".to_string(),
+            extends: None,
+            implements: vec![],
+            file: PathBuf::from("/a/UserDao.java"),
+            line: 3,
+        };
+
+        let method = JavaMethodInfo {
+            name: "findAll".to_string(),
+            class_fqn: "com.example.UserDao".to_string(),
+            signature: "List<User> findAll()".to_string(),
+            file: PathBuf::from("/a/UserDao.java"),
+            line: 8,
+            calls: vec![],
+        };
+
+        let make_result = |path_str: &str| JavaParseResult {
+            file: PathBuf::from(path_str),
+            package: "com.example".to_string(),
+            imports: vec![],
+            classes: vec![class.clone()],
+            methods: vec![method.clone()],
+            content_hash: "abc".to_string(),
+        };
+
+        let results = vec![
+            make_result("/a/UserDao.java"),
+            make_result("/b/UserDao.java"),
+        ];
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_java_method_nodes_from_parsed(
+            &results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+        );
+
+        let method_nodes: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &ctx.graph[*i],
+                    Node::JavaMethod { fqn, .. } if fqn == "com.example.UserDao.findAll"
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            method_nodes.len(),
+            1,
+            "duplicate JavaMethodInfo with same FQN should produce exactly 1 JavaMethod node, got {}",
+            method_nodes.len()
         );
     }
 }

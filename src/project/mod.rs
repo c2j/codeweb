@@ -440,17 +440,52 @@ impl Project {
 
 fn scan_with_fingerprints(paths: &[PathBuf], exclude: &[String]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for path in paths {
         let scanned = parser::scan_directory(path, exclude);
         for p in &scanned.sql_files {
-            files.push((p.clone(), FileType::Sql));
+            if seen.insert(p.clone()) {
+                files.push((p.clone(), FileType::Sql));
+            }
         }
         for p in &scanned.java_files {
-            files.push((p.clone(), FileType::Java));
+            if seen.insert(p.clone()) {
+                files.push((p.clone(), FileType::Java));
+            }
         }
         for p in &scanned.xml_files {
-            files.push((p.clone(), FileType::Xml));
+            if seen.insert(p.clone()) {
+                files.push((p.clone(), FileType::Xml));
+            }
         }
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn scan_with_fingerprints_deduplicates_overlapping_paths() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src_dir = tmpdir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("test.sql"), "SELECT 1;").unwrap();
+
+        // Pass both the parent dir and the child dir — test.sql should appear only once
+        let paths = vec![tmpdir.path().to_path_buf(), src_dir.clone()];
+        let result = scan_with_fingerprints(&paths, &[]);
+
+        let sql_count = result
+            .iter()
+            .filter(|(p, ft)| *ft == FileType::Sql && p.file_name().unwrap() == "test.sql")
+            .count();
+        assert_eq!(
+            sql_count, 1,
+            "test.sql should appear exactly once even with overlapping scan paths, got {}",
+            sql_count
+        );
+    }
 }

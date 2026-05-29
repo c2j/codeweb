@@ -1,9 +1,0 @@
-[project]
-name = "test-project"
-
-[analysis]
-paths = ["lib/codeweb-complex-demo"]
-
-[store]
-path = ".codeweb/store.bincode"
-format = "bincode"
