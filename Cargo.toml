@@ -18,7 +18,7 @@ serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_
 search-sql-v2 = []
 
 [dependencies]
-ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", rev = "088eb4d6", features = ["ibatis", "java"] }
+ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", rev = "866554e", features = ["ibatis", "java"] }
 petgraph = { version = "0.7", features = ["serde-1"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
