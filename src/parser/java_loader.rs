@@ -137,3 +137,132 @@ pub fn extraction_method_label(method: &ExtractionMethod) -> &'static str {
         ExtractionMethod::Constant => "constant",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_java(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::with_suffix(".java").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn load_java_file_annotation_extraction() {
+        let source = r#"package com.example;
+import org.apache.ibatis.annotations.Select;
+public interface UserDao {
+    @Select("SELECT * FROM users WHERE id = #{id}")
+    Object findById(Long id);
+}"#;
+        let f = write_temp_java(source);
+        let (result, hash) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
+            .expect("should parse");
+
+        assert!(!result.extractions.is_empty(), "should find SQL extractions");
+        let sql_found = result.extractions.iter().any(|e| e.sql.contains("SELECT"));
+        assert!(sql_found, "at least one extraction should contain SELECT");
+        assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn load_java_file_jdbc_extraction() {
+        let source = r#"package com.example;
+import java.sql.*;
+public class ReportDao {
+    public void find() throws SQLException {
+        PreparedStatement ps = conn.prepareStatement("SELECT * FROM t_reports WHERE id = ?");
+        ps.setInt(1, 42);
+    }
+}"#;
+        let f = write_temp_java(source);
+        let (result, _) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
+            .expect("should parse");
+
+        assert!(!result.extractions.is_empty(), "JDBC extraction should find SQL");
+        let found = result.extractions.iter().any(|e| {
+            e.sql.contains("SELECT") && e.sql.contains("t_reports")
+        });
+        assert!(found, "should extract SELECT with t_reports");
+    }
+
+    #[test]
+    fn load_java_file_no_sql() {
+        let source = r#"package com.example;
+public class Util {
+    public String hello() { return "world"; }
+}"#;
+        let f = write_temp_java(source);
+        let (result, _) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
+            .expect("should parse");
+
+        assert!(result.extractions.is_empty(), "plain Java should have no extractions");
+    }
+
+    #[test]
+    fn parse_java_combined_both_results() {
+        // Use JDBC prepareStatement which is reliably extracted
+        let source = r#"package com.example;
+import java.sql.*;
+public class Service {
+    public void doWork() throws SQLException {
+        PreparedStatement ps = conn.prepareStatement("SELECT * FROM t_orders WHERE id = ?");
+    }
+}"#;
+        let f = write_temp_java(source);
+        let combined = parse_java_combined_with_config(f.path(), &JavaExtractConfig::default())
+            .expect("should parse combined");
+
+        assert!(
+            !combined.sql_result.extractions.is_empty(),
+            "should extract SQL from JDBC"
+        );
+        assert!(
+            !combined.method_result.methods.is_empty(),
+            "should extract methods"
+        );
+        assert!(
+            !combined.method_result.classes.is_empty(),
+            "should extract classes"
+        );
+        assert!(!combined.content_hash.is_empty());
+    }
+
+    #[test]
+    fn extraction_method_label_correct() {
+        assert_eq!(extraction_method_label(&ExtractionMethod::Annotation), "annotation");
+        assert_eq!(extraction_method_label(&ExtractionMethod::MethodCall), "method_call");
+        assert_eq!(extraction_method_label(&ExtractionMethod::Constant), "constant");
+    }
+
+    #[test]
+    fn load_java_file_nonexistent_path() {
+        let result = load_java_file_with_config(
+            Path::new("/nonexistent/File.java"),
+            &JavaExtractConfig::default(),
+        );
+        assert!(result.is_err(), "nonexistent path should return Err");
+    }
+
+    #[test]
+    fn load_java_file_jdbc_sql_has_parse_result() {
+        // JDBC prepareStatement with SELECT — reliably extracted with parse_result
+        let source = r#"package com.example;
+import java.sql.*;
+public class Dao {
+    public void run() throws SQLException {
+        PreparedStatement ps = conn.prepareStatement("SELECT * FROM t_users WHERE id = ?");
+    }
+}"#;
+        let f = write_temp_java(source);
+        let (result, _) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
+            .expect("should parse");
+
+        assert!(!result.extractions.is_empty(), "should find extractions");
+        let with_pr = result.extractions.iter().any(|e| e.parse_result.is_some());
+        assert!(with_pr, "at least one extraction should have parse_result");
+    }
+}

@@ -88,3 +88,110 @@ fn parse_file(path: &Path) -> std::result::Result<(Vec<StatementInfo>, String), 
 
     Ok((stmts, content_hash))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_sql(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn parse_file_create_procedure() {
+        let sql = r#"CREATE OR REPLACE PROCEDURE pkg_users.get_user(p_id IN INTEGER)
+AS
+BEGIN
+    SELECT * FROM t_users WHERE id = p_id;
+END;
+/"#;
+        let f = write_temp_sql(sql);
+        let (stmts, hash) = parse_file(f.path()).expect("should parse");
+
+        assert!(!stmts.is_empty(), "should find statements");
+        assert!(!hash.is_empty(), "should have content hash");
+    }
+
+    #[test]
+    fn parse_file_call_statement() {
+        let sql = r#"CREATE OR REPLACE PROCEDURE pkg_orders.process_order(p_id INTEGER)
+AS
+BEGIN
+    CALL pkg_inventory.check_stock(p_id);
+END;
+/"#;
+        let f = write_temp_sql(sql);
+        let (stmts, _) = parse_file(f.path()).expect("should parse");
+
+        assert!(!stmts.is_empty(), "should find the CREATE PROCEDURE");
+    }
+
+    #[test]
+    fn parse_file_multiple_statements() {
+        let sql = r#"CREATE TABLE t_users (id INTEGER PRIMARY KEY, name VARCHAR(100));
+
+CREATE OR REPLACE PROCEDURE pkg_users.list_users()
+AS
+BEGIN
+    SELECT * FROM t_users;
+END;
+/"#;
+        let f = write_temp_sql(sql);
+        let (stmts, _) = parse_file(f.path()).expect("should parse");
+
+        assert!(stmts.len() >= 2, "should find at least 2 statements, got {}", stmts.len());
+    }
+
+    #[test]
+    fn parse_file_whitespace_only() {
+        let f = write_temp_sql("   \n\n  \t  \n");
+        let result = parse_file(f.path());
+        assert!(result.is_ok(), "whitespace-only SQL should not panic");
+    }
+
+    #[test]
+    fn parse_file_nonexistent_path() {
+        assert!(
+            parse_file(Path::new("/nonexistent/file.sql")).is_err(),
+            "nonexistent file should return Err"
+        );
+    }
+
+    #[test]
+    fn parse_file_invalid_encoding_no_panic() {
+        let mut f = tempfile::NamedTempFile::with_suffix(".sql").unwrap();
+        // Write invalid UTF-8 bytes — from_utf8_lossy handles this
+        f.write_all(&[0xFF, 0xFE, 0x00, 0x00]).unwrap();
+        f.flush().unwrap();
+        // Must not panic; Ok or Err both acceptable
+        let _ = parse_file(f.path());
+    }
+
+    #[test]
+    fn parse_sql_files_batch() {
+        let f1 = write_temp_sql("CREATE PROCEDURE proc1() AS BEGIN NULL; END; /");
+        let f2 = write_temp_sql("CREATE PROCEDURE proc2() AS BEGIN NULL; END; /");
+
+        let results = parse_sql_files(&[f1.path().to_path_buf(), f2.path().to_path_buf()]);
+        assert_eq!(results.len(), 2, "should parse both files");
+
+        for pf in &results {
+            assert!(!pf.statements.is_empty(), "each file should have statements");
+        }
+    }
+
+    #[test]
+    fn parse_sql_files_skips_unparseable() {
+        let valid = write_temp_sql("CREATE PROCEDURE proc1() AS BEGIN NULL; END; /");
+
+        let results = parse_sql_files(&[
+            valid.path().to_path_buf(),
+            PathBuf::from("/nonexistent/file.sql"),
+        ]);
+        assert_eq!(results.len(), 1, "unparseable file should be filtered out");
+    }
+}
