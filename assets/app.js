@@ -4,6 +4,8 @@ let selectedNodeId = null;
 let currentTraceKey = null;
 let searchMode = 'name'; // 'name' or 'sql'
 let showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
+let currentOffset = 0;
+let isLoading = false;
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -67,6 +69,8 @@ async function init() {
 
 async function loadNodes(search) {
   const q = search || document.getElementById('search-input').value;
+  currentOffset = 0;
+  isLoading = true;
   let data;
   if (searchMode === 'sql' && q) {
     data = await api('/nodes/search-sql?q=' + encodeURIComponent(q));
@@ -76,11 +80,32 @@ async function loadNodes(search) {
     data = await api('/nodes?limit=100&offset=0&search=' + encodeURIComponent(q));
     allNodes = data.nodes;
     allNodesTotal = data.total;
+    currentOffset = data.nodes.length;
   } else {
     data = await api('/nodes?limit=100&offset=0');
     allNodes = data.nodes;
     allNodesTotal = data.total;
+    currentOffset = data.nodes.length;
   }
+  isLoading = false;
+  renderVirtualList();
+  updateNodeCount();
+}
+
+async function loadMore() {
+  if (isLoading || allNodes.length >= allNodesTotal) return;
+  if (searchMode === 'sql') return;
+  isLoading = true;
+  const q = document.getElementById('search-input').value;
+  let url = '/nodes?limit=100&offset=' + currentOffset;
+  if (q) url += '&search=' + encodeURIComponent(q);
+  try {
+    const data = await api(url);
+    allNodes = allNodes.concat(data.nodes);
+    allNodesTotal = data.total;
+    currentOffset += data.nodes.length;
+  } catch (_) {}
+  isLoading = false;
   renderVirtualList();
   updateNodeCount();
 }
@@ -240,7 +265,13 @@ function hideDetail() {
   renderVirtualList();
 }
 
-document.getElementById('node-list').addEventListener('scroll', renderVirtualList);
+document.getElementById('node-list').addEventListener('scroll', function() {
+  renderVirtualList();
+  const el = this;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - ITEM_HEIGHT * BUFFER) {
+    loadMore();
+  }
+});
 
 document.querySelectorAll('.panel-divider').forEach(divider => {
   let startX, startLeftWidth, leftPanel;
