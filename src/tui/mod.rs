@@ -1,4 +1,5 @@
 pub mod app;
+pub mod theme;
 
 use crate::error::Result;
 

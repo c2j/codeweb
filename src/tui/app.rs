@@ -2,6 +2,7 @@ use crate::graph::key::NodeKey;
 use crate::graph::traverse;
 use crate::graph::Node;
 use crate::project::Project;
+use crate::tui::theme::TuiTheme;
 use petgraph::graph::NodeIndex;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -15,6 +16,7 @@ pub struct App {
     project: Project,
     screen: Screen,
     should_quit: bool,
+    theme: TuiTheme,
 
     // Explorer: search + node list
     search_query: String,
@@ -55,6 +57,7 @@ impl App {
             project,
             screen: Screen::Explorer,
             should_quit: false,
+            theme: TuiTheme::detect(),
             search_query: String::new(),
             search_mode: false,
             sql_search_mode: false,
@@ -183,7 +186,7 @@ impl App {
                 t!("degree.total"),
                 in_deg + out_deg
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.fg_secondary()),
         )));
         lines.push(Line::from(""));
 
@@ -192,7 +195,7 @@ impl App {
             for attr_line in attr_lines {
                 lines.push(Line::from(Span::styled(
                     attr_line,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(self.theme.fg_secondary()),
                 )));
             }
             lines.push(Line::from(""));
@@ -219,7 +222,7 @@ impl App {
                 lines.push(Line::from(Span::styled(
                     t!("none").to_string(),
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(self.theme.fg_empty())
                         .add_modifier(Modifier::DIM),
                 )));
             } else {
@@ -235,13 +238,13 @@ impl App {
                     for node_label in display_nodes {
                         lines.push(Line::from(Span::styled(
                             format!("      {}", node_label),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(self.theme.fg_dim()),
                         )));
                     }
                     if nodes.len() > 8 {
                         lines.push(Line::from(Span::styled(
                             format!("      ... +{} more", nodes.len() - 8),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(self.theme.fg_dim()),
                         )));
                     }
                 }
@@ -603,7 +606,7 @@ impl App {
                     let out_label = t!("degree.out").to_string();
                     spans.push(Span::styled(
                         format!(" [{}:{} {}:{}]", in_label, in_deg, out_label, out_deg),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.theme.fg_dim()),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -680,56 +683,56 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.procedures")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.procedures)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.functions")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.functions)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.tables")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.tables)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.views")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.views)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.mappers")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.mappers)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.java_methods")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.java_methods)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.edges")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.edges)),
             ]),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", t!("stat.files")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.fg_secondary()),
                 ),
                 Span::raw(format!("{}", stats.files)),
             ]),
@@ -802,13 +805,13 @@ impl App {
             lines.push(Line::from(Span::styled(
                 t!("none").to_string(),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(self.theme.fg_empty())
                     .add_modifier(Modifier::DIM),
             )));
         } else {
             for (i, caller) in chain.callers.iter().enumerate() {
                 let is_last = i == chain.callers.len() - 1;
-                tree_node_to_lines(caller, graph, "  ", is_last, &mut lines);
+                tree_node_to_lines(caller, graph, "  ", is_last, &mut lines, &self.theme);
             }
         }
 
@@ -840,7 +843,7 @@ impl App {
         for attr_line in attr_lines {
             lines.push(Line::from(Span::styled(
                 format!("  {}", attr_line),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.fg_secondary()),
             )));
         }
 
@@ -853,13 +856,13 @@ impl App {
             lines.push(Line::from(Span::styled(
                 t!("none").to_string(),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(self.theme.fg_empty())
                     .add_modifier(Modifier::DIM),
             )));
         } else {
             for (i, callee) in chain.callees.iter().enumerate() {
                 let is_last = i == chain.callees.len() - 1;
-                tree_node_to_lines(callee, graph, "  ", is_last, &mut lines);
+                tree_node_to_lines(callee, graph, "  ", is_last, &mut lines, &self.theme);
             }
         }
 
@@ -901,6 +904,7 @@ fn tree_node_to_lines(
     prefix: &str,
     is_last: bool,
     lines: &mut Vec<Line>,
+    theme: &TuiTheme,
 ) {
     let connector = if is_last { "└── " } else { "├── " };
     let (tag, color) = node_tag(&graph[node.idx]);
@@ -910,11 +914,11 @@ fn tree_node_to_lines(
         Span::styled(
             connector.to_string(),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme.fg_dim())
                 .add_modifier(Modifier::DIM),
         ),
         Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
-        Span::styled(key.to_string(), Style::default().fg(Color::Black)),
+        Span::styled(key.to_string(), Style::default().fg(theme.fg_primary())),
     ]));
 
     let child_prefix = if is_last {
@@ -924,7 +928,7 @@ fn tree_node_to_lines(
     };
     for (i, child) in node.children.iter().enumerate() {
         let child_last = i == node.children.len() - 1;
-        tree_node_to_lines(child, graph, &child_prefix, child_last, lines);
+        tree_node_to_lines(child, graph, &child_prefix, child_last, lines, theme);
     }
 }
 
