@@ -39,7 +39,10 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store().stats())
+    let mut stats =
+        serde_json::to_value(state.store().stats()).unwrap_or_else(|_| serde_json::json!({}));
+    stats["project_name"] = serde_json::Value::String(state.project_name().to_string());
+    Json(stats)
 }
 
 #[derive(serde::Deserialize)]
@@ -144,7 +147,7 @@ async fn search_sql(
     let results = state.store().search_by_sql(&query.q);
     let nodes: Vec<Value> = results
         .into_iter()
-        .map(|(idx, display_key)| {
+        .map(|(idx, display_key, score)| {
             let node = &graph[idx];
             let detail = node_type_tag(node);
             let in_deg = graph
@@ -177,6 +180,7 @@ async fn search_sql(
                 "id": idx.index(),
                 "key": display_key,
                 "type": detail,
+                "score": (score * 100.0).round() / 100.0,
                 "in_degree": in_deg,
                 "out_degree": out_deg,
                 "body_sql": body_sql,
