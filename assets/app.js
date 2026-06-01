@@ -25,6 +25,10 @@ async function api(path) {
 
 async function init() {
   const stats = await api('/stats');
+  const projectName = stats.project_name || 'codeweb';
+  document.title = 'Codeweb-' + projectName;
+  document.getElementById('title').textContent = 'codeweb';
+  document.getElementById('project-name').textContent = projectName;
   document.getElementById('stats-bar').innerHTML = [
     stats.procedures + ' procs',
     stats.functions + ' funcs',
@@ -170,6 +174,7 @@ function renderVirtualList() {
       '<div class="node-item-row">' +
       '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
       '<span class="node-key" title="' + esc(n.key) + '">' + esc(n.key) + '</span>' +
+      (n.score != null ? '<span class="node-score">' + Math.round(n.score * 100) + '%</span>' : '') +
       '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span>' +
       '</div>' + snippet + '</div>';
   }
