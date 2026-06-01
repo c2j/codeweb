@@ -549,16 +549,14 @@ impl GraphStore {
                     class_name,
                     method_name,
                     ..
-                } => {
-                    if prepared.matches(sql_text) {
-                        let ctx = match (class_name, method_name) {
-                            (Some(c), Some(m)) => format!("{}.{}", c, m),
-                            (Some(c), None) => c.clone(),
-                            (None, Some(m)) => m.clone(),
-                            (None, None) => "?".to_string(),
-                        };
-                        results.push((idx, format!("javasql:{}", ctx)));
-                    }
+                } if prepared.matches(sql_text) => {
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    results.push((idx, format!("javasql:{}", ctx)));
                 }
                 Node::Procedure { id, body_sql, .. } => {
                     for sql in body_sql {

@@ -326,6 +326,7 @@ fn main() {
         .spawn_handler(|thread| {
             std::thread::Builder::new()
                 .name(thread.name().unwrap_or_default().to_string())
+                .stack_size(4 * 1024 * 1024)
                 .spawn(move || {
                     #[cfg(target_os = "macos")]
                     {
