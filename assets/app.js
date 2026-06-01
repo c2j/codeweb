@@ -134,10 +134,29 @@ function renderVirtualList() {
   const viewHeight = list.clientHeight;
   const count = allNodes.length;
 
-  const startIdx = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER);
-  const endIdx = Math.min(count, Math.ceil((scrollTop + viewHeight) / ITEM_HEIGHT) + BUFFER);
+  // Precompute heights and cumulative Y positions for all items
+  const heights = [];
+  const cumY = [0]; // cumY[i] = Y position of item i
+  for (let i = 0; i < count; i++) {
+    const n = allNodes[i];
+    if (!n) { heights[i] = 0; continue; }
+    const snippet = searchMode === 'sql' ? renderSqlSnippet(n.body_sql) : '';
+    heights[i] = snippet ? ITEM_HEIGHT + 20 : ITEM_HEIGHT;
+    cumY[i + 1] = cumY[i] + heights[i];
+  }
 
-  const totalHeight = count * ITEM_HEIGHT;
+  // Binary search to find the actual index at scrollTop
+  let lo = 0, hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cumY[mid] < scrollTop) lo = mid + 1;
+    else hi = mid;
+  }
+  const actualStart = Math.max(0, lo - 1 - BUFFER);
+  const startIdx = Math.max(0, actualStart);
+  const endIdx = Math.min(count, lo + Math.ceil(viewHeight / ITEM_HEIGHT) + BUFFER);
+
+  const totalHeight = cumY[count];
 
   let html = '<div style="height:' + totalHeight + 'px;position:relative">';
   for (let i = startIdx; i < endIdx; i++) {
@@ -145,9 +164,8 @@ function renderVirtualList() {
     if (!n) continue;
     const snippet = searchMode === 'sql' ? renderSqlSnippet(n.body_sql) : '';
     const itemExtra = snippet ? ' node-item-with-snippet' : '';
-    const itemHeight = snippet ? ITEM_HEIGHT + 20 : ITEM_HEIGHT;
     html += '<div class="node-item' + (n.id === selectedNodeId ? ' active' : '') + itemExtra +
-      '" style="position:absolute;top:' + (i * ITEM_HEIGHT) + 'px;left:0;right:0;height:' + itemHeight + 'px"' +
+      '" style="position:absolute;top:' + cumY[i] + 'px;left:0;right:0;height:' + heights[i] + 'px"' +
       ' onclick="selectNode(' + n.id + ')" data-id="' + n.id + '">' +
       '<div class="node-item-row">' +
       '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
