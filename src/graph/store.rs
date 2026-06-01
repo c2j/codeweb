@@ -213,6 +213,26 @@ impl GraphStore {
                         .or_default()
                         .push((idx, display_key));
                 }
+                Node::Procedure { id, body_sql, .. } => {
+                    for sql in body_sql {
+                        let fp = sql_fingerprint(&sql.sql_text);
+                        let display_key = format!("proc:{}", id);
+                        sql_fingerprint_index
+                            .entry(fp)
+                            .or_default()
+                            .push((idx, display_key));
+                    }
+                }
+                Node::Function { id, body_sql, .. } => {
+                    for sql in body_sql {
+                        let fp = sql_fingerprint(&sql.sql_text);
+                        let display_key = format!("func:{}", id);
+                        sql_fingerprint_index
+                            .entry(fp)
+                            .or_default()
+                            .push((idx, display_key));
+                    }
+                }
                 _ => {}
             }
         }
@@ -538,6 +558,22 @@ impl GraphStore {
                             (None, None) => "?".to_string(),
                         };
                         results.push((idx, format!("javasql:{}", ctx)));
+                    }
+                }
+                Node::Procedure { id, body_sql, .. } => {
+                    for sql in body_sql {
+                        if prepared.matches(&sql.sql_text) {
+                            results.push((idx, format!("proc:{}", id)));
+                            break;
+                        }
+                    }
+                }
+                Node::Function { id, body_sql, .. } => {
+                    for sql in body_sql {
+                        if prepared.matches(&sql.sql_text) {
+                            results.push((idx, format!("func:{}", id)));
+                            break;
+                        }
                     }
                 }
                 _ => {}
@@ -4045,6 +4081,119 @@ mod tests {
 
             assert_eq!(store.search_by_sql("select * from users").len(), 1);
             assert_eq!(store.search_by_sql("select * from orders").len(), 1);
+        }
+
+        #[test]
+        fn search_by_sql_finds_procedure_body_sql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: None,
+                    package: None,
+                    name: "get_users".to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: crate::graph::SourceLocation {
+                    file: Arc::new(PathBuf::from("test.sql")),
+                    line: 1,
+                },
+                partial: false,
+                body_sql: vec![crate::graph::ProcedureBodySql {
+                    sql_text: "SELECT * FROM t_users WHERE status = 'ACTIVE'".to_string(),
+                    kind: "SELECT".to_string(),
+                    line: Some(3),
+                }],
+            });
+            let store = GraphStore::from_graph("test", graph);
+            let results = store.search_by_sql("select * from t_users where status");
+            assert_eq!(results.len(), 1);
+            assert!(results[0].1.contains("get_users"));
+        }
+
+        #[test]
+        fn search_by_sql_finds_function_body_sql() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(crate::graph::Node::Function {
+                id: crate::graph::RoutineId {
+                    schema: None,
+                    package: None,
+                    name: "count_orders".to_string(),
+                    kind: crate::graph::RoutineKind::Function,
+                },
+                location: crate::graph::SourceLocation {
+                    file: Arc::new(PathBuf::from("test.sql")),
+                    line: 1,
+                },
+                partial: false,
+                body_sql: vec![crate::graph::ProcedureBodySql {
+                    sql_text: "SELECT COUNT(*) FROM t_orders".to_string(),
+                    kind: "SELECT".to_string(),
+                    line: Some(3),
+                }],
+            });
+            let store = GraphStore::from_graph("test", graph);
+            let results = store.search_by_sql("select count(*) from t_orders");
+            assert_eq!(results.len(), 1);
+            assert!(results[0].1.contains("count_orders"));
+        }
+
+        #[test]
+        fn search_by_sql_proc_multiple_sqls_match_one() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: None,
+                    package: None,
+                    name: "process".to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: crate::graph::SourceLocation {
+                    file: Arc::new(PathBuf::from("test.sql")),
+                    line: 1,
+                },
+                partial: false,
+                body_sql: vec![
+                    crate::graph::ProcedureBodySql {
+                        sql_text: "UPDATE t_orders SET status = 'DONE'".to_string(),
+                        kind: "UPDATE".to_string(),
+                        line: Some(3),
+                    },
+                    crate::graph::ProcedureBodySql {
+                        sql_text: "INSERT INTO t_log(msg) VALUES('done')".to_string(),
+                        kind: "INSERT".to_string(),
+                        line: Some(4),
+                    },
+                ],
+            });
+            let store = GraphStore::from_graph("test", graph);
+            let results = store.search_by_sql("insert into t_log");
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn search_by_sql_proc_rejects_unrelated() {
+            let mut graph = CodeGraph::new();
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: None,
+                    package: None,
+                    name: "reader".to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: crate::graph::SourceLocation {
+                    file: Arc::new(PathBuf::from("test.sql")),
+                    line: 1,
+                },
+                partial: false,
+                body_sql: vec![crate::graph::ProcedureBodySql {
+                    sql_text: "SELECT * FROM t_users".to_string(),
+                    kind: "SELECT".to_string(),
+                    line: Some(3),
+                }],
+            });
+            let store = GraphStore::from_graph("test", graph);
+            let results = store.search_by_sql("insert into t_orders");
+            assert!(results.is_empty());
         }
 
         // --- SQL fingerprint index ---
