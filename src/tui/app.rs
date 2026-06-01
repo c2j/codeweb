@@ -129,7 +129,7 @@ impl App {
             self.nodes = store
                 .search_by_sql(&self.search_query)
                 .into_iter()
-                .map(|(idx, _)| idx)
+                .map(|(idx, _, _)| idx)
                 .collect();
         } else {
             self.nodes = traverse::find_nodes_by_name(graph, &self.search_query)

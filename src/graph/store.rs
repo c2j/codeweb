@@ -519,19 +519,25 @@ impl GraphStore {
     }
 
     /// Search nodes by SQL text content (substring match, case-insensitive).
-    /// Checks MappedStatement.sql and JavaSql.sql fields.
-    /// Returns Vec of (NodeIndex, display_key).
-    pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String)> {
+    /// Checks MappedStatement.sql, JavaSql.sql, Procedure.body_sql, Function.body_sql.
+    /// Returns Vec of (NodeIndex, display_key, relevance_score) sorted by score descending,
+    /// then by node type prefix and display key as tiebreakers.
+    pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String, f64)> {
         let normalized = normalize_for_matching(&query.to_lowercase());
         let fp = blake3::hash(normalized.as_bytes()).to_hex().to_string();
         if let Some(hits) = self.sql_fingerprint_index.get(&fp) {
             if !hits.is_empty() {
-                return hits.clone();
+                let mut results: Vec<(NodeIndex, String, f64)> = hits
+                    .iter()
+                    .map(|(idx, key)| (*idx, key.clone(), 1.0))
+                    .collect();
+                sort_scored_results(&mut results);
+                return results;
             }
         }
 
         let prepared = PreparedQuery::new(query);
-        let mut results = Vec::new();
+        let mut results: Vec<(NodeIndex, String, f64)> = Vec::new();
         for idx in self.graph.node_indices() {
             match &self.graph[idx] {
                 Node::MappedStatement {
@@ -541,7 +547,12 @@ impl GraphStore {
                     ..
                 } => {
                     if prepared.matches(sql_text) {
-                        results.push((idx, format!("mapper:{}.{}", namespace, statement_id)));
+                        let score = prepared.score(sql_text);
+                        results.push((
+                            idx,
+                            format!("mapper:{}.{}", namespace, statement_id),
+                            score,
+                        ));
                     }
                 }
                 Node::JavaSql {
@@ -556,27 +567,37 @@ impl GraphStore {
                         (None, Some(m)) => m.clone(),
                         (None, None) => "?".to_string(),
                     };
-                    results.push((idx, format!("javasql:{}", ctx)));
+                    let score = prepared.score(sql_text);
+                    results.push((idx, format!("javasql:{}", ctx), score));
                 }
                 Node::Procedure { id, body_sql, .. } => {
+                    let mut best: Option<f64> = None;
                     for sql in body_sql {
                         if prepared.matches(&sql.sql_text) {
-                            results.push((idx, format!("proc:{}", id)));
-                            break;
+                            let s = prepared.score(&sql.sql_text);
+                            best = Some(best.map_or(s, |b| b.max(s)));
                         }
+                    }
+                    if let Some(score) = best {
+                        results.push((idx, format!("proc:{}", id), score));
                     }
                 }
                 Node::Function { id, body_sql, .. } => {
+                    let mut best: Option<f64> = None;
                     for sql in body_sql {
                         if prepared.matches(&sql.sql_text) {
-                            results.push((idx, format!("func:{}", id)));
-                            break;
+                            let s = prepared.score(&sql.sql_text);
+                            best = Some(best.map_or(s, |b| b.max(s)));
                         }
+                    }
+                    if let Some(score) = best {
+                        results.push((idx, format!("func:{}", id), score));
                     }
                 }
                 _ => {}
             }
         }
+        sort_scored_results(&mut results);
         results
     }
 }
@@ -769,6 +790,15 @@ impl PreparedQuery {
 
         false
     }
+
+    /// Compute a relevance score in [0.0, 1.0] for SQL text against this query.
+    ///
+    /// This always returns a value ≥ 0 even when `matches()` returns false,
+    /// so it should only be called after `matches()` has been confirmed.
+    fn score(&self, sql_text: &str) -> f64 {
+        let sql_norm = normalize_for_matching(&sql_text.to_lowercase());
+        compute_relevance(&self.normalized, &sql_norm, self.keyword, &self.table)
+    }
 }
 
 /// Compute Jaccard similarity between two normalized SQL strings by splitting
@@ -791,6 +821,59 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
     let union = tokens_a.union(&tokens_b).count();
 
     intersection as f64 / union as f64
+}
+
+/// Extract the type prefix from a display_key (e.g. "mapper", "javasql", "proc", "func").
+/// Used as the primary tiebreaker when scores are equal.
+fn extract_type_prefix(display_key: &str) -> &str {
+    display_key.split(':').next().unwrap_or(display_key)
+}
+
+/// Compute a relevance score in [0.0, 1.0] for a SQL match.
+///
+/// Scoring tiers:
+/// - 1.00  Exact match (normalized query == normalized SQL)
+/// - 0.95  Query is a substring of SQL
+/// - 0.85  Jaccard ≥ 0.8 with same DML keyword + same table
+/// - 0.70  Jaccard ≥ 0.8 with different DML keyword or table
+/// - 0.00  No match (caller should have already filtered)
+fn compute_relevance(
+    query_norm: &str,
+    sql_norm: &str,
+    query_kw: SqlKeyword,
+    query_table: &Option<String>,
+) -> f64 {
+    if sql_norm == query_norm {
+        return 1.0;
+    }
+    if sql_norm.contains(query_norm) {
+        return 0.95;
+    }
+
+    let jaccard = jaccard_similarity(query_norm, sql_norm);
+
+    let kw_bonus = if query_kw.is_compatible(&SqlKeyword::extract(sql_norm)) {
+        0.10
+    } else {
+        0.0
+    };
+
+    let table_bonus = if tables_compatible(query_table, sql_norm) {
+        0.05
+    } else {
+        0.0
+    };
+
+    (jaccard * 0.85 + kw_bonus + table_bonus).clamp(0.0, 1.0)
+}
+
+fn sort_scored_results(results: &mut [(NodeIndex, String, f64)]) {
+    results.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| extract_type_prefix(&a.1).cmp(extract_type_prefix(&b.1)))
+            .then_with(|| a.1.cmp(&b.1))
+    });
 }
 
 fn normalize_for_matching_pre_collapse(s: &str) -> String {
@@ -1170,8 +1253,8 @@ impl GraphStore {
         // This bridges the gap between search results (which show
         // "javasql:ClassName.method") and CLI commands like detail/trace
         // (which use search_nodes() for lookup).
-        if lower.starts_with("javasql:") {
-            let semantic_query = lower["javasql:".len()..].trim();
+        if let Some(stripped) = lower.strip_prefix("javasql:") {
+            let semantic_query = stripped.trim();
             if !semantic_query.is_empty() {
                 for idx in self.nodes_by_type("sql") {
                     if results.iter().any(|(i, _, _)| i == idx) {
@@ -1197,9 +1280,8 @@ impl GraphStore {
                     };
                     if let Some(candidate) = semantic_candidate {
                         if let Some(rank) = MatchRank::classify(semantic_query, &candidate) {
-                            let display =
-                                crate::graph::key::NodeKey::from_node(&self.graph[*idx])
-                                    .to_string();
+                            let display = crate::graph::key::NodeKey::from_node(&self.graph[*idx])
+                                .to_string();
                             results.push((*idx, display, rank));
                         }
                     }

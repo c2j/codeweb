@@ -894,8 +894,9 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
     println_stdout!("Found {} matching node(s)", matches.len());
     println_stdout!();
 
-    for (idx, _) in &matches {
+    for (idx, _, score) in &matches {
         let node = &graph[*idx];
+        let score_pct = (*score * 100.0).round() as u8;
         match node {
             Node::MappedStatement {
                 namespace,
@@ -906,7 +907,12 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 sql: Some(sql_text),
                 ..
             } => {
-                println_stdout!("  MappedStatement: {}.{}", namespace, statement_id);
+                println_stdout!(
+                    "  MappedStatement: {}.{}  [{}%]",
+                    namespace,
+                    statement_id,
+                    score_pct
+                );
                 println_stdout!("    kind:  {}", kind);
                 println_stdout!("    file:  {}:{}", xml_file.to_string_lossy(), line);
                 for l in sql_text.lines().take(5) {
@@ -961,7 +967,12 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     (None, Some(m)) => m.clone(),
                     (None, None) => "?".to_string(),
                 };
-                println_stdout!("  JavaSql: {} ({})", ctx, extraction_method);
+                println_stdout!(
+                    "  JavaSql: {} ({})  [{}%]",
+                    ctx,
+                    extraction_method,
+                    score_pct
+                );
                 println_stdout!("    file:  {}:{}", java_file.to_string_lossy(), line);
                 for l in sql_text.lines().take(5) {
                     println_stdout!("    sql:   {}", l);
@@ -978,7 +989,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 body_sql,
                 ..
             } => {
-                println_stdout!("  Procedure: {}", id);
+                println_stdout!("  Procedure: {}  [{}%]", id, score_pct);
                 println_stdout!(
                     "    file:  {}:{}",
                     location.file.to_string_lossy(),
@@ -1011,7 +1022,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 body_sql,
                 ..
             } => {
-                println_stdout!("  Function: {}", id);
+                println_stdout!("  Function: {}  [{}%]", id, score_pct);
                 println_stdout!(
                     "    file:  {}:{}",
                     location.file.to_string_lossy(),
