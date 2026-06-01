@@ -205,8 +205,14 @@ mod tests {
 <configuration><property name="foo">bar</property></configuration>"#;
         let f = write_temp_xml(xml);
         let (mapper, _) = load_ibatis_file(f.path()).expect("should return Ok even for non-mapper");
-        assert!(mapper.statements.is_empty(), "non-mapper should have zero statements");
-        assert!(mapper.namespace.is_empty(), "non-mapper should have empty namespace");
+        assert!(
+            mapper.statements.is_empty(),
+            "non-mapper should have zero statements"
+        );
+        assert!(
+            mapper.namespace.is_empty(),
+            "non-mapper should have empty namespace"
+        );
     }
 
     #[test]

@@ -143,7 +143,11 @@ END;
         let f = write_temp_sql(sql);
         let (stmts, _) = parse_file(f.path()).expect("should parse");
 
-        assert!(stmts.len() >= 2, "should find at least 2 statements, got {}", stmts.len());
+        assert!(
+            stmts.len() >= 2,
+            "should find at least 2 statements, got {}",
+            stmts.len()
+        );
     }
 
     #[test]
@@ -180,7 +184,10 @@ END;
         assert_eq!(results.len(), 2, "should parse both files");
 
         for pf in &results {
-            assert!(!pf.statements.is_empty(), "each file should have statements");
+            assert!(
+                !pf.statements.is_empty(),
+                "each file should have statements"
+            );
         }
     }
 

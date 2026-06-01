@@ -166,15 +166,19 @@ impl GraphBuilder {
                 match &info.statement {
                     Statement::CreateProcedure(p) => {
                         let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
-                        let body_sql = p.block.as_ref()
-                            .map(|b| crate::parser::extract_body_sql(b)
-                                .into_iter()
-                                .map(|sql| crate::graph::ProcedureBodySql {
-                                    sql_text: sql.sql_text,
-                                    kind: sql.kind,
-                                    line: sql.line,
-                                })
-                                .collect())
+                        let body_sql = p
+                            .block
+                            .as_ref()
+                            .map(|b| {
+                                crate::parser::extract_body_sql(b)
+                                    .into_iter()
+                                    .map(|sql| crate::graph::ProcedureBodySql {
+                                        sql_text: sql.sql_text,
+                                        kind: sql.kind,
+                                        line: sql.line,
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         proc_index.entry(id.clone()).or_insert_with(|| {
                             let node = Node::Procedure {
@@ -191,15 +195,19 @@ impl GraphBuilder {
                     }
                     Statement::CreateFunction(f) => {
                         let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
-                        let body_sql = f.block.as_ref()
-                            .map(|b| crate::parser::extract_body_sql(b)
-                                .into_iter()
-                                .map(|sql| crate::graph::ProcedureBodySql {
-                                    sql_text: sql.sql_text,
-                                    kind: sql.kind,
-                                    line: sql.line,
-                                })
-                                .collect())
+                        let body_sql = f
+                            .block
+                            .as_ref()
+                            .map(|b| {
+                                crate::parser::extract_body_sql(b)
+                                    .into_iter()
+                                    .map(|sql| crate::graph::ProcedureBodySql {
+                                        sql_text: sql.sql_text,
+                                        kind: sql.kind,
+                                        line: sql.line,
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         proc_index.entry(id.clone()).or_insert_with(|| {
                             let node = Node::Function {
@@ -915,15 +923,18 @@ impl GraphBuilder {
             let Some(_block) = block else {
                 continue;
             };
-            let body_sql = block.as_ref()
-                .map(|b| crate::parser::extract_body_sql(b)
-                    .into_iter()
-                    .map(|sql| crate::graph::ProcedureBodySql {
-                        sql_text: sql.sql_text,
-                        kind: sql.kind,
-                        line: sql.line,
-                    })
-                    .collect())
+            let body_sql = block
+                .as_ref()
+                .map(|b| {
+                    crate::parser::extract_body_sql(b)
+                        .into_iter()
+                        .map(|sql| crate::graph::ProcedureBodySql {
+                            sql_text: sql.sql_text,
+                            kind: sql.kind,
+                            line: sql.line,
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let proc_id = RoutineId {
                 schema: schema_part.clone(),

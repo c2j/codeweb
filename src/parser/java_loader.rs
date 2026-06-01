@@ -162,7 +162,10 @@ public interface UserDao {
         let (result, hash) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
             .expect("should parse");
 
-        assert!(!result.extractions.is_empty(), "should find SQL extractions");
+        assert!(
+            !result.extractions.is_empty(),
+            "should find SQL extractions"
+        );
         let sql_found = result.extractions.iter().any(|e| e.sql.contains("SELECT"));
         assert!(sql_found, "at least one extraction should contain SELECT");
         assert!(!hash.is_empty());
@@ -182,10 +185,14 @@ public class ReportDao {
         let (result, _) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
             .expect("should parse");
 
-        assert!(!result.extractions.is_empty(), "JDBC extraction should find SQL");
-        let found = result.extractions.iter().any(|e| {
-            e.sql.contains("SELECT") && e.sql.contains("t_reports")
-        });
+        assert!(
+            !result.extractions.is_empty(),
+            "JDBC extraction should find SQL"
+        );
+        let found = result
+            .extractions
+            .iter()
+            .any(|e| e.sql.contains("SELECT") && e.sql.contains("t_reports"));
         assert!(found, "should extract SELECT with t_reports");
     }
 
@@ -199,7 +206,10 @@ public class Util {
         let (result, _) = load_java_file_with_config(f.path(), &JavaExtractConfig::default())
             .expect("should parse");
 
-        assert!(result.extractions.is_empty(), "plain Java should have no extractions");
+        assert!(
+            result.extractions.is_empty(),
+            "plain Java should have no extractions"
+        );
     }
 
     #[test]
@@ -233,9 +243,18 @@ public class Service {
 
     #[test]
     fn extraction_method_label_correct() {
-        assert_eq!(extraction_method_label(&ExtractionMethod::Annotation), "annotation");
-        assert_eq!(extraction_method_label(&ExtractionMethod::MethodCall), "method_call");
-        assert_eq!(extraction_method_label(&ExtractionMethod::Constant), "constant");
+        assert_eq!(
+            extraction_method_label(&ExtractionMethod::Annotation),
+            "annotation"
+        );
+        assert_eq!(
+            extraction_method_label(&ExtractionMethod::MethodCall),
+            "method_call"
+        );
+        assert_eq!(
+            extraction_method_label(&ExtractionMethod::Constant),
+            "constant"
+        );
     }
 
     #[test]

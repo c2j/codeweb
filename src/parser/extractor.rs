@@ -22,7 +22,9 @@ pub struct ProcedureSqlExtractor {
 
 impl ProcedureSqlExtractor {
     pub fn new() -> Self {
-        Self { results: Vec::new() }
+        Self {
+            results: Vec::new(),
+        }
     }
     pub fn finish(self) -> Vec<ProcedureBodySql> {
         self.results
@@ -55,17 +57,15 @@ impl Visitor for ProcedureSqlExtractor {
             }
             PlStatement::Perform {
                 query,
-                parsed_query,
+                parsed_query: Some(stmt),
                 ..
             } => {
-                if let Some(ref stmt) = parsed_query {
-                    let kind = statement_kind_name(stmt);
-                    self.results.push(ProcedureBodySql {
-                        sql_text: query.clone(),
-                        kind,
-                        line: None,
-                    });
-                }
+                let kind = statement_kind_name(stmt);
+                self.results.push(ProcedureBodySql {
+                    sql_text: query.clone(),
+                    kind,
+                    line: None,
+                });
             }
             _ => {}
         }
@@ -2532,11 +2532,7 @@ mod procedure_sql_extraction {
         let has_update = results
             .iter()
             .any(|(text, kind)| kind.as_deref() == Some("UPDATE") && text.contains("t_users"));
-        assert!(
-            has_update,
-            "should find UPDATE t_users, got: {:?}",
-            results
-        );
+        assert!(has_update, "should find UPDATE t_users, got: {:?}", results);
     }
 
     #[test]
