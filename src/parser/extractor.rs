@@ -1,5 +1,6 @@
 use crate::graph::{AccessMode, RoutineId, RoutineKind, SourceLocation, WriteKind};
-use ogsql_parser::ast::plpgsql::{PlExecuteStmt, PlProcedureCall, PlStatement};
+use ogsql_parser::ast::plpgsql::PlDeclaration;
+use ogsql_parser::ast::plpgsql::{PlCursorDecl, PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::{
     CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
     ObjectName, SelectStatement, SelectTarget, SequenceFunc, Statement, TableRef as AstTableRef,
@@ -8,6 +9,142 @@ use ogsql_parser::ast::{
 use ogsql_parser::{Visitor, VisitorResult};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub struct ProcedureBodySql {
+    pub sql_text: String,
+    pub kind: String,
+    pub line: Option<usize>,
+}
+
+pub struct ProcedureSqlExtractor {
+    results: Vec<ProcedureBodySql>,
+}
+
+impl ProcedureSqlExtractor {
+    pub fn new() -> Self {
+        Self {
+            results: Vec::new(),
+        }
+    }
+    pub fn finish(self) -> Vec<ProcedureBodySql> {
+        self.results
+    }
+}
+
+impl Visitor for ProcedureSqlExtractor {
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        if let PlDeclaration::Cursor(PlCursorDecl {
+            query,
+            parsed_query,
+            ..
+        }) = decl
+        {
+            let kind = parsed_query
+                .as_ref()
+                .and_then(|q| {
+                    let name = statement_kind_name(q);
+                    if name == "SQL" {
+                        None
+                    } else {
+                        Some(name)
+                    }
+                })
+                .unwrap_or_else(|| "SQL".to_string());
+            self.results.push(ProcedureBodySql {
+                sql_text: query.clone(),
+                kind,
+                line: None,
+            });
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
+        match stmt {
+            PlStatement::SqlStatement {
+                sql_text,
+                statement,
+                span,
+                ..
+            } => {
+                let kind = statement_kind_name(statement);
+                let line = span.as_ref().map(|s| s.start.line);
+                self.results.push(ProcedureBodySql {
+                    sql_text: sql_text.clone(),
+                    kind,
+                    line,
+                });
+            }
+            PlStatement::Sql(sql_text) => {
+                self.results.push(ProcedureBodySql {
+                    sql_text: sql_text.clone(),
+                    kind: "SQL".to_string(),
+                    line: None,
+                });
+            }
+            PlStatement::Perform {
+                query,
+                parsed_query,
+                ..
+            } => {
+                let kind = parsed_query
+                    .as_ref()
+                    .and_then(|q| {
+                        let name = statement_kind_name(q);
+                        if name == "SQL" {
+                            None
+                        } else {
+                            Some(name)
+                        }
+                    })
+                    .unwrap_or_else(|| "SQL".to_string());
+                self.results.push(ProcedureBodySql {
+                    sql_text: query.clone(),
+                    kind,
+                    line: None,
+                });
+            }
+            PlStatement::Execute(exec) => {
+                let kind = exec
+                    .node
+                    .parsed_query
+                    .as_ref()
+                    .map(|parsed| statement_kind_name(parsed))
+                    .unwrap_or_else(|| "SQL".to_string());
+                let sql_text = match &exec.node.string_expr {
+                    Expr::Literal(Literal::String(s)) => s.clone(),
+                    _ => format!("{:?}", exec.node.string_expr),
+                };
+                self.results.push(ProcedureBodySql {
+                    sql_text,
+                    kind,
+                    line: None,
+                });
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+}
+
+fn statement_kind_name(stmt: &Statement) -> String {
+    match stmt {
+        Statement::Select(_) => "SELECT",
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Merge(_) => "MERGE",
+        _ => "SQL",
+    }
+    .to_string()
+}
+
+pub fn extract_body_sql(block: &ogsql_parser::ast::plpgsql::PlBlock) -> Vec<ProcedureBodySql> {
+    let mut extractor = ProcedureSqlExtractor::new();
+    ogsql_parser::walk_pl_block(&mut extractor, block);
+    extractor.finish()
+}
 
 #[derive(Debug, Clone)]
 pub struct CallEdge {
@@ -2314,5 +2451,643 @@ mod column_tests {
             id_refs[0].contexts.contains(&ColumnContext::OrderBy),
             "should have OrderBy context"
         );
+    }
+}
+
+/// Verification tests for ogsql-parser's ability to extract SQL statements
+/// from stored procedure bodies. These tests validate the foundation for
+/// the `search_sql` feature extension to cover Procedure/Function nodes.
+#[cfg(test)]
+mod procedure_sql_extraction {
+    use super::*;
+    use ogsql_parser::ast::plpgsql::PlStatement;
+    use ogsql_parser::ast::Statement;
+    use ogsql_parser::{walk_pl_block, Tokenizer};
+
+    /// A simple visitor that collects SQL texts from PL/pgSQL procedure bodies.
+    struct ProcedureSqlCollector {
+        sql_texts: Vec<(String, Option<String>)>, // (sql_text, statement_kind)
+    }
+
+    impl ProcedureSqlCollector {
+        fn new() -> Self {
+            Self {
+                sql_texts: Vec::new(),
+            }
+        }
+    }
+
+    impl ogsql_parser::Visitor for ProcedureSqlCollector {
+        fn visit_pl_statement(
+            &mut self,
+            stmt: &ogsql_parser::ast::plpgsql::PlStatement,
+        ) -> VisitorResult {
+            match stmt {
+                PlStatement::SqlStatement {
+                    sql_text,
+                    statement,
+                    ..
+                } => {
+                    let kind = match statement.as_ref() {
+                        Statement::Select(_) => Some("SELECT".to_string()),
+                        Statement::Insert(_) => Some("INSERT".to_string()),
+                        Statement::Update(_) => Some("UPDATE".to_string()),
+                        Statement::Delete(_) => Some("DELETE".to_string()),
+                        Statement::Merge(_) => Some("MERGE".to_string()),
+                        _ => None,
+                    };
+                    self.sql_texts.push((sql_text.clone(), kind));
+                }
+                PlStatement::Sql(sql_text) => {
+                    self.sql_texts.push((sql_text.clone(), None));
+                }
+                _ => {}
+            }
+            VisitorResult::Continue
+        }
+    }
+
+    fn parse_procedure_and_collect(sql: &str) -> Vec<(String, Option<String>)> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+
+        let mut collector = ProcedureSqlCollector::new();
+        for info in &stmts {
+            match &info.statement {
+                Statement::CreateProcedure(p) => {
+                    if let Some(ref block) = p.block {
+                        walk_pl_block(&mut collector, block);
+                    }
+                }
+                Statement::CreateFunction(f) => {
+                    if let Some(ref block) = f.block {
+                        walk_pl_block(&mut collector, block);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collector.sql_texts
+    }
+
+    // ──── Basic SQL statement extraction ────
+
+    #[test]
+    fn extract_select_from_procedure_body() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE get_users()
+            AS BEGIN
+                SELECT * FROM t_users WHERE status = 'ACTIVE';
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(!results.is_empty(), "should extract at least one SQL");
+        let has_select = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("SELECT") && text.contains("t_users"));
+        assert!(
+            has_select,
+            "should find SELECT with t_users, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn extract_insert_from_procedure_body() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE add_user(p_name VARCHAR)
+            AS BEGIN
+                INSERT INTO t_users(name, status) VALUES(p_name, 'PENDING');
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let has_insert = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("INSERT") && text.contains("t_users"));
+        assert!(
+            has_insert,
+            "should find INSERT into t_users, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn extract_update_from_procedure_body() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE activate_user(p_id INT)
+            AS BEGIN
+                UPDATE t_users SET status = 'ACTIVE' WHERE id = p_id;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let has_update = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("UPDATE") && text.contains("t_users"));
+        assert!(has_update, "should find UPDATE t_users, got: {:?}", results);
+    }
+
+    #[test]
+    fn extract_delete_from_procedure_body() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE remove_user(p_id INT)
+            AS BEGIN
+                DELETE FROM t_users WHERE id = p_id;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let has_delete = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("DELETE") && text.contains("t_users"));
+        assert!(
+            has_delete,
+            "should find DELETE from t_users, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn extract_multiple_sql_statements_from_body() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE process_order(p_id INT)
+            AS
+            BEGIN
+                UPDATE t_orders SET status = 'PROCESSING' WHERE id = p_id;
+                INSERT INTO t_order_log(order_id, action) VALUES(p_id, 'PROCESSING');
+                DELETE FROM t_pending WHERE order_id = p_id;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            results.len() >= 3,
+            "should extract at least 3 SQL statements, got {}: {:?}",
+            results.len(),
+            results
+        );
+    }
+
+    // ──── Function bodies ────
+
+    #[test]
+    fn extract_sql_from_function_body() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION count_users() RETURNS INT
+            AS $$
+            DECLARE v_count INT;
+            BEGIN
+                SELECT COUNT(*) INTO v_count FROM t_users;
+                RETURN v_count;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let has_select = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("SELECT") && text.contains("t_users"));
+        assert!(
+            has_select,
+            "should find SELECT from function body, got: {:?}",
+            results
+        );
+    }
+
+    // ──── Control flow nesting ────
+
+    #[test]
+    fn extract_sql_from_if_block() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE conditional_update(p_id INT, p_action VARCHAR)
+            AS
+            BEGIN
+                IF p_action = 'activate' THEN
+                    UPDATE t_users SET status = 'ACTIVE' WHERE id = p_id;
+                ELSE
+                    UPDATE t_users SET status = 'INACTIVE' WHERE id = p_id;
+                END IF;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let update_count = results
+            .iter()
+            .filter(|(text, kind)| kind.as_deref() == Some("UPDATE") && text.contains("t_users"))
+            .count();
+        assert!(
+            update_count >= 2,
+            "should find 2 UPDATE statements in IF/ELSE, got {}: {:?}",
+            update_count,
+            results
+        );
+    }
+
+    #[test]
+    fn extract_sql_from_loop() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE batch_process()
+            AS
+            BEGIN
+                FOR i IN 1..10 LOOP
+                    INSERT INTO t_log(msg) VALUES('processing');
+                END LOOP;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let has_insert = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("INSERT") && text.contains("t_log"));
+        assert!(
+            has_insert,
+            "should find INSERT inside FOR loop, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn extract_sql_from_nested_blocks() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE nested_blocks()
+            AS
+            BEGIN
+                SELECT * FROM t_config;
+
+                BEGIN
+                    INSERT INTO t_audit(action) VALUES('inner_block');
+                END;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            results.len() >= 2,
+            "should find SQL from both outer and inner blocks, got {}: {:?}",
+            results.len(),
+            results
+        );
+    }
+
+    #[test]
+    fn extract_sql_from_exception_handler() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE with_exception()
+            AS
+            BEGIN
+                UPDATE t_orders SET status = 'DONE' WHERE id = 1;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    INSERT INTO t_error_log(msg) VALUES('order failed');
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            results.len() >= 2,
+            "should find SQL from both body and exception handler, got {}: {:?}",
+            results.len(),
+            results
+        );
+        let has_insert = results
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("INSERT") && text.contains("t_error_log"));
+        assert!(
+            has_insert,
+            "should find INSERT in exception handler, got: {:?}",
+            results
+        );
+    }
+
+    // ──── sql_text quality ────
+
+    #[test]
+    fn sql_text_is_searchable_raw_text() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE search_test()
+            AS BEGIN
+                SELECT id, name, status FROM t_users WHERE status = 'ACTIVE' ORDER BY id;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        let select_result = results
+            .iter()
+            .find(|(_, kind)| kind.as_deref() == Some("SELECT"));
+        assert!(select_result.is_some(), "should find SELECT statement");
+
+        let sql_text = &select_result.unwrap().0;
+        // sql_text should contain the raw SQL that can be searched
+        let lower = sql_text.to_lowercase();
+        assert!(
+            lower.contains("select"),
+            "sql_text should contain 'select': {}",
+            sql_text
+        );
+        assert!(
+            lower.contains("t_users"),
+            "sql_text should contain 't_users': {}",
+            sql_text
+        );
+        assert!(
+            lower.contains("where"),
+            "sql_text should contain 'where': {}",
+            sql_text
+        );
+    }
+
+    // ──── Package body procedures ────
+
+    #[test]
+    fn extract_sql_from_package_body_procedure() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_users AS
+                PROCEDURE activate(p_id INT) IS
+                BEGIN
+                    UPDATE t_users SET status = 'ACTIVE' WHERE id = p_id;
+                END;
+            END pkg_users;
+        "#;
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+
+        let mut collector = ProcedureSqlCollector::new();
+        for info in &stmts {
+            if let Statement::CreatePackageBody(pkg) = &info.statement {
+                for item in &pkg.items {
+                    if let ogsql_parser::ast::PackageItem::Procedure(p) = item {
+                        if let Some(ref block) = p.block {
+                            walk_pl_block(&mut collector, block);
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_update = collector
+            .sql_texts
+            .iter()
+            .any(|(text, kind)| kind.as_deref() == Some("UPDATE") && text.contains("t_users"));
+        assert!(
+            has_update,
+            "should find UPDATE in package body procedure, got: {:?}",
+            collector.sql_texts
+        );
+    }
+
+    // ──── Dialect variations ────
+
+    #[test]
+    fn extract_from_as_begin_end_procedure() {
+        // openGauss/GaussDB: AS BEGIN ... END; /
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE test_as()
+            AS BEGIN
+                SELECT 1 FROM dual;
+            END;
+            /
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            !results.is_empty(),
+            "AS BEGIN..END procedure should yield SQL"
+        );
+    }
+
+    #[test]
+    fn extract_from_is_begin_end_procedure() {
+        // Oracle-compatible: IS BEGIN ... END;
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE test_is()
+            IS
+            BEGIN
+                SELECT 1 FROM dual;
+            END;
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            !results.is_empty(),
+            "IS BEGIN..END procedure should yield SQL"
+        );
+    }
+
+    #[test]
+    fn extract_from_plpgsql_dollar_quoted() {
+        // PostgreSQL-style: $$ ... $$ LANGUAGE plpgsql
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION test_dollar() RETURNS VOID
+            AS $$
+            BEGIN
+                SELECT * FROM t_config;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            !results.is_empty(),
+            "$$-quoted function body should yield SQL"
+        );
+    }
+
+    // ──── Edge cases ────
+
+    #[test]
+    fn procedure_with_no_body_produces_no_sql() {
+        let sql = "CREATE PROCEDURE no_body() AS BEGIN NULL; END; /";
+        let results = parse_procedure_and_collect(sql);
+        // NULL statement should not produce SQL texts
+        let non_null = results
+            .iter()
+            .filter(|(text, _)| !text.trim().eq_ignore_ascii_case("null"))
+            .count();
+        assert_eq!(
+            non_null, 0,
+            "procedure with only NULL should produce no searchable SQL, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn procedure_with_declare_block() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE with_declare()
+            AS $$
+            DECLARE
+                v_count INT;
+                v_name VARCHAR(100);
+            BEGIN
+                SELECT COUNT(*) INTO v_count FROM t_users;
+                INSERT INTO t_log(cnt) VALUES(v_count);
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = parse_procedure_and_collect(sql);
+        assert!(
+            results.len() >= 2,
+            "should find SQL despite DECLARE block, got {}: {:?}",
+            results.len(),
+            results
+        );
+    }
+
+    #[test]
+    fn cursor_declaration_sql_extracted() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE process_items(p_id INT)
+            AS $$
+            DECLARE
+                CURSOR c_items(p_cat INT) IS
+                    SELECT id, name, price
+                    FROM products
+                    WHERE category_id = p_cat
+                    FOR UPDATE;
+            BEGIN
+                FOR rec IN c_items(p_id) LOOP
+                    NULL;
+                END LOOP;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        assert!(
+            !results.is_empty(),
+            "cursor SQL should be extracted, got empty"
+        );
+        assert!(
+            results.iter().any(|s| s.sql_text.contains("products")),
+            "cursor SQL should contain table name, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn cursor_declaration_kind_is_select() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION get_orders(p_status TEXT)
+            RETURNS REFCURSOR AS $$
+            DECLARE
+                ref REFCURSOR;
+                CURSOR c_orders IS
+                    SELECT o.id, o.total
+                    FROM orders o
+                    WHERE o.status = p_status;
+            BEGIN
+                OPEN c_orders;
+                RETURN c_orders;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        let cursor_sql = results.iter().find(|s| s.sql_text.contains("orders"));
+        assert!(cursor_sql.is_some(), "cursor SQL should be extracted");
+        if let Some(cs) = cursor_sql {
+            assert_eq!(
+                cs.kind, "SELECT",
+                "cursor should be kind SELECT, got: {}",
+                cs.kind
+            );
+        }
+    }
+
+    #[test]
+    fn perform_query_extracted() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE check_health()
+            AS $$
+            BEGIN
+                PERFORM 1 FROM dual WHERE status = 'OK';
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        let has_perform = results.iter().any(|s| s.sql_text.contains("dual"));
+        assert!(
+            has_perform,
+            "PERFORM query should be extracted, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn perform_function_call_extracted() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE setup_session()
+            AS $$
+            BEGIN
+                PERFORM set_config('work_mem', '256MB', true);
+                PERFORM pg_sleep(0.1);
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        let has_set_config = results.iter().any(|s| s.sql_text.contains("set_config"));
+        assert!(
+            has_set_config,
+            "PERFORM function call should be extracted, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn execute_immediate_sql_extracted() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE dynamic_update(p_id INT)
+            AS $$
+            BEGIN
+                EXECUTE IMMEDIATE 'UPDATE t_items SET status = ''DONE'' WHERE id = ' || p_id;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        let has_update = results.iter().any(|s| s.sql_text.contains("UPDATE"));
+        assert!(
+            has_update,
+            "EXECUTE IMMEDIATE SQL should be extracted, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn execute_immediate_with_parsed_query_kind() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE archive_old(p_days INT)
+            AS $$
+            BEGIN
+                EXECUTE 'DELETE FROM t_logs WHERE created_at < NOW() - INTERVAL ''1 day'' * p_days';
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        let results = extract_body_sql_from_sql(sql);
+        if let Some(ex) = results.iter().find(|s| s.sql_text.contains("DELETE")) {
+            assert_eq!(
+                ex.kind, "DELETE",
+                "EXECUTE with parsed DELETE should have kind DELETE"
+            );
+        }
+    }
+
+    fn extract_body_sql_from_sql(sql: &str) -> Vec<ProcedureBodySql> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        for info in &stmts {
+            match &info.statement {
+                Statement::CreateProcedure(p) => {
+                    if let Some(ref block) = p.block {
+                        return extract_body_sql(block);
+                    }
+                }
+                Statement::CreateFunction(f) => {
+                    if let Some(ref block) = f.block {
+                        return extract_body_sql(block);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Vec::new()
     }
 }

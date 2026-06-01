@@ -260,7 +260,7 @@ pub fn collect_chain_files(
     collect_from_tree(&chain.callees, graph, &mut file_nodes);
 
     let mut result: Vec<_> = file_nodes.into_iter().collect();
-    result.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    result.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     result
 }
 
@@ -534,7 +534,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
             }
         }
         let mut conv_entries: Vec<_> = convergence.into_iter().collect();
-        conv_entries.sort_by(|a, b| b.1.cmp(&a.1));
+        conv_entries.sort_by_key(|b| std::cmp::Reverse(b.1));
         lines.push(String::new());
         lines.push("── CONVERGENCE ──".to_string());
         for (idx, count) in &conv_entries {

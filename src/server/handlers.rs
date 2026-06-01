@@ -153,12 +153,33 @@ async fn search_sql(
             let out_deg = graph
                 .neighbors_directed(idx, petgraph::Direction::Outgoing)
                 .count();
+            let body_sql = match node {
+                Node::Procedure { body_sql, .. } | Node::Function { body_sql, .. } => {
+                    if body_sql.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            body_sql
+                                .iter()
+                                .map(|s| {
+                                    serde_json::json!({
+                                        "sql": s.sql_text,
+                                        "kind": s.kind,
+                                    })
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                }
+                _ => None,
+            };
             serde_json::json!({
                 "id": idx.index(),
                 "key": display_key,
                 "type": detail,
                 "in_degree": in_deg,
                 "out_degree": out_deg,
+                "body_sql": body_sql,
             })
         })
         .collect();
@@ -300,12 +321,14 @@ async fn node_detail(
             id,
             location,
             partial,
+            body_sql,
             ..
         }
         | Node::Function {
             id,
             location,
             partial,
+            body_sql,
             ..
         } => {
             properties.push(serde_json::json!({"label": "schema", "value": id.schema}));
@@ -317,6 +340,18 @@ async fn node_detail(
             properties.push(serde_json::json!({"label": "line", "value": location.line}));
             if *partial {
                 properties.push(serde_json::json!({"label": "partial", "value": "true"}));
+            }
+            if !body_sql.is_empty() {
+                let body_sql_list: Vec<Value> = body_sql
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "sql": s.sql_text,
+                            "kind": s.kind,
+                        })
+                    })
+                    .collect();
+                properties.push(serde_json::json!({"label": "body_sql", "value": body_sql_list}));
             }
         }
         Node::JavaMethod {

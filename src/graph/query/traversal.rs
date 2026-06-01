@@ -231,6 +231,7 @@ mod tests {
                 line: 0,
             },
             partial: false,
+            body_sql: Vec::new(),
         }
     }
 

@@ -172,3 +172,85 @@ fn trace_sql_reads_from_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn write_sql_file(dir: &TempDir, filename: &str, sql: &str) -> std::path::PathBuf {
+    let path = dir.path().join(filename);
+    fs::write(&path, sql).unwrap();
+    path
+}
+
+#[test]
+fn trace_sql_finds_matching_procedure() {
+    let dir = TempDir::new().unwrap();
+    write_sql_file(
+        &dir,
+        "procs.sql",
+        r#"
+            CREATE OR REPLACE PROCEDURE get_active_users()
+            AS BEGIN
+                SELECT * FROM t_users WHERE status = 'ACTIVE';
+            END;
+            /
+        "#,
+    );
+
+    let init_out = init_project(&dir, "test-proc-search");
+    assert!(
+        init_out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let output = run_codeweb(&[
+        "trace-sql",
+        "select * from t_users where status",
+        "--project",
+        dir.path().to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("get_active_users") || stdout.contains("Procedure"),
+        "trace-sql should find procedure body SQL. stdout: {}, stderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn trace_sql_finds_matching_function() {
+    let dir = TempDir::new().unwrap();
+    write_sql_file(
+        &dir,
+        "funcs.sql",
+        r#"
+            CREATE OR REPLACE FUNCTION count_orders() RETURNS INT
+            AS $$
+            BEGIN
+                INSERT INTO t_audit(action) VALUES('count');
+                RETURN 0;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#,
+    );
+
+    let init_out = init_project(&dir, "test-func-search");
+    assert!(
+        init_out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    let output = run_codeweb(&[
+        "trace-sql",
+        "insert into t_audit",
+        "--project",
+        dir.path().to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("count_orders") || stdout.contains("Function"),
+        "trace-sql should find function body SQL. stdout: {}, stderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

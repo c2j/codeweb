@@ -231,6 +231,13 @@ pub enum DistributeInfo {
     Modulo { columns: Vec<String> },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcedureBodySql {
+    pub sql_text: String,
+    pub kind: String,
+    pub line: Option<usize>,
+}
+
 /// A node in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
@@ -238,19 +245,19 @@ pub enum Node {
     Procedure {
         id: RoutineId,
         location: SourceLocation,
-        /// True if this node was created from a spec declaration but the body
-        /// implementation could not be parsed (partial/placeholder node).
         #[serde(default)]
         partial: bool,
+        #[serde(default)]
+        body_sql: Vec<ProcedureBodySql>,
     },
     /// A resolved SQL function.
     Function {
         id: RoutineId,
         location: SourceLocation,
-        /// True if this node was created from a spec declaration but the body
-        /// implementation could not be parsed (partial/placeholder node).
         #[serde(default)]
         partial: bool,
+        #[serde(default)]
+        body_sql: Vec<ProcedureBodySql>,
     },
     /// An unresolved call target (e.g. dynamic SQL).
     #[allow(clippy::box_collection)]
@@ -927,6 +934,7 @@ mod tests {
                 },
                 location: loc.clone(),
                 partial: false,
+                body_sql: Vec::new(),
             };
             node_indices.push(graph.add_node(node));
         }

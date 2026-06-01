@@ -122,6 +122,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         };
         let filter = NodeFilter::new().with_type("proc");
         assert!(filter.matches(&proc));

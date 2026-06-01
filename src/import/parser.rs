@@ -167,6 +167,7 @@ impl CgefParser {
                     id,
                     location: loc,
                     partial,
+                    body_sql: Vec::new(),
                 })
             }
             "function" => {
@@ -195,6 +196,7 @@ impl CgefParser {
                     id,
                     location: loc,
                     partial,
+                    body_sql: Vec::new(),
                 })
             }
             "table" => {

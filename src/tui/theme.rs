@@ -19,11 +19,19 @@ impl TuiTheme {
     }
 
     pub fn fg_secondary(&self) -> Color {
-        if self.is_dark { Color::Gray } else { Color::DarkGray }
+        if self.is_dark {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        }
     }
 
     pub fn fg_dim(&self) -> Color {
-        if self.is_dark { Color::DarkGray } else { Color::Gray }
+        if self.is_dark {
+            Color::DarkGray
+        } else {
+            Color::Gray
+        }
     }
 
     pub fn fg_empty(&self) -> Color {
@@ -34,7 +42,11 @@ impl TuiTheme {
 fn detect_dark_terminal() -> bool {
     // COLORFGBG: "fg_color;bg_color" with ANSI color indices (xterm, rxvt, kitty, etc.)
     if let Ok(val) = std::env::var("COLORFGBG") {
-        if let Some(bg) = val.split(';').next_back().and_then(|s| s.trim().parse::<u8>().ok()) {
+        if let Some(bg) = val
+            .split(';')
+            .next_back()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+        {
             // 0-7: standard (0=black..7=white), 8-15: bright (8=darkgray..15=bright white)
             return bg <= 8;
         }
