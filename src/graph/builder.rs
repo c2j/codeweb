@@ -166,6 +166,16 @@ impl GraphBuilder {
                 match &info.statement {
                     Statement::CreateProcedure(p) => {
                         let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
+                        let body_sql = p.block.as_ref()
+                            .map(|b| crate::parser::extract_body_sql(b)
+                                .into_iter()
+                                .map(|sql| crate::graph::ProcedureBodySql {
+                                    sql_text: sql.sql_text,
+                                    kind: sql.kind,
+                                    line: sql.line,
+                                })
+                                .collect())
+                            .unwrap_or_default();
                         proc_index.entry(id.clone()).or_insert_with(|| {
                             let node = Node::Procedure {
                                 id,
@@ -174,12 +184,23 @@ impl GraphBuilder {
                                     line: info.start_line,
                                 },
                                 partial: false,
+                                body_sql,
                             };
                             graph.add_node(node)
                         });
                     }
                     Statement::CreateFunction(f) => {
                         let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
+                        let body_sql = f.block.as_ref()
+                            .map(|b| crate::parser::extract_body_sql(b)
+                                .into_iter()
+                                .map(|sql| crate::graph::ProcedureBodySql {
+                                    sql_text: sql.sql_text,
+                                    kind: sql.kind,
+                                    line: sql.line,
+                                })
+                                .collect())
+                            .unwrap_or_default();
                         proc_index.entry(id.clone()).or_insert_with(|| {
                             let node = Node::Function {
                                 id,
@@ -188,6 +209,7 @@ impl GraphBuilder {
                                     line: info.start_line,
                                 },
                                 partial: false,
+                                body_sql,
                             };
                             graph.add_node(node)
                         });
@@ -828,6 +850,7 @@ impl GraphBuilder {
                                     line: 0,
                                 },
                                 partial: true,
+                                body_sql: Vec::new(),
                             },
                             RoutineKind::Function => Node::Function {
                                 id: routine_id.clone(),
@@ -836,6 +859,7 @@ impl GraphBuilder {
                                     line: 0,
                                 },
                                 partial: true,
+                                body_sql: Vec::new(),
                             },
                         };
                         let idx = graph.add_node(node);
@@ -891,6 +915,16 @@ impl GraphBuilder {
             let Some(_block) = block else {
                 continue;
             };
+            let body_sql = block.as_ref()
+                .map(|b| crate::parser::extract_body_sql(b)
+                    .into_iter()
+                    .map(|sql| crate::graph::ProcedureBodySql {
+                        sql_text: sql.sql_text,
+                        kind: sql.kind,
+                        line: sql.line,
+                    })
+                    .collect())
+                .unwrap_or_default();
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
                 package: Some(pkg_name_part.clone()),
@@ -906,6 +940,7 @@ impl GraphBuilder {
                             line: start_line,
                         },
                         partial: false,
+                        body_sql,
                     },
                     RoutineKind::Function => Node::Function {
                         id: proc_id.clone(),
@@ -914,6 +949,7 @@ impl GraphBuilder {
                             line: start_line,
                         },
                         partial: false,
+                        body_sql,
                     },
                 };
                 graph.add_node(node)

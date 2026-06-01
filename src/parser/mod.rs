@@ -10,8 +10,9 @@ pub mod scanner;
 pub use extractor::{
     CallEdge, CallExtractor, ColumnAccessExtractor, ColumnAnalysis, ColumnContext, ColumnRef,
     EnumMapping, FilterOperator, FilterValue, HardFilter, InsertColumnInfo, JoinCondition,
-    JoinConditionSource, JoinType, SelectIntoMapping, SequenceRef, SequenceRefVia,
-    TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
+    JoinConditionSource, JoinType, ProcedureBodySql, ProcedureSqlExtractor,
+    SelectIntoMapping, SequenceRef, SequenceRefVia, TableAccessExtractor, TableAlias, TypeRef,
+    TypeSequenceRefExtractor, UpdateColumnInfo, extract_body_sql,
 };
 #[allow(unused_imports)]
 pub use ibatis_loader::{

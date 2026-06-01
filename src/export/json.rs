@@ -245,6 +245,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 id,
                 location,
                 partial,
+                ..
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Procedure {
@@ -259,6 +260,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 id,
                 location,
                 partial,
+                ..
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Function {

@@ -1701,6 +1701,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         };
         let table = crate::graph::Node::Table {
             schema: Some("public".to_string()),
@@ -1754,6 +1755,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         };
         let table = crate::graph::Node::Table {
             schema: Some("public".to_string()),
@@ -1933,6 +1935,7 @@ mod tests {
                 },
                 location: loc.clone(),
                 partial: false,
+                body_sql: Vec::new(),
             });
         }
         for i in 0..2 {
@@ -1958,6 +1961,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
 
         let store = GraphStore::from_graph("test", graph);
@@ -1982,6 +1986,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
@@ -2004,6 +2009,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
 
         let store = GraphStore::from_graph("test", graph);
@@ -2032,6 +2038,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_node(crate::graph::Node::Table {
             schema: Some("schema_a".to_string()),
@@ -2054,6 +2061,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_node(crate::graph::Node::View {
             schema: Some("schema_b".to_string()),
@@ -2088,6 +2096,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
@@ -2123,6 +2132,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_node(crate::graph::Node::Function {
             id: crate::graph::RoutineId {
@@ -2133,6 +2143,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
 
         let store = GraphStore::from_graph("test", graph);
@@ -2156,6 +2167,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
 
         let store = GraphStore::from_graph("test", graph);
@@ -2178,6 +2190,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         let proc_b = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2188,6 +2201,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         let table = graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
@@ -2272,6 +2286,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let orphan = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2285,6 +2300,7 @@ mod tests {
                 line: 2,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let caller = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2298,6 +2314,7 @@ mod tests {
                 line: 3,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_edge(
             caller,
@@ -2337,6 +2354,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let b = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2350,6 +2368,7 @@ mod tests {
                 line: 2,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_edge(
             a,
@@ -2396,6 +2415,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let caller = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2409,6 +2429,7 @@ mod tests {
                 line: 2,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let grandcaller = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
@@ -2422,6 +2443,7 @@ mod tests {
                 line: 3,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_edge(
             caller,
@@ -2466,6 +2488,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         }
     }
 
@@ -2644,6 +2667,7 @@ mod tests {
             },
             location: loc.clone(),
             partial: false,
+            body_sql: Vec::new(),
         });
         let table = graph_a.add_node(crate::graph::Node::Table {
             schema: Some("public".into()),
@@ -2680,6 +2704,7 @@ mod tests {
             },
             location: loc,
             partial: false,
+            body_sql: Vec::new(),
         });
         let store_b = GraphStore::from_graph("b", graph_b);
 
@@ -3289,6 +3314,7 @@ mod tests {
                     line: 1,
                 },
                 partial: false,
+                body_sql: Vec::new(),
             };
             graph.add_node(proc);
 

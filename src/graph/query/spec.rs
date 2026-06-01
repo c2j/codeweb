@@ -299,6 +299,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         }
     }
 
@@ -388,6 +389,7 @@ mod tests {
                 line: 1,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         let b = graph.add_node(Node::Procedure {
             id: RoutineId {
@@ -401,6 +403,7 @@ mod tests {
                 line: 2,
             },
             partial: false,
+            body_sql: Vec::new(),
         });
         graph.add_edge(
             a,

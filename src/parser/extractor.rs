@@ -10,6 +10,88 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+pub struct ProcedureBodySql {
+    pub sql_text: String,
+    pub kind: String,
+    pub line: Option<usize>,
+}
+
+pub struct ProcedureSqlExtractor {
+    results: Vec<ProcedureBodySql>,
+}
+
+impl ProcedureSqlExtractor {
+    pub fn new() -> Self {
+        Self { results: Vec::new() }
+    }
+    pub fn finish(self) -> Vec<ProcedureBodySql> {
+        self.results
+    }
+}
+
+impl Visitor for ProcedureSqlExtractor {
+    fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
+        match stmt {
+            PlStatement::SqlStatement {
+                sql_text,
+                statement,
+                span,
+                ..
+            } => {
+                let kind = statement_kind_name(statement);
+                let line = span.as_ref().map(|s| s.start.line);
+                self.results.push(ProcedureBodySql {
+                    sql_text: sql_text.clone(),
+                    kind,
+                    line,
+                });
+            }
+            PlStatement::Sql(sql_text) => {
+                self.results.push(ProcedureBodySql {
+                    sql_text: sql_text.clone(),
+                    kind: "SQL".to_string(),
+                    line: None,
+                });
+            }
+            PlStatement::Perform {
+                query,
+                parsed_query,
+                ..
+            } => {
+                if let Some(ref stmt) = parsed_query {
+                    let kind = statement_kind_name(stmt);
+                    self.results.push(ProcedureBodySql {
+                        sql_text: query.clone(),
+                        kind,
+                        line: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+}
+
+fn statement_kind_name(stmt: &Statement) -> String {
+    match stmt {
+        Statement::Select(_) => "SELECT",
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Merge(_) => "MERGE",
+        _ => "SQL",
+    }
+    .to_string()
+}
+
+pub fn extract_body_sql(block: &ogsql_parser::ast::plpgsql::PlBlock) -> Vec<ProcedureBodySql> {
+    let mut extractor = ProcedureSqlExtractor::new();
+    ogsql_parser::walk_pl_block(&mut extractor, block);
+    extractor.finish()
+}
+
+#[derive(Debug, Clone)]
 pub struct CallEdge {
     pub caller: Option<RoutineId>,
     pub callee_name: String,
