@@ -588,6 +588,9 @@ fn cmd_stats(project: &Path) -> Result<()> {
     println_stdout!("  {:>12}  mappers", stats.mappers,);
     println_stdout!("  {:>12}  java methods", stats.java_methods,);
     println_stdout!("  {:>12}  java classes", stats.java_classes,);
+    if stats.java_sql > 0 {
+        println_stdout!("  {:>12}  java sql sources", stats.java_sql,);
+    }
     if stats.unresolved > 0 {
         println_stdout!("  {:>12}  unresolved", stats.unresolved,);
     }
