@@ -119,6 +119,15 @@ function updateNodeCount() {
   }
 }
 
+function renderSqlSnippet(bodySql) {
+  if (!bodySql || bodySql.length === 0) return '';
+  const s = bodySql[0];
+  const line = (s.sql || '').split('\n')[0].trim();
+  if (!line) return '';
+  const display = line.substring(0, 120) + (line.length > 120 ? '...' : '');
+  return '<div class="sql-snippet"><span class="sql-kind">' + esc(s.kind) + '</span> <span class="sql-text">' + esc(display) + '</span></div>';
+}
+
 function renderVirtualList() {
   const list = document.getElementById('node-list');
   const scrollTop = list.scrollTop;
@@ -134,12 +143,17 @@ function renderVirtualList() {
   for (let i = startIdx; i < endIdx; i++) {
     const n = allNodes[i];
     if (!n) continue;
-    html += '<div class="node-item' + (n.id === selectedNodeId ? ' active' : '') +
-      '" style="position:absolute;top:' + (i * ITEM_HEIGHT) + 'px;left:0;right:0;height:' + ITEM_HEIGHT + 'px"' +
+    const snippet = searchMode === 'sql' ? renderSqlSnippet(n.body_sql) : '';
+    const itemExtra = snippet ? ' node-item-with-snippet' : '';
+    const itemHeight = snippet ? ITEM_HEIGHT + 20 : ITEM_HEIGHT;
+    html += '<div class="node-item' + (n.id === selectedNodeId ? ' active' : '') + itemExtra +
+      '" style="position:absolute;top:' + (i * ITEM_HEIGHT) + 'px;left:0;right:0;height:' + itemHeight + 'px"' +
       ' onclick="selectNode(' + n.id + ')" data-id="' + n.id + '">' +
+      '<div class="node-item-row">' +
       '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
       '<span class="node-key" title="' + esc(n.key) + '">' + esc(n.key) + '</span>' +
-      '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span></div>';
+      '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span>' +
+      '</div>' + snippet + '</div>';
   }
   html += '</div>';
   list.innerHTML = html;
@@ -165,7 +179,7 @@ async function navigateTo(key) {
     selectedNodeId !== null ? api('/nodes/' + selectedNodeId) : Promise.resolve(null),
   ]);
   if (currentTraceKey !== key) return;
-  showDetail(trace, detail);
+  showDetail(trace, detail, searchMode);
 }
 
 function toggleProperties() {
@@ -176,13 +190,21 @@ function toggleProperties() {
   document.getElementById('prop-toggle').textContent = showProperties ? '[-]' : '[+]';
 }
 
-function renderPropertiesHtml(detail) {
+function renderPropertiesHtml(detail, showBodySql) {
   if (!detail || !detail.properties || detail.properties.length === 0) return '';
   const expanded = showProperties;
   let h = '<div class="section-title" style="cursor:pointer" onclick="toggleProperties()">Properties <span id="prop-toggle">' + (expanded ? '[-]' : '[+]') + '</span></div>';
   h += '<div id="prop-content" style="display:' + (expanded ? 'block' : 'none') + '"><div class="prop-list">';
   for (const p of detail.properties) {
-    if (Array.isArray(p.value)) {
+    if (p.label === 'body_sql') {
+      if (showBodySql) {
+        h += '<div class="prop-entry"><span class="prop-label">Procedure SQL (' + p.value.length + ' statements):</span></div>';
+        for (const s of p.value) {
+          h += '<div class="prop-entry"><span class="prop-label dim">[' + esc(s.kind) + ']</span></div>';
+          h += '<pre class="prop-sql">' + esc(s.sql) + '</pre>';
+        }
+      }
+    } else if (Array.isArray(p.value)) {
       h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> (' + p.value.length + ')</div>';
       for (const col of p.value.slice(0, 10)) {
         h += '<div class="prop-col"><span class="prop-col-name">' + esc(col.name) + '</span> <span class="prop-col-type">' + esc(col.type) + '</span>' + (col.pk ? ' <span class="prop-pk">PK</span>' : '') + '</div>';
@@ -201,10 +223,11 @@ function renderPropertiesHtml(detail) {
   return h;
 }
 
-function showDetail(trace, detail) {
+function showDetail(trace, detail, mode) {
   const target = trace.target;
   const inDeg = trace.caller_count;
   const outDeg = trace.callee_count;
+  const showBodySql = mode === 'sql';
 
   showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
   document.getElementById('detail-title').textContent = target.type + ' ' + target.key;
@@ -212,7 +235,7 @@ function showDetail(trace, detail) {
   let h = '<div class="section-title first">Degree</div>';
   h += '<div>in:' + inDeg + ' out:' + outDeg + ' total:' + (inDeg + outDeg) + '</div>';
 
-  h += renderPropertiesHtml(detail);
+  h += renderPropertiesHtml(detail, showBodySql);
 
   h += '<div class="section-title">Callers (' + inDeg + ')</div>';
   h += '<div class="tree-list">';
