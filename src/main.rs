@@ -882,10 +882,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
     let matches = store.search_by_sql(fragment);
 
     if matches.is_empty() {
-        eprintln!(
-            "No MappedStatement or JavaSql nodes contain the SQL fragment: '{}'",
-            fragment
-        );
+        eprintln!("No matching SQL found for fragment: '{}'", fragment);
         return Ok(());
     }
 
@@ -968,6 +965,72 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 let line_count = sql_text.lines().count();
                 if line_count > 5 {
                     println_stdout!("    sql:   ... +{} more lines", line_count - 5);
+                }
+                println_stdout!();
+            }
+            Node::Procedure {
+                id,
+                location,
+                body_sql,
+                ..
+            } => {
+                println_stdout!("  Procedure: {}", id);
+                println_stdout!(
+                    "    file:  {}:{}",
+                    location.file.to_string_lossy(),
+                    location.line
+                );
+                for sql in body_sql.iter().take(5) {
+                    for l in sql.sql_text.lines().take(3) {
+                        println_stdout!("    sql:   {} [{}]", l, sql.kind);
+                    }
+                }
+                let total = body_sql.len();
+                if total > 5 {
+                    println_stdout!("    sql:   ... +{} more SQL statements", total - 5);
+                }
+                let callers: Vec<petgraph::graph::NodeIndex> = graph
+                    .neighbors_directed(*idx, petgraph::Direction::Incoming)
+                    .collect();
+                if !callers.is_empty() {
+                    println_stdout!("    called by:");
+                    for ci in &callers {
+                        let key = crate::graph::key::NodeKey::from_node(&graph[*ci]);
+                        println_stdout!("      {}", key);
+                    }
+                }
+                println_stdout!();
+            }
+            Node::Function {
+                id,
+                location,
+                body_sql,
+                ..
+            } => {
+                println_stdout!("  Function: {}", id);
+                println_stdout!(
+                    "    file:  {}:{}",
+                    location.file.to_string_lossy(),
+                    location.line
+                );
+                for sql in body_sql.iter().take(5) {
+                    for l in sql.sql_text.lines().take(3) {
+                        println_stdout!("    sql:   {} [{}]", l, sql.kind);
+                    }
+                }
+                let total = body_sql.len();
+                if total > 5 {
+                    println_stdout!("    sql:   ... +{} more SQL statements", total - 5);
+                }
+                let callers: Vec<petgraph::graph::NodeIndex> = graph
+                    .neighbors_directed(*idx, petgraph::Direction::Incoming)
+                    .collect();
+                if !callers.is_empty() {
+                    println_stdout!("    called by:");
+                    for ci in &callers {
+                        let key = crate::graph::key::NodeKey::from_node(&graph[*ci]);
+                        println_stdout!("      {}", key);
+                    }
                 }
                 println_stdout!();
             }
