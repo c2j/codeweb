@@ -1160,6 +1160,53 @@ impl GraphStore {
             }
         }
 
+        // 2. JavaSql semantic key fallback
+        //
+        // When query is "javasql:ClassName.methodName", the name_index won't
+        // match (it stores "javasql:/path/file:line" via NodeKey Display).
+        // Search JavaSql nodes by their (class_name, method_name) derived
+        // display key — the same format used by search_by_sql().
+        //
+        // This bridges the gap between search results (which show
+        // "javasql:ClassName.method") and CLI commands like detail/trace
+        // (which use search_nodes() for lookup).
+        if lower.starts_with("javasql:") {
+            let semantic_query = lower["javasql:".len()..].trim();
+            if !semantic_query.is_empty() {
+                for idx in self.nodes_by_type("sql") {
+                    if results.iter().any(|(i, _, _)| i == idx) {
+                        continue;
+                    }
+                    let semantic_candidate: Option<String> = match &self.graph[*idx] {
+                        Node::JavaSql {
+                            class_name: Some(c),
+                            method_name: Some(m),
+                            ..
+                        } => Some(format!("{}.{}", c, m).to_lowercase()),
+                        Node::JavaSql {
+                            class_name: Some(c),
+                            method_name: None,
+                            ..
+                        } => Some(c.to_lowercase()),
+                        Node::JavaSql {
+                            class_name: None,
+                            method_name: Some(m),
+                            ..
+                        } => Some(m.to_lowercase()),
+                        _ => None,
+                    };
+                    if let Some(candidate) = semantic_candidate {
+                        if let Some(rank) = MatchRank::classify(semantic_query, &candidate) {
+                            let display =
+                                crate::graph::key::NodeKey::from_node(&self.graph[*idx])
+                                    .to_string();
+                            results.push((*idx, display, rank));
+                        }
+                    }
+                }
+            }
+        }
+
         results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
         results
             .into_iter()
