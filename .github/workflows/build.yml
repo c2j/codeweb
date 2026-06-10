@@ -85,11 +85,8 @@ jobs:
           for dir in */; do
             name="${dir%/}"
             archive_name="codeweb-${VERSION}-${name#codeweb-}"
-            if [ "$name" = "codeweb-x86_64-pc-windows-msvc" ]; then
-              7z a "${archive_name}.zip" "./${name}/"
-            else
-              tar czf "${archive_name}.tar.gz" -C "${name}" .
-            fi
+            tar czf "${archive_name}.tar.gz" -C "${name}" .
+            7z a "${archive_name}.zip" "./${name}/"
           done
 
       - name: Create release
@@ -99,3 +96,4 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+
