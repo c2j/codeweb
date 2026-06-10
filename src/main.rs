@@ -298,6 +298,21 @@ enum Commands {
         project: PathBuf,
     },
 
+    /// Deduplicate graph nodes and edges
+    Dedup {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Output deduplicated store to a new file (default: in-place)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show what would be deduplicated without modifying the store
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Execute a JSON query spec against the graph
     Query {
         /// Path to JSON query spec file (use - for stdin)
@@ -439,6 +454,11 @@ fn run() -> Result<()> {
             spec,
             project,
         }) => cmd_query(file.as_deref(), spec.as_deref(), &project),
+        Some(Commands::Dedup {
+            project,
+            output,
+            dry_run,
+        }) => cmd_dedup(&project, output.as_deref(), dry_run),
     }
 }
 
@@ -526,6 +546,43 @@ fn cmd_merge(stores: &[PathBuf], output: &Path, name: &str) -> Result<()> {
     );
     merged.save_bincode(output)?;
     eprintln!("Saved to {}", output.display());
+    Ok(())
+}
+
+fn cmd_dedup(project: &Path, output: Option<&Path>, dry_run: bool) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+
+    eprintln!(
+        "Before: {} nodes, {} edges",
+        store.graph().node_count(),
+        store.graph().edge_count()
+    );
+
+    if dry_run {
+        eprintln!("(dry-run mode — no changes made)");
+        return Ok(());
+    }
+
+    let mut store = proj.take_store().unwrap();
+    let report = store.dedup();
+
+    eprintln!(
+        "After:  {} nodes, {} edges (removed {} nodes, {} edges)",
+        store.graph().node_count(),
+        store.graph().edge_count(),
+        report.nodes_removed,
+        report.edges_removed,
+    );
+
+    if let Some(out_path) = output {
+        store.save_bincode(out_path)?;
+        eprintln!("Saved to {}", out_path.display());
+    } else {
+        proj.save_store(&store)?;
+        eprintln!("Store updated in-place");
+    }
+
     Ok(())
 }
 
