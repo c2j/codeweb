@@ -414,7 +414,7 @@ impl Project {
         self.root.join(&self.config.store.path)
     }
 
-    fn save_store(&self, store: &GraphStore) -> Result<()> {
+    pub fn save_store(&self, store: &GraphStore) -> Result<()> {
         let path = self.store_path();
         match self.config.store.format {
             config::StoreFormat::Bincode => store.save_bincode(&path)?,
