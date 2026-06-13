@@ -8,6 +8,8 @@ mod export;
 mod graph;
 #[allow(dead_code)]
 mod import;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod parse_log;
 #[allow(dead_code)]
 mod parser;
@@ -177,6 +179,19 @@ enum Commands {
         /// Open browser automatically after server starts
         #[arg(long)]
         open: bool,
+    },
+
+    /// Start MCP server for LLM integration (stdio JSON-RPC)
+    ///
+    /// Launches a Model Context Protocol server over stdio, enabling LLM clients
+    /// (Claude Desktop, Cursor, etc.) to query the code graph via JSON-RPC tools.
+    ///
+    /// Requires the "mcp" feature flag: cargo run --features mcp -- mcp
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
     },
 
     /// Trace complete call chain from a node
@@ -409,6 +424,8 @@ fn run() -> Result<()> {
             addr,
             open,
         }) => server::run(&project, &addr, open),
+        #[cfg(feature = "mcp")]
+        Some(Commands::Mcp { project }) => mcp::server::run(&project),
         Some(Commands::Trace {
             from,
             project,

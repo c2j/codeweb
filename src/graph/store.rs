@@ -1826,8 +1826,18 @@ fn pick_richer_node(a: &Node, idx_a: NodeIndex, b: &Node, idx_b: NodeIndex) -> N
         (Node::Procedure { partial: true, .. }, Node::Procedure { partial: false, .. }) => idx_b,
         (Node::Function { partial: false, .. }, Node::Function { partial: true, .. }) => idx_a,
         (Node::Function { partial: true, .. }, Node::Function { partial: false, .. }) => idx_b,
-        (Node::Table { location: Some(_), .. }, Node::Table { location: None, .. }) => idx_a,
-        (Node::Table { location: None, .. }, Node::Table { location: Some(_), .. }) => idx_b,
+        (
+            Node::Table {
+                location: Some(_), ..
+            },
+            Node::Table { location: None, .. },
+        ) => idx_a,
+        (
+            Node::Table { location: None, .. },
+            Node::Table {
+                location: Some(_), ..
+            },
+        ) => idx_b,
         _ => idx_a,
     }
 }
@@ -1944,12 +1954,7 @@ impl GraphStore {
                     continue;
                 }
 
-                let keep = pick_richer_node(
-                    &self.graph[c_idx],
-                    c_idx,
-                    &self.graph[idx],
-                    idx,
-                );
+                let keep = pick_richer_node(&self.graph[c_idx], c_idx, &self.graph[idx], idx);
 
                 if keep == idx {
                     canonical.insert(key, idx);
@@ -1980,26 +1985,24 @@ impl GraphStore {
             let mut rewires: Vec<(NodeIndex, NodeIndex, crate::graph::Edge)> = Vec::new();
 
             for (&remove, &canon) in &final_mapping {
-                for edge_ref in
-                    self.graph
-                        .edges_directed(remove, petgraph::Direction::Incoming)
+                for edge_ref in self
+                    .graph
+                    .edges_directed(remove, petgraph::Direction::Incoming)
                 {
                     let src = edge_ref.source();
                     let final_src = final_mapping.get(&src).copied().unwrap_or(src);
                     if final_src != canon {
-                        rewires
-                            .push((final_src, canon, edge_ref.weight().clone()));
+                        rewires.push((final_src, canon, edge_ref.weight().clone()));
                     }
                 }
-                for edge_ref in
-                    self.graph
-                        .edges_directed(remove, petgraph::Direction::Outgoing)
+                for edge_ref in self
+                    .graph
+                    .edges_directed(remove, petgraph::Direction::Outgoing)
                 {
                     let dst = edge_ref.target();
                     let final_dst = final_mapping.get(&dst).copied().unwrap_or(dst);
                     if canon != final_dst {
-                        rewires
-                            .push((canon, final_dst, edge_ref.weight().clone()));
+                        rewires.push((canon, final_dst, edge_ref.weight().clone()));
                     }
                 }
             }
@@ -2021,8 +2024,7 @@ impl GraphStore {
         }
 
         {
-            let all_edges: Vec<petgraph::graph::EdgeIndex> =
-                self.graph.edge_indices().collect();
+            let all_edges: Vec<petgraph::graph::EdgeIndex> = self.graph.edge_indices().collect();
             let mut edge_groups: HashMap<
                 (NodeIndex, NodeIndex, String),
                 Vec<petgraph::graph::EdgeIndex>,
@@ -2048,9 +2050,7 @@ impl GraphStore {
                         let extra = &self.graph[remove_idx];
                         let (extra_modes, extra_kinds) =
                             if let crate::graph::Edge::TableAccess {
-                                modes,
-                                write_kinds,
-                                ..
+                                modes, write_kinds, ..
                             } = extra
                             {
                                 (*modes, write_kinds.clone())
@@ -4231,7 +4231,6 @@ mod tests {
     // Activate with: cargo test --features search-sql-v2
     // =======================================================================
 
-
     // ── Dedup tests ───────────────────────────────────────────────────────────
 
     #[test]
@@ -4309,10 +4308,7 @@ mod tests {
             .graph()
             .node_indices()
             .filter(|i| {
-                matches!(
-                    &store.graph()[*i],
-                    crate::graph::Node::Procedure { .. }
-                ) && {
+                matches!(&store.graph()[*i], crate::graph::Node::Procedure { .. }) && {
                     let key = crate::graph::key::NodeKey::from_node(&store.graph()[*i]);
                     key.to_string().contains("do_work")
                 }
@@ -4324,10 +4320,7 @@ mod tests {
             .graph()
             .node_indices()
             .filter(|i| {
-                matches!(
-                    &store.graph()[*i],
-                    crate::graph::Node::Procedure { .. }
-                ) && {
+                matches!(&store.graph()[*i], crate::graph::Node::Procedure { .. }) && {
                     let key = crate::graph::key::NodeKey::from_node(&store.graph()[*i]);
                     key.to_string().contains("caller")
                 }
@@ -4335,13 +4328,10 @@ mod tests {
             .collect();
         assert_eq!(caller_indices.len(), 1, "caller should survive");
 
-        let has_edge = store
-            .graph()
-            .edge_indices()
-            .any(|e| {
-                let (src, dst) = store.graph().edge_endpoints(e).unwrap();
-                src == caller_indices[0] && dst == proc_indices[0]
-            });
+        let has_edge = store.graph().edge_indices().any(|e| {
+            let (src, dst) = store.graph().edge_endpoints(e).unwrap();
+            src == caller_indices[0] && dst == proc_indices[0]
+        });
         assert!(
             has_edge,
             "caller should have edge rewired to surviving procedure"
@@ -4445,10 +4435,7 @@ mod tests {
         let surviving = &store.graph()[NodeIndex::new(0)];
         match surviving {
             crate::graph::Node::Table { location, .. } => {
-                assert!(
-                    location.is_some(),
-                    "DDL table with location should survive"
-                );
+                assert!(location.is_some(), "DDL table with location should survive");
             }
             _ => panic!("expected Table node"),
         }
@@ -4693,8 +4680,14 @@ mod tests {
             let (src, dst) = store.graph().edge_endpoints(e).unwrap();
             src == p2 && dst == surviving_u
         });
-        assert!(p1_has_edge, "p1 should have edge to surviving Unresolved node");
-        assert!(p2_has_edge, "p2 should have edge to surviving Unresolved node");
+        assert!(
+            p1_has_edge,
+            "p1 should have edge to surviving Unresolved node"
+        );
+        assert!(
+            p2_has_edge,
+            "p2 should have edge to surviving Unresolved node"
+        );
     }
 
     #[cfg(feature = "search-sql-v2")]
@@ -5715,6 +5708,5 @@ mod tests {
                 1
             );
         }
-
     }
 }

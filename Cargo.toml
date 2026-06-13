@@ -11,10 +11,11 @@ fallback_locale = "en"
 
 [features]
 default = ["cli", "tui"]
-full = ["cli", "tui", "serve"]
+full = ["cli", "tui", "serve", "mcp"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
 serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
 search-sql-v2 = []
 
 [dependencies]
@@ -38,7 +39,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 axum = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"], optional = true }
+rmcp = { version = "1.7", features = ["server", "transport-io"], optional = true }
+schemars = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
