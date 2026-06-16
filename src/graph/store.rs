@@ -3769,14 +3769,6 @@ mod tests {
         }
     }
 
-    fn make_view_node(name: &str, schema: Option<&str>) -> crate::graph::Node {
-        crate::graph::Node::View {
-            schema: schema.map(String::from),
-            name: name.to_string(),
-            location: None,
-        }
-    }
-
     // --- search_by_sql: exact and substring matching ---
 
     #[test]
@@ -4242,7 +4234,7 @@ mod tests {
         };
 
         // Two procedures with same NodeKey.
-        let p1 = graph.add_node(crate::graph::Node::Procedure {
+        let _p1 = graph.add_node(crate::graph::Node::Procedure {
             id: crate::graph::RoutineId {
                 schema: Some("public".to_string()),
                 package: None,
@@ -4390,10 +4382,6 @@ mod tests {
     #[test]
     fn dedup_merges_table_nodes() {
         let mut graph = CodeGraph::new();
-        let loc = crate::graph::SourceLocation {
-            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
-            line: 1,
-        };
 
         // Implicit table (no location).
         graph.add_node(crate::graph::Node::Table {
