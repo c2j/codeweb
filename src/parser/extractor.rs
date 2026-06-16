@@ -468,11 +468,11 @@ impl TableAccessExtractor {
             return;
         }
         let (schema, table_name) = if name.len() == 1 {
-            (None, name[0].clone())
+            (None, name[0].to_string())
         } else {
             (
                 Some(name[..name.len() - 1].join(".")),
-                name[name.len() - 1].clone(),
+                name[name.len() - 1].to_string(),
             )
         };
 
@@ -904,11 +904,18 @@ impl ColumnAccessExtractor {
         self.alias_map.get(&prefix.to_lowercase())
     }
 
-    fn add_column_ref(&mut self, names: &[String], extra_context: Option<ColumnContext>) {
+    fn add_column_ref(
+        &mut self,
+        names: &[ogsql_parser::Ident],
+        extra_context: Option<ColumnContext>,
+    ) {
         let (alias_prefix, column) = if names.len() >= 2 {
-            (Some(names[0].clone()), names[names.len() - 1].clone())
+            (
+                Some(names[0].to_string()),
+                names[names.len() - 1].to_string(),
+            )
         } else {
-            (None, names[0].clone())
+            (None, names[0].to_string())
         };
         let resolved_table = alias_prefix
             .as_ref()
@@ -1124,8 +1131,8 @@ impl ColumnAccessExtractor {
 
     fn extract_join_condition(
         &mut self,
-        left_names: &[String],
-        right_names: &[String],
+        left_names: &[ogsql_parser::Ident],
+        right_names: &[ogsql_parser::Ident],
         join_type: &AstJoinType,
         is_explicit_on: bool,
     ) {
@@ -1176,7 +1183,12 @@ impl ColumnAccessExtractor {
         }
     }
 
-    fn add_hard_filter(&mut self, col_names: &[String], op: FilterOperator, val: FilterValue) {
+    fn add_hard_filter(
+        &mut self,
+        col_names: &[ogsql_parser::Ident],
+        op: FilterOperator,
+        val: FilterValue,
+    ) {
         let (alias_prefix, column) = split_alias_column(col_names);
         let table = alias_prefix
             .as_ref()
@@ -1307,7 +1319,7 @@ impl Visitor for ColumnAccessExtractor {
     }
 
     fn visit_insert(&mut self, insert: &InsertStatement) -> VisitorResult {
-        let table_name = insert.table.last().cloned().unwrap_or_default();
+        let table_name = insert.table.last().cloned().unwrap_or_default().to_string();
         self.insert_columns.push(InsertColumnInfo {
             table: table_name,
             columns: insert.columns.clone(),
@@ -1335,7 +1347,7 @@ impl Visitor for ColumnAccessExtractor {
             .first()
             .and_then(|tr| {
                 if let AstTableRef::Table { name, .. } = tr {
-                    Some(name.last().cloned().unwrap_or_default())
+                    Some(name.last().cloned().unwrap_or_default().to_string())
                 } else {
                     None
                 }
@@ -1345,7 +1357,7 @@ impl Visitor for ColumnAccessExtractor {
         let set_columns: Vec<String> = update
             .assignments
             .iter()
-            .filter_map(|a| a.columns.first()?.last().cloned())
+            .filter_map(|a| a.columns.first()?.last().map(|i| i.to_string()))
             .collect();
 
         if !table_name.is_empty() {
@@ -1521,27 +1533,30 @@ fn format_literal_short(lit: &Literal) -> String {
     }
 }
 
-fn split_alias_column(names: &[String]) -> (Option<String>, String) {
+fn split_alias_column(names: &[ogsql_parser::Ident]) -> (Option<String>, String) {
     if names.len() >= 2 {
-        (Some(names[0].clone()), names[names.len() - 1].clone())
+        (
+            Some(names[0].to_string()),
+            names[names.len() - 1].to_string(),
+        )
     } else {
-        (None, names[0].clone())
+        (None, names[0].to_string())
     }
 }
 
 fn split_schema_table(name: &ObjectName) -> (Option<String>, String) {
     if name.len() == 1 {
-        (None, name[0].clone())
+        (None, name[0].to_string())
     } else {
         (
             Some(name[..name.len() - 1].join(".")),
-            name[name.len() - 1].clone(),
+            name[name.len() - 1].to_string(),
         )
     }
 }
 
 /// Check if an expression is a ColumnRef and return the names.
-fn as_column_ref(expr: &Expr) -> Option<Vec<String>> {
+fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {
     match expr {
         Expr::ColumnRef(names) => Some(names.clone()),
         _ => None,
