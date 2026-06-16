@@ -1,7 +1,17 @@
 #[cfg(feature = "serve")]
 mod tests {
     use std::process::{Child, Command};
+    use std::sync::OnceLock;
     use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    static PROJECT: OnceLock<ProjectFixture> = OnceLock::new();
+
+    struct ProjectFixture {
+        _tmp: TempDir,
+        root: std::path::PathBuf,
+    }
 
     fn codeweb_bin() -> std::path::PathBuf {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -20,12 +30,56 @@ mod tests {
         base.join("debug").join(bin_name)
     }
 
+    fn project_root() -> &'static std::path::Path {
+        let fixture = PROJECT
+            .get_or_init(|| build_fixture().expect("failed to build serve_api fixture project"));
+        &fixture.root
+    }
+
+    fn build_fixture() -> std::io::Result<ProjectFixture> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+
+        let toml = "[project]\n\
+                    name = \"serve-api-test\"\n\
+                    \n\
+                    [analysis]\n\
+                    paths = [\"sql/\"]\n\
+                    \n\
+                    [store]\n\
+                    path = \".codeweb/store.bincode\"\n\
+                    format = \"bincode\"\n";
+        std::fs::write(root.join("codeweb.toml"), toml)?;
+
+        let fixture_sql = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/serve_demo/sample.sql");
+        let sql_dir = root.join("sql");
+        std::fs::create_dir_all(&sql_dir)?;
+        std::fs::copy(&fixture_sql, sql_dir.join("sample.sql"))?;
+
+        let output = Command::new(codeweb_bin())
+            .arg("analyze")
+            .current_dir(&root)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "codeweb analyze failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            root.join(".codeweb/store.bincode").exists(),
+            "store.bincode not produced by analyze"
+        );
+
+        Ok(ProjectFixture { _tmp: tmp, root })
+    }
+
     fn start_server(port: u16) -> Child {
         let child = Command::new(codeweb_bin())
             .args([
                 "serve",
                 "--project",
-                env!("CARGO_MANIFEST_DIR"),
+                project_root().to_str().expect("utf-8 path"),
                 "--addr",
                 &format!("127.0.0.1:{}", port),
             ])
@@ -34,6 +88,11 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(2));
         child
+    }
+
+    fn stop_server(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn get(port: u16, path: &str) -> (u16, String) {
@@ -54,7 +113,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, body) = get(port, "/api/v1/stats");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -67,7 +126,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, body) = get(port, "/api/v1/nodes");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -83,7 +142,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, body) = get(port, "/api/v1/graph");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         assert!(body.contains("nodes"));
@@ -95,7 +154,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, _body) = get(port, "/api/v1/export?format=dot");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
     }
@@ -106,7 +165,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, body) = get(port, "/");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         assert!(body.contains("codeweb"));
@@ -119,7 +178,7 @@ mod tests {
         let mut child = start_server(port);
 
         let (status, body) = get(port, "/api/v1/nodes/search-sql?q=select");
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -136,7 +195,7 @@ mod tests {
             port,
             "/api/v1/nodes/search-sql?q=DROP+TABLE+nonexistent_xyz",
         );
-        child.kill().ok();
+        stop_server(&mut child);
 
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
