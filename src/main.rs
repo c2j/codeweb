@@ -94,6 +94,10 @@ struct Cli {
     /// Only scan SQL files (ignore Java and XML)
     #[arg(long)]
     sql_only: bool,
+
+    /// Output language (zh-CN or en, default: zh-CN)
+    #[arg(long, global = true)]
+    lang: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +346,29 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
     },
+
+    /// Partition graph nodes into k clusters for system decomposition analysis
+    Partition {
+        /// Target number of clusters (omit for auto-discovery)
+        #[arg(short, long)]
+        k: Option<usize>,
+
+        /// Resolution parameter γ (lower = fewer/larger clusters, default 1.0)
+        #[arg(long)]
+        gamma: Option<f64>,
+
+        /// Auto-discover optimal cluster count via γ sweep
+        #[arg(long)]
+        auto: bool,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Export clustered graph as DOT to file (with subgraph cluster_* blocks)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -392,6 +419,12 @@ fn run() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Some(ref lang) = cli.lang {
+        rust_i18n::set_locale(lang);
+    } else {
+        rust_i18n::set_locale("zh-CN");
+    }
 
     match cli.command {
         None => {
@@ -476,6 +509,13 @@ fn run() -> Result<()> {
             output,
             dry_run,
         }) => cmd_dedup(&project, output.as_deref(), dry_run),
+        Some(Commands::Partition {
+            k,
+            gamma,
+            auto,
+            project,
+            output,
+        }) => cmd_partition(k, gamma, auto, &project, output.as_deref()),
     }
 }
 
@@ -1485,6 +1525,281 @@ fn write_output(content: &str, output: Option<&std::path::Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_partition(
+    k: Option<usize>,
+    gamma: Option<f64>,
+    auto: bool,
+    project: &Path,
+    output: Option<&Path>,
+) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+
+    if auto || (k.is_none() && gamma.is_none()) {
+        let base_config = graph::cluster::ClusterConfig::auto();
+        let auto_report = graph::cluster::auto_partition(store.graph(), &base_config);
+
+        println_stdout!(
+            "{}",
+            t!(
+                "partition.auto_title",
+                total = auto_report.report.total_nodes
+            )
+        );
+        println_stdout!();
+
+        let gamma_count = graph::cluster::AUTO_GAMMA_SWEEP_LEN;
+        println_stdout!("  {}", t!("partition.gamma_sweep"));
+        println_stdout!(
+            "  {:>10}  {:>8}  {:>12}  {:>14}",
+            "Gamma",
+            "Clusters",
+            "Modularity Q",
+            "Avg Cluster Size"
+        );
+        for e in auto_report.sweep.iter().take(gamma_count) {
+            println_stdout!(
+                "  {:>10.2}  {:>8}  {:>12.3}  {:>14.1}",
+                e.gamma,
+                e.k,
+                e.modularity,
+                e.avg_cluster_size
+            );
+        }
+        println_stdout!();
+        println_stdout!("  {}", t!("partition.k_sweep"));
+        println_stdout!(
+            "  {:>10}  {:>8}  {:>12}  {:>14}",
+            t!("partition.forced_k"),
+            t!("partition.actual"),
+            "Modularity Q",
+            "Avg Cluster Size"
+        );
+        for e in auto_report.sweep.iter().skip(gamma_count) {
+            println_stdout!(
+                "  {:>10}  {:>8}  {:>12.3}  {:>14.1}",
+                e.k,
+                e.k,
+                e.modularity,
+                e.avg_cluster_size
+            );
+        }
+        println_stdout!();
+        let rec_q = auto_report
+            .sweep
+            .iter()
+            .find(|e| e.k == auto_report.recommended_k)
+            .map(|e| e.modularity)
+            .unwrap_or(0.0);
+        println_stdout!(
+            "{}",
+            t!(
+                "partition.recommended",
+                k = auto_report.recommended_k,
+                q = format!("{:.3}", rec_q)
+            )
+        );
+        println_stdout!();
+
+        print_cluster_details(&auto_report.report);
+        print_cluster_analysis(&auto_report.report);
+
+        if let Some(path) = output {
+            let cr = graph::cluster::ClusterResult::from(&auto_report.report);
+            let dot = export::dot::to_dot_with_clusters(store.graph(), Some(&cr));
+            write_output(&dot, Some(path))?;
+            eprintln!("Clustered DOT exported to {}", path.display());
+        }
+        return Ok(());
+    }
+
+    let mut config = match k {
+        Some(k) => graph::cluster::ClusterConfig::new(k),
+        None => graph::cluster::ClusterConfig::auto(),
+    };
+    if let Some(g) = gamma {
+        config = config.with_gamma(g);
+    }
+
+    let report = store.partition(&config);
+
+    let k_desc = match report.k_requested {
+        Some(k) => format!("requested {}", k),
+        None => "auto-discovered".to_string(),
+    };
+    println_stdout!(
+        "Partitioned {} nodes into {} clusters ({}, γ={:.2}, modularity Q = {:.3})",
+        report.total_nodes,
+        report.k_actual,
+        k_desc,
+        report.gamma,
+        report.modularity
+    );
+    println_stdout!();
+
+    print_cluster_details(&report);
+
+    if !report.inter_cluster_coupling.is_empty() {
+        println_stdout!();
+        let total_coupling: f64 = report.inter_cluster_coupling.iter().map(|c| c.weight).sum();
+        println_stdout!(
+            "Inter-cluster coupling ({} entries, total weight {:.1}):",
+            report.inter_cluster_coupling.len(),
+            total_coupling
+        );
+        for c in report.inter_cluster_coupling.iter().take(10) {
+            println_stdout!(
+                "  Cluster {} → Cluster {}:  {:.1}  ({} edges)",
+                c.from,
+                c.to,
+                c.weight,
+                c.edge_count
+            );
+        }
+    }
+
+    if let Some(path) = output {
+        let cluster_result = graph::cluster::ClusterResult::from(&report);
+        let dot = export::dot::to_dot_with_clusters(store.graph(), Some(&cluster_result));
+        write_output(&dot, Some(path))?;
+        eprintln!("Clustered DOT exported to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn print_cluster_details(report: &graph::cluster::PartitionReport) {
+    println_stdout!(
+        "  {:>7}  {:>6}  {:>10}  {:>10}  {}",
+        t!("partition.cluster"),
+        t!("partition.size"),
+        t!("partition.internal"),
+        t!("partition.external"),
+        t!("partition.type_breakdown")
+    );
+    for stat in &report.cluster_stats {
+        let breakdown: Vec<String> = {
+            let mut entries: Vec<(graph::cluster::NodeKind, usize)> = stat
+                .type_distribution
+                .iter()
+                .map(|(k, c)| (*k, *c))
+                .collect();
+            entries.sort_by_key(|b| std::cmp::Reverse(b.1));
+            entries
+                .iter()
+                .map(|(kind, count)| format!("{}: {}", kind.tag(), count))
+                .collect::<Vec<_>>()
+        };
+        println_stdout!(
+            "  {:>7}  {:>6}  {:>10.1}  {:>10.1}  {}",
+            stat.id,
+            stat.node_count,
+            stat.internal_weight,
+            stat.external_weight,
+            breakdown.join(", ")
+        );
+    }
+}
+
+fn print_cluster_analysis(report: &graph::cluster::PartitionReport) {
+    println_stdout!();
+    println_stdout!("{}", t!("partition.analysis_title"));
+    println_stdout!();
+
+    let total = report.total_nodes.max(1);
+    let largest = report.cluster_stats.iter().max_by_key(|s| s.node_count);
+    let disconnected: Vec<_> = report
+        .cluster_stats
+        .iter()
+        .filter(|s| s.external_weight == 0.0)
+        .collect();
+    let connected: Vec<_> = report
+        .cluster_stats
+        .iter()
+        .filter(|s| s.external_weight > 0.0)
+        .collect();
+    let total_coupling: f64 = report.inter_cluster_coupling.iter().map(|c| c.weight).sum();
+    let total_internal: f64 = report.cluster_stats.iter().map(|s| s.internal_weight).sum();
+
+    if let Some(lg) = largest {
+        let pct = lg.node_count * 100 / total;
+        if pct > 40 {
+            println_stdout!(
+                "{}",
+                t!(
+                    "partition.catchall",
+                    id = lg.id,
+                    pct = pct,
+                    size = lg.node_count,
+                    total = total
+                )
+            );
+            println_stdout!("{}", t!("partition.catchall_2"));
+        }
+    }
+
+    if disconnected.len() == report.cluster_stats.len() && !disconnected.is_empty() {
+        let n = disconnected.len();
+        println_stdout!("{}", t!("partition.all_disconnected", n = n));
+        println_stdout!("{}", t!("partition.all_disconnected_2"));
+        println_stdout!("{}", t!("partition.all_disconnected_3"));
+    } else if !disconnected.is_empty() {
+        println_stdout!(
+            "{}",
+            t!(
+                "partition.some_disconnected",
+                disc = disconnected.len(),
+                total = report.cluster_stats.len(),
+                conn = connected.len()
+            )
+        );
+    }
+
+    if total_coupling > 0.0 && total_internal + total_coupling > 0.0 {
+        let ratio = total_coupling / (total_internal + total_coupling) * 100.0;
+        println_stdout!(
+            "{}",
+            t!("partition.coupling_ratio", ratio = format!("{:.0}", ratio))
+        );
+        if ratio < 20.0 {
+            println_stdout!("{}", t!("partition.coupling_low"));
+        } else if ratio < 50.0 {
+            println_stdout!("{}", t!("partition.coupling_mid"));
+        } else {
+            println_stdout!("{}", t!("partition.coupling_high"));
+        }
+    }
+
+    let has_proc = report.cluster_stats.iter().any(|s| {
+        s.type_distribution
+            .contains_key(&graph::cluster::NodeKind::Procedure)
+    });
+    let has_method = report.cluster_stats.iter().any(|s| {
+        s.type_distribution
+            .contains_key(&graph::cluster::NodeKind::JavaMethod)
+    });
+    let mixed = report.cluster_stats.iter().any(|s| {
+        s.type_distribution
+            .contains_key(&graph::cluster::NodeKind::Procedure)
+            && s.type_distribution
+                .contains_key(&graph::cluster::NodeKind::JavaMethod)
+    });
+    if has_proc && has_method && !mixed {
+        println_stdout!("{}", t!("partition.layer_split"));
+        println_stdout!("{}", t!("partition.layer_split_2"));
+    }
+
+    let q = report.modularity;
+    let q_str = format!("{:.3}", q);
+    if q > 0.7 {
+        println_stdout!("{}", t!("partition.q_strong", q = q_str));
+    } else if q > 0.3 {
+        println_stdout!("{}", t!("partition.q_moderate", q = q_str));
+    } else {
+        println_stdout!("{}", t!("partition.q_weak", q = q_str));
+    }
 }
 
 fn print_analyze_report(report: &project::AnalyzeReport) {
