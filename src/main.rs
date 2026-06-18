@@ -361,6 +361,16 @@ enum Commands {
         #[arg(long)]
         auto: bool,
 
+        /// Cap natural-mode CNM iterations per sweep (e.g. 5000). Forced-k
+        /// sweeps ignore this. Useful to bound runtime on very large graphs.
+        #[arg(long)]
+        max_iterations: Option<usize>,
+
+        /// Stop merging when ΔQ falls at or below this threshold (natural mode
+        /// only). Default 0.0; raise to prune negligible merges.
+        #[arg(long)]
+        min_delta_q: Option<f64>,
+
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
@@ -513,9 +523,19 @@ fn run() -> Result<()> {
             k,
             gamma,
             auto,
+            max_iterations,
+            min_delta_q,
             project,
             output,
-        }) => cmd_partition(k, gamma, auto, &project, output.as_deref()),
+        }) => cmd_partition(
+            k,
+            gamma,
+            auto,
+            max_iterations,
+            min_delta_q,
+            &project,
+            output.as_deref(),
+        ),
     }
 }
 
@@ -1531,6 +1551,8 @@ fn cmd_partition(
     k: Option<usize>,
     gamma: Option<f64>,
     auto: bool,
+    max_iterations: Option<usize>,
+    min_delta_q: Option<f64>,
     project: &Path,
     output: Option<&Path>,
 ) -> Result<()> {
@@ -1538,8 +1560,31 @@ fn cmd_partition(
     let store = proj.load_store()?;
 
     if auto || (k.is_none() && gamma.is_none()) {
-        let base_config = graph::cluster::ClusterConfig::auto();
-        let auto_report = graph::cluster::auto_partition(store.graph(), &base_config);
+        let mut base_config = graph::cluster::ClusterConfig::auto();
+        if let Some(n) = max_iterations {
+            base_config = base_config.with_max_iterations(n);
+        }
+        if let Some(q) = min_delta_q {
+            base_config = base_config.with_min_delta_q(q);
+        }
+
+        let pb = indicatif::ProgressBar::new((graph::cluster::AUTO_GAMMA_SWEEP_LEN + 5) as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  {bar:40.cyan/blue} {pos}/{len} {wide_msg:.dim}",
+            )
+            .unwrap()
+            .progress_chars("━━╾─"),
+        );
+        let auto_report = graph::cluster::auto_partition_with_progress(
+            store.graph(),
+            &base_config,
+            Some(&pb),
+        );
+        pb.finish_with_message(format!(
+            "auto-partition complete | recommended k={} γ={:.2}",
+            auto_report.recommended_k, auto_report.recommended_gamma
+        ));
 
         println_stdout!(
             "{}",
@@ -1621,6 +1666,12 @@ fn cmd_partition(
     };
     if let Some(g) = gamma {
         config = config.with_gamma(g);
+    }
+    if let Some(n) = max_iterations {
+        config = config.with_max_iterations(n);
+    }
+    if let Some(q) = min_delta_q {
+        config = config.with_min_delta_q(q);
     }
 
     let report = store.partition(&config);
