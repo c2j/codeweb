@@ -221,11 +221,8 @@ mod tests {
         let f = write_temp_xml("");
         let result = load_ibatis_file(f.path());
         // Either rejected (Err) or accepted with no statements (Ok)
-        match result {
-            Ok((mapper, _)) => {
-                assert!(mapper.statements.is_empty());
-            }
-            Err(_) => {}
+        if let Ok((mapper, _)) = result {
+            assert!(mapper.statements.is_empty());
         }
     }
 

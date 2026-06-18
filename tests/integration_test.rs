@@ -722,8 +722,8 @@ fn test_package_cross_call_resolution() {
     let edges = parsed["edges"].as_array().unwrap();
     let has_call_edge = edges.iter().any(|e| {
         e["type"] == "direct"
-            && e["source"] == serde_json::Value::from(caller_idx.unwrap() as u64)
-            && e["target"] == serde_json::Value::from(dowork_idx.unwrap() as u64)
+            && e["source"] == caller_idx.unwrap() as u64
+            && e["target"] == dowork_idx.unwrap() as u64
     });
     assert!(
         has_call_edge,
@@ -935,11 +935,9 @@ fn test_insert_select_read_write() {
     let archive_idx = nodes
         .iter()
         .position(|n| n["type"] == "table" && n["name"] == "t_archive");
-    let archive_edge = table_access_edges.iter().find(|e| {
-        archive_idx.map_or(false, |idx| {
-            e["target"] == serde_json::Value::from(idx as u64)
-        })
-    });
+    let archive_edge = table_access_edges
+        .iter()
+        .find(|e| archive_idx.is_some_and(|idx| e["target"] == idx as u64));
     assert!(archive_edge.is_some(), "Expected edge to t_archive");
     let modes = archive_edge.unwrap()["modes"].as_array().unwrap();
     assert!(
@@ -956,11 +954,9 @@ fn test_insert_select_read_write() {
     let users_idx = nodes
         .iter()
         .position(|n| n["type"] == "table" && n["name"] == "t_users");
-    let users_edge = table_access_edges.iter().find(|e| {
-        users_idx.map_or(false, |idx| {
-            e["target"] == serde_json::Value::from(idx as u64)
-        })
-    });
+    let users_edge = table_access_edges
+        .iter()
+        .find(|e| users_idx.is_some_and(|idx| e["target"] == idx as u64));
     assert!(users_edge.is_some(), "Expected edge to t_users");
     let modes = users_edge.unwrap()["modes"].as_array().unwrap();
     assert!(
@@ -1582,7 +1578,7 @@ fn test_external_call_scope() {
 
     let external_edges: Vec<_> = edges
         .iter()
-        .filter(|e| e["type"] == "direct" && e.get("scope").map_or(true, |s| s == "external"))
+        .filter(|e| e["type"] == "direct" && e.get("scope").is_none_or(|s| s == "external"))
         .collect();
     assert!(
         !external_edges.is_empty(),
@@ -1797,8 +1793,8 @@ fn test_intra_package_bare_name_resolves() {
 
     let has_edge = edges.iter().any(|e| {
         e["type"] != "contains"
-            && e["source"] == serde_json::Value::from(submit_idx as u64)
-            && e["target"] == serde_json::Value::from(addjob_idx as u64)
+            && e["source"] == submit_idx as u64
+            && e["target"] == addjob_idx as u64
     });
     assert!(
         has_edge,
