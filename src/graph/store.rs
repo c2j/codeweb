@@ -262,6 +262,14 @@ impl GraphStore {
         &self.graph
     }
 
+    #[allow(dead_code)]
+    pub fn partition(
+        &self,
+        config: &crate::graph::cluster::ClusterConfig,
+    ) -> crate::graph::cluster::PartitionReport {
+        crate::graph::cluster::partition(&self.graph, config)
+    }
+
     pub fn ensure_consistency(&mut self) {
         let expected = self.graph.node_count();
         let needs_rebuild = self.node_summaries.len() != expected
