@@ -148,7 +148,7 @@ impl RoutineId {
         }
     }
 
-    pub fn from_object_name(parts: &[String], kind: RoutineKind) -> Self {
+    pub fn from_object_name(parts: &[ogsql_parser::Ident], kind: RoutineKind) -> Self {
         match parts.len() {
             0 => Self {
                 schema: None,
@@ -159,13 +159,13 @@ impl RoutineId {
             1 => Self {
                 schema: None,
                 package: None,
-                name: parts[0].clone(),
+                name: parts[0].to_string(),
                 kind,
             },
             _ => Self {
                 schema: Some(parts[..parts.len() - 1].join(".")),
                 package: None,
-                name: parts[parts.len() - 1].clone(),
+                name: parts[parts.len() - 1].to_string(),
                 kind,
             },
         }

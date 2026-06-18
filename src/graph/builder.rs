@@ -232,7 +232,7 @@ impl GraphBuilder {
                             proc_index,
                             package_index,
                         );
-                        let pkg_name = pkg.name.last().cloned().unwrap_or_default();
+                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_string();
                         for item in &pkg.items {
                             let (name, kind) = match item {
                                 PackageItem::Procedure(p) => {
@@ -259,7 +259,7 @@ impl GraphBuilder {
                             proc_index,
                             package_index,
                         );
-                        let pkg_name = pkg.name.last().cloned().unwrap_or_default();
+                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_string();
                         for item in &pkg.items {
                             let name = match item {
                                 PackageItem::Procedure(p) => p.name.join("."),
@@ -274,7 +274,7 @@ impl GraphBuilder {
                     Statement::CreateTrigger(t) => {
                         let trigger_node = Node::Trigger {
                             name: t.name.clone(),
-                            table: t.table.clone(),
+                            table: t.table.iter().map(|i| i.to_string()).collect(),
                             location: SourceLocation {
                                 file: file_arc.clone(),
                                 line: info.start_line,
@@ -319,7 +319,7 @@ impl GraphBuilder {
                         } else {
                             None
                         };
-                        let view_name = v.name.last().cloned().unwrap_or_default();
+                        let view_name = v.name.last().cloned().unwrap_or_default().to_string();
                         let view_node = Node::View {
                             schema: view_schema.clone(),
                             name: view_name.clone(),
@@ -427,7 +427,7 @@ impl GraphBuilder {
                         let idx_name = i
                             .name
                             .as_ref()
-                            .map(|n| n.last().cloned().unwrap_or_default());
+                            .map(|n| n.last().cloned().unwrap_or_default().to_string());
                         let (table_schema, table_name) = split_object_name(&i.table);
                         let index_node = Node::Index {
                             name: idx_name,
@@ -891,7 +891,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         package_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default();
+        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
             Some(pkg_name[..pkg_name.len() - 1].join("."))
         } else {
@@ -1223,7 +1223,7 @@ impl GraphBuilder {
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
     ) {
-        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default();
+        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
             Some(pkg_name[..pkg_name.len() - 1].join("."))
         } else {
@@ -1290,7 +1290,7 @@ impl GraphBuilder {
         pkg_items: &[PackageItem],
         extractor: &mut CallExtractor,
     ) {
-        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default();
+        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
             Some(pkg_name[..pkg_name.len() - 1].join("."))
         } else {
@@ -1794,7 +1794,7 @@ impl GraphBuilder {
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default();
+        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
             Some(pkg_name[..pkg_name.len() - 1].join("."))
         } else {
@@ -2633,13 +2633,16 @@ fn normalize_table_key(schema: Option<&str>, name: &str) -> String {
     }
 }
 
-fn split_object_name(name: &[String]) -> (Option<String>, String) {
+fn split_object_name(name: &[ogsql_parser::Ident]) -> (Option<String>, String) {
     if name.len() <= 1 {
-        (None, name.first().cloned().unwrap_or_default())
+        (
+            None,
+            name.first().map(|i| i.to_string()).unwrap_or_default(),
+        )
     } else {
         (
             Some(name[..name.len() - 1].join(".")),
-            name[name.len() - 1].clone(),
+            name[name.len() - 1].to_string(),
         )
     }
 }
@@ -3588,6 +3591,8 @@ mod tests {
             has_dynamic_elements: false,
             line: 5,
             parse_result: None,
+            database_id: None,
+            statement_type: None,
         };
 
         let make_parsed_file = |path_str: &str| crate::parser::ibatis_loader::IbatisParsedFile {
