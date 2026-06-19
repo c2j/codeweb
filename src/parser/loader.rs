@@ -13,13 +13,19 @@ pub struct AllParsedFiles {
     pub java_files: Vec<crate::parser::java_loader::JavaParsedFile>,
     pub ibatis_files: Vec<crate::parser::ibatis_loader::IbatisParsedFile>,
     pub java_method_results: Vec<crate::parser::java_method::JavaParseResult>,
+    #[cfg(feature = "jsp")]
+    pub jsp_files: Vec<crate::parser::jsp_loader::JspFileResult>,
 }
 
 pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
     let scanned = crate::parser::scanner::scan_directory(input, &[]);
 
-    if scanned.sql_files.is_empty() && scanned.java_files.is_empty() && scanned.xml_files.is_empty()
-    {
+    let empty = scanned.sql_files.is_empty()
+        && scanned.java_files.is_empty()
+        && scanned.xml_files.is_empty();
+    #[cfg(feature = "jsp")]
+    let empty = empty && scanned.jsp_files.is_empty();
+    if empty {
         return Err(CodeWebError::NoFilesFound {
             path: input.to_path_buf(),
         });
@@ -31,12 +37,22 @@ pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
         crate::parser::ibatis_loader::load_ibatis_files_from_paths(&scanned.xml_files);
     let java_method_results =
         crate::parser::java_method::parse_java_files_from_paths(&scanned.java_files);
+    #[cfg(feature = "jsp")]
+    let jsp_files = {
+        use ogsql_parser::java::JavaExtractConfig;
+        crate::parser::jsp_loader::load_jsp_files_from_paths(
+            &scanned.jsp_files,
+            &JavaExtractConfig::default(),
+        )
+    };
 
     Ok(AllParsedFiles {
         sql_files,
         java_files,
         ibatis_files,
         java_method_results,
+        #[cfg(feature = "jsp")]
+        jsp_files,
     })
 }
 

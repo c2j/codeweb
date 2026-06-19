@@ -1508,13 +1508,24 @@ fn cmd_legacy(cli: Cli) -> Result<()> {
     } else {
         let all = parser::load_all_files(&input)?;
         eprintln!(
-            "loaded {} SQL, {} Java, {} XML file(s)",
+            "loaded {} SQL, {} Java, {} XML file(s){}",
             all.sql_files.len(),
             all.java_files.len(),
-            all.ibatis_files.len()
+            all.ibatis_files.len(),
+            jsp_count_fragment(
+                #[cfg(feature = "jsp")]
+                all.jsp_files.len(),
+            ),
         );
         let builder = graph::builder::GraphBuilder::new();
-        builder.build_all(&all)
+        #[cfg(feature = "jsp")]
+        {
+            builder.build_all_with_jsp(&all, &all.jsp_files)
+        }
+        #[cfg(not(feature = "jsp"))]
+        {
+            builder.build_all(&all)
+        }
     };
 
     print_stats(&graph, cli.include_unresolved);
@@ -1986,5 +1997,15 @@ fn build_jsp_fragment(jsp_pages: usize, jsp_sql: usize) -> String {
 
 #[cfg(not(feature = "jsp"))]
 fn build_jsp_fragment() -> String {
+    String::new()
+}
+
+#[cfg(feature = "jsp")]
+fn jsp_count_fragment(jsp_count: usize) -> String {
+    format!(", {} JSP", jsp_count)
+}
+
+#[cfg(not(feature = "jsp"))]
+fn jsp_count_fragment() -> String {
     String::new()
 }
