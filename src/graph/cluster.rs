@@ -30,6 +30,10 @@ pub enum NodeKind {
     Synonym,
     Event,
     Custom,
+    #[cfg(feature = "jsp")]
+    JspPage,
+    #[cfg(feature = "jsp")]
+    JspSql,
 }
 
 impl NodeKind {
@@ -53,6 +57,10 @@ impl NodeKind {
             Node::Synonym { .. } => NodeKind::Synonym,
             Node::Event { .. } => NodeKind::Event,
             Node::Custom { .. } => NodeKind::Custom,
+            #[cfg(feature = "jsp")]
+            Node::JspPage { .. } => NodeKind::JspPage,
+            #[cfg(feature = "jsp")]
+            Node::JspSql { .. } => NodeKind::JspSql,
         }
     }
 
@@ -77,6 +85,10 @@ impl NodeKind {
             NodeKind::Synonym => "synonym",
             NodeKind::Event => "event",
             NodeKind::Custom => "custom",
+            #[cfg(feature = "jsp")]
+            NodeKind::JspPage => "jsp",
+            #[cfg(feature = "jsp")]
+            NodeKind::JspSql => "jsql",
         }
     }
 }
@@ -120,6 +132,8 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
         | Edge::AliasesObject { .. }
         | Edge::CustomEdge { .. } => Some(config.reference),
         Edge::ContainsMethod | Edge::ContainsRoutine => Some(config.composition),
+        #[cfg(feature = "jsp")]
+        Edge::ContainsSql => Some(config.composition),
     }
 }
 

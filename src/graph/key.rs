@@ -75,6 +75,16 @@ pub enum NodeKey {
         type_name: String,
         key: String,
     },
+    #[cfg(feature = "jsp")]
+    JspPage {
+        path: String,
+    },
+    #[cfg(feature = "jsp")]
+    JspSql {
+        file: String,
+        line: usize,
+        sql_hash: String,
+    },
 }
 
 impl fmt::Display for NodeKey {
@@ -152,6 +162,12 @@ impl fmt::Display for NodeKey {
                     write!(f, "custom:{}:{}", type_name, key)
                 }
             }
+            #[cfg(feature = "jsp")]
+            NodeKey::JspPage { path } => write!(f, "jsp:{}", path),
+            #[cfg(feature = "jsp")]
+            NodeKey::JspSql {
+                file, line, sql_hash,
+            } => write!(f, "jsql:{}:{}:{}", file, line, sql_hash),
         }
     }
 }
@@ -237,6 +253,22 @@ impl NodeKey {
                 NodeKey::Custom {
                     type_name: (**type_name).clone(),
                     key,
+                }
+            }
+            #[cfg(feature = "jsp")]
+            super::Node::JspPage { path, .. } => NodeKey::JspPage {
+                path: path.to_string_lossy().to_string(),
+            },
+            #[cfg(feature = "jsp")]
+            super::Node::JspSql {
+                sql, file, line, ..
+            } => {
+                let sql_hash = blake3::hash(sql.as_bytes()).to_hex();
+                let sql_hash = sql_hash.as_str()[..16].to_string();
+                NodeKey::JspSql {
+                    file: file.to_string_lossy().to_string(),
+                    line: *line,
+                    sql_hash,
                 }
             }
         }

@@ -469,6 +469,10 @@ impl GraphStore {
                 Node::Synonym { .. } => s.synonyms += 1,
                 Node::Event { .. } => s.events += 1,
                 Node::Custom { .. } => s.custom_nodes += 1,
+                #[cfg(feature = "jsp")]
+                Node::JspPage { .. } => s.jsp_pages += 1,
+                #[cfg(feature = "jsp")]
+                Node::JspSql { .. } => s.jsp_sql += 1,
             }
         }
         s.edges = self.graph.edge_count();
@@ -1787,6 +1791,10 @@ fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
         Node::Event { location, .. } => Some(location.file.to_path_buf()),
         Node::Custom { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
+        #[cfg(feature = "jsp")]
+        Node::JspPage { path, .. } => Some(path.clone()),
+        #[cfg(feature = "jsp")]
+        Node::JspSql { file, .. } => Some(file.clone()),
     }
 }
 
@@ -1810,6 +1818,8 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
         crate::graph::Edge::CallsJava { .. } => "calls_java",
         crate::graph::Edge::ContainsMethod => "contains_method",
+        #[cfg(feature = "jsp")]
+        crate::graph::Edge::ContainsSql => "contains_sql",
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",
         crate::graph::Edge::TableAccess { .. } => "table_access",
@@ -1874,6 +1884,10 @@ pub struct StoreStats {
     pub custom_edges: usize,
     pub edges: usize,
     pub files: usize,
+    #[cfg(feature = "jsp")]
+    pub jsp_pages: usize,
+    #[cfg(feature = "jsp")]
+    pub jsp_sql: usize,
 }
 
 #[derive(Debug, Default, Serialize)]

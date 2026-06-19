@@ -120,6 +120,15 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Node::Custom {
                 label, type_name, ..
             } => (format!("{}:{}", **type_name, **label), ("[\"", "\"]")),
+            #[cfg(feature = "jsp")]
+            Node::JspPage { display_name, .. } => {
+                (format!("JSP:{}", display_name), ("[\"", "\"]"))
+            }
+            #[cfg(feature = "jsp")]
+            Node::JspSql { sql, kind, .. } => {
+                let short: String = sql.chars().take(30).collect();
+                (format!("{}|{}", kind.as_str(), short), ("[\"", "\"]"))
+            }
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);
@@ -143,6 +152,8 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::InvokesMapper { .. } => "-->",
             Edge::CallsJava { .. } => "-.->",
             Edge::ContainsMethod => "-.->",
+            #[cfg(feature = "jsp")]
+            Edge::ContainsSql => "-.->",
             Edge::Extends { .. } => "==>",
             Edge::Implements { .. } => "-->",
             Edge::DirectCall { .. } => "-->",

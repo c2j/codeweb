@@ -396,6 +396,24 @@ pub enum Node {
         properties: Box<JsonMap>,
         location: Option<SourceLocation>,
     },
+    /// A JSP page that contains embedded SQL.
+    #[cfg(feature = "jsp")]
+    JspPage {
+        path: PathBuf,
+        display_name: String,
+        #[serde(default)]
+        url_pattern: Option<String>,
+    },
+    /// SQL extracted from a JSP page (scriptlet, declaration, or JSTL tag).
+    #[cfg(feature = "jsp")]
+    JspSql {
+        sql: String,
+        file: PathBuf,
+        line: usize,
+        kind: crate::parser::jsp_types::JspSqlKind,
+        #[serde(default)]
+        parsed: bool,
+    },
 }
 
 /// Returns the short type tag string for a node (e.g. "proc", "table", "mapper").
@@ -421,6 +439,10 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::Synonym { .. } => "synonym",
         Node::Event { .. } => "event",
         Node::Custom { .. } => "custom",
+        #[cfg(feature = "jsp")]
+        Node::JspPage { .. } => "jsp",
+        #[cfg(feature = "jsp")]
+        Node::JspSql { .. } => "jsql",
     }
 }
 
@@ -448,6 +470,8 @@ pub enum Edge {
         location: SourceLocation,
     },
     ContainsMethod,
+    #[cfg(feature = "jsp")]
+    ContainsSql,
     Extends {
         location: SourceLocation,
     },
@@ -500,6 +524,8 @@ impl Edge {
             | Edge::InvokesMapper { .. }
             | Edge::CallsJava { .. } => EdgeCategory::Call,
             Edge::ContainsRoutine | Edge::ContainsMethod => EdgeCategory::Composition,
+            #[cfg(feature = "jsp")]
+            Edge::ContainsSql => EdgeCategory::Composition,
             Edge::TableAccess { .. } | Edge::DependsOn { .. } => EdgeCategory::DataFlow,
             Edge::TriggersRoutine { .. }
             | Edge::ReferencesType { .. }
@@ -558,6 +584,10 @@ impl Node {
                 .as_ref()
                 .map(|l| l.file.as_path())
                 .unwrap_or(Path::new("")),
+            #[cfg(feature = "jsp")]
+            Node::JspPage { path, .. } => path.as_path(),
+            #[cfg(feature = "jsp")]
+            Node::JspSql { file, .. } => file.as_path(),
         }
     }
 }

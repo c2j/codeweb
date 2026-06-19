@@ -195,6 +195,21 @@ fn node_dot_line(graph: &CodeGraph, idx: NodeIndex) -> Option<String> {
             "box",
             ", style=filled, fillcolor=lightgray",
         ),
+        #[cfg(feature = "jsp")]
+        Node::JspPage { display_name, .. } => (
+            display_name.clone(),
+            "component",
+            ", style=filled, fillcolor=\"#FFE4B5\"",
+        ),
+        #[cfg(feature = "jsp")]
+        Node::JspSql { sql, kind, .. } => {
+            let short: String = sql.chars().take(40).collect();
+            (
+                format!("{}|{}", kind.as_str(), short),
+                "note",
+                ", style=filled, fillcolor=\"#FFFACD\"",
+            )
+        }
     };
     let escaped = dot_escape(&label);
     Some(format!(
@@ -289,6 +304,8 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
         Edge::InvokesMapper { .. } => (String::new(), "color=green,".to_string()),
         Edge::CallsJava { .. } => (String::new(), "color=orange,".to_string()),
         Edge::ContainsMethod => (String::new(), "style=dotted,".to_string()),
+        #[cfg(feature = "jsp")]
+        Edge::ContainsSql => (String::new(), "style=dotted,".to_string()),
         Edge::Extends { .. } => ("label=\"extends\"".to_string(), "style=bold,".to_string()),
         Edge::Implements { .. } => (
             "label=\"implements\"".to_string(),
