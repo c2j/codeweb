@@ -1591,11 +1591,8 @@ fn cmd_partition(
             .unwrap()
             .progress_chars("━━╾─"),
         );
-        let auto_report = graph::cluster::auto_partition_with_progress(
-            store.graph(),
-            &base_config,
-            Some(&pb),
-        );
+        let auto_report =
+            graph::cluster::auto_partition_with_progress(store.graph(), &base_config, Some(&pb));
         pb.finish_with_message(format!(
             "auto-partition complete | recommended k={} γ={:.2}",
             auto_report.recommended_k, auto_report.recommended_gamma

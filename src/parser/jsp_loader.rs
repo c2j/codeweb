@@ -123,8 +123,15 @@ cs.registerOutParameter(2, Types.VARCHAR);
 cs.execute();
 %>"#;
         let result = load_jsp_string(src.to_string(), Path::new("/t.jsp"), &default_config());
-        assert!(!result.extractions.is_empty(), "extractions: {:?}", result.extractions);
-        let found = result.extractions.iter().any(|e| e.sql.contains("pkg.get_user"));
+        assert!(
+            !result.extractions.is_empty(),
+            "extractions: {:?}",
+            result.extractions
+        );
+        let found = result
+            .extractions
+            .iter()
+            .any(|e| e.sql.contains("pkg.get_user"));
         assert!(found, "should detect stored procedure call");
     }
 

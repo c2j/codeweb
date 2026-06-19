@@ -1986,10 +1986,8 @@ impl GraphBuilder {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
                     for callee_name in calls {
-                        let callee_id = RoutineId::from_qualified_name(
-                            &callee_name,
-                            RoutineKind::Procedure,
-                        );
+                        let callee_id =
+                            RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
                             ctx.proc_index.entry(callee_id.clone()).or_insert_with(|| {
                                 crate::parse_log::warn(

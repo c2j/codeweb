@@ -166,7 +166,9 @@ impl fmt::Display for NodeKey {
             NodeKey::JspPage { path } => write!(f, "jsp:{}", path),
             #[cfg(feature = "jsp")]
             NodeKey::JspSql {
-                file, line, sql_hash,
+                file,
+                line,
+                sql_hash,
             } => write!(f, "jsql:{}:{}:{}", file, line, sql_hash),
         }
     }
