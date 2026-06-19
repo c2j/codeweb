@@ -199,6 +199,124 @@ fn extract_attr(content: &str, name: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+#[derive(Debug, Clone)]
+pub struct SynthesizedJava {
+    pub source: String,
+    pub class_name: String,
+}
+
+/// Stitch JSP segments into a parseable Java source so that
+/// `ogsql_parser::java::extract_sql_from_java` can walk it.
+///
+/// - Declarations (`<%! %>`) go to class top-level
+/// - Scriptlets (`<% %>`) and Expressions (`<%= %>`) go to `_jspService` body, in order
+/// - EL `${foo}` becomes a string literal placeholder `"<EL_FOO>"`
+/// - Expressions `<%= e %>` become `out.print(e);`
+pub fn synthesize_java(parsed: &JspParseResult) -> SynthesizedJava {
+    let path_str = parsed.file.to_string_lossy().to_string();
+    let hash = blake3::hash(path_str.as_bytes());
+    let hex = hash.to_hex();
+    let suffix = &hex.as_str()[..8];
+    let class_name = format!("__JspPage_{}", suffix);
+
+    let mut class_body = String::new();
+    let mut service_body = String::new();
+
+    for seg in &parsed.segments {
+        match seg.kind {
+            JspSegmentKind::Declaration => {
+                class_body.push_str(&replace_el(&seg.content));
+                class_body.push('\n');
+            }
+            JspSegmentKind::Scriptlet => {
+                service_body.push_str(&replace_el(&seg.content));
+                service_body.push('\n');
+            }
+            JspSegmentKind::Expression => {
+                let expr = replace_el(&seg.content);
+                service_body.push_str(&format!("out.print({});\n", expr.trim()));
+            }
+            JspSegmentKind::Text
+            | JspSegmentKind::Directive
+            | JspSegmentKind::Comment
+            | JspSegmentKind::JstlSql => {}
+        }
+    }
+
+    let source = format!(
+        r#"package __jsp_synthetic__;
+
+import java.sql.*;
+import javax.servlet.*;
+import javax.servlet.http.*;
+import javax.servlet.jsp.*;
+
+public class {class_name} {{
+{class_body}
+    public void _jspService(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            PageContext pageContext,
+            HttpSession session,
+            ServletContext application,
+            JspWriter out) throws Throwable {{
+{service_body}
+    }}
+}}
+"#,
+        class_name = class_name,
+        class_body = indent(&class_body, "    "),
+        service_body = indent(&service_body, "        "),
+    );
+
+    SynthesizedJava { source, class_name }
+}
+
+/// Replace `${...}` EL expressions with Java string-literal placeholders.
+/// `${param.id}` -> `"<EL_PARAM_ID>"` (uppercased, non-alphanumerics -> `_`).
+fn replace_el(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = s[i + 2..].find('}') {
+                let expr = &s[i + 2..i + 2 + end];
+                let ident: String = expr
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '_' {
+                            c.to_ascii_uppercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let trimmed = ident.trim_start_matches('_');
+                out.push_str(&format!("\"<EL_{}>\"", trimmed));
+                i = i + 2 + end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn indent(s: &str, prefix: &str) -> String {
+    s.lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", prefix, line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +428,87 @@ PreparedStatement ps = conn.prepareStatement(sql);
         assert_eq!(scriptlets.len(), 2);
         assert_eq!(scriptlets[0].content, "if (cond) {");
         assert_eq!(scriptlets[1].content, "}");
+    }
+}
+
+#[cfg(test)]
+mod synthesize_tests {
+    use super::*;
+
+    fn parse_and_synthesize(src: &str) -> SynthesizedJava {
+        let parsed = lex_jsp(src, Path::new("/test/sample.jsp"));
+        synthesize_java(&parsed)
+    }
+
+    #[test]
+    fn synthesize_produces_valid_class_skeleton() {
+        let syn = parse_and_synthesize("<% int x = 1; %>");
+        assert!(syn.source.contains("public class __JspPage_"));
+        assert!(syn.source.contains("_jspService"));
+        assert!(syn.source.contains("int x = 1;"));
+    }
+
+    #[test]
+    fn synthesize_declaration_goes_to_class_level() {
+        let src = "<%! private static final String SQL = \"SELECT 1\"; %>";
+        let syn = parse_and_synthesize(src);
+        let decl_pos = syn.source.find("private static final String SQL");
+        let service_pos = syn.source.find("_jspService").unwrap();
+        assert!(decl_pos.unwrap() < service_pos);
+    }
+
+    #[test]
+    fn synthesize_expression_becomes_out_print() {
+        let src = "<p>Hello <%= user.getName() %></p>";
+        let syn = parse_and_synthesize(src);
+        assert!(syn.source.contains("out.print(user.getName());"));
+    }
+
+    #[test]
+    fn synthesize_el_expression_replaced() {
+        let src = "<% String sql = \"WHERE id=\" + ${param.id}; %>";
+        let syn = parse_and_synthesize(src);
+        assert!(syn.source.contains("WHERE id="));
+        assert!(
+            !syn.source.contains("${"),
+            "EL markers must be stripped: {}",
+            syn.source
+        );
+    }
+
+    #[test]
+    fn synthesize_split_scriptlets_preserve_order() {
+        let src = "<% if (x > 0) { %><b>positive</b><% } else { %><b>else</b><% } %>";
+        let syn = parse_and_synthesize(src);
+        let if_pos = syn.source.find("if (x > 0)").unwrap();
+        let else_pos = syn.source.find("} else {").unwrap();
+        assert!(if_pos < else_pos);
+    }
+
+    #[test]
+    fn synthesize_produces_parseable_java() {
+        let src = r#"<%!
+private static final String SQL = "SELECT * FROM users";
+%>
+<%
+Connection conn = DriverManager.getConnection("...");
+PreparedStatement ps = conn.prepareStatement(SQL);
+ResultSet rs = ps.executeQuery();
+%>"#;
+        let syn = parse_and_synthesize(src);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&syn.source, None);
+        assert!(tree.is_some(), "tree-sitter should parse synthesized Java");
+        let tree = tree.unwrap();
+        let root = tree.root_node();
+        assert!(
+            !root.has_error(),
+            "synthesized Java should parse without errors:\n{}",
+            syn.source
+        );
     }
 }
