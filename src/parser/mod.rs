@@ -2,6 +2,8 @@ mod extractor;
 pub mod fingerprint;
 pub mod ibatis_loader;
 #[cfg(feature = "jsp")]
+pub mod jsp_loader;
+#[cfg(feature = "jsp")]
 pub mod jsp_preprocessor;
 #[cfg(feature = "jsp")]
 pub mod jsp_types;
