@@ -6,6 +6,7 @@
 use crate::graph::{CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 /// Lightweight node kind for clustering — derived from `Node` enum variants.
 /// Avoids carrying full node data during algorithm execution.
@@ -128,6 +129,15 @@ pub struct ClusterConfig {
     pub gamma: f64,
     pub edge_weights: EdgeWeights,
     pub participant_kinds: HashSet<NodeKind>,
+    /// Cap on CNM merge iterations per `cluster_cnm` run. `None` = unlimited.
+    /// In natural mode (no `k`), the algorithm stops after this many iterations
+    /// even if modularity could still improve. Ignored in forced-k mode (which
+    /// must reach the target k).
+    pub max_iterations: Option<usize>,
+    /// Stop merging when the best available ΔQ falls at or below this threshold
+    /// (natural mode only). Default `0.0` preserves original CNM behavior.
+    /// Set to a small positive value (e.g. `1e-6`) to prune negligible merges.
+    pub min_delta_q: f64,
 }
 
 impl ClusterConfig {
@@ -137,6 +147,8 @@ impl ClusterConfig {
             gamma: 1.0,
             edge_weights: EdgeWeights::default(),
             participant_kinds: default_participant_kinds(),
+            max_iterations: None,
+            min_delta_q: 0.0,
         }
     }
 
@@ -146,11 +158,25 @@ impl ClusterConfig {
             gamma: 1.0,
             edge_weights: EdgeWeights::default(),
             participant_kinds: default_participant_kinds(),
+            max_iterations: None,
+            min_delta_q: 0.0,
         }
     }
 
     pub fn with_gamma(mut self, gamma: f64) -> Self {
         self.gamma = gamma;
+        self
+    }
+
+    /// Cap natural-mode merging at `n` iterations.
+    pub fn with_max_iterations(mut self, n: usize) -> Self {
+        self.max_iterations = Some(n);
+        self
+    }
+
+    /// Stop natural-mode merging once best ΔQ ≤ `q`.
+    pub fn with_min_delta_q(mut self, q: f64) -> Self {
+        self.min_delta_q = q;
         self
     }
 }
@@ -282,130 +308,343 @@ fn build_condensed_graph(
 }
 
 /// Run CNM-style greedy modularity maximization, merging until target_k clusters
-/// remain or no merge improves modularity (ΔQ ≤ 0).
+/// remain, no merge improves modularity (ΔQ ≤ `min_delta_q`), or `max_iterations`
+/// is reached (natural mode only — forced-k mode ignores `max_iterations`).
+///
+/// `progress`, if given, is updated once per merge attempt with the current
+/// iteration / community count / last ΔQ. It is NOT finished by this function.
 ///
 /// Returns `(community_of_super_node, modularity_Q)`.
 fn cluster_cnm(
     condensed: &CondensedGraph,
     target_k: Option<usize>,
     gamma: f64,
+    max_iterations: Option<usize>,
+    min_delta_q: f64,
+    progress: Option<&indicatif::ProgressBar>,
 ) -> (Vec<usize>, f64) {
-    let n = condensed.adj.len();
-    if n == 0 {
-        return (vec![], 0.0);
+    let state = CnmState::new(condensed, target_k, gamma, max_iterations, min_delta_q);
+    state.run(progress)
+}
+
+/// `f64` wrapper that implements `Ord` so it can be stored in `BinaryHeap`.
+/// NaN is treated as equal to itself (defensive — should not occur in practice
+/// because all weights and degrees are finite).
+#[derive(Copy, Clone, PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
+}
 
-    let min_k = target_k.unwrap_or(1).min(n);
-    let w = condensed.total_weight;
-    if w == 0.0 {
-        let labels = (0..n).map(|i| i.min(min_k.saturating_sub(1))).collect();
-        return (labels, 0.0);
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
+}
 
-    let mut community_of: Vec<usize> = (0..n).collect();
-    let mut comm_degree: Vec<f64> = condensed.degrees.clone();
+/// One candidate merge in the priority queue. Stored with both endpoints'
+/// generation counters so stale entries can be discarded lazily on pop.
+#[derive(PartialEq, Eq)]
+struct HeapEntry {
+    dq: OrdF64,
+    a: usize,
+    b: usize,
+    gen_a: u64,
+    gen_b: u64,
+}
 
-    let mut inter_weight: HashMap<(usize, usize), f64> = HashMap::new();
-    for i in 0..n {
-        for (&j, &weight) in &condensed.adj[i] {
-            if i < j {
-                *inter_weight.entry((i, j)).or_insert(0.0) += weight;
-            }
-        }
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
+}
 
-    let mut num_communities = n;
-    let force_k = target_k.is_some();
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is max-heap; we want the largest ΔQ first.
+        // Tie-break by (a, b) for deterministic ordering on equal ΔQ.
+        self.dq
+            .cmp(&other.dq)
+            .then_with(|| (self.a, self.b).cmp(&(other.a, other.b)))
+    }
+}
 
-    while num_communities > min_k {
-        if inter_weight.is_empty() {
-            if !force_k {
-                break;
-            }
-            let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (sn, &c) in community_of.iter().enumerate() {
-                comm_members.entry(c).or_default().push(sn);
-            }
-            let mut sizes: Vec<(usize, usize)> =
-                comm_members.iter().map(|(&c, m)| (c, m.len())).collect();
-            sizes.sort_by_key(|(_, s)| *s);
-            if sizes.len() < 2 {
-                break;
-            }
-            let smallest = sizes[0].0;
-            let largest = sizes[sizes.len() - 1].0;
-            for c in community_of.iter_mut() {
-                if *c == smallest {
-                    *c = largest;
-                }
-            }
-            num_communities -= 1;
-            continue;
-        }
-        // ΔQ_γ = (2/W) * [e_ab - γ * K_a * K_b / W]
-        let mut best_dq = f64::NEG_INFINITY;
-        let mut best_pair: Option<(usize, usize)> = None;
+/// Mutable state of one CNM run. Replaces the O(n²) scan of `inter_weight`
+/// with a global max-heap + generation-counted lazy deletion, and the O(n)
+/// community relabel with an inverse `members` index.
+struct CnmState<'a> {
+    condensed: &'a CondensedGraph,
+    target_k: Option<usize>,
+    gamma: f64,
+    max_iterations: Option<usize>,
+    min_delta_q: f64,
 
-        for &(a, b) in inter_weight.keys() {
-            let e_ab = inter_weight[&(a, b)];
-            let dq = (2.0 / w) * (e_ab - gamma * comm_degree[a] * comm_degree[b] / w);
-            if dq > best_dq {
-                best_dq = dq;
-                best_pair = Some((a, b));
-            }
-        }
+    n: usize,
+    total_weight: f64,
 
-        let should_merge = if force_k {
-            num_communities > min_k
-        } else {
-            best_dq > 0.0
+    community_of: Vec<usize>,
+    members: Vec<Vec<usize>>,
+    comm_degree: Vec<f64>,
+    generation: Vec<u64>,
+
+    edge_weight: HashMap<(usize, usize), f64>,
+    neighbors: Vec<HashSet<usize>>,
+    heap: BinaryHeap<HeapEntry>,
+
+    num_communities: usize,
+    iterations: usize,
+}
+
+impl<'a> CnmState<'a> {
+    fn new(
+        condensed: &'a CondensedGraph,
+        target_k: Option<usize>,
+        gamma: f64,
+        max_iterations: Option<usize>,
+        min_delta_q: f64,
+    ) -> Self {
+        let n = condensed.adj.len();
+        let total_weight = condensed.total_weight;
+
+        let mut state = Self {
+            condensed,
+            target_k,
+            gamma,
+            max_iterations,
+            min_delta_q,
+            n,
+            total_weight,
+            community_of: (0..n).collect(),
+            members: (0..n).map(|i| vec![i]).collect(),
+            comm_degree: condensed.degrees.clone(),
+            generation: vec![0; n],
+            edge_weight: HashMap::new(),
+            neighbors: vec![HashSet::new(); n],
+            heap: BinaryHeap::new(),
+            num_communities: n,
+            iterations: 0,
         };
 
-        match best_pair {
-            Some((a, b)) if should_merge => {
-                for c in community_of.iter_mut() {
-                    if *c == b {
-                        *c = a;
-                    }
+        for i in 0..n {
+            for (&j, &w) in &condensed.adj[i] {
+                if i < j && w > 0.0 {
+                    state.edge_weight.insert((i, j), w);
+                    state.neighbors[i].insert(j);
+                    state.neighbors[j].insert(i);
                 }
-                comm_degree[a] += comm_degree[b];
-                comm_degree[b] = 0.0;
-
-                let b_keys: Vec<(usize, usize)> = inter_weight
-                    .keys()
-                    .filter(|&&(x, y)| x == b || y == b)
-                    .copied()
-                    .collect();
-
-                for key in b_keys {
-                    let weight = inter_weight.remove(&key).unwrap_or(0.0);
-                    let other = if key.0 == b { key.1 } else { key.0 };
-                    if other == a {
-                        continue;
-                    }
-                    let new_key = if a < other { (a, other) } else { (other, a) };
-                    *inter_weight.entry(new_key).or_insert(0.0) += weight;
-                }
-
-                num_communities -= 1;
             }
-            _ => break,
+        }
+        for &(a, b) in state.edge_weight.keys() {
+            let dq = state.compute_dq(a, b);
+            state.heap.push(HeapEntry {
+                dq: OrdF64(dq),
+                a,
+                b,
+                gen_a: 0,
+                gen_b: 0,
+            });
+        }
+        state
+    }
+
+    fn compute_dq(&self, a: usize, b: usize) -> f64 {
+        let e_ab = self
+            .edge_weight
+            .get(&(a.min(b), a.max(b)))
+            .copied()
+            .unwrap_or(0.0);
+        let k_a = self.comm_degree[a];
+        let k_b = self.comm_degree[b];
+        let w = self.total_weight;
+        if w == 0.0 {
+            return 0.0;
+        }
+        (2.0 / w) * (e_ab - self.gamma * k_a * k_b / w)
+    }
+
+    fn run(mut self, progress: Option<&indicatif::ProgressBar>) -> (Vec<usize>, f64) {
+        if self.n == 0 {
+            return (vec![], 0.0);
+        }
+        let min_k = self.target_k.unwrap_or(1).min(self.n);
+        if self.total_weight == 0.0 {
+            let labels: Vec<usize> = (0..self.n).map(|i| i.min(min_k.saturating_sub(1))).collect();
+            return (labels, 0.0);
+        }
+
+        let force_k = self.target_k.is_some();
+
+        while self.num_communities > min_k {
+            if !force_k && self.max_iterations.is_some_and(|cap| self.iterations >= cap) {
+                break;
+            }
+
+            let entry = match self.pop_valid() {
+                Some(e) => e,
+                None => {
+                    if force_k {
+                        if !self.force_merge_disconnected() {
+                            break;
+                        }
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            let dq = entry.dq.0;
+            let should_merge = if force_k {
+                true
+            } else {
+                dq > self.min_delta_q
+            };
+
+            if !should_merge {
+                break;
+            }
+
+            self.iterations += 1;
+            if let Some(pb) = progress {
+                pb.set_message(format!(
+                    "iter {} | {}→{} clusters | ΔQ={:.4}",
+                    self.iterations,
+                    self.num_communities,
+                    min_k,
+                    dq
+                ));
+            }
+            self.merge_communities(entry.a, entry.b);
+        }
+
+        self.finalize()
+    }
+
+    /// Pop the highest-ΔQ entry whose generation counters still match.
+    fn pop_valid(&mut self) -> Option<HeapEntry> {
+        while let Some(entry) = self.heap.pop() {
+            if self.generation[entry.a] == entry.gen_a
+                && self.generation[entry.b] == entry.gen_b
+            {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Merge community `b` into community `a`: transfer members, edges, and
+    /// bump both generations. Then push fresh ΔQ entries for all of `a`'s
+    /// current neighbors.
+    fn merge_communities(&mut self, a: usize, b: usize) {
+        for &node in &self.members[b] {
+            self.community_of[node] = a;
+        }
+        let b_members = std::mem::take(&mut self.members[b]);
+        self.members[a].extend(b_members);
+
+        self.comm_degree[a] += self.comm_degree[b];
+        self.comm_degree[b] = 0.0;
+
+        self.generation[a] = self.generation[a].wrapping_add(1);
+        self.generation[b] = self.generation[b].wrapping_add(1);
+
+        // The (a, b) edge is the merge pair itself: it becomes internal to the
+        // merged community and must be removed from inter-community state.
+        let key_ab = (a.min(b), a.max(b));
+        self.edge_weight.remove(&key_ab);
+        self.neighbors[a].remove(&b);
+
+        let b_neighbors: Vec<usize> = self.neighbors[b].iter().copied().collect();
+        for x in b_neighbors {
+            if x == a {
+                continue;
+            }
+            let key_bx = (b.min(x), b.max(x));
+            let e_bx = self.edge_weight.remove(&key_bx).unwrap_or(0.0);
+            self.neighbors[x].remove(&b);
+
+            let key_ax = (a.min(x), a.max(x));
+            let existing = self.edge_weight.get(&key_ax).copied().unwrap_or(0.0);
+            let new_w = existing + e_bx;
+            if new_w > 0.0 {
+                self.edge_weight.insert(key_ax, new_w);
+                self.neighbors[a].insert(x);
+                self.neighbors[x].insert(a);
+            } else {
+                self.edge_weight.remove(&key_ax);
+                self.neighbors[a].remove(&x);
+                self.neighbors[x].remove(&a);
+            }
+        }
+        self.neighbors[b].clear();
+
+        let a_neighbors: Vec<usize> = self.neighbors[a].iter().copied().collect();
+        for x in a_neighbors {
+            let dq = self.compute_dq(a, x);
+            self.heap.push(HeapEntry {
+                dq: OrdF64(dq),
+                a: a.min(x),
+                b: a.max(x),
+                gen_a: self.generation[a.min(x)],
+                gen_b: self.generation[a.max(x)],
+            });
+        }
+
+        self.num_communities -= 1;
+    }
+
+    /// Fallback used in forced-k mode when no inter-community edges remain:
+    /// merge the smallest live community into the largest. Returns false if
+    /// fewer than two live communities exist.
+    fn force_merge_disconnected(&mut self) -> bool {
+        let mut largest: Option<usize> = None;
+        let mut largest_size: usize = 0;
+        let mut smallest: Option<usize> = None;
+        let mut smallest_size: usize = usize::MAX;
+        for (cid, members) in self.members.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let size = members.len();
+            if size > largest_size {
+                largest_size = size;
+                largest = Some(cid);
+            }
+            if size < smallest_size {
+                smallest_size = size;
+                smallest = Some(cid);
+            }
+        }
+        match (largest, smallest) {
+            (Some(l), Some(s)) if l != s => {
+                self.merge_communities(l, s);
+                true
+            }
+            _ => false,
         }
     }
 
-    let mut id_map: HashMap<usize, usize> = HashMap::new();
-    let mut next_id = 0;
-    for &c in &community_of {
-        use std::collections::hash_map::Entry;
-        if let Entry::Vacant(e) = id_map.entry(c) {
-            e.insert(next_id);
-            next_id += 1;
+    fn finalize(self) -> (Vec<usize>, f64) {
+        let mut id_map: HashMap<usize, usize> = HashMap::new();
+        let mut next_id = 0;
+        for &c in &self.community_of {
+            use std::collections::hash_map::Entry;
+            if let Entry::Vacant(e) = id_map.entry(c) {
+                e.insert(next_id);
+                next_id += 1;
+            }
         }
+        let community_of: Vec<usize> = self.community_of.iter().map(|&c| id_map[&c]).collect();
+        let q = compute_modularity(self.condensed, &community_of);
+        (community_of, q)
     }
-    let community_of: Vec<usize> = community_of.iter().map(|&c| id_map[&c]).collect();
-
-    let q = compute_modularity(condensed, &community_of);
-    (community_of, q)
 }
 
 /// Compute modularity Q for a given community assignment.
@@ -463,15 +702,55 @@ const AUTO_GAMMA_SWEEP: &[f64] = &[1.0, 0.5, 0.25, 0.1, 0.05];
 pub const AUTO_GAMMA_SWEEP_LEN: usize = AUTO_GAMMA_SWEEP.len();
 const AUTO_K_SWEEP: &[usize] = &[3, 5, 10, 20, 50];
 
-pub fn auto_partition(graph: &CodeGraph, base_config: &ClusterConfig) -> AutoClusterReport {
+/// Above this super-node count, `auto_partition` skips the most aggressive
+/// forced-k values (3 and 5) because each forces ≈(n − k) heap-driven merges
+/// that, while no longer O(n²) after the priority-queue rewrite, still
+/// produce low-value partitions on huge graphs.
+const LARGE_GRAPH_K_SWEEP_THRESHOLD: usize = 10_000;
+const LARGE_GRAPH_K_SWEEP: &[usize] = &[10, 20, 50];
+
+/// Pick the forced-k sweep list appropriate for the condensed-graph size.
+pub fn adaptive_k_sweep(total_super_nodes: usize) -> &'static [usize] {
+    if total_super_nodes > LARGE_GRAPH_K_SWEEP_THRESHOLD {
+        LARGE_GRAPH_K_SWEEP
+    } else {
+        AUTO_K_SWEEP
+    }
+}
+
+/// `progress`, if given, is updated once per sweep step and forwarded into
+/// each `cluster_cnm` run for per-iteration feedback. It is NOT finished by
+/// this function — the caller controls lifecycle.
+pub fn auto_partition_with_progress(
+    graph: &CodeGraph,
+    base_config: &ClusterConfig,
+    progress: Option<&indicatif::ProgressBar>,
+) -> AutoClusterReport {
     let condensation = condense_sccs(graph, base_config);
     let condensed = build_condensed_graph(graph, &condensation, base_config);
     let total_nodes = condensation.super_nodes.len().max(1);
 
+    let k_sweep = adaptive_k_sweep(total_nodes);
+
     let mut sweep: Vec<GammaSweepEntry> = Vec::new();
 
-    for &gamma in AUTO_GAMMA_SWEEP {
-        let (communities, q) = cluster_cnm(&condensed, None, gamma);
+    for (idx, &gamma) in AUTO_GAMMA_SWEEP.iter().enumerate() {
+        if let Some(pb) = progress {
+            pb.set_message(format!(
+                "γ sweep {}/{}  γ={:.2}",
+                idx + 1,
+                AUTO_GAMMA_SWEEP.len(),
+                gamma
+            ));
+        }
+        let (communities, q) = cluster_cnm(
+            &condensed,
+            None,
+            gamma,
+            base_config.max_iterations,
+            base_config.min_delta_q,
+            progress,
+        );
         let k = communities
             .iter()
             .copied()
@@ -484,13 +763,34 @@ pub fn auto_partition(graph: &CodeGraph, base_config: &ClusterConfig) -> AutoClu
             modularity: q,
             avg_cluster_size: total_nodes as f64 / k.max(1) as f64,
         });
+        if let Some(pb) = progress {
+            pb.inc(1);
+        }
     }
 
-    for &forced_k in AUTO_K_SWEEP {
+    for (idx, &forced_k) in k_sweep.iter().enumerate() {
         if forced_k >= total_nodes {
+            if let Some(pb) = progress {
+                pb.inc(1);
+            }
             continue;
         }
-        let (communities, q) = cluster_cnm(&condensed, Some(forced_k), base_config.gamma);
+        if let Some(pb) = progress {
+            pb.set_message(format!(
+                "k sweep {}/{}  k={}",
+                idx + 1,
+                k_sweep.len(),
+                forced_k
+            ));
+        }
+        let (communities, q) = cluster_cnm(
+            &condensed,
+            Some(forced_k),
+            base_config.gamma,
+            base_config.max_iterations,
+            base_config.min_delta_q,
+            progress,
+        );
         let k = communities
             .iter()
             .copied()
@@ -503,6 +803,9 @@ pub fn auto_partition(graph: &CodeGraph, base_config: &ClusterConfig) -> AutoClu
             modularity: q,
             avg_cluster_size: total_nodes as f64 / k.max(1) as f64,
         });
+        if let Some(pb) = progress {
+            pb.inc(1);
+        }
     }
 
     let natural_k = sweep.first().map(|e| e.k).unwrap_or(1);
@@ -574,7 +877,14 @@ pub struct PartitionReport {
 pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
     let condensation = condense_sccs(graph, config);
     let condensed = build_condensed_graph(graph, &condensation, config);
-    let (super_communities, modularity) = cluster_cnm(&condensed, config.k, config.gamma);
+    let (super_communities, modularity) = cluster_cnm(
+        &condensed,
+        config.k,
+        config.gamma,
+        config.max_iterations,
+        config.min_delta_q,
+        None,
+    );
 
     let mut assignments: HashMap<NodeIndex, ClusterId> = HashMap::new();
     for (super_idx, members) in condensation.super_nodes.iter().enumerate() {
@@ -1238,5 +1548,218 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn cluster_config_supports_early_termination_options() {
+        let cfg = ClusterConfig::auto()
+            .with_max_iterations(1000)
+            .with_min_delta_q(1e-6);
+        assert_eq!(cfg.max_iterations, Some(1000));
+        assert_eq!(cfg.min_delta_q, 1e-6);
+
+        let default_cfg = ClusterConfig::new(3);
+        assert_eq!(default_cfg.max_iterations, None);
+        assert_eq!(default_cfg.min_delta_q, 0.0);
+    }
+
+    #[test]
+    fn adaptive_k_sweep_skips_aggressive_values_on_large_graphs() {
+        assert_eq!(adaptive_k_sweep(0), &[3, 5, 10, 20, 50]);
+        assert_eq!(adaptive_k_sweep(10_000), &[3, 5, 10, 20, 50]);
+        assert_eq!(adaptive_k_sweep(10_001), &[10, 20, 50]);
+        assert_eq!(adaptive_k_sweep(130_000), &[10, 20, 50]);
+    }
+
+    #[test]
+    fn auto_partition_with_progress_runs_full_sweep() {
+        // Three-domain graph: γ sweep + k sweep should produce a report with
+        // entries for both phases, and the recommended config should yield a
+        // non-trivial partition.
+        let graph = build_three_domain_graph();
+        let config = ClusterConfig::auto();
+
+        let pb = indicatif::ProgressBar::hidden();
+        let report = auto_partition_with_progress(&graph, &config, Some(&pb));
+
+        assert!(
+            report.sweep.len() >= AUTO_GAMMA_SWEEP_LEN,
+            "expected at least {} sweep entries, got {}",
+            AUTO_GAMMA_SWEEP_LEN,
+            report.sweep.len()
+        );
+        assert!(
+            report.recommended_k > 0 && report.recommended_k <= 50,
+            "recommended_k out of range: {}",
+            report.recommended_k
+        );
+        assert!(
+            report.report.k_actual > 0,
+            "final partition produced 0 clusters"
+        );
+    }
+
+    /// Performance smoke test: build a synthetic 50k-node participant graph
+    /// (~10k SCCs after condensation, ~100k inter-SCC edges) and verify a
+    /// single forced-k CNM run finishes well under 5 seconds. Run with:
+    ///   cargo test --bin codeweb cluster::tests::bench_cnm_large_graph -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_cnm_large_graph() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("bench.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+        let edge = Edge::DirectCall {
+            scope: CallScope::IntraPackage,
+            location: loc.clone(),
+        };
+
+        const CLUMPS: usize = 10_000;
+        const CLUMP_SIZE: usize = 5;
+        const N: usize = CLUMPS * CLUMP_SIZE;
+
+        let mut nodes = Vec::with_capacity(N);
+        for i in 0..N {
+            let node = Node::Procedure {
+                id: RoutineId {
+                    schema: Some("bench".to_string()),
+                    package: Some(format!("pkg_{}", i % CLUMPS)),
+                    name: format!("proc_{}", i),
+                    kind: RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            };
+            nodes.push(graph.add_node(node));
+        }
+
+        // Within each clump: bidirectional clique (forms 1 SCC of size CLUMP_SIZE).
+        for c in 0..CLUMPS {
+            let base = c * CLUMP_SIZE;
+            for i in 0..CLUMP_SIZE {
+                for j in (i + 1)..CLUMP_SIZE {
+                    graph.add_edge(nodes[base + i], nodes[base + j], edge.clone());
+                    graph.add_edge(nodes[base + j], nodes[base + i], edge.clone());
+                }
+            }
+        }
+        // Between clumps: forward-only bridges, no wrap-around (prevents
+        // inter-clump cycles → preserves 10k distinct SCCs after condensation).
+        for c in 0..(CLUMPS - 3) {
+            let src = nodes[c * CLUMP_SIZE];
+            let dst = nodes[(c + 1) * CLUMP_SIZE + 1];
+            graph.add_edge(src, dst, edge.clone());
+            let src2 = nodes[c * CLUMP_SIZE + 2];
+            let dst2 = nodes[(c + 3) * CLUMP_SIZE];
+            graph.add_edge(src2, dst2, edge.clone());
+        }
+
+        let config = ClusterConfig::new(10);
+
+        let t0 = Instant::now();
+        let report = partition(&graph, &config);
+        let elapsed = t0.elapsed();
+
+        eprintln!(
+            "bench_cnm: {} participant nodes, forced k=10, k_actual={}, Q={:.3}, elapsed {:.2?}",
+            N, report.k_actual, report.modularity, elapsed
+        );
+
+        assert!(elapsed.as_secs() < 10, "CNM took {elapsed:?}, expected < 10s");
+        assert_eq!(report.k_actual, 10, "forced k=10 must produce 10 clusters");
+    }
+
+    #[test]
+    fn cluster_cnm_respects_max_iterations_in_natural_mode() {
+        // Directed chain a→b→c→d (acyclic → each node is its own SCC, so the
+        // condensed graph has 4 super-nodes with chain edges of weight 1).
+        // ΔQ(a,b) = (2/6)*(1 - 1·2/6) ≈ 0.222 > 0, so natural mode WOULD merge
+        // without a cap. With max_iterations=0, no merge is allowed.
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        graph.add_edge(c, d, call_edge());
+
+        let capped = partition(&graph, &ClusterConfig::auto().with_max_iterations(0));
+        assert_eq!(
+            capped.k_actual, 4,
+            "max_iterations=0 must prevent any merge"
+        );
+
+        let unlimited = partition(&graph, &ClusterConfig::auto());
+        assert!(
+            unlimited.k_actual < 4,
+            "unlimited should merge at least once (got {})",
+            unlimited.k_actual
+        );
+    }
+
+    #[test]
+    fn cluster_cnm_min_delta_q_prunes_negligible_merges() {
+        // Same chain: max ΔQ ≈ 0.222. A strict threshold of 0.5 must block all
+        // merges; the lenient default (0.0) allows them.
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        graph.add_edge(c, d, call_edge());
+
+        let strict = partition(
+            &graph,
+            &ClusterConfig::auto().with_min_delta_q(0.5),
+        );
+        let lenient = partition(&graph, &ClusterConfig::auto());
+
+        assert_eq!(
+            strict.k_actual, 4,
+            "strict threshold 0.5 should block all merges"
+        );
+        assert!(
+            lenient.k_actual < 4,
+            "lenient threshold should allow merges (got {})",
+            lenient.k_actual
+        );
+    }
+
+    #[test]
+    fn cluster_cnm_force_k_ignores_max_iterations() {
+        // max_iterations must NOT apply when target_k is set (forced-k mode
+        // is contract-bound to reach target_k).
+        let mut graph = CodeGraph::new();
+        let nodes: Vec<NodeIndex> = (0..6)
+            .map(|i| graph.add_node(proc_node(&format!("n{i}"))))
+            .collect();
+        for i in 0..6 {
+            for j in 0..6 {
+                if i < j {
+                    graph.add_edge(nodes[i], nodes[j], call_edge());
+                    graph.add_edge(nodes[j], nodes[i], call_edge());
+                }
+            }
+        }
+
+        let config = ClusterConfig::new(2).with_max_iterations(1);
+        let report = partition(&graph, &config);
+
+        // Forced k=2 must be respected even with max_iterations=1.
+        assert!(
+            report.k_actual <= 2,
+            "k_actual was {}, expected <= 2 (forced k overrides max_iterations)",
+            report.k_actual
+        );
     }
 }
