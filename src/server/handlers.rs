@@ -574,6 +574,8 @@ async fn files(State(state): State<AppState>) -> impl IntoResponse {
                 crate::parser::fingerprint::FileType::Sql => "SQL",
                 crate::parser::fingerprint::FileType::Java => "Java",
                 crate::parser::fingerprint::FileType::Xml => "XML",
+                #[cfg(feature = "jsp")]
+                crate::parser::fingerprint::FileType::Jsp => "JSP",
             };
             let node_count = file_nodes
                 .get(path as &std::path::Path)

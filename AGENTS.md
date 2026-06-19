@@ -72,15 +72,43 @@ CLI: `codeweb analyze`, `codeweb trace --from <node> --direction forward|backwar
 - Tests alongside source files (`#[cfg(test)]` modules), integration tests in `tests/`.
 - `cargo fmt` and `cargo clippy` must pass before commit.
 
+## Definition of Done
+
+A task is **not complete** until ALL of the following pass:
+
+1. **Compilation** — clean `cargo build` under EVERY feature combination the change touches:
+   - At minimum: `cargo build` (default) and `cargo build --features <feature-being-added>`
+   - If the change could affect any feature-gated code path (e.g. adding an enum variant that other features match against): `cargo build --features full` MUST also compile
+   - Rule of thumb: when adding a new feature flag, run `cargo build --features full` before declaring done
+2. **Unit tests** — `cargo test --features <feature>` passes (0 failures)
+3. **Guard cases** — `cargo clippy --features <feature> -- -D warnings` is clean
+4. **Formatting** — `cargo fmt -- --check` is clean
+
+**Mandatory pre-completion verification matrix** (adapt to features touched):
+
+```sh
+cargo build --features full         # catches cross-feature regressions
+cargo test --features full          # or per-feature if --features full has pre-existing failures
+cargo clippy --features full -- -D warnings
+cargo fmt -- --check
+```
+
+If `--features full` has **pre-existing** failures unrelated to the change, document them explicitly in the PR/commit message and verify the change doesn't make them worse.
+
 ## Commands
 
 ```sh
-cargo build                  # build
-cargo build --features serve # build with HTTP server + browser UI
-cargo test                   # run all tests
-cargo test --features serve  # run all tests including serve integration tests
-cargo test --test <name>     # run single integration test
-cargo clippy -- -D warnings  # lint (CI-gating level)
+cargo build                              # build (default features)
+cargo build --features serve             # build with HTTP server + browser UI
+cargo build --features mcp               # build with MCP server
+cargo build --features jsp               # build with JSP SQL extraction
+cargo build --features full              # build all features (catches cross-feature regressions)
+cargo test                               # run all tests (default features)
+cargo test --features serve              # run all tests including serve integration tests
+cargo test --features jsp                # run all tests including jsp integration tests
+cargo test --test <name>                 # run single integration test
+cargo clippy -- -D warnings              # lint (CI-gating level)
 cargo clippy --features serve -- -D warnings  # lint with serve feature
-cargo fmt -- --check         # format check
+cargo clippy --features full -- -D warnings   # lint with all features
+cargo fmt -- --check                     # format check
 ```
