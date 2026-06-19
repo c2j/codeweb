@@ -178,14 +178,22 @@ impl Project {
         let mut all_sql_paths: Vec<PathBuf> = Vec::new();
         let mut all_java_paths: Vec<PathBuf> = Vec::new();
         let mut all_xml_paths: Vec<PathBuf> = Vec::new();
+        #[cfg(feature = "jsp")]
+        let mut all_jsp_paths: Vec<PathBuf> = Vec::new();
         for (path, file_type) in &current_files {
             match file_type {
                 FileType::Sql => all_sql_paths.push(path.clone()),
                 FileType::Java => all_java_paths.push(path.clone()),
                 FileType::Xml => all_xml_paths.push(path.clone()),
+                #[cfg(feature = "jsp")]
+                FileType::Jsp => all_jsp_paths.push(path.clone()),
             }
         }
 
+        #[cfg(feature = "jsp")]
+        let total =
+            all_sql_paths.len() + all_java_paths.len() + all_xml_paths.len() + all_jsp_paths.len();
+        #[cfg(not(feature = "jsp"))]
         let total = all_sql_paths.len() + all_java_paths.len() + all_xml_paths.len();
 
         // Phase 3-4: Chunked parsing + streaming graph building
@@ -302,6 +310,28 @@ impl Project {
             &mut ctx.proc_index,
             &ctx.mapper_index,
         );
+
+        #[cfg(feature = "jsp")]
+        {
+            if !all_jsp_paths.is_empty() {
+                pb.set_message("Parsing JSP...");
+                let jsp_results = crate::parser::jsp_loader::load_jsp_files_from_paths(
+                    &all_jsp_paths,
+                    &java_config,
+                );
+                pb.inc(all_jsp_paths.len() as u64);
+
+                for result in &jsp_results {
+                    let hash = blake3::hash(result.synthesized.source.as_bytes())
+                        .to_hex()
+                        .to_string();
+                    all_hashes.push((result.file.clone(), hash, FileType::Jsp));
+                }
+
+                GraphBuilder::add_jsp_nodes_from_parsed(&jsp_results, &mut ctx);
+            }
+        }
+
         GraphBuilder::finalize_graph(&mut ctx);
 
         // Expand dynamic SQL variants for fingerprint index
@@ -456,6 +486,12 @@ fn scan_with_fingerprints(paths: &[PathBuf], exclude: &[String]) -> Vec<(PathBuf
         for p in &scanned.xml_files {
             if seen.insert(p.clone()) {
                 files.push((p.clone(), FileType::Xml));
+            }
+        }
+        #[cfg(feature = "jsp")]
+        for p in &scanned.jsp_files {
+            if seen.insert(p.clone()) {
+                files.push((p.clone(), FileType::Jsp));
             }
         }
     }

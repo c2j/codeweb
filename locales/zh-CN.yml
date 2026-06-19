@@ -61,6 +61,7 @@ style.path: "路径"
 filetype.sql: "SQL"
 filetype.java: "Java"
 filetype.xml: "XML"
+filetype.jsp: "JSP"
 
 partition.auto_title: "自动聚类（%{total} 个参与者节点）"
 partition.gamma_sweep: "[1] 分辨率扫描 — 不同 γ 值下的自然社区数："

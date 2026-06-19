@@ -756,6 +756,8 @@ fn cmd_files(project: &Path) -> Result<()> {
                 parser::fingerprint::FileType::Sql => "SQL",
                 parser::fingerprint::FileType::Java => "Java",
                 parser::fingerprint::FileType::Xml => "XML",
+                #[cfg(feature = "jsp")]
+                parser::fingerprint::FileType::Jsp => "JSP",
             };
             let node_count = file_nodes
                 .get(path as &std::path::Path)

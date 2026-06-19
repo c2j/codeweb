@@ -61,6 +61,7 @@ style.path: "Path"
 filetype.sql: "SQL"
 filetype.java: "Java"
 filetype.xml: "XML"
+filetype.jsp: "JSP"
 
 partition.auto_title: "Auto-clustering (%{total} participant nodes)"
 partition.gamma_sweep: "[1] Resolution sweep — natural community count at different γ:"

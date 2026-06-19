@@ -760,6 +760,8 @@ impl App {
                     crate::parser::fingerprint::FileType::Sql => t!("filetype.sql").to_string(),
                     crate::parser::fingerprint::FileType::Java => t!("filetype.java").to_string(),
                     crate::parser::fingerprint::FileType::Xml => t!("filetype.xml").to_string(),
+                    #[cfg(feature = "jsp")]
+                    crate::parser::fingerprint::FileType::Jsp => t!("filetype.jsp").to_string(),
                 };
                 let node_count = file_nodes
                     .get(path as &std::path::Path)
