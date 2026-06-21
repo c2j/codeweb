@@ -907,6 +907,103 @@ pub struct PartitionReport {
     pub topology: Option<WccTopology>,
 }
 
+/// Sparse binary matrix of procedure → table access.
+///
+/// Built from `Edge::TableAccess` edges where source is a participant
+/// and destination is a Table. Used as input to TF-IDF + cosine similarity.
+#[derive(Debug, Clone)]
+pub struct ProcTableMatrix {
+    pub procs: Vec<NodeIndex>,
+    pub tables: Vec<NodeIndex>,
+    access_map: HashSet<(usize, usize)>,
+    proc_index: HashMap<NodeIndex, usize>,
+    table_index: HashMap<NodeIndex, usize>,
+}
+
+impl ProcTableMatrix {
+    pub fn access(&self, proc: NodeIndex, table: NodeIndex) -> bool {
+        let p = match self.proc_index.get(&proc) {
+            Some(&i) => i,
+            None => return false,
+        };
+        let t = match self.table_index.get(&table) {
+            Some(&i) => i,
+            None => return false,
+        };
+        self.access_map.contains(&(p, t))
+    }
+
+    pub fn proc_count(&self) -> usize {
+        self.procs.len()
+    }
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+    pub fn accesses(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.access_map.iter().copied()
+    }
+}
+
+/// Build the proc-table access matrix from the graph.
+///
+/// Includes only edges where:
+///   - source is a participant (per `config.participant_kinds`)
+///   - destination is a Table (matches `Node::Table { .. }`)
+///   - edge is `Edge::TableAccess` with `flow_kind == DmlAccess`
+pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> ProcTableMatrix {
+    use crate::graph::{DataFlowKind, Edge};
+
+    let mut proc_set: HashSet<NodeIndex> = HashSet::new();
+    let mut table_set: HashSet<NodeIndex> = HashSet::new();
+    let mut access_pairs: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
+
+    for edge_idx in graph.edge_indices() {
+        let (src, dst) = match graph.edge_endpoints(edge_idx) {
+            Some(ep) => ep,
+            None => continue,
+        };
+        if !config
+            .participant_kinds
+            .contains(&NodeKind::from_node(&graph[src]))
+        {
+            continue;
+        }
+        if !matches!(graph[dst], Node::Table { .. }) {
+            continue;
+        }
+        match &graph[edge_idx] {
+            Edge::TableAccess { flow_kind, .. } if *flow_kind == DataFlowKind::DmlAccess => {}
+            _ => continue,
+        }
+        proc_set.insert(src);
+        table_set.insert(dst);
+        access_pairs.insert((src, dst));
+    }
+
+    let mut procs: Vec<NodeIndex> = proc_set.into_iter().collect();
+    procs.sort();
+    let mut tables: Vec<NodeIndex> = table_set.into_iter().collect();
+    tables.sort();
+
+    let proc_index: HashMap<NodeIndex, usize> =
+        procs.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let table_index: HashMap<NodeIndex, usize> =
+        tables.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+
+    let access_map: HashSet<(usize, usize)> = access_pairs
+        .into_iter()
+        .map(|(p, t)| (proc_index[&p], table_index[&t]))
+        .collect();
+
+    ProcTableMatrix {
+        procs,
+        tables,
+        access_map,
+        proc_index,
+        table_index,
+    }
+}
+
 /// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
 #[derive(Debug, Clone)]
 pub struct WccTopology {
@@ -2014,10 +2111,7 @@ mod tests {
         assert_eq!(topo.gcc_size, 6);
 
         // With filter min_size=3: only GCC participates (6 nodes)
-        let report_filtered = partition(
-            &graph,
-            &ClusterConfig::auto().with_min_component_size(3),
-        );
+        let report_filtered = partition(&graph, &ClusterConfig::auto().with_min_component_size(3));
         assert_eq!(report_filtered.total_nodes, 6);
         // All clustered nodes are GCC members (indices 0-5)
         for &node_idx in report_filtered.assignments.keys() {
@@ -2031,5 +2125,50 @@ mod tests {
         let topo2 = report_filtered.topology.as_ref().unwrap();
         assert_eq!(topo2.wcc_count, 6); // topology unchanged
         assert_eq!(topo2.gcc_size, 6);
+    }
+
+    // --- Task 5 Tests ---
+
+    #[test]
+    fn proc_table_matrix_captures_accesses() {
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        let t_audit = graph.add_node(table_node("audit_log"));
+
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_audit, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+        graph.add_edge(p3, t_customers, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+
+        assert_eq!(matrix.procs.len(), 3);
+        assert_eq!(matrix.tables.len(), 3);
+        assert!(matrix.access(p1, t_orders));
+        assert!(matrix.access(p1, t_audit));
+        assert!(!matrix.access(p1, t_customers));
+        assert!(matrix.access(p2, t_orders));
+        assert!(matrix.access(p2, t_customers));
+        assert!(matrix.access(p3, t_customers));
+        assert!(!matrix.access(p3, t_orders));
+    }
+
+    #[test]
+    fn proc_table_matrix_excludes_non_participants() {
+        let mut graph = CodeGraph::new();
+        let t1 = graph.add_node(table_node("t1"));
+        let t2 = graph.add_node(table_node("t2"));
+        graph.add_edge(t1, t2, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        assert_eq!(matrix.procs.len(), 0);
+        assert_eq!(matrix.tables.len(), 0);
     }
 }
