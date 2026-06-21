@@ -6,6 +6,7 @@
 use crate::graph::{CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
 use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 
 /// Lightweight node kind for clustering — derived from `Node` enum variants.
@@ -883,6 +884,98 @@ pub struct PartitionReport {
     pub cluster_stats: Vec<ClusterStat>,
     pub inter_cluster_coupling: Vec<InterClusterCoupling>,
     pub total_nodes: usize,
+}
+
+/// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
+#[derive(Debug, Clone)]
+pub struct WccTopology {
+    pub total_participants: usize,
+    pub wcc_count: usize,
+    pub gcc_size: usize,
+    pub isolates_count: usize,
+    pub isolates_node_count: usize,
+    pub largest_components: Vec<Vec<NodeIndex>>,
+}
+
+impl WccTopology {
+    pub fn participants_above_threshold(&self, min_size: usize) -> Vec<NodeIndex> {
+        self.largest_components
+            .iter()
+            .filter(|c| c.len() >= min_size)
+            .flat_map(|c| c.iter().copied())
+            .collect()
+    }
+}
+
+pub fn compute_wcc_topology(graph: &CodeGraph, config: &ClusterConfig) -> WccTopology {
+    let participants: HashSet<NodeIndex> = graph
+        .node_indices()
+        .filter(|&idx| {
+            config
+                .participant_kinds
+                .contains(&NodeKind::from_node(&graph[idx]))
+        })
+        .collect();
+
+    let mut adj: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+    for &p in &participants {
+        adj.insert(p, HashSet::new());
+    }
+    for edge_idx in graph.edge_indices() {
+        let (src, dst) = match graph.edge_endpoints(edge_idx) {
+            Some(ep) => ep,
+            None => continue,
+        };
+        if participants.contains(&src) && participants.contains(&dst) && src != dst {
+            adj.get_mut(&src).unwrap().insert(dst);
+            adj.get_mut(&dst).unwrap().insert(src);
+        }
+    }
+
+    let mut visited: HashSet<NodeIndex> = HashSet::new();
+    let mut components: Vec<Vec<NodeIndex>> = Vec::new();
+    for &start in participants.iter() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut component: Vec<NodeIndex> = Vec::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        while let Some(node) = queue.pop_front() {
+            component.push(node);
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    if !visited.contains(&nb) {
+                        visited.insert(nb);
+                        queue.push_back(nb);
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let total_participants = participants.len();
+    let wcc_count = components.len();
+    let gcc_size = components.first().map(|c| c.len()).unwrap_or(0);
+    let isolates_count = wcc_count.saturating_sub(if gcc_size > 0 { 1 } else { 0 });
+    let isolates_node_count: usize = components
+        .iter()
+        .skip(if gcc_size > 0 { 1 } else { 0 })
+        .map(|c| c.len())
+        .sum();
+
+    WccTopology {
+        total_participants,
+        wcc_count,
+        gcc_size,
+        isolates_count,
+        isolates_node_count,
+        largest_components: components,
+    }
 }
 
 pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
@@ -1772,5 +1865,56 @@ mod tests {
             "k_actual was {}, expected <= 2 (forced k overrides max_iterations)",
             report.k_actual
         );
+    }
+
+    // --- Task 1: WccTopology Tests ---
+
+    #[test]
+    fn wcc_topology_counts_components_correctly() {
+        let mut graph = CodeGraph::new();
+        // GCC: a-b-c-d-e (5 nodes, connected via call edges)
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        let e = graph.add_node(proc_node("e"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        graph.add_edge(c, d, call_edge());
+        graph.add_edge(d, e, call_edge());
+        // Isolate 1: f (singleton)
+        let _f = graph.add_node(proc_node("f"));
+        // Isolate 2: g-h (mutual call pair)
+        let g = graph.add_node(proc_node("g"));
+        let h = graph.add_node(proc_node("h"));
+        graph.add_edge(g, h, call_edge());
+        graph.add_edge(h, g, call_edge());
+
+        let config = ClusterConfig::auto();
+        let topo = compute_wcc_topology(&graph, &config);
+
+        assert_eq!(topo.total_participants, 8);
+        assert_eq!(topo.wcc_count, 3);
+        assert_eq!(topo.gcc_size, 5);
+        assert_eq!(topo.isolates_count, 2);
+        assert_eq!(topo.isolates_node_count, 3);
+        assert_eq!(topo.largest_components[0].len(), 5);
+        assert_eq!(topo.largest_components[1].len(), 2);
+        assert_eq!(topo.largest_components[2].len(), 1);
+    }
+
+    #[test]
+    fn wcc_topology_excludes_non_participants() {
+        let mut graph = CodeGraph::new();
+        let p = graph.add_node(proc_node("p"));
+        let t = graph.add_node(table_node("orders"));
+        graph.add_edge(p, t, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let topo = compute_wcc_topology(&graph, &config);
+
+        assert_eq!(topo.total_participants, 1);
+        assert_eq!(topo.wcc_count, 1);
+        assert_eq!(topo.gcc_size, 1);
     }
 }
