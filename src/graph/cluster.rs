@@ -138,6 +138,32 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
     }
 }
 
+/// Configuration for TF-IDF table-access projection.
+///
+/// When enabled, procedures that share table accesses get weighted
+/// similarity edges added to the condensed graph, bridging otherwise-
+/// isolated WCCs.
+#[derive(Debug, Clone)]
+pub struct TableProjectionConfig {
+    /// Minimum cosine similarity to add an edge. Edges with sim < tau are dropped.
+    pub tau: f64,
+    /// Edge weight multiplier. Projection edges are weighted `lambda * cosine_similarity`,
+    /// relative to direct call edges (weight 1.0).
+    pub lambda: f64,
+    /// Top-K nearest neighbors per proc. Each proc connects to at most k_neighbors others.
+    pub k_neighbors: usize,
+}
+
+impl Default for TableProjectionConfig {
+    fn default() -> Self {
+        Self {
+            tau: 0.1,
+            lambda: 0.3,
+            k_neighbors: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub k: Option<usize>,
@@ -157,6 +183,11 @@ pub struct ClusterConfig {
     /// Nodes in WCCs smaller than this are excluded from condensation and
     /// community detection. Default `1` includes all participants.
     pub min_component_size: usize,
+
+    /// Optional TF-IDF table-access projection config.
+    /// When `Some`, procedures that share table accesses get weighted
+    /// similarity edges added to the condensed graph.
+    pub table_projection: Option<TableProjectionConfig>,
 }
 
 impl ClusterConfig {
@@ -169,6 +200,7 @@ impl ClusterConfig {
             max_iterations: None,
             min_delta_q: 0.0,
             min_component_size: 1,
+            table_projection: None,
         }
     }
 
@@ -181,6 +213,7 @@ impl ClusterConfig {
             max_iterations: None,
             min_delta_q: 0.0,
             min_component_size: 1,
+            table_projection: None,
         }
     }
 
@@ -205,6 +238,18 @@ impl ClusterConfig {
     /// Nodes in components smaller than `n` are excluded. Minimum clamped to 1.
     pub fn with_min_component_size(mut self, n: usize) -> Self {
         self.min_component_size = n.max(1);
+        self
+    }
+
+    /// Enable TF-IDF table-access projection. Adds weighted similarity edges
+    /// between procedures that share table accesses.
+    #[allow(dead_code)]
+    pub fn with_table_projection(mut self, tau: f64, lambda: f64, k_neighbors: usize) -> Self {
+        self.table_projection = Some(TableProjectionConfig {
+            tau,
+            lambda,
+            k_neighbors,
+        });
         self
     }
 }
@@ -327,6 +372,37 @@ fn build_condensed_graph(
         } else {
             *adj[src_super].entry(dst_super).or_insert(0.0) += weight;
             *adj[dst_super].entry(src_super).or_insert(0.0) += weight;
+        }
+    }
+
+    // NEW: TF-IDF table-access projection
+    if let Some(proj) = &config.table_projection {
+        let matrix = build_proc_table_matrix(graph, config);
+        let sim_edges = compute_tfidf_cosine_edges(&matrix, proj.tau, proj.k_neighbors);
+        // Build proc NodeIndex → super-node index lookup
+        let proc_to_super: HashMap<NodeIndex, usize> = matrix
+            .procs
+            .iter()
+            .filter_map(|&p| condensation.node_to_super.get(&p).map(|&s| (p, s)))
+            .collect();
+        for (i, j, sim) in sim_edges {
+            let p_i = matrix.procs[i];
+            let p_j = matrix.procs[j];
+            let s_i = match proc_to_super.get(&p_i) {
+                Some(&s) => s,
+                None => continue,
+            };
+            let s_j = match proc_to_super.get(&p_j) {
+                Some(&s) => s,
+                None => continue,
+            };
+            let w = proj.lambda * sim;
+            if s_i == s_j {
+                *adj[s_i].entry(s_i).or_insert(0.0) += w;
+            } else {
+                *adj[s_i].entry(s_j).or_insert(0.0) += w;
+                *adj[s_j].entry(s_i).or_insert(0.0) += w;
+            }
         }
     }
 
@@ -911,13 +987,14 @@ pub struct PartitionReport {
 ///
 /// Built from `Edge::TableAccess` edges where source is a participant
 /// and destination is a Table. Used as input to TF-IDF + cosine similarity.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProcTableMatrix {
     pub procs: Vec<NodeIndex>,
     pub tables: Vec<NodeIndex>,
     access_map: HashSet<(usize, usize)>,
+    #[allow(dead_code)]
     proc_index: HashMap<NodeIndex, usize>,
+    #[allow(dead_code)]
     table_index: HashMap<NodeIndex, usize>,
 }
 
@@ -952,7 +1029,6 @@ impl ProcTableMatrix {
 ///   - source is a participant (per `config.participant_kinds`)
 ///   - destination is a Table (matches `Node::Table { .. }`)
 ///   - edge is `Edge::TableAccess` with `flow_kind == DmlAccess`
-#[allow(dead_code)]
 pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> ProcTableMatrix {
     use crate::graph::{DataFlowKind, Edge};
 
@@ -1018,7 +1094,6 @@ pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> Pro
 /// 2. TF-IDF vector per proc: binary TF (1.0 if accessed) x IDF
 /// 3. Cosine similarity between each proc pair
 /// 4. Sparsification: keep top-`k_neighbors` per proc, then drop edges below `tau`
-#[allow(dead_code)]
 pub fn compute_tfidf_cosine_edges(
     matrix: &ProcTableMatrix,
     tau: f64,
@@ -2319,6 +2394,38 @@ mod tests {
             .iter()
             .find(|(a, b, _)| (*a == p1_idx && *b == p3_idx) || (*a == p3_idx && *b == p1_idx));
         assert!(sim_13.is_none(), "p1-p3 should not have an edge");
+    }
+
+    // --- Task 7 Test ---
+
+    #[test]
+    fn table_projection_bridges_isolated_procs() {
+        let mut graph = CodeGraph::new();
+        // p1, p2 don't call each other but both read "orders" and "customers"
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_customers, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+
+        // Without projection: p1, p2 are in different WCCs (tables excluded from clustering)
+        let report_no_proj = partition(&graph, &ClusterConfig::new(1));
+        let topo = report_no_proj.topology.as_ref().unwrap();
+        assert_eq!(
+            topo.wcc_count, 2,
+            "p1 and p2 should be in separate WCCs without projection"
+        );
+
+        // With projection: p1, p2 get bridged via TF-IDF similarity → same cluster
+        let config = ClusterConfig::new(1).with_table_projection(0.1, 0.3, 10);
+        let report_proj = partition(&graph, &config);
+        assert_eq!(report_proj.total_nodes, 2);
+        let c1 = report_proj.assignments[&p1];
+        let c2 = report_proj.assignments[&p2];
+        assert_eq!(c1, c2, "p1 and p2 must be in same cluster with projection");
     }
 
     #[test]
