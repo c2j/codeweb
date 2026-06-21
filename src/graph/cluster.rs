@@ -911,6 +911,7 @@ pub struct PartitionReport {
 ///
 /// Built from `Edge::TableAccess` edges where source is a participant
 /// and destination is a Table. Used as input to TF-IDF + cosine similarity.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProcTableMatrix {
     pub procs: Vec<NodeIndex>,
@@ -920,6 +921,7 @@ pub struct ProcTableMatrix {
     table_index: HashMap<NodeIndex, usize>,
 }
 
+#[allow(dead_code)]
 impl ProcTableMatrix {
     pub fn access(&self, proc: NodeIndex, table: NodeIndex) -> bool {
         let p = match self.proc_index.get(&proc) {
@@ -950,6 +952,7 @@ impl ProcTableMatrix {
 ///   - source is a participant (per `config.participant_kinds`)
 ///   - destination is a Table (matches `Node::Table { .. }`)
 ///   - edge is `Edge::TableAccess` with `flow_kind == DmlAccess`
+#[allow(dead_code)]
 pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> ProcTableMatrix {
     use crate::graph::{DataFlowKind, Edge};
 
@@ -1002,6 +1005,103 @@ pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> Pro
         proc_index,
         table_index,
     }
+}
+
+/// Compute TF-IDF weighted cosine similarity edges between procedures.
+///
+/// Returns `Vec<(proc_idx_a, proc_idx_b, weight)>` where indices refer to
+/// positions in `matrix.procs`, and `weight` is the cosine similarity
+/// in [0, 1] (TF-IDF vectors are non-negative).
+///
+/// Algorithm:
+/// 1. IDF per table: `idf(t) = log(N / df(t))` where N = proc count, df(t) = procs accessing table t
+/// 2. TF-IDF vector per proc: binary TF (1.0 if accessed) x IDF
+/// 3. Cosine similarity between each proc pair
+/// 4. Sparsification: keep top-`k_neighbors` per proc, then drop edges below `tau`
+#[allow(dead_code)]
+pub fn compute_tfidf_cosine_edges(
+    matrix: &ProcTableMatrix,
+    tau: f64,
+    k_neighbors: usize,
+) -> Vec<(usize, usize, f64)> {
+    let n_procs = matrix.proc_count();
+    let n_tables = matrix.table_count();
+    if n_procs <= 1 || n_tables == 0 {
+        return Vec::new();
+    }
+
+    // 1. Document frequency per table
+    let mut df: Vec<usize> = vec![0; n_tables];
+    for &(_, t) in matrix.access_map.iter() {
+        df[t] += 1;
+    }
+
+    // 2. IDF: log(N / df). If df == N, IDF = 0 (generic table).
+    let n = n_procs as f64;
+    let idf: Vec<f64> = df
+        .iter()
+        .map(|&d| if d == 0 { 0.0 } else { (n / d as f64).ln() })
+        .collect();
+
+    // 3. TF-IDF vector per proc (sparse: HashMap<table_idx, weight>)
+    let mut tfidf_vectors: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n_procs];
+    for &(p, t) in matrix.access_map.iter() {
+        let weight = idf[t];
+        if weight > 0.0 {
+            tfidf_vectors[p].insert(t, weight);
+        }
+    }
+
+    // 4. Vector norms
+    let norms: Vec<f64> = tfidf_vectors
+        .iter()
+        .map(|v| {
+            let sum_sq: f64 = v.values().map(|w| w * w).sum();
+            sum_sq.sqrt()
+        })
+        .collect();
+
+    // 5. For each proc, compute cosine similarity to all others, keep top-K
+    let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+    for i in 0..n_procs {
+        if norms[i] == 0.0 {
+            continue;
+        }
+        let mut sims: Vec<(usize, f64)> = (0..n_procs)
+            .filter(|&j| j != i && norms[j] > 0.0)
+            .map(|j| {
+                let (small, large) = if tfidf_vectors[i].len() < tfidf_vectors[j].len() {
+                    (&tfidf_vectors[i], &tfidf_vectors[j])
+                } else {
+                    (&tfidf_vectors[j], &tfidf_vectors[i])
+                };
+                let dot: f64 = small
+                    .iter()
+                    .filter_map(|(t, w)| large.get(t).map(|w2| w * w2))
+                    .sum();
+                let cos = dot / (norms[i] * norms[j]);
+                (j, cos)
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, sim) in sims.into_iter().take(k_neighbors) {
+            if sim >= tau {
+                let (a, b) = if i < j { (i, j) } else { (j, i) };
+                edges.push((a, b, sim));
+            }
+        }
+    }
+
+    // Deduplicate (i,j) pairs (each pair may be added from both sides)
+    edges.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    edges.dedup_by_key(|(a, b, _)| (*a, *b));
+
+    edges
 }
 
 /// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
@@ -2170,5 +2270,130 @@ mod tests {
         let matrix = build_proc_table_matrix(&graph, &config);
         assert_eq!(matrix.procs.len(), 0);
         assert_eq!(matrix.tables.len(), 0);
+    }
+
+    // --- Task 6 Tests ---
+
+    #[test]
+    fn tfidf_cosine_groups_similar_procs() {
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        let t_audit = graph.add_node(table_node("audit_log"));
+
+        // p1, p2 both read orders + customers (similar)
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_customers, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+        // p3 reads only audit_log (dissimilar)
+        graph.add_edge(p3, t_audit, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        let edges = compute_tfidf_cosine_edges(&matrix, 0.1, 10);
+
+        let p1_idx = matrix.proc_index[&p1];
+        let p2_idx = matrix.proc_index[&p2];
+        let p3_idx = matrix.proc_index[&p3];
+
+        // p1-p2 should have high similarity (they share 2 tables, both with idf > 0
+        // because df=2, N=3 -> idf = ln(3/2) approximately 0.405)
+        let sim_12 = edges
+            .iter()
+            .find(|(a, b, _)| (*a == p1_idx && *b == p2_idx) || (*a == p2_idx && *b == p1_idx))
+            .map(|(_, _, s)| *s);
+        assert!(sim_12.is_some(), "p1-p2 edge must exist");
+        // cosine(p1,p2) should be 1.0 because their TF-IDF vectors are identical
+        assert!(
+            (sim_12.unwrap() - 1.0).abs() < 1e-9,
+            "p1-p2 similarity should be 1.0 (identical vectors), got {}",
+            sim_12.unwrap()
+        );
+
+        // p3 shares nothing with p1/p2 -> no edges
+        let sim_13 = edges
+            .iter()
+            .find(|(a, b, _)| (*a == p1_idx && *b == p3_idx) || (*a == p3_idx && *b == p1_idx));
+        assert!(sim_13.is_none(), "p1-p3 should not have an edge");
+    }
+
+    #[test]
+    fn tfidf_downweights_generic_tables() {
+        let mut graph = CodeGraph::new();
+        // 3 procs all read the same "common_codes" table and nothing else
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_common = graph.add_node(table_node("common_codes"));
+        graph.add_edge(p1, t_common, table_access_edge());
+        graph.add_edge(p2, t_common, table_access_edge());
+        graph.add_edge(p3, t_common, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        let edges = compute_tfidf_cosine_edges(&matrix, 0.1, 10);
+
+        // If all procs share ONLY the generic table, IDF = log(3/3) = 0,
+        // so TF-IDF vectors are all-zero -> no similarity edges.
+        assert!(
+            edges.is_empty(),
+            "generic-only sharing should produce no edges"
+        );
+    }
+
+    #[test]
+    fn tfidf_cosine_respects_threshold() {
+        // Use 3 procs where cosine(p1,p2) ~= 0.463 so tau=0.3 vs tau=0.6 distinguishes.
+        //
+        // p1 reads t1, t2          -> vector: {t1: idf(t1), t2: idf(t2)}
+        // p2 reads t1, t2, t3      -> vector: {t1: idf(t1), t2: idf(t2), t3: idf(t3)}
+        // p3 reads t4              -> vector: {t4: idf(t4)}  (isolated, makes N=3)
+        //
+        // N=3; df(t1)=df(t2)=2, df(t3)=df(t4)=1
+        // idf(t1)=idf(t2)=ln(3/2)~=0.405, idf(t3)=idf(t4)=ln(3)~=1.099
+        // cosine(p1,p2) ~= 0.405 / (sqrt(0.405^2+0.405^2) * sqrt(0.405^2+0.405^2+1.099^2))
+        //              ~= 0.463
+        //
+        // So tau=0.3 -> edge present, tau=0.6 -> edge absent.
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let _p3 = graph.add_node(proc_node("p3"));
+        let t1 = graph.add_node(table_node("t1"));
+        let t2 = graph.add_node(table_node("t2"));
+        let t3 = graph.add_node(table_node("t3"));
+        let t4 = graph.add_node(table_node("t4"));
+
+        graph.add_edge(p1, t1, table_access_edge());
+        graph.add_edge(p1, t2, table_access_edge());
+        graph.add_edge(p2, t1, table_access_edge());
+        graph.add_edge(p2, t2, table_access_edge());
+        graph.add_edge(p2, t3, table_access_edge());
+        graph.add_edge(_p3, t4, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+
+        // High threshold: no edge
+        let edges_high = compute_tfidf_cosine_edges(&matrix, 0.6, 10);
+        let has_edge_high = edges_high.iter().any(|(a, b, _)| {
+            let p1i = matrix.proc_index[&p1];
+            let p2i = matrix.proc_index[&p2];
+            (*a == p1i && *b == p2i) || (*a == p2i && *b == p1i)
+        });
+        assert!(!has_edge_high, "tau=0.6 should reject edge (cosine~=0.463)");
+
+        // Low threshold: edge present
+        let edges_low = compute_tfidf_cosine_edges(&matrix, 0.3, 10);
+        let has_edge_low = edges_low.iter().any(|(a, b, _)| {
+            let p1i = matrix.proc_index[&p1];
+            let p2i = matrix.proc_index[&p2];
+            (*a == p1i && *b == p2i) || (*a == p2i && *b == p1i)
+        });
+        assert!(has_edge_low, "tau=0.3 should accept edge (cosine~=0.463)");
     }
 }
