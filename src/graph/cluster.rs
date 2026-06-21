@@ -153,6 +153,10 @@ pub struct ClusterConfig {
     /// (natural mode only). Default `0.0` preserves original CNM behavior.
     /// Set to a small positive value (e.g. `1e-6`) to prune negligible merges.
     pub min_delta_q: f64,
+    /// Minimum WCC component size for a node to participate in clustering.
+    /// Nodes in WCCs smaller than this are excluded from condensation and
+    /// community detection. Default `1` includes all participants.
+    pub min_component_size: usize,
 }
 
 impl ClusterConfig {
@@ -164,6 +168,7 @@ impl ClusterConfig {
             participant_kinds: default_participant_kinds(),
             max_iterations: None,
             min_delta_q: 0.0,
+            min_component_size: 1,
         }
     }
 
@@ -175,6 +180,7 @@ impl ClusterConfig {
             participant_kinds: default_participant_kinds(),
             max_iterations: None,
             min_delta_q: 0.0,
+            min_component_size: 1,
         }
     }
 
@@ -192,6 +198,14 @@ impl ClusterConfig {
     /// Stop natural-mode merging once best ΔQ ≤ `q`.
     pub fn with_min_delta_q(mut self, q: f64) -> Self {
         self.min_delta_q = q;
+        self
+    }
+
+    /// Set minimum WCC component size for clustering participation.
+    /// Nodes in components smaller than `n` are excluded. Minimum clamped to 1.
+    #[allow(dead_code)]
+    pub fn with_min_component_size(mut self, n: usize) -> Self {
+        self.min_component_size = n.max(1);
         self
     }
 }
@@ -229,14 +243,19 @@ struct SccCondensation {
 /// Only participant nodes are included; non-participant nodes are filtered out
 /// of SCC membership but their bridging role in cycles is preserved conservatively.
 fn condense_sccs(graph: &CodeGraph, config: &ClusterConfig) -> SccCondensation {
-    let participants: HashSet<NodeIndex> = graph
-        .node_indices()
-        .filter(|&idx| {
-            config
-                .participant_kinds
-                .contains(&NodeKind::from_node(&graph[idx]))
-        })
-        .collect();
+    let topology = compute_wcc_topology(graph, config);
+    let allowed: HashSet<NodeIndex> = if config.min_component_size <= 1 {
+        topology
+            .largest_components
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect()
+    } else {
+        topology
+            .participants_above_threshold(config.min_component_size)
+            .into_iter()
+            .collect()
+    };
 
     let sccs = petgraph::algo::kosaraju_scc(graph);
 
@@ -246,7 +265,7 @@ fn condense_sccs(graph: &CodeGraph, config: &ClusterConfig) -> SccCondensation {
     for scc in sccs {
         let filtered: HashSet<NodeIndex> = scc
             .into_iter()
-            .filter(|idx| participants.contains(idx))
+            .filter(|idx| allowed.contains(idx))
             .collect();
         if filtered.is_empty() {
             continue;
@@ -884,10 +903,15 @@ pub struct PartitionReport {
     pub cluster_stats: Vec<ClusterStat>,
     pub inter_cluster_coupling: Vec<InterClusterCoupling>,
     pub total_nodes: usize,
+    /// Weakly-connected-component topology of the participant subgraph.
+    /// Always populated by `partition()`.
+    #[allow(dead_code)]
+    pub topology: Option<WccTopology>,
 }
 
 /// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WccTopology {
     pub total_participants: usize,
     pub wcc_count: usize,
@@ -956,7 +980,7 @@ pub fn compute_wcc_topology(graph: &CodeGraph, config: &ClusterConfig) -> WccTop
         components.push(component);
     }
 
-    components.sort_by(|a, b| b.len().cmp(&a.len()));
+    components.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     let total_participants = participants.len();
     let wcc_count = components.len();
@@ -979,6 +1003,7 @@ pub fn compute_wcc_topology(graph: &CodeGraph, config: &ClusterConfig) -> WccTop
 }
 
 pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
+    let topology = compute_wcc_topology(graph, config);
     let condensation = condense_sccs(graph, config);
     let condensed = build_condensed_graph(graph, &condensation, config);
     let (super_communities, modularity) = cluster_cnm(
@@ -1018,6 +1043,7 @@ pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
         cluster_stats,
         inter_cluster_coupling,
         total_nodes,
+        topology: Some(topology),
     }
 }
 
@@ -1916,5 +1942,45 @@ mod tests {
         assert_eq!(topo.total_participants, 1);
         assert_eq!(topo.wcc_count, 1);
         assert_eq!(topo.gcc_size, 1);
+    }
+
+    // --- Task 2: PartitionReport + Config Integration Tests ---
+
+    #[test]
+    fn partition_report_includes_topology() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, a, call_edge());
+        graph.add_edge(c, d, call_edge());
+        graph.add_edge(d, c, call_edge());
+
+        let report = partition(&graph, &ClusterConfig::auto());
+        assert!(report.topology.is_some());
+        let topo = report.topology.as_ref().unwrap();
+        assert_eq!(topo.wcc_count, 2);
+        assert_eq!(topo.gcc_size, 2);
+    }
+
+    #[test]
+    fn min_component_size_filters_isolates() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        let _d = graph.add_node(proc_node("d"));
+
+        let config = ClusterConfig::auto().with_min_component_size(2);
+        let report = partition(&graph, &config);
+        assert_eq!(report.total_nodes, 3);
+        assert!(report.assignments.contains_key(&a));
+        assert!(report.assignments.contains_key(&b));
+        assert!(report.assignments.contains_key(&c));
+        assert!(!report.assignments.contains_key(&NodeIndex::new(3))); // d filtered
     }
 }
