@@ -1980,4 +1980,56 @@ mod tests {
         assert!(report.assignments.contains_key(&c));
         assert!(!report.assignments.contains_key(&NodeIndex::new(3))); // d filtered
     }
+
+    #[test]
+    fn min_component_size_clusters_only_gcc() {
+        // Realistic micro-fixture: GCC of 6 nodes + 3 isolated pairs + 2 singletons
+        let mut graph = CodeGraph::new();
+        // GCC: 6 procs in a clique
+        let gcc_nodes: Vec<NodeIndex> = (0..6)
+            .map(|i| graph.add_node(proc_node(&format!("gcc{i}"))))
+            .collect();
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                graph.add_edge(gcc_nodes[i], gcc_nodes[j], call_edge());
+                graph.add_edge(gcc_nodes[j], gcc_nodes[i], call_edge());
+            }
+        }
+        // 3 isolated pairs
+        for pair_idx in 0..3 {
+            let p1 = graph.add_node(proc_node(&format!("iso_p{pair_idx}_a")));
+            let p2 = graph.add_node(proc_node(&format!("iso_p{pair_idx}_b")));
+            graph.add_edge(p1, p2, call_edge());
+            graph.add_edge(p2, p1, call_edge());
+        }
+        // 2 singletons
+        let _s1 = graph.add_node(proc_node("singleton_1"));
+        let _s2 = graph.add_node(proc_node("singleton_2"));
+
+        // Without filter: all 14 nodes participate
+        let report_all = partition(&graph, &ClusterConfig::auto());
+        assert_eq!(report_all.total_nodes, 14);
+        let topo = report_all.topology.as_ref().unwrap();
+        assert_eq!(topo.wcc_count, 6); // 1 GCC + 3 pairs + 2 singletons
+        assert_eq!(topo.gcc_size, 6);
+
+        // With filter min_size=3: only GCC participates (6 nodes)
+        let report_filtered = partition(
+            &graph,
+            &ClusterConfig::auto().with_min_component_size(3),
+        );
+        assert_eq!(report_filtered.total_nodes, 6);
+        // All clustered nodes are GCC members (indices 0-5)
+        for &node_idx in report_filtered.assignments.keys() {
+            assert!(
+                node_idx.index() < 6,
+                "node {} should not be clustered (not in GCC)",
+                node_idx.index()
+            );
+        }
+        // Isolates are still in topology
+        let topo2 = report_filtered.topology.as_ref().unwrap();
+        assert_eq!(topo2.wcc_count, 6); // topology unchanged
+        assert_eq!(topo2.gcc_size, 6);
+    }
 }
