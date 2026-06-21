@@ -371,6 +371,13 @@ enum Commands {
         #[arg(long)]
         min_delta_q: Option<f64>,
 
+        /// Minimum weakly connected component size to participate in clustering.
+        /// Components smaller than this are reported but excluded from clustering.
+        /// Use to focus on the giant component when the graph has many isolates.
+        /// Default: 1 (all components participate).
+        #[arg(long, default_value = "1")]
+        min_component_size: usize,
+
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
@@ -525,6 +532,7 @@ fn run() -> Result<()> {
             auto,
             max_iterations,
             min_delta_q,
+            min_component_size,
             project,
             output,
         }) => cmd_partition(
@@ -533,6 +541,7 @@ fn run() -> Result<()> {
             auto,
             max_iterations,
             min_delta_q,
+            min_component_size,
             &project,
             output.as_deref(),
         ),
@@ -1564,12 +1573,14 @@ fn write_output(content: &str, output: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_partition(
     k: Option<usize>,
     gamma: Option<f64>,
     auto: bool,
     max_iterations: Option<usize>,
     min_delta_q: Option<f64>,
+    min_component_size: usize,
     project: &Path,
     output: Option<&Path>,
 ) -> Result<()> {
@@ -1578,6 +1589,7 @@ fn cmd_partition(
 
     if auto || (k.is_none() && gamma.is_none()) {
         let mut base_config = graph::cluster::ClusterConfig::auto();
+        base_config = base_config.with_min_component_size(min_component_size);
         if let Some(n) = max_iterations {
             base_config = base_config.with_max_iterations(n);
         }
@@ -1661,7 +1673,7 @@ fn cmd_partition(
             )
         );
         println_stdout!();
-
+        print_wcc_topology(&auto_report.report, min_component_size);
         print_cluster_details(&auto_report.report);
         print_cluster_analysis(&auto_report.report);
 
@@ -1687,6 +1699,7 @@ fn cmd_partition(
     if let Some(q) = min_delta_q {
         config = config.with_min_delta_q(q);
     }
+    config = config.with_min_component_size(min_component_size);
 
     let report = store.partition(&config);
 
@@ -1703,7 +1716,7 @@ fn cmd_partition(
         report.modularity
     );
     println_stdout!();
-
+    print_wcc_topology(&report, min_component_size);
     print_cluster_details(&report);
 
     if !report.inter_cluster_coupling.is_empty() {
@@ -1733,6 +1746,55 @@ fn cmd_partition(
     }
 
     Ok(())
+}
+
+fn print_wcc_topology(report: &graph::cluster::PartitionReport, min_component_size: usize) {
+    let Some(topo) = report.topology.as_ref() else {
+        return;
+    };
+    println_stdout!("{}", t!("partition.wcc_topology"));
+    println_stdout!(
+        "{}",
+        t!("partition.wcc_total", total = topo.total_participants)
+    );
+    println_stdout!("{}", t!("partition.wcc_count", count = topo.wcc_count));
+
+    let gcc_pct = if topo.total_participants > 0 {
+        topo.gcc_size as f64 * 100.0 / topo.total_participants as f64
+    } else {
+        0.0
+    };
+    println_stdout!(
+        "{}",
+        t!(
+            "partition.wcc_gcc",
+            size = topo.gcc_size,
+            pct = format!("{:.1}", gcc_pct)
+        )
+    );
+    println_stdout!(
+        "{}",
+        t!(
+            "partition.wcc_isolates",
+            components = topo.isolates_count,
+            nodes = topo.isolates_node_count
+        )
+    );
+
+    // Report filter status: compare clustered node count to total participants
+    let clustered_nodes: usize = report.cluster_stats.iter().map(|s| s.node_count).sum();
+    if min_component_size > 1 && clustered_nodes < topo.total_participants {
+        let excluded = topo.total_participants - clustered_nodes;
+        println_stdout!(
+            "{}",
+            t!(
+                "partition.wcc_filter_active",
+                threshold = min_component_size,
+                excluded = excluded
+            )
+        );
+    }
+    println_stdout!();
 }
 
 fn print_cluster_details(report: &graph::cluster::PartitionReport) {

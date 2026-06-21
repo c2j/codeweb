@@ -203,7 +203,6 @@ impl ClusterConfig {
 
     /// Set minimum WCC component size for clustering participation.
     /// Nodes in components smaller than `n` are excluded. Minimum clamped to 1.
-    #[allow(dead_code)]
     pub fn with_min_component_size(mut self, n: usize) -> Self {
         self.min_component_size = n.max(1);
         self
@@ -905,13 +904,11 @@ pub struct PartitionReport {
     pub total_nodes: usize,
     /// Weakly-connected-component topology of the participant subgraph.
     /// Always populated by `partition()`.
-    #[allow(dead_code)]
     pub topology: Option<WccTopology>,
 }
 
 /// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WccTopology {
     pub total_participants: usize,
     pub wcc_count: usize,
