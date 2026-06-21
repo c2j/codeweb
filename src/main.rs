@@ -378,6 +378,13 @@ enum Commands {
         #[arg(long, default_value = "1")]
         min_component_size: usize,
 
+        /// Enable TF-IDF table-access projection. Bridges procedures that
+        /// share table accesses but don't call each other directly.
+        /// Optional value format: "tau:lambda:k_neighbors" (e.g., "0.1:0.3:10").
+        /// Bare flag uses defaults: tau=0.1, lambda=0.3, k=10.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0.1:0.3:10")]
+        table_projection: Option<String>,
+
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
@@ -533,6 +540,7 @@ fn run() -> Result<()> {
             max_iterations,
             min_delta_q,
             min_component_size,
+            table_projection,
             project,
             output,
         }) => cmd_partition(
@@ -542,6 +550,7 @@ fn run() -> Result<()> {
             max_iterations,
             min_delta_q,
             min_component_size,
+            table_projection,
             &project,
             output.as_deref(),
         ),
@@ -1581,6 +1590,7 @@ fn cmd_partition(
     max_iterations: Option<usize>,
     min_delta_q: Option<f64>,
     min_component_size: usize,
+    table_projection: Option<String>,
     project: &Path,
     output: Option<&Path>,
 ) -> Result<()> {
@@ -1590,6 +1600,13 @@ fn cmd_partition(
     if auto || (k.is_none() && gamma.is_none()) {
         let mut base_config = graph::cluster::ClusterConfig::auto();
         base_config = base_config.with_min_component_size(min_component_size);
+        if let Some(spec) = &table_projection {
+            let parts: Vec<&str> = spec.split(':').collect();
+            let tau: f64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.1);
+            let lambda: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.3);
+            let k: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+            base_config = base_config.with_table_projection(tau, lambda, k);
+        }
         if let Some(n) = max_iterations {
             base_config = base_config.with_max_iterations(n);
         }
@@ -1673,7 +1690,11 @@ fn cmd_partition(
             )
         );
         println_stdout!();
-        print_wcc_topology(&auto_report.report, min_component_size);
+        print_wcc_topology(
+            &auto_report.report,
+            min_component_size,
+            table_projection.as_deref(),
+        );
         print_cluster_details(&auto_report.report);
         print_cluster_analysis(&auto_report.report);
 
@@ -1700,6 +1721,13 @@ fn cmd_partition(
         config = config.with_min_delta_q(q);
     }
     config = config.with_min_component_size(min_component_size);
+    if let Some(spec) = &table_projection {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let tau: f64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.1);
+        let lambda: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.3);
+        let k: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+        config = config.with_table_projection(tau, lambda, k);
+    }
 
     let report = store.partition(&config);
 
@@ -1716,7 +1744,7 @@ fn cmd_partition(
         report.modularity
     );
     println_stdout!();
-    print_wcc_topology(&report, min_component_size);
+    print_wcc_topology(&report, min_component_size, table_projection.as_deref());
     print_cluster_details(&report);
 
     if !report.inter_cluster_coupling.is_empty() {
@@ -1748,7 +1776,11 @@ fn cmd_partition(
     Ok(())
 }
 
-fn print_wcc_topology(report: &graph::cluster::PartitionReport, min_component_size: usize) {
+fn print_wcc_topology(
+    report: &graph::cluster::PartitionReport,
+    min_component_size: usize,
+    table_projection_spec: Option<&str>,
+) {
     let Some(topo) = report.topology.as_ref() else {
         return;
     };
@@ -1793,6 +1825,24 @@ fn print_wcc_topology(report: &graph::cluster::PartitionReport, min_component_si
                 excluded = excluded
             )
         );
+    }
+
+    if let Some(spec) = table_projection_spec {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let tau = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.1);
+        let lambda = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.3);
+        let k = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+        println_stdout!(
+            "{}",
+            t!(
+                "partition.projection_active",
+                tau = tau,
+                lambda = lambda,
+                k = k
+            )
+        );
+    } else {
+        println_stdout!("{}", t!("partition.projection_off"));
     }
     println_stdout!();
 }
