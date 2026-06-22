@@ -243,7 +243,6 @@ impl ClusterConfig {
 
     /// Enable TF-IDF table-access projection. Adds weighted similarity edges
     /// between procedures that share table accesses.
-    #[allow(dead_code)]
     pub fn with_table_projection(mut self, tau: f64, lambda: f64, k_neighbors: usize) -> Self {
         self.table_projection = Some(TableProjectionConfig {
             tau,
