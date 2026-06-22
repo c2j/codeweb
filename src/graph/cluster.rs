@@ -6,6 +6,7 @@
 use crate::graph::{CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
 use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 
 /// Lightweight node kind for clustering — derived from `Node` enum variants.
@@ -137,6 +138,32 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
     }
 }
 
+/// Configuration for TF-IDF table-access projection.
+///
+/// When enabled, procedures that share table accesses get weighted
+/// similarity edges added to the condensed graph, bridging otherwise-
+/// isolated WCCs.
+#[derive(Debug, Clone)]
+pub struct TableProjectionConfig {
+    /// Minimum cosine similarity to add an edge. Edges with sim < tau are dropped.
+    pub tau: f64,
+    /// Edge weight multiplier. Projection edges are weighted `lambda * cosine_similarity`,
+    /// relative to direct call edges (weight 1.0).
+    pub lambda: f64,
+    /// Top-K nearest neighbors per proc. Each proc connects to at most k_neighbors others.
+    pub k_neighbors: usize,
+}
+
+impl Default for TableProjectionConfig {
+    fn default() -> Self {
+        Self {
+            tau: 0.1,
+            lambda: 0.3,
+            k_neighbors: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub k: Option<usize>,
@@ -152,6 +179,15 @@ pub struct ClusterConfig {
     /// (natural mode only). Default `0.0` preserves original CNM behavior.
     /// Set to a small positive value (e.g. `1e-6`) to prune negligible merges.
     pub min_delta_q: f64,
+    /// Minimum WCC component size for a node to participate in clustering.
+    /// Nodes in WCCs smaller than this are excluded from condensation and
+    /// community detection. Default `1` includes all participants.
+    pub min_component_size: usize,
+
+    /// Optional TF-IDF table-access projection config.
+    /// When `Some`, procedures that share table accesses get weighted
+    /// similarity edges added to the condensed graph.
+    pub table_projection: Option<TableProjectionConfig>,
 }
 
 impl ClusterConfig {
@@ -163,6 +199,8 @@ impl ClusterConfig {
             participant_kinds: default_participant_kinds(),
             max_iterations: None,
             min_delta_q: 0.0,
+            min_component_size: 1,
+            table_projection: None,
         }
     }
 
@@ -174,6 +212,8 @@ impl ClusterConfig {
             participant_kinds: default_participant_kinds(),
             max_iterations: None,
             min_delta_q: 0.0,
+            min_component_size: 1,
+            table_projection: None,
         }
     }
 
@@ -191,6 +231,24 @@ impl ClusterConfig {
     /// Stop natural-mode merging once best ΔQ ≤ `q`.
     pub fn with_min_delta_q(mut self, q: f64) -> Self {
         self.min_delta_q = q;
+        self
+    }
+
+    /// Set minimum WCC component size for clustering participation.
+    /// Nodes in components smaller than `n` are excluded. Minimum clamped to 1.
+    pub fn with_min_component_size(mut self, n: usize) -> Self {
+        self.min_component_size = n.max(1);
+        self
+    }
+
+    /// Enable TF-IDF table-access projection. Adds weighted similarity edges
+    /// between procedures that share table accesses.
+    pub fn with_table_projection(mut self, tau: f64, lambda: f64, k_neighbors: usize) -> Self {
+        self.table_projection = Some(TableProjectionConfig {
+            tau,
+            lambda,
+            k_neighbors,
+        });
         self
     }
 }
@@ -228,14 +286,19 @@ struct SccCondensation {
 /// Only participant nodes are included; non-participant nodes are filtered out
 /// of SCC membership but their bridging role in cycles is preserved conservatively.
 fn condense_sccs(graph: &CodeGraph, config: &ClusterConfig) -> SccCondensation {
-    let participants: HashSet<NodeIndex> = graph
-        .node_indices()
-        .filter(|&idx| {
-            config
-                .participant_kinds
-                .contains(&NodeKind::from_node(&graph[idx]))
-        })
-        .collect();
+    let topology = compute_wcc_topology(graph, config);
+    let allowed: HashSet<NodeIndex> = if config.min_component_size <= 1 {
+        topology
+            .largest_components
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect()
+    } else {
+        topology
+            .participants_above_threshold(config.min_component_size)
+            .into_iter()
+            .collect()
+    };
 
     let sccs = petgraph::algo::kosaraju_scc(graph);
 
@@ -245,7 +308,7 @@ fn condense_sccs(graph: &CodeGraph, config: &ClusterConfig) -> SccCondensation {
     for scc in sccs {
         let filtered: HashSet<NodeIndex> = scc
             .into_iter()
-            .filter(|idx| participants.contains(idx))
+            .filter(|idx| allowed.contains(idx))
             .collect();
         if filtered.is_empty() {
             continue;
@@ -308,6 +371,37 @@ fn build_condensed_graph(
         } else {
             *adj[src_super].entry(dst_super).or_insert(0.0) += weight;
             *adj[dst_super].entry(src_super).or_insert(0.0) += weight;
+        }
+    }
+
+    // NEW: TF-IDF table-access projection
+    if let Some(proj) = &config.table_projection {
+        let matrix = build_proc_table_matrix(graph, config);
+        let sim_edges = compute_tfidf_cosine_edges(&matrix, proj.tau, proj.k_neighbors);
+        // Build proc NodeIndex → super-node index lookup
+        let proc_to_super: HashMap<NodeIndex, usize> = matrix
+            .procs
+            .iter()
+            .filter_map(|&p| condensation.node_to_super.get(&p).map(|&s| (p, s)))
+            .collect();
+        for (i, j, sim) in sim_edges {
+            let p_i = matrix.procs[i];
+            let p_j = matrix.procs[j];
+            let s_i = match proc_to_super.get(&p_i) {
+                Some(&s) => s,
+                None => continue,
+            };
+            let s_j = match proc_to_super.get(&p_j) {
+                Some(&s) => s,
+                None => continue,
+            };
+            let w = proj.lambda * sim;
+            if s_i == s_j {
+                *adj[s_i].entry(s_i).or_insert(0.0) += w;
+            } else {
+                *adj[s_i].entry(s_j).or_insert(0.0) += w;
+                *adj[s_j].entry(s_i).or_insert(0.0) += w;
+            }
         }
     }
 
@@ -883,9 +977,301 @@ pub struct PartitionReport {
     pub cluster_stats: Vec<ClusterStat>,
     pub inter_cluster_coupling: Vec<InterClusterCoupling>,
     pub total_nodes: usize,
+    /// Weakly-connected-component topology of the participant subgraph.
+    /// Always populated by `partition()`.
+    pub topology: Option<WccTopology>,
+}
+
+/// Sparse binary matrix of procedure → table access.
+///
+/// Built from `Edge::TableAccess` edges where source is a participant
+/// and destination is a Table. Used as input to TF-IDF + cosine similarity.
+#[derive(Debug, Clone)]
+pub struct ProcTableMatrix {
+    pub procs: Vec<NodeIndex>,
+    pub tables: Vec<NodeIndex>,
+    access_map: HashSet<(usize, usize)>,
+    #[allow(dead_code)]
+    proc_index: HashMap<NodeIndex, usize>,
+    #[allow(dead_code)]
+    table_index: HashMap<NodeIndex, usize>,
+}
+
+#[allow(dead_code)]
+impl ProcTableMatrix {
+    pub fn access(&self, proc: NodeIndex, table: NodeIndex) -> bool {
+        let p = match self.proc_index.get(&proc) {
+            Some(&i) => i,
+            None => return false,
+        };
+        let t = match self.table_index.get(&table) {
+            Some(&i) => i,
+            None => return false,
+        };
+        self.access_map.contains(&(p, t))
+    }
+
+    pub fn proc_count(&self) -> usize {
+        self.procs.len()
+    }
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+    pub fn accesses(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.access_map.iter().copied()
+    }
+}
+
+/// Build the proc-table access matrix from the graph.
+///
+/// Includes only edges where:
+///   - source is a participant (per `config.participant_kinds`)
+///   - destination is a Table (matches `Node::Table { .. }`)
+///   - edge is `Edge::TableAccess` with `flow_kind == DmlAccess`
+pub fn build_proc_table_matrix(graph: &CodeGraph, config: &ClusterConfig) -> ProcTableMatrix {
+    use crate::graph::{DataFlowKind, Edge};
+
+    let mut proc_set: HashSet<NodeIndex> = HashSet::new();
+    let mut table_set: HashSet<NodeIndex> = HashSet::new();
+    let mut access_pairs: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
+
+    for edge_idx in graph.edge_indices() {
+        let (src, dst) = match graph.edge_endpoints(edge_idx) {
+            Some(ep) => ep,
+            None => continue,
+        };
+        if !config
+            .participant_kinds
+            .contains(&NodeKind::from_node(&graph[src]))
+        {
+            continue;
+        }
+        if !matches!(graph[dst], Node::Table { .. }) {
+            continue;
+        }
+        match &graph[edge_idx] {
+            Edge::TableAccess { flow_kind, .. } if *flow_kind == DataFlowKind::DmlAccess => {}
+            _ => continue,
+        }
+        proc_set.insert(src);
+        table_set.insert(dst);
+        access_pairs.insert((src, dst));
+    }
+
+    let mut procs: Vec<NodeIndex> = proc_set.into_iter().collect();
+    procs.sort();
+    let mut tables: Vec<NodeIndex> = table_set.into_iter().collect();
+    tables.sort();
+
+    let proc_index: HashMap<NodeIndex, usize> =
+        procs.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let table_index: HashMap<NodeIndex, usize> =
+        tables.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+
+    let access_map: HashSet<(usize, usize)> = access_pairs
+        .into_iter()
+        .map(|(p, t)| (proc_index[&p], table_index[&t]))
+        .collect();
+
+    ProcTableMatrix {
+        procs,
+        tables,
+        access_map,
+        proc_index,
+        table_index,
+    }
+}
+
+/// Compute TF-IDF weighted cosine similarity edges between procedures.
+///
+/// Returns `Vec<(proc_idx_a, proc_idx_b, weight)>` where indices refer to
+/// positions in `matrix.procs`, and `weight` is the cosine similarity
+/// in [0, 1] (TF-IDF vectors are non-negative).
+///
+/// Algorithm:
+/// 1. IDF per table: `idf(t) = log(N / df(t))` where N = proc count, df(t) = procs accessing table t
+/// 2. TF-IDF vector per proc: binary TF (1.0 if accessed) x IDF
+/// 3. Cosine similarity between each proc pair
+/// 4. Sparsification: keep top-`k_neighbors` per proc, then drop edges below `tau`
+pub fn compute_tfidf_cosine_edges(
+    matrix: &ProcTableMatrix,
+    tau: f64,
+    k_neighbors: usize,
+) -> Vec<(usize, usize, f64)> {
+    let n_procs = matrix.proc_count();
+    let n_tables = matrix.table_count();
+    if n_procs <= 1 || n_tables == 0 {
+        return Vec::new();
+    }
+
+    // 1. Document frequency per table
+    let mut df: Vec<usize> = vec![0; n_tables];
+    for &(_, t) in matrix.access_map.iter() {
+        df[t] += 1;
+    }
+
+    // 2. IDF: log(N / df). If df == N, IDF = 0 (generic table).
+    let n = n_procs as f64;
+    let idf: Vec<f64> = df
+        .iter()
+        .map(|&d| if d == 0 { 0.0 } else { (n / d as f64).ln() })
+        .collect();
+
+    // 3. TF-IDF vector per proc (sparse: HashMap<table_idx, weight>)
+    let mut tfidf_vectors: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n_procs];
+    for &(p, t) in matrix.access_map.iter() {
+        let weight = idf[t];
+        if weight > 0.0 {
+            tfidf_vectors[p].insert(t, weight);
+        }
+    }
+
+    // 4. Vector norms
+    let norms: Vec<f64> = tfidf_vectors
+        .iter()
+        .map(|v| {
+            let sum_sq: f64 = v.values().map(|w| w * w).sum();
+            sum_sq.sqrt()
+        })
+        .collect();
+
+    // 5. For each proc, compute cosine similarity to all others, keep top-K
+    let mut edges: Vec<(usize, usize, f64)> = Vec::new();
+    for i in 0..n_procs {
+        if norms[i] == 0.0 {
+            continue;
+        }
+        let mut sims: Vec<(usize, f64)> = (0..n_procs)
+            .filter(|&j| j != i && norms[j] > 0.0)
+            .map(|j| {
+                let (small, large) = if tfidf_vectors[i].len() < tfidf_vectors[j].len() {
+                    (&tfidf_vectors[i], &tfidf_vectors[j])
+                } else {
+                    (&tfidf_vectors[j], &tfidf_vectors[i])
+                };
+                let dot: f64 = small
+                    .iter()
+                    .filter_map(|(t, w)| large.get(t).map(|w2| w * w2))
+                    .sum();
+                let cos = dot / (norms[i] * norms[j]);
+                (j, cos)
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, sim) in sims.into_iter().take(k_neighbors) {
+            if sim >= tau {
+                let (a, b) = if i < j { (i, j) } else { (j, i) };
+                edges.push((a, b, sim));
+            }
+        }
+    }
+
+    // Deduplicate (i,j) pairs (each pair may be added from both sides)
+    edges.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    edges.dedup_by_key(|(a, b, _)| (*a, *b));
+
+    edges
+}
+
+/// Topology of weakly connected components (WCCs) on the participant-induced subgraph.
+#[derive(Debug, Clone)]
+pub struct WccTopology {
+    pub total_participants: usize,
+    pub wcc_count: usize,
+    pub gcc_size: usize,
+    pub isolates_count: usize,
+    pub isolates_node_count: usize,
+    pub largest_components: Vec<Vec<NodeIndex>>,
+}
+
+impl WccTopology {
+    pub fn participants_above_threshold(&self, min_size: usize) -> Vec<NodeIndex> {
+        self.largest_components
+            .iter()
+            .filter(|c| c.len() >= min_size)
+            .flat_map(|c| c.iter().copied())
+            .collect()
+    }
+}
+
+pub fn compute_wcc_topology(graph: &CodeGraph, config: &ClusterConfig) -> WccTopology {
+    let participants: HashSet<NodeIndex> = graph
+        .node_indices()
+        .filter(|&idx| {
+            config
+                .participant_kinds
+                .contains(&NodeKind::from_node(&graph[idx]))
+        })
+        .collect();
+
+    let mut adj: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+    for &p in &participants {
+        adj.insert(p, HashSet::new());
+    }
+    for edge_idx in graph.edge_indices() {
+        let (src, dst) = match graph.edge_endpoints(edge_idx) {
+            Some(ep) => ep,
+            None => continue,
+        };
+        if participants.contains(&src) && participants.contains(&dst) && src != dst {
+            adj.get_mut(&src).unwrap().insert(dst);
+            adj.get_mut(&dst).unwrap().insert(src);
+        }
+    }
+
+    let mut visited: HashSet<NodeIndex> = HashSet::new();
+    let mut components: Vec<Vec<NodeIndex>> = Vec::new();
+    for &start in participants.iter() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut component: Vec<NodeIndex> = Vec::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        while let Some(node) = queue.pop_front() {
+            component.push(node);
+            if let Some(neighbors) = adj.get(&node) {
+                for &nb in neighbors {
+                    if !visited.contains(&nb) {
+                        visited.insert(nb);
+                        queue.push_back(nb);
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+    let total_participants = participants.len();
+    let wcc_count = components.len();
+    let gcc_size = components.first().map(|c| c.len()).unwrap_or(0);
+    let isolates_count = wcc_count.saturating_sub(if gcc_size > 0 { 1 } else { 0 });
+    let isolates_node_count: usize = components
+        .iter()
+        .skip(if gcc_size > 0 { 1 } else { 0 })
+        .map(|c| c.len())
+        .sum();
+
+    WccTopology {
+        total_participants,
+        wcc_count,
+        gcc_size,
+        isolates_count,
+        isolates_node_count,
+        largest_components: components,
+    }
 }
 
 pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
+    let topology = compute_wcc_topology(graph, config);
     let condensation = condense_sccs(graph, config);
     let condensed = build_condensed_graph(graph, &condensation, config);
     let (super_communities, modularity) = cluster_cnm(
@@ -925,6 +1311,7 @@ pub fn partition(graph: &CodeGraph, config: &ClusterConfig) -> PartitionReport {
         cluster_stats,
         inter_cluster_coupling,
         total_nodes,
+        topology: Some(topology),
     }
 }
 
@@ -1772,5 +2159,347 @@ mod tests {
             "k_actual was {}, expected <= 2 (forced k overrides max_iterations)",
             report.k_actual
         );
+    }
+
+    // --- Task 1: WccTopology Tests ---
+
+    #[test]
+    fn wcc_topology_counts_components_correctly() {
+        let mut graph = CodeGraph::new();
+        // GCC: a-b-c-d-e (5 nodes, connected via call edges)
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        let e = graph.add_node(proc_node("e"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        graph.add_edge(c, d, call_edge());
+        graph.add_edge(d, e, call_edge());
+        // Isolate 1: f (singleton)
+        let _f = graph.add_node(proc_node("f"));
+        // Isolate 2: g-h (mutual call pair)
+        let g = graph.add_node(proc_node("g"));
+        let h = graph.add_node(proc_node("h"));
+        graph.add_edge(g, h, call_edge());
+        graph.add_edge(h, g, call_edge());
+
+        let config = ClusterConfig::auto();
+        let topo = compute_wcc_topology(&graph, &config);
+
+        assert_eq!(topo.total_participants, 8);
+        assert_eq!(topo.wcc_count, 3);
+        assert_eq!(topo.gcc_size, 5);
+        assert_eq!(topo.isolates_count, 2);
+        assert_eq!(topo.isolates_node_count, 3);
+        assert_eq!(topo.largest_components[0].len(), 5);
+        assert_eq!(topo.largest_components[1].len(), 2);
+        assert_eq!(topo.largest_components[2].len(), 1);
+    }
+
+    #[test]
+    fn wcc_topology_excludes_non_participants() {
+        let mut graph = CodeGraph::new();
+        let p = graph.add_node(proc_node("p"));
+        let t = graph.add_node(table_node("orders"));
+        graph.add_edge(p, t, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let topo = compute_wcc_topology(&graph, &config);
+
+        assert_eq!(topo.total_participants, 1);
+        assert_eq!(topo.wcc_count, 1);
+        assert_eq!(topo.gcc_size, 1);
+    }
+
+    // --- Task 2: PartitionReport + Config Integration Tests ---
+
+    #[test]
+    fn partition_report_includes_topology() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        let d = graph.add_node(proc_node("d"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, a, call_edge());
+        graph.add_edge(c, d, call_edge());
+        graph.add_edge(d, c, call_edge());
+
+        let report = partition(&graph, &ClusterConfig::auto());
+        assert!(report.topology.is_some());
+        let topo = report.topology.as_ref().unwrap();
+        assert_eq!(topo.wcc_count, 2);
+        assert_eq!(topo.gcc_size, 2);
+    }
+
+    #[test]
+    fn min_component_size_filters_isolates() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(proc_node("a"));
+        let b = graph.add_node(proc_node("b"));
+        let c = graph.add_node(proc_node("c"));
+        graph.add_edge(a, b, call_edge());
+        graph.add_edge(b, c, call_edge());
+        let _d = graph.add_node(proc_node("d"));
+
+        let config = ClusterConfig::auto().with_min_component_size(2);
+        let report = partition(&graph, &config);
+        assert_eq!(report.total_nodes, 3);
+        assert!(report.assignments.contains_key(&a));
+        assert!(report.assignments.contains_key(&b));
+        assert!(report.assignments.contains_key(&c));
+        assert!(!report.assignments.contains_key(&NodeIndex::new(3))); // d filtered
+    }
+
+    #[test]
+    fn min_component_size_clusters_only_gcc() {
+        // Realistic micro-fixture: GCC of 6 nodes + 3 isolated pairs + 2 singletons
+        let mut graph = CodeGraph::new();
+        // GCC: 6 procs in a clique
+        let gcc_nodes: Vec<NodeIndex> = (0..6)
+            .map(|i| graph.add_node(proc_node(&format!("gcc{i}"))))
+            .collect();
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                graph.add_edge(gcc_nodes[i], gcc_nodes[j], call_edge());
+                graph.add_edge(gcc_nodes[j], gcc_nodes[i], call_edge());
+            }
+        }
+        // 3 isolated pairs
+        for pair_idx in 0..3 {
+            let p1 = graph.add_node(proc_node(&format!("iso_p{pair_idx}_a")));
+            let p2 = graph.add_node(proc_node(&format!("iso_p{pair_idx}_b")));
+            graph.add_edge(p1, p2, call_edge());
+            graph.add_edge(p2, p1, call_edge());
+        }
+        // 2 singletons
+        let _s1 = graph.add_node(proc_node("singleton_1"));
+        let _s2 = graph.add_node(proc_node("singleton_2"));
+
+        // Without filter: all 14 nodes participate
+        let report_all = partition(&graph, &ClusterConfig::auto());
+        assert_eq!(report_all.total_nodes, 14);
+        let topo = report_all.topology.as_ref().unwrap();
+        assert_eq!(topo.wcc_count, 6); // 1 GCC + 3 pairs + 2 singletons
+        assert_eq!(topo.gcc_size, 6);
+
+        // With filter min_size=3: only GCC participates (6 nodes)
+        let report_filtered = partition(&graph, &ClusterConfig::auto().with_min_component_size(3));
+        assert_eq!(report_filtered.total_nodes, 6);
+        // All clustered nodes are GCC members (indices 0-5)
+        for &node_idx in report_filtered.assignments.keys() {
+            assert!(
+                node_idx.index() < 6,
+                "node {} should not be clustered (not in GCC)",
+                node_idx.index()
+            );
+        }
+        // Isolates are still in topology
+        let topo2 = report_filtered.topology.as_ref().unwrap();
+        assert_eq!(topo2.wcc_count, 6); // topology unchanged
+        assert_eq!(topo2.gcc_size, 6);
+    }
+
+    // --- Task 5 Tests ---
+
+    #[test]
+    fn proc_table_matrix_captures_accesses() {
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        let t_audit = graph.add_node(table_node("audit_log"));
+
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_audit, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+        graph.add_edge(p3, t_customers, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+
+        assert_eq!(matrix.procs.len(), 3);
+        assert_eq!(matrix.tables.len(), 3);
+        assert!(matrix.access(p1, t_orders));
+        assert!(matrix.access(p1, t_audit));
+        assert!(!matrix.access(p1, t_customers));
+        assert!(matrix.access(p2, t_orders));
+        assert!(matrix.access(p2, t_customers));
+        assert!(matrix.access(p3, t_customers));
+        assert!(!matrix.access(p3, t_orders));
+    }
+
+    #[test]
+    fn proc_table_matrix_excludes_non_participants() {
+        let mut graph = CodeGraph::new();
+        let t1 = graph.add_node(table_node("t1"));
+        let t2 = graph.add_node(table_node("t2"));
+        graph.add_edge(t1, t2, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        assert_eq!(matrix.procs.len(), 0);
+        assert_eq!(matrix.tables.len(), 0);
+    }
+
+    // --- Task 6 Tests ---
+
+    #[test]
+    fn tfidf_cosine_groups_similar_procs() {
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        let t_audit = graph.add_node(table_node("audit_log"));
+
+        // p1, p2 both read orders + customers (similar)
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_customers, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+        // p3 reads only audit_log (dissimilar)
+        graph.add_edge(p3, t_audit, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        let edges = compute_tfidf_cosine_edges(&matrix, 0.1, 10);
+
+        let p1_idx = matrix.proc_index[&p1];
+        let p2_idx = matrix.proc_index[&p2];
+        let p3_idx = matrix.proc_index[&p3];
+
+        // p1-p2 should have high similarity (they share 2 tables, both with idf > 0
+        // because df=2, N=3 -> idf = ln(3/2) approximately 0.405)
+        let sim_12 = edges
+            .iter()
+            .find(|(a, b, _)| (*a == p1_idx && *b == p2_idx) || (*a == p2_idx && *b == p1_idx))
+            .map(|(_, _, s)| *s);
+        assert!(sim_12.is_some(), "p1-p2 edge must exist");
+        // cosine(p1,p2) should be 1.0 because their TF-IDF vectors are identical
+        assert!(
+            (sim_12.unwrap() - 1.0).abs() < 1e-9,
+            "p1-p2 similarity should be 1.0 (identical vectors), got {}",
+            sim_12.unwrap()
+        );
+
+        // p3 shares nothing with p1/p2 -> no edges
+        let sim_13 = edges
+            .iter()
+            .find(|(a, b, _)| (*a == p1_idx && *b == p3_idx) || (*a == p3_idx && *b == p1_idx));
+        assert!(sim_13.is_none(), "p1-p3 should not have an edge");
+    }
+
+    // --- Task 7 Test ---
+
+    #[test]
+    fn table_projection_bridges_isolated_procs() {
+        let mut graph = CodeGraph::new();
+        // p1, p2 don't call each other but both read "orders" and "customers"
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let t_orders = graph.add_node(table_node("orders"));
+        let t_customers = graph.add_node(table_node("customers"));
+        graph.add_edge(p1, t_orders, table_access_edge());
+        graph.add_edge(p1, t_customers, table_access_edge());
+        graph.add_edge(p2, t_orders, table_access_edge());
+        graph.add_edge(p2, t_customers, table_access_edge());
+
+        // Without projection: p1, p2 are in different WCCs (tables excluded from clustering)
+        let report_no_proj = partition(&graph, &ClusterConfig::new(1));
+        let topo = report_no_proj.topology.as_ref().unwrap();
+        assert_eq!(
+            topo.wcc_count, 2,
+            "p1 and p2 should be in separate WCCs without projection"
+        );
+
+        // With projection: p1, p2 get bridged via TF-IDF similarity → same cluster
+        let config = ClusterConfig::new(1).with_table_projection(0.1, 0.3, 10);
+        let report_proj = partition(&graph, &config);
+        assert_eq!(report_proj.total_nodes, 2);
+        let c1 = report_proj.assignments[&p1];
+        let c2 = report_proj.assignments[&p2];
+        assert_eq!(c1, c2, "p1 and p2 must be in same cluster with projection");
+    }
+
+    #[test]
+    fn tfidf_downweights_generic_tables() {
+        let mut graph = CodeGraph::new();
+        // 3 procs all read the same "common_codes" table and nothing else
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let p3 = graph.add_node(proc_node("p3"));
+        let t_common = graph.add_node(table_node("common_codes"));
+        graph.add_edge(p1, t_common, table_access_edge());
+        graph.add_edge(p2, t_common, table_access_edge());
+        graph.add_edge(p3, t_common, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+        let edges = compute_tfidf_cosine_edges(&matrix, 0.1, 10);
+
+        // If all procs share ONLY the generic table, IDF = log(3/3) = 0,
+        // so TF-IDF vectors are all-zero -> no similarity edges.
+        assert!(
+            edges.is_empty(),
+            "generic-only sharing should produce no edges"
+        );
+    }
+
+    #[test]
+    fn tfidf_cosine_respects_threshold() {
+        // Use 3 procs where cosine(p1,p2) ~= 0.463 so tau=0.3 vs tau=0.6 distinguishes.
+        //
+        // p1 reads t1, t2          -> vector: {t1: idf(t1), t2: idf(t2)}
+        // p2 reads t1, t2, t3      -> vector: {t1: idf(t1), t2: idf(t2), t3: idf(t3)}
+        // p3 reads t4              -> vector: {t4: idf(t4)}  (isolated, makes N=3)
+        //
+        // N=3; df(t1)=df(t2)=2, df(t3)=df(t4)=1
+        // idf(t1)=idf(t2)=ln(3/2)~=0.405, idf(t3)=idf(t4)=ln(3)~=1.099
+        // cosine(p1,p2) ~= 0.405 / (sqrt(0.405^2+0.405^2) * sqrt(0.405^2+0.405^2+1.099^2))
+        //              ~= 0.463
+        //
+        // So tau=0.3 -> edge present, tau=0.6 -> edge absent.
+        let mut graph = CodeGraph::new();
+        let p1 = graph.add_node(proc_node("p1"));
+        let p2 = graph.add_node(proc_node("p2"));
+        let _p3 = graph.add_node(proc_node("p3"));
+        let t1 = graph.add_node(table_node("t1"));
+        let t2 = graph.add_node(table_node("t2"));
+        let t3 = graph.add_node(table_node("t3"));
+        let t4 = graph.add_node(table_node("t4"));
+
+        graph.add_edge(p1, t1, table_access_edge());
+        graph.add_edge(p1, t2, table_access_edge());
+        graph.add_edge(p2, t1, table_access_edge());
+        graph.add_edge(p2, t2, table_access_edge());
+        graph.add_edge(p2, t3, table_access_edge());
+        graph.add_edge(_p3, t4, table_access_edge());
+
+        let config = ClusterConfig::auto();
+        let matrix = build_proc_table_matrix(&graph, &config);
+
+        // High threshold: no edge
+        let edges_high = compute_tfidf_cosine_edges(&matrix, 0.6, 10);
+        let has_edge_high = edges_high.iter().any(|(a, b, _)| {
+            let p1i = matrix.proc_index[&p1];
+            let p2i = matrix.proc_index[&p2];
+            (*a == p1i && *b == p2i) || (*a == p2i && *b == p1i)
+        });
+        assert!(!has_edge_high, "tau=0.6 should reject edge (cosine~=0.463)");
+
+        // Low threshold: edge present
+        let edges_low = compute_tfidf_cosine_edges(&matrix, 0.3, 10);
+        let has_edge_low = edges_low.iter().any(|(a, b, _)| {
+            let p1i = matrix.proc_index[&p1];
+            let p2i = matrix.proc_index[&p2];
+            (*a == p1i && *b == p2i) || (*a == p2i && *b == p1i)
+        });
+        assert!(has_edge_low, "tau=0.3 should accept edge (cosine~=0.463)");
     }
 }
