@@ -167,6 +167,22 @@ enum NodeKindJson {
         file: Option<String>,
         line: Option<usize>,
     },
+    #[cfg(feature = "jsp")]
+    #[serde(rename = "jsp")]
+    JspPage {
+        file: String,
+        display_name: String,
+        url_pattern: Option<String>,
+    },
+    #[cfg(feature = "jsp")]
+    #[serde(rename = "jsql")]
+    JspSql {
+        sql: String,
+        file: String,
+        line: usize,
+        kind: String,
+        parsed: bool,
+    },
 }
 
 #[derive(Serialize)]
@@ -235,6 +251,9 @@ enum EdgeKindJson {
         file: Option<String>,
         line: Option<usize>,
     },
+    #[cfg(feature = "jsp")]
+    #[serde(rename = "contains_sql")]
+    ContainsSql,
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
@@ -523,6 +542,36 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.as_ref().map(|l| l.line),
                 },
             },
+            #[cfg(feature = "jsp")]
+            Node::JspPage {
+                path,
+                display_name,
+                url_pattern,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::JspPage {
+                    file: path.to_string_lossy().to_string(),
+                    display_name: display_name.clone(),
+                    url_pattern: url_pattern.clone(),
+                },
+            },
+            #[cfg(feature = "jsp")]
+            Node::JspSql {
+                sql,
+                file,
+                line,
+                kind,
+                parsed,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::JspSql {
+                    sql: sql.clone(),
+                    file: file.to_string_lossy().to_string(),
+                    line: *line,
+                    kind: kind.as_str().to_string(),
+                    parsed: *parsed,
+                },
+            },
         };
         nodes.push(node_json);
     }
@@ -720,6 +769,12 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                         .map(|l| l.file.to_string_lossy().to_string()),
                     line: location.as_ref().map(|l| l.line),
                 },
+            },
+            #[cfg(feature = "jsp")]
+            Edge::ContainsSql => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::ContainsSql,
             },
         };
         edges.push(edge_json);

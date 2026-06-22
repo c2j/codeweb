@@ -51,6 +51,7 @@ impl GraphBuilder {
         Self::build_graph_internal(files, &[], &[], &[])
     }
 
+    #[cfg_attr(feature = "jsp", allow(dead_code))]
     pub fn build_all(&self, all: &AllParsedFiles) -> CodeGraph {
         Self::build_graph_internal(
             &all.sql_files,
@@ -104,6 +105,42 @@ impl GraphBuilder {
         Self::merge_table_access_edges(&mut ctx.graph);
         Self::resolve_unresolved_nodes(&mut ctx.graph);
 
+        ctx.graph
+    }
+
+    /// Build graph with explicit JSP file results. Only available with `jsp` feature.
+    #[cfg(feature = "jsp")]
+    pub fn build_all_with_jsp(
+        &self,
+        all: &AllParsedFiles,
+        jsp_files: &[crate::parser::jsp_loader::JspFileResult],
+    ) -> CodeGraph {
+        let mut ctx = GraphBuildContext::new();
+        Self::build_sql_chunk(&mut ctx, &all.sql_files);
+        Self::add_ibatis_nodes_from_parsed(
+            &all.ibatis_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+        Self::add_java_nodes_from_parsed(
+            &all.java_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+        );
+        Self::add_java_method_nodes_from_parsed(
+            &all.java_method_results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+        );
+        Self::add_jsp_nodes_from_parsed(jsp_files, &mut ctx);
+        Self::dedup_table_view_nodes(&mut ctx.graph);
+        Self::merge_table_access_edges(&mut ctx.graph);
+        Self::resolve_unresolved_nodes(&mut ctx.graph);
         ctx.graph
     }
 
@@ -1900,6 +1937,98 @@ impl GraphBuilder {
                             None
                         },
                     },
+                );
+            }
+        }
+    }
+
+    /// Add JSP page + JSP SQL nodes to the graph and link them to existing
+    /// procedures/tables. Available only with the `jsp` feature.
+    #[cfg(feature = "jsp")]
+    pub(crate) fn add_jsp_nodes_from_parsed(
+        jsp_results: &[crate::parser::jsp_loader::JspFileResult],
+        ctx: &mut GraphBuildContext,
+    ) {
+        use crate::parser::jsp_loader::infer_kind;
+
+        for file_result in jsp_results {
+            let jsp_path: Arc<PathBuf> = Arc::new(file_result.file.clone());
+
+            let page_node = Node::JspPage {
+                path: file_result.file.clone(),
+                display_name: file_result.display_name.clone(),
+                url_pattern: None,
+            };
+            let page_idx = ctx.graph.add_node(page_node);
+
+            let mut seen_sql: HashSet<String> = HashSet::new();
+            for extraction in &file_result.extractions {
+                let sql_hash =
+                    blake3::hash(extraction.sql.as_bytes()).to_hex().as_str()[..16].to_string();
+                if !seen_sql.insert(sql_hash.clone()) {
+                    continue;
+                }
+
+                let kind = infer_kind(extraction);
+                let parsed = extraction.parse_result.is_some();
+                let sql_node = Node::JspSql {
+                    sql: extraction.sql.clone(),
+                    file: file_result.file.clone(),
+                    line: extraction.origin.line,
+                    kind,
+                    parsed,
+                };
+                let sql_idx = ctx.graph.add_node(sql_node);
+
+                ctx.graph.add_edge(page_idx, sql_idx, Edge::ContainsSql);
+
+                if let Some(parse_result) = &extraction.parse_result {
+                    let calls =
+                        Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
+                    for callee_name in calls {
+                        let callee_id =
+                            RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
+                        let callee_idx =
+                            ctx.proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                                crate::parse_log::warn(
+                                    &jsp_path.to_string_lossy(),
+                                    &format!(
+                                        "unresolved: JSP '{}' calls '{}' not found in parsed files",
+                                        file_result.display_name, callee_name
+                                    ),
+                                );
+                                let unresolved = Node::Unresolved {
+                                    raw_expr: Box::new(callee_name.clone()),
+                                    context: Box::new(file_result.display_name.clone()),
+                                };
+                                ctx.graph.add_node(unresolved)
+                            });
+                        ctx.graph.add_edge(
+                            sql_idx,
+                            *callee_idx,
+                            Edge::CallsProcedure {
+                                location: SourceLocation {
+                                    file: jsp_path.clone(),
+                                    line: extraction.origin.line,
+                                },
+                            },
+                        );
+                    }
+
+                    Self::collect_table_access_from_statements(
+                        &parse_result.statements,
+                        &jsp_path,
+                        sql_idx,
+                        &mut ctx.graph,
+                        &mut ctx.table_index,
+                    );
+                }
+            }
+
+            for err in &file_result.errors {
+                crate::parse_log::warn(
+                    &file_result.file.to_string_lossy(),
+                    &format!("[jsp] {}", err),
                 );
             }
         }

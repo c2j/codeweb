@@ -573,6 +573,60 @@ codeweb trace --from "pkg_users.get_user" --direction backward --depth 5
 
 ---
 
+## Phase 3b: + JSP 内嵌 SQL 抽取
+
+**目标**：从 JSP 文件中提取内嵌的 SQL（scriptlet JDBC、declaration、字符串拼接），扩展调用图，使 Phase 4 的 `trace()` / `impact()` 能反向追溯到 JSP 入口。
+
+**工期**：~6.5 人日（MVP）
+**交付价值**：legacy Java Web 系统（银行、电信、政企）的存储过程调用链完整性 —— 这类项目里 JSP 内嵌 SQL 是普遍现象。
+
+### 3.1 依赖条件
+
+- [x] ogsql-parser `java` feature（`extract_sql_from_java()` 已就绪）
+- [x] Phase 1–4 完成
+
+### 3.2 模块设计
+
+```
+src/parser/
+├── jsp_types.rs           # 中间数据结构
+├── jsp_preprocessor.rs    # JSP lexer + 合成 Java
+└── jsp_loader.rs          # ogsql-parser 集成 + 文件加载
+```
+
+### 3.3 关键设计
+
+**feature-gated**：`jsp` Cargo feature 默认关闭，所有 JSP 相关代码用 `#[cfg(feature = "jsp")]` 门控，对现有用户零影响。
+
+**三层管线**：
+1. JSP 预处理器切分 `<% %>` / `<%! %>` / `<%= %>` / `<%@ %>` 片段
+2. 缝合为合成 Java 源（声明放类顶层，scriptlet 放 `_jspService` 方法体）
+3. 喂给 ogsql-parser 的 `extract_sql_from_java()`，复用所有 Java SQL 检测能力
+
+**图模型扩展**：
+- `Node::JspPage { path, display_name, url_pattern }`
+- `Node::JspSql { sql, file, line, kind, parsed }`
+- `Edge::ContainsSql`（JspPage → JspSql）
+- `JspSql → Procedure` 复用既有 `CallsProcedure`
+
+### 3.4 已知限制
+
+- ogsql-parser 的关键字过滤器仅接受 SELECT/INSERT/UPDATE/DELETE/MERGE/WITH
+- JDBC 转义语法 `{call pkg.x(...)}` 当前被过滤，需要后续在 jsp_loader 内追加后处理
+- `<%@ include %>` / `<jsp:include>` 跨文件解析不在 MVP 范围
+
+### 3.5 验收标准
+
+- [x] `cargo build --features jsp` 编译通过
+- [x] 关闭 jsp feature 时既有功能不受影响
+- [x] JSP 中 `prepareStatement("SELECT...")` 能被抽取并链接到 Procedure
+- [x] 纯 HTML JSP 不导致分析失败
+- [x] DOT/JSON/Mermaid 三种导出格式正确渲染 JSP 节点
+
+实施细节见 [`2026-06-19-jsp-sql-extraction.md`](./2026-06-19-jsp-sql-extraction.md)。
+
+---
+
 ## Phase 4: + 双向图查询 + CLI 完善
 
 **目标**：提供强大的双向查询能力、完善的 CLI 体验和可扩展的架构。

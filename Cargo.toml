@@ -11,11 +11,12 @@ fallback_locale = "en"
 
 [features]
 default = ["cli", "tui"]
-full = ["cli", "tui", "serve", "mcp"]
+full = ["cli", "tui", "serve", "mcp", "jsp", "search-sql-v2"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
 serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
+jsp = []
 search-sql-v2 = []
 
 [dependencies]

@@ -8,6 +8,8 @@ pub enum FileType {
     Sql,
     Java,
     Xml,
+    #[cfg(feature = "jsp")]
+    Jsp,
 }
 
 #[allow(dead_code)]

@@ -756,6 +756,8 @@ fn cmd_files(project: &Path) -> Result<()> {
                 parser::fingerprint::FileType::Sql => "SQL",
                 parser::fingerprint::FileType::Java => "Java",
                 parser::fingerprint::FileType::Xml => "XML",
+                #[cfg(feature = "jsp")]
+                parser::fingerprint::FileType::Jsp => "JSP",
             };
             let node_count = file_nodes
                 .get(path as &std::path::Path)
@@ -800,6 +802,10 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
         Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
         Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
+        #[cfg(feature = "jsp")]
+        Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
+        #[cfg(feature = "jsp")]
+        Node::JspSql { .. } => std::borrow::Cow::Borrowed("jsql"),
     }
 }
 
@@ -1504,13 +1510,24 @@ fn cmd_legacy(cli: Cli) -> Result<()> {
     } else {
         let all = parser::load_all_files(&input)?;
         eprintln!(
-            "loaded {} SQL, {} Java, {} XML file(s)",
+            "loaded {} SQL, {} Java, {} XML file(s){}",
             all.sql_files.len(),
             all.java_files.len(),
-            all.ibatis_files.len()
+            all.ibatis_files.len(),
+            jsp_count_fragment(
+                #[cfg(feature = "jsp")]
+                all.jsp_files.len(),
+            ),
         );
         let builder = graph::builder::GraphBuilder::new();
-        builder.build_all(&all)
+        #[cfg(feature = "jsp")]
+        {
+            builder.build_all_with_jsp(&all, &all.jsp_files)
+        }
+        #[cfg(not(feature = "jsp"))]
+        {
+            builder.build_all(&all)
+        }
     };
 
     print_stats(&graph, cli.include_unresolved);
@@ -1576,11 +1593,8 @@ fn cmd_partition(
             .unwrap()
             .progress_chars("━━╾─"),
         );
-        let auto_report = graph::cluster::auto_partition_with_progress(
-            store.graph(),
-            &base_config,
-            Some(&pb),
-        );
+        let auto_report =
+            graph::cluster::auto_partition_with_progress(store.graph(), &base_config, Some(&pb));
         pb.finish_with_message(format!(
             "auto-partition complete | recommended k={} γ={:.2}",
             auto_report.recommended_k, auto_report.recommended_gamma
@@ -1908,6 +1922,10 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut events = 0usize;
     let mut partial = 0usize;
     let mut custom_nodes = 0usize;
+    #[cfg(feature = "jsp")]
+    let mut jsp_pages = 0usize;
+    #[cfg(feature = "jsp")]
+    let mut jsp_sql = 0usize;
 
     for idx in graph.node_indices() {
         match &graph[idx] {
@@ -1937,23 +1955,56 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::Synonym { .. } => synonyms += 1,
             Node::Event { .. } => events += 1,
             Node::Custom { .. } => custom_nodes += 1,
+            #[cfg(feature = "jsp")]
+            Node::JspPage { .. } => jsp_pages += 1,
+            #[cfg(feature = "jsp")]
+            Node::JspSql { .. } => jsp_sql += 1,
         }
     }
 
     let edges = graph.edge_count();
 
+    let jsp_fragment = build_jsp_fragment(
+        #[cfg(feature = "jsp")]
+        jsp_pages,
+        #[cfg(feature = "jsp")]
+        jsp_sql,
+    );
+
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} edges",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, edges,
+            jsp_fragment
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} edges",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, edges
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, edges,
+            jsp_fragment
         );
     }
     if partial > 0 {
         eprintln!("  ⚠ {} partial nodes (unparsed body)", partial);
     }
+}
+
+#[cfg(feature = "jsp")]
+fn build_jsp_fragment(jsp_pages: usize, jsp_sql: usize) -> String {
+    format!(", {} jsp-pages, {} jsp-sql", jsp_pages, jsp_sql)
+}
+
+#[cfg(not(feature = "jsp"))]
+fn build_jsp_fragment() -> String {
+    String::new()
+}
+
+#[cfg(feature = "jsp")]
+fn jsp_count_fragment(jsp_count: usize) -> String {
+    format!(", {} JSP", jsp_count)
+}
+
+#[cfg(not(feature = "jsp"))]
+fn jsp_count_fragment() -> String {
+    String::new()
 }

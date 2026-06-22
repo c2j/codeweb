@@ -3,6 +3,12 @@ pub mod fingerprint;
 pub mod ibatis_loader;
 pub mod java_loader;
 pub mod java_method;
+#[cfg(feature = "jsp")]
+pub mod jsp_loader;
+#[cfg(feature = "jsp")]
+pub mod jsp_preprocessor;
+#[cfg(feature = "jsp")]
+pub mod jsp_types;
 mod loader;
 pub mod scanner;
 

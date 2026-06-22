@@ -5,8 +5,8 @@
 
 use crate::graph::{CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
-use std::collections::{HashMap, HashSet};
 use std::collections::BinaryHeap;
+use std::collections::{HashMap, HashSet};
 
 /// Lightweight node kind for clustering — derived from `Node` enum variants.
 /// Avoids carrying full node data during algorithm execution.
@@ -30,6 +30,10 @@ pub enum NodeKind {
     Synonym,
     Event,
     Custom,
+    #[cfg(feature = "jsp")]
+    JspPage,
+    #[cfg(feature = "jsp")]
+    JspSql,
 }
 
 impl NodeKind {
@@ -53,6 +57,10 @@ impl NodeKind {
             Node::Synonym { .. } => NodeKind::Synonym,
             Node::Event { .. } => NodeKind::Event,
             Node::Custom { .. } => NodeKind::Custom,
+            #[cfg(feature = "jsp")]
+            Node::JspPage { .. } => NodeKind::JspPage,
+            #[cfg(feature = "jsp")]
+            Node::JspSql { .. } => NodeKind::JspSql,
         }
     }
 
@@ -77,6 +85,10 @@ impl NodeKind {
             NodeKind::Synonym => "synonym",
             NodeKind::Event => "event",
             NodeKind::Custom => "custom",
+            #[cfg(feature = "jsp")]
+            NodeKind::JspPage => "jsp",
+            #[cfg(feature = "jsp")]
+            NodeKind::JspSql => "jsql",
         }
     }
 }
@@ -120,6 +132,8 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
         | Edge::AliasesObject { .. }
         | Edge::CustomEdge { .. } => Some(config.reference),
         Edge::ContainsMethod | Edge::ContainsRoutine => Some(config.composition),
+        #[cfg(feature = "jsp")]
+        Edge::ContainsSql => Some(config.composition),
     }
 }
 
@@ -475,14 +489,20 @@ impl<'a> CnmState<'a> {
         }
         let min_k = self.target_k.unwrap_or(1).min(self.n);
         if self.total_weight == 0.0 {
-            let labels: Vec<usize> = (0..self.n).map(|i| i.min(min_k.saturating_sub(1))).collect();
+            let labels: Vec<usize> = (0..self.n)
+                .map(|i| i.min(min_k.saturating_sub(1)))
+                .collect();
             return (labels, 0.0);
         }
 
         let force_k = self.target_k.is_some();
 
         while self.num_communities > min_k {
-            if !force_k && self.max_iterations.is_some_and(|cap| self.iterations >= cap) {
+            if !force_k
+                && self
+                    .max_iterations
+                    .is_some_and(|cap| self.iterations >= cap)
+            {
                 break;
             }
 
@@ -501,11 +521,7 @@ impl<'a> CnmState<'a> {
             };
 
             let dq = entry.dq.0;
-            let should_merge = if force_k {
-                true
-            } else {
-                dq > self.min_delta_q
-            };
+            let should_merge = if force_k { true } else { dq > self.min_delta_q };
 
             if !should_merge {
                 break;
@@ -515,10 +531,7 @@ impl<'a> CnmState<'a> {
             if let Some(pb) = progress {
                 pb.set_message(format!(
                     "iter {} | {}→{} clusters | ΔQ={:.4}",
-                    self.iterations,
-                    self.num_communities,
-                    min_k,
-                    dq
+                    self.iterations, self.num_communities, min_k, dq
                 ));
             }
             self.merge_communities(entry.a, entry.b);
@@ -530,9 +543,7 @@ impl<'a> CnmState<'a> {
     /// Pop the highest-ΔQ entry whose generation counters still match.
     fn pop_valid(&mut self) -> Option<HeapEntry> {
         while let Some(entry) = self.heap.pop() {
-            if self.generation[entry.a] == entry.gen_a
-                && self.generation[entry.b] == entry.gen_b
-            {
+            if self.generation[entry.a] == entry.gen_a && self.generation[entry.b] == entry.gen_b {
                 return Some(entry);
             }
         }
@@ -1672,7 +1683,10 @@ mod tests {
             N, report.k_actual, report.modularity, elapsed
         );
 
-        assert!(elapsed.as_secs() < 10, "CNM took {elapsed:?}, expected < 10s");
+        assert!(
+            elapsed.as_secs() < 10,
+            "CNM took {elapsed:?}, expected < 10s"
+        );
         assert_eq!(report.k_actual, 10, "forced k=10 must produce 10 clusters");
     }
 
@@ -1718,10 +1732,7 @@ mod tests {
         graph.add_edge(b, c, call_edge());
         graph.add_edge(c, d, call_edge());
 
-        let strict = partition(
-            &graph,
-            &ClusterConfig::auto().with_min_delta_q(0.5),
-        );
+        let strict = partition(&graph, &ClusterConfig::auto().with_min_delta_q(0.5));
         let lenient = partition(&graph, &ClusterConfig::auto());
 
         assert_eq!(
