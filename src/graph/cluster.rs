@@ -1451,7 +1451,7 @@ impl From<&PartitionReport> for ClusterResult {
 mod tests {
     use super::*;
     use crate::graph::{
-        CallScope, DataFlowKind, Edge, EdgeCategory, Node, RoutineId, RoutineKind, SourceLocation,
+        CallScope, DataFlowKind, Edge, Node, RoutineId, RoutineKind, SourceLocation,
     };
     use petgraph::graph::NodeIndex;
     use std::collections::HashSet;
@@ -1699,10 +1699,10 @@ mod tests {
     fn cnm_disconnected_graph_respects_components() {
         // 4 disconnected nodes
         let mut graph = CodeGraph::new();
-        let a = graph.add_node(proc_node("a"));
-        let b = graph.add_node(proc_node("b"));
-        let c = graph.add_node(proc_node("c"));
-        let d = graph.add_node(proc_node("d"));
+        let _a = graph.add_node(proc_node("a"));
+        let _b = graph.add_node(proc_node("b"));
+        let _c = graph.add_node(proc_node("c"));
+        let _d = graph.add_node(proc_node("d"));
 
         let report = partition(&graph, &ClusterConfig::new(2));
 
