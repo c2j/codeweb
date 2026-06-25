@@ -24,7 +24,8 @@ local_var_not_call_edges/
     ├── collection_index_not_captured.sql
     ├── collection_index_with_real_call.sql
     ├── param_shadows_procedure.sql
-    └── scope_reset_across_procedures.sql
+    ├── scope_reset_across_procedures.sql
+    └── type_constructor_not_captured.sql
 ```
 
 ## 案例一览
@@ -35,6 +36,7 @@ local_var_not_call_edges/
 | `collection_index_with_real_call` | 同一过程体内既有真实调用（RHS）又有集合下标（WHERE） | `clean_proc → compute_score`；不产生 `clean_proc → v_scores` |
 | `param_shadows_procedure` | 过程参数以括号语法出现在 WHERE 子句 | `batch_check → real_target`；参数 `p_ids` 不产生 Unresolved 节点 |
 | `scope_reset_across_procedures` | proc_a 局部变量 `v_date` 与全局函数同名；proc_b 调用该函数 | `proc_b → v_date` 存在；`proc_a → v_date` 不存在（局部变量被过滤） |
+| `type_constructor_not_captured` | TYPE 构造函数 `account_record_table()`、成员方法 `obj_account_record.equals(...)`、集合下标 `aaa1(i)` | 无 call edge（TYPE 名 + 局部变量双重过滤） |
 
 ## 添加新案例
 

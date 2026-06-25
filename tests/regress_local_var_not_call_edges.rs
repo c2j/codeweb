@@ -9,6 +9,8 @@ const PARAM_SHADOWS_PROCEDURE: &str =
     include_str!("regress/local_var_not_call_edges/cases/param_shadows_procedure.sql");
 const SCOPE_RESET_ACROSS_PROCEDURES: &str =
     include_str!("regress/local_var_not_call_edges/cases/scope_reset_across_procedures.sql");
+const TYPE_CONSTRUCTOR_NOT_CAPTURED: &str =
+    include_str!("regress/local_var_not_call_edges/cases/type_constructor_not_captured.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -135,5 +137,16 @@ fn regress_scope_reset_across_procedures() {
     assert!(
         !has_direct_edge(&json, "proc_a", "v_date"),
         "proc_a's local collection variable v_date must NOT produce a call edge to the v_date function"
+    );
+}
+
+#[test]
+fn regress_type_constructor_not_captured() {
+    let json = analyze_json(TYPE_CONSTRUCTOR_NOT_CAPTURED);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "TYPE constructor account_record_table(), member method obj_account_record.equals(...), \
+         and collection index aaa1(i)/aaa2(i) must NOT spawn Unresolved nodes; found {unresolved}"
     );
 }

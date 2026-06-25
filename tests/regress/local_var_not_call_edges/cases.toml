@@ -65,3 +65,16 @@ fixed_in = "v0.7.7"
 from = "proc_b"
 to = "v_date"
 type = "direct"
+
+# ── TYPE name filter: constructors + member methods ──────────
+# account_record_table() is a TYPE constructor (not a procedure call).
+# obj_account_record.equals(...) is a member method on an object TYPE.
+# Both parse as Expr::FunctionCall; the fix's known_types set
+# (sourced from the global type_index) filters them alongside
+# local collection index access aaa1(i) / aaa2(i).
+
+[case.type_constructor_not_captured]
+description = "TYPE constructor, member method call, and collection index access must NOT be call edges"
+sql = "cases/type_constructor_not_captured.sql"
+fixed_in = "v0.7.7"
+expected_no_call_edges = true

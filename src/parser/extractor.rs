@@ -162,15 +162,20 @@ pub struct CallExtractor {
     /// (variables, cursors, records) plus its parameter list. Used to filter
     /// false-positive call edges from PL/SQL collection indexing `v(i)`.
     local_vars: HashSet<String>,
+    /// Globally known TYPE names (lowercased). A `type_name()` constructor
+    /// call or `type_name.method(...)` member call is not a procedure/function
+    /// call edge and must be filtered.
+    known_types: HashSet<String>,
 }
 
 impl CallExtractor {
-    pub fn new(file: Arc<std::path::PathBuf>) -> Self {
+    pub fn new(file: Arc<std::path::PathBuf>, known_types: HashSet<String>) -> Self {
         Self {
             current_procedure: None,
             edges: Vec::new(),
             file,
             local_vars: HashSet::new(),
+            known_types,
         }
     }
 
@@ -292,7 +297,7 @@ impl Visitor for CallExtractor {
         {
             if !name.is_empty() {
                 let first = name[0].to_lowercase();
-                if !self.local_vars.contains(&first) {
+                if !self.local_vars.contains(&first) && !self.known_types.contains(&first) {
                     self.push_call(&name.join("."), false, 0);
                 }
             }
@@ -1945,7 +1950,8 @@ mod tests {
         let stmts = parser.parse_with_text();
         let mut all_edges = Vec::new();
         for info in &stmts {
-            let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
+            let mut extractor =
+                CallExtractor::new(Arc::new(PathBuf::from("test.sql")), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             all_edges.extend(extractor.edges);
         }
@@ -2054,7 +2060,7 @@ mod tests {
         let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
         let stmts = parser.parse_with_text();
 
-        let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
+        let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")), HashSet::new());
 
         for info in &stmts {
             if let ogsql_parser::ast::Statement::CreatePackageBody(pkg) = &info.statement {
