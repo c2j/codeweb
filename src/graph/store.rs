@@ -1771,7 +1771,7 @@ pub(crate) fn extract_schema(node: &Node) -> Option<&str> {
     }
 }
 
-fn node_source_file(node: &Node) -> Option<PathBuf> {
+pub fn node_source_file(node: &Node) -> Option<PathBuf> {
     match node {
         Node::Procedure { location, .. } => Some(location.file.to_path_buf()),
         Node::Function { location, .. } => Some(location.file.to_path_buf()),
