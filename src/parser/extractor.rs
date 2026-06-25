@@ -3,8 +3,8 @@ use ogsql_parser::ast::plpgsql::PlDeclaration;
 use ogsql_parser::ast::plpgsql::{PlCursorDecl, PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::{
     CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
-    ObjectName, SelectStatement, SelectTarget, SequenceFunc, Statement, TableRef as AstTableRef,
-    UpdateStatement, WhenClause,
+    ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
+    TableRef as AstTableRef, UpdateStatement, WhenClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
 use std::collections::{BTreeMap, HashSet};
@@ -158,14 +158,24 @@ pub struct CallExtractor {
     pub current_procedure: Option<RoutineId>,
     pub edges: Vec<CallEdge>,
     file: Arc<std::path::PathBuf>,
+    /// Local identifiers declared in the current procedure's DECLARE block
+    /// (variables, cursors, records) plus its parameter list. Used to filter
+    /// false-positive call edges from PL/SQL collection indexing `v(i)`.
+    local_vars: HashSet<String>,
+    /// Globally known TYPE names (lowercased). A `type_name()` constructor
+    /// call or `type_name.method(...)` member call is not a procedure/function
+    /// call edge and must be filtered.
+    known_types: HashSet<String>,
 }
 
 impl CallExtractor {
-    pub fn new(file: Arc<std::path::PathBuf>) -> Self {
+    pub fn new(file: Arc<std::path::PathBuf>, known_types: HashSet<String>) -> Self {
         Self {
             current_procedure: None,
             edges: Vec::new(),
             file,
+            local_vars: HashSet::new(),
+            known_types,
         }
     }
 
@@ -173,6 +183,19 @@ impl CallExtractor {
         SourceLocation {
             file: self.file.clone(),
             line,
+        }
+    }
+
+    /// Establish a fresh local-variable scope for a routine body.
+    /// Clears any previous locals and populates from the parameter list.
+    /// Must be called before walking every routine body — standalone
+    /// (visit_statement), package item (collect_package_call_edges), or
+    /// nested (visit_pl_declaration) — so identifiers don't leak across
+    /// sibling or enclosing scopes.
+    pub fn begin_routine_scope(&mut self, params: &[RoutineParam]) {
+        self.local_vars.clear();
+        for param in params {
+            self.local_vars.insert(param.name.to_lowercase());
         }
     }
 
@@ -200,16 +223,60 @@ impl Visitor for CallExtractor {
     fn visit_statement(&mut self, stmt: &Statement) -> VisitorResult {
         match stmt {
             Statement::CreateProcedure(p) => {
+                self.begin_routine_scope(&p.parameters);
                 let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                 self.current_procedure = Some(id);
             }
             Statement::CreateFunction(f) => {
+                self.begin_routine_scope(&f.parameters);
                 let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                 self.current_procedure = Some(id);
             }
             _ => {}
         }
         VisitorResult::Continue
+    }
+
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        match decl {
+            PlDeclaration::Variable(v) => {
+                self.local_vars.insert(v.name.to_lowercase());
+                VisitorResult::Continue
+            }
+            PlDeclaration::Cursor(c) => {
+                self.local_vars.insert(c.name.to_lowercase());
+                VisitorResult::Continue
+            }
+            PlDeclaration::Record(r) => {
+                self.local_vars.insert(r.name.to_lowercase());
+                VisitorResult::Continue
+            }
+            // Nested routines need their own fresh scope. The default walker
+            // recurses into walk_pl_block AFTER visit_pl_declaration returns,
+            // with no cleanup — causing inner locals to leak outward. We
+            // prevent this by returning SkipChildren and manually walking
+            // the nested block with a save/restore barrier.
+            PlDeclaration::NestedProcedure(p) => {
+                let saved = std::mem::take(&mut self.local_vars);
+                self.begin_routine_scope(&p.parameters);
+                if let Some(ref block) = p.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.local_vars = saved;
+                VisitorResult::SkipChildren
+            }
+            PlDeclaration::NestedFunction(f) => {
+                let saved = std::mem::take(&mut self.local_vars);
+                self.begin_routine_scope(&f.parameters);
+                if let Some(ref block) = f.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.local_vars = saved;
+                VisitorResult::SkipChildren
+            }
+            // Type / Pragma: not local data identifiers.
+            _ => VisitorResult::Continue,
+        }
     }
 
     fn visit_call(&mut self, call: &CallFuncStatement) -> VisitorResult {
@@ -261,7 +328,10 @@ impl Visitor for CallExtractor {
         } = expr
         {
             if !name.is_empty() {
-                self.push_call(&name.join("."), false, 0);
+                let first = name[0].to_lowercase();
+                if !self.local_vars.contains(&first) && !self.known_types.contains(&first) {
+                    self.push_call(&name.join("."), false, 0);
+                }
             }
         }
         VisitorResult::Continue
@@ -1912,7 +1982,8 @@ mod tests {
         let stmts = parser.parse_with_text();
         let mut all_edges = Vec::new();
         for info in &stmts {
-            let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
+            let mut extractor =
+                CallExtractor::new(Arc::new(PathBuf::from("test.sql")), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             all_edges.extend(extractor.edges);
         }
@@ -2021,7 +2092,7 @@ mod tests {
         let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
         let stmts = parser.parse_with_text();
 
-        let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")));
+        let mut extractor = CallExtractor::new(Arc::new(PathBuf::from("test.sql")), HashSet::new());
 
         for info in &stmts {
             if let ogsql_parser::ast::Statement::CreatePackageBody(pkg) = &info.statement {

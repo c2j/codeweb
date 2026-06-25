@@ -162,6 +162,7 @@ impl GraphBuilder {
             &mut ctx.graph,
             &mut ctx.proc_index,
             &mut ctx.table_index,
+            &ctx.type_index,
         );
         Self::create_object_ref_edges(
             sql_files,
@@ -1014,13 +1015,16 @@ impl GraphBuilder {
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        type_index: &HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let mut all_edges = Vec::new();
+
+        let known_types: HashSet<String> = type_index.keys().map(|k| k.to_lowercase()).collect();
 
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
-                let mut extractor = CallExtractor::new(file_arc.clone());
+                let mut extractor = CallExtractor::new(file_arc.clone(), known_types.clone());
                 match &info.statement {
                     Statement::CreatePackage(pkg) => {
                         Self::collect_package_call_edges(&pkg.name, &pkg.items, &mut extractor);
@@ -1337,6 +1341,7 @@ impl GraphBuilder {
             match item {
                 PackageItem::Procedure(p) => {
                     if let Some(ref block) = p.block {
+                        extractor.begin_routine_scope(&p.parameters);
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
@@ -1348,6 +1353,7 @@ impl GraphBuilder {
                 }
                 PackageItem::Function(f) => {
                     if let Some(ref block) = f.block {
+                        extractor.begin_routine_scope(&f.parameters);
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
@@ -1817,7 +1823,7 @@ impl GraphBuilder {
     ) -> Vec<String> {
         let mut calls = Vec::new();
         for info in statements {
-            let mut extractor = CallExtractor::new(file_path.clone());
+            let mut extractor = CallExtractor::new(file_path.clone(), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             for edge in extractor.edges {
                 calls.push(edge.callee_name);
