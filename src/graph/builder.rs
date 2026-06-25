@@ -2317,8 +2317,13 @@ impl GraphBuilder {
             }
         }
 
-        // ── Remove resolved/filtered nodes (reverse order not needed, slot-based) ──
-        for idx in to_remove {
+        // ── Remove resolved/filtered nodes ──
+        // petgraph::Graph::remove_node swaps the last node into the freed slot,
+        // so indices shift on each removal. Remove in descending index order
+        // (with dedup) to keep all pending indices in to_remove valid.
+        to_remove.sort_unstable();
+        to_remove.dedup();
+        for idx in to_remove.into_iter().rev() {
             graph.remove_node(idx);
         }
     }
@@ -2648,65 +2653,14 @@ fn is_noise_unresolved(raw_expr: &str) -> bool {
         return true;
     }
 
-    // Known system packages and built-in functions in openGauss/GaussDB
-    if is_known_system_call(trimmed) {
+    // GaussDB/openGauss built-in system functions — delegated to ogsql-parser's
+    // builtin registry (case-insensitive exact match, 449+ functions incl.
+    // dbe_xmldom / dbe_scheduler / dbms_* / pg_*), replacing a former local
+    // whitelist that was incomplete (e.g. missed dbe_xmldom).
+    if ogsql_parser::parser::function_registry::lookup_builtin_meta(trimmed).is_some() {
         return true;
     }
 
-    false
-}
-
-/// Known system packages and functions that are never user-defined routines.
-fn is_known_system_call(name: &str) -> bool {
-    let upper = name.to_uppercase();
-    let system_prefixes = [
-        "DBE_SCHEDULER.",
-        "DBE_OUTPUT.",
-        "DBE_UTILITY.",
-        "DBE_STATS.",
-        "DBE_SQL.",
-        "DBE_LOB.",
-        "DBE_RAW.",
-        "DBE_DESCRIBE.",
-        "DBE_ASSERT.",
-        "DBE_PROFILER.",
-        "DBE_PLDEBUGGER.",
-        "DBE_PLDEVELOPER.",
-        "DBE_TASK.",
-        "DBE_FILE.",
-        "DBE_PERF.",
-        "DBE_SESSION.",
-        "DBE_APPLICATION_INFO.",
-        "PG_",
-        "DBMS_",
-    ];
-    let system_functions = [
-        "PG_SLEEP",
-        "PG_SLEEP_FOR",
-        "PG_SLEEP_UNTIL",
-        "RAISE_NOTICE",
-        "RAISE_WARNING",
-        "RAISE_EXCEPTION",
-        "RAISE_INFO",
-        "RAISE_LOG",
-        "RAISE_DEBUG",
-        "RAISE",
-        "DBE_OUTPUT.PRINT",
-        "DBE_OUTPUT.PRINT_LINE",
-        "DBE_OUTPUT.PRINTF",
-        "PRINT",
-    ];
-
-    for prefix in &system_prefixes {
-        if upper.starts_with(prefix) {
-            return true;
-        }
-    }
-    for func in &system_functions {
-        if upper == *func || upper.starts_with(&format!("{}(", func)) {
-            return true;
-        }
-    }
     false
 }
 
@@ -3713,6 +3667,82 @@ mod tests {
         assert!(
             unresolved.is_empty(),
             "DBE_SCHEDULER.enable unresolved node should be filtered as system call"
+        );
+    }
+
+    #[test]
+    fn noise_filter_recognizes_dbe_xmldom_builtins() {
+        assert!(super::is_noise_unresolved("dbe_xmldom.setattribute"));
+        assert!(super::is_noise_unresolved("dbe_xmldom.appendchild"));
+        assert!(super::is_noise_unresolved("DBE_XMLDOM.SETATTRIBUTE"));
+    }
+
+    #[test]
+    fn noise_filter_preserves_prior_system_package_coverage() {
+        assert!(super::is_noise_unresolved("dbe_scheduler.enable"));
+        assert!(super::is_noise_unresolved("dbe_output.put_line"));
+        assert!(super::is_noise_unresolved("DBE_OUTPUT.PUT_LINE"));
+    }
+
+    #[test]
+    fn noise_filter_keeps_user_routines_unfiltered() {
+        assert!(!super::is_noise_unresolved("calc_total"));
+        assert!(!super::is_noise_unresolved("biz.calc_total"));
+        assert!(!super::is_noise_unresolved("my_pkg.do_work"));
+    }
+
+    #[test]
+    fn raise_statement_does_not_spawn_unresolved() {
+        let sql = r#"
+            CREATE PROCEDURE log_warn AS $$
+            BEGIN
+                RAISE NOTICE 'started';
+                RAISE WARNING 'risky value: %', 42;
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { .. }))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "RAISE statements must not spawn unresolved nodes: {:?}",
+            unresolved
+                .iter()
+                .map(|i| format!("{:?}", graph[*i]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dbe_xmldom_calls_not_unresolved_in_build() {
+        let sql = r#"
+            CREATE PROCEDURE build_xml_doc AS $$
+            DECLARE
+                l_doc  INTEGER;
+                l_elem INTEGER;
+            BEGIN
+                l_doc  := dbe_xmldom.newdomdocument();
+                l_elem := dbe_xmldom.createelement(l_doc, 'root');
+                dbe_xmldom.setattribute(l_elem, 'id', '1');
+                dbe_xmldom.appendchild(l_doc, l_elem);
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Unresolved { .. }))
+            .collect();
+        let details: Vec<_> = unresolved
+            .iter()
+            .map(|i| format!("{:?}", graph[*i]))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "dbe_xmldom builtins must not spawn unresolved nodes: {details:?}"
         );
     }
 
