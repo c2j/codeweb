@@ -1,0 +1,38 @@
+# Regression test cases for local-variable false-positive call edge filtering.
+#
+# Each [case.<id>] section defines:
+#   description       — what the case verifies
+#   sql               — path to SQL fixture (relative to this file)
+#   fixed_in          — version that fixed the bug
+#   [[.expected_edges]] — expected graph edges (from, to, type)
+#   expected_no_call_edges — if true, assert zero DirectCall/DynamicCall edges
+#
+# Scope: PL/SQL local identifiers (collection vars, scalars, record fields, FOR
+# loop counters, parameters) used with paren syntax `name(args)` must NOT be
+# mistaken for procedure/function calls. Distinct from the `function_call_edges`
+# suite, which covers real call detection.
+
+# ── Negative: collection index access NOT captured ────────────
+# Bug: v_date(i) parses as Expr::FunctionCall; without a local symbol table
+# built from DECLARE, the visitor cannot tell collection indexing from a call.
+
+[case.collection_index_not_captured]
+description = "PL/SQL collection index access (v_date(i), v_fund(i)) must NOT be a call edge"
+sql = "cases/collection_index_not_captured.sql"
+fixed_in = "v0.7.7"
+expected_no_call_edges = true
+
+# ── Mixed: real call captured alongside collection access ─────
+# Same procedure body contains both a real function call (RHS assignment) and
+# a collection index access in a SQL WHERE clause. The fix must keep the real
+# edge while filtering the false positive.
+
+[case.collection_index_with_real_call]
+description = "Real function call captured alongside collection index access in SQL WHERE"
+sql = "cases/collection_index_with_real_call.sql"
+fixed_in = "v0.7.7"
+
+[[case.collection_index_with_real_call.expected_edges]]
+from = "clean_proc"
+to = "compute_score"
+type = "direct"

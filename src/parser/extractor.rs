@@ -158,6 +158,10 @@ pub struct CallExtractor {
     pub current_procedure: Option<RoutineId>,
     pub edges: Vec<CallEdge>,
     file: Arc<std::path::PathBuf>,
+    /// Local identifiers declared in the current procedure's DECLARE block
+    /// (variables, cursors, records) plus its parameter list. Used to filter
+    /// false-positive call edges from PL/SQL collection indexing `v(i)`.
+    local_vars: HashSet<String>,
 }
 
 impl CallExtractor {
@@ -166,6 +170,7 @@ impl CallExtractor {
             current_procedure: None,
             edges: Vec::new(),
             file,
+            local_vars: HashSet::new(),
         }
     }
 
@@ -200,13 +205,32 @@ impl Visitor for CallExtractor {
     fn visit_statement(&mut self, stmt: &Statement) -> VisitorResult {
         match stmt {
             Statement::CreateProcedure(p) => {
+                self.local_vars.clear();
                 let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                 self.current_procedure = Some(id);
             }
             Statement::CreateFunction(f) => {
+                self.local_vars.clear();
                 let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                 self.current_procedure = Some(id);
             }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        match decl {
+            PlDeclaration::Variable(v) => {
+                self.local_vars.insert(v.name.to_lowercase());
+            }
+            PlDeclaration::Cursor(c) => {
+                self.local_vars.insert(c.name.to_lowercase());
+            }
+            PlDeclaration::Record(r) => {
+                self.local_vars.insert(r.name.to_lowercase());
+            }
+            // Type / NestedProcedure / NestedFunction / Pragma: not local data identifiers.
             _ => {}
         }
         VisitorResult::Continue
@@ -261,7 +285,10 @@ impl Visitor for CallExtractor {
         } = expr
         {
             if !name.is_empty() {
-                self.push_call(&name.join("."), false, 0);
+                let first = name[0].to_lowercase();
+                if !self.local_vars.contains(&first) {
+                    self.push_call(&name.join("."), false, 0);
+                }
             }
         }
         VisitorResult::Continue
