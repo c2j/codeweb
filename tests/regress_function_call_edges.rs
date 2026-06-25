@@ -9,6 +9,8 @@ const SCHEMA_MISMATCH: &str = include_str!("regress/function_call_edges/cases/sc
 const WHERE_SUBQUERY: &str = include_str!("regress/function_call_edges/cases/where_subquery.sql");
 const BUILTIN_NOT_CAPTURED: &str =
     include_str!("regress/function_call_edges/cases/builtin_not_captured.sql");
+const DBE_XMLDOM_BUILTIN: &str =
+    include_str!("regress/function_call_edges/cases/dbe_xmldom_builtin.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -78,6 +80,15 @@ fn has_any_direct_or_dynamic_edge(json: &serde_json::Value) -> bool {
         .any(|e| e["type"] == "direct" || e["type"] == "dynamic")
 }
 
+fn unresolved_nodes(json: &serde_json::Value) -> Vec<&serde_json::Value> {
+    json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"].as_str() == Some("unresolved"))
+        .collect()
+}
+
 #[test]
 fn regress_expr_assignment() {
     let json = analyze_json(EXPR_ASSIGNMENT);
@@ -133,5 +144,17 @@ fn regress_builtin_not_captured() {
     assert!(
         !has_any_direct_or_dynamic_edge(&json),
         "Built-in COUNT must NOT create any call edges"
+    );
+}
+
+#[test]
+fn regress_dbe_xmldom_builtin_not_unresolved() {
+    let json = analyze_json(DBE_XMLDOM_BUILTIN);
+    let unresolved = unresolved_nodes(&json);
+    assert!(
+        unresolved.is_empty(),
+        "dbe_xmldom.* are GaussDB built-in system calls and must NOT spawn Unresolved nodes; \
+         found: {:?}",
+        unresolved
     );
 }
