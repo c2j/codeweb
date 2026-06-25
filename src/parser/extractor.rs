@@ -206,11 +206,17 @@ impl Visitor for CallExtractor {
         match stmt {
             Statement::CreateProcedure(p) => {
                 self.local_vars.clear();
+                for param in &p.parameters {
+                    self.local_vars.insert(param.name.to_lowercase());
+                }
                 let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                 self.current_procedure = Some(id);
             }
             Statement::CreateFunction(f) => {
                 self.local_vars.clear();
+                for param in &f.parameters {
+                    self.local_vars.insert(param.name.to_lowercase());
+                }
                 let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                 self.current_procedure = Some(id);
             }

@@ -36,3 +36,32 @@ fixed_in = "v0.7.7"
 from = "clean_proc"
 to = "compute_score"
 type = "direct"
+
+# ── Parameter scope: param names tracked like locals ─────────
+# Same bug class, but the identifier arrives via the routine signature,
+# not DECLARE. visit_statement must collect param names into local_vars.
+
+[case.param_shadows_procedure]
+description = "Procedure parameter indexed with paren syntax must NOT be a call edge"
+sql = "cases/param_shadows_procedure.sql"
+fixed_in = "v0.7.7"
+
+[[case.param_shadows_procedure.expected_edges]]
+from = "batch_check"
+to = "real_target"
+type = "direct"
+
+# ── Scope isolation: locals don't leak across procedures ──────
+# proc_a declares a local v_date (shadowing a global function of the same
+# name); proc_b calls the global v_date function. The fix's local_vars.clear()
+# on CreateProcedure entry must keep proc_b's real call intact.
+
+[case.scope_reset_across_procedures]
+description = "Local var in proc_a must not mask real call to same-named function in proc_b"
+sql = "cases/scope_reset_across_procedures.sql"
+fixed_in = "v0.7.7"
+
+[[case.scope_reset_across_procedures.expected_edges]]
+from = "proc_b"
+to = "v_date"
+type = "direct"

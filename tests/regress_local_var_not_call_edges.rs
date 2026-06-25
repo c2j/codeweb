@@ -5,6 +5,10 @@ const COLLECTION_INDEX_NOT_CAPTURED: &str =
     include_str!("regress/local_var_not_call_edges/cases/collection_index_not_captured.sql");
 const COLLECTION_INDEX_WITH_REAL_CALL: &str =
     include_str!("regress/local_var_not_call_edges/cases/collection_index_with_real_call.sql");
+const PARAM_SHADOWS_PROCEDURE: &str =
+    include_str!("regress/local_var_not_call_edges/cases/param_shadows_procedure.sql");
+const SCOPE_RESET_ACROSS_PROCEDURES: &str =
+    include_str!("regress/local_var_not_call_edges/cases/scope_reset_across_procedures.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -104,5 +108,32 @@ fn regress_collection_index_with_real_call() {
     assert_eq!(
         unresolved, 0,
         "Collection variable v_scores must NOT spawn an Unresolved node; found {unresolved}"
+    );
+}
+
+#[test]
+fn regress_param_shadows_procedure() {
+    let json = analyze_json(PARAM_SHADOWS_PROCEDURE);
+    assert!(
+        has_direct_edge(&json, "batch_check", "real_target"),
+        "Expected DirectCall edge: batch_check -> real_target (real function call)"
+    );
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "Parameter p_ids must NOT spawn an Unresolved node; found {unresolved}"
+    );
+}
+
+#[test]
+fn regress_scope_reset_across_procedures() {
+    let json = analyze_json(SCOPE_RESET_ACROSS_PROCEDURES);
+    assert!(
+        has_direct_edge(&json, "proc_b", "v_date"),
+        "proc_b must have a DirectCall edge to the v_date function (scope reset working)"
+    );
+    assert!(
+        !has_direct_edge(&json, "proc_a", "v_date"),
+        "proc_a's local collection variable v_date must NOT produce a call edge to the v_date function"
     );
 }
