@@ -471,10 +471,28 @@ fn main() {
         eprintln!("warning: failed to configure thread pool: {e}");
     }
 
-    if let Err(e) = run() {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    }
+    // Run main work in a thread with an enlarged stack.
+    //
+    // Windows main thread default stack = 1 MB (Linux/macOS = 8 MB).
+    // ogsql-parser uses a recursive descent walker that recurses deeply on
+    // PL/pgSQL with nested SELECT/subquery expressions, which overflows the
+    // 1 MB stack on Windows (regress_where_subquery). 8 MB matches the Unix
+    // default and is also what rayon worker threads already use (see above).
+    let exit_code = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            if let Err(e) = run() {
+                eprintln!("error: {}", e);
+                1
+            } else {
+                0
+            }
+        })
+        .expect("failed to spawn main worker thread")
+        .join()
+        .unwrap_or(1);
+
+    std::process::exit(exit_code);
 }
 
 fn run() -> Result<()> {
