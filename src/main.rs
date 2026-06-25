@@ -20,8 +20,11 @@ mod server;
 #[cfg(feature = "tui")]
 mod tui;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use petgraph::graph::NodeIndex;
 
 /// Like `println_stdout!` but handles `BrokenPipe` gracefully (exit 0 instead of panic).
 macro_rules! println_stdout {
@@ -48,6 +51,24 @@ macro_rules! println_stdout {
 use clap::{Parser, Subcommand};
 use error::Result;
 use graph::Node;
+use serde::Serialize;
+
+/// JSON output schema entry for upstream/downstream
+#[derive(Serialize, PartialEq, Eq, Hash, Clone)]
+struct ImpactEntry {
+    file_path: Option<String>,
+    symbol: String,
+    line: Option<usize>,
+}
+
+/// `impact --file` JSON output schema (schema_version=1, frozen contract)
+#[derive(Serialize)]
+struct ImpactResult {
+    schema_version: u32,
+    file: String,
+    upstream: Vec<ImpactEntry>,
+    downstream: Vec<ImpactEntry>,
+}
 
 const LOGO: &str = r#"
   ██████╗  ██████╗  ██████╗  ███████╗ ██╗    ██╗ ███████╗ ██████╗
@@ -393,6 +414,29 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Show upstream callers and downstream callees for all nodes in a file
+    ///
+    /// Aggregates impact analysis across all nodes (methods, mappers, procedures)
+    /// defined in the given file. Designed for subprocess integration (e.g.
+    /// CodeRoughcollie) — outputs stable JSON by default.
+    Impact {
+        /// File path to analyze (relative to CWD or absolute)
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Output format (json for integration, text for human reading)
+        #[arg(short, long, default_value = "json", value_parser = ["json", "text"])]
+        format: String,
+
+        /// Traversal depth (1 = direct callers/callees only)
+        #[arg(short, long, default_value = "1")]
+        depth: usize,
+    },
 }
 
 fn main() {
@@ -554,6 +598,12 @@ fn run() -> Result<()> {
             &project,
             output.as_deref(),
         ),
+        Some(Commands::Impact {
+            file,
+            project,
+            format,
+            depth,
+        }) => cmd_impact(&file, &project, &format, depth),
     }
 }
 
@@ -2119,4 +2169,274 @@ fn jsp_count_fragment(jsp_count: usize) -> String {
 #[cfg(not(feature = "jsp"))]
 fn jsp_count_fragment() -> String {
     String::new()
+}
+
+fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result<()> {
+    use crate::graph::query::filter::EdgeFilter;
+    use petgraph::Direction;
+
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+    let file_nodes = store.file_nodes();
+    let key_index = store.node_key_index();
+
+    let (matched_path, was_fuzzy) = match resolve_file_path(file, file_nodes) {
+        Some((p, fuzzy)) => (p, fuzzy),
+        None => {
+            let result = ImpactResult {
+                schema_version: 1,
+                file: file.to_string_lossy().to_string(),
+                upstream: vec![],
+                downstream: vec![],
+            };
+            if format == "json" {
+                let json = serde_json::to_string_pretty(&result).map_err(|e| {
+                    error::CodeWebError::ExportError {
+                        message: format!("JSON serialization: {}", e),
+                    }
+                })?;
+                println_stdout!("{}", json);
+            } else {
+                print_impact_text(&result);
+            }
+            eprintln!(
+                "Warning: file '{}' not found in graph (no nodes analyzed for this file)",
+                file.display()
+            );
+            return Ok(());
+        }
+    };
+
+    if was_fuzzy {
+        eprintln!(
+            "Warning: '{}' resolved via fuzzy match to '{}'",
+            file.display(),
+            matched_path.display()
+        );
+    }
+
+    let file_node_indices: Vec<NodeIndex> = file_nodes
+        .get(matched_path)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|k| key_index.get(k).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if file_node_indices.is_empty() {
+        let result = ImpactResult {
+            schema_version: 1,
+            file: matched_path.to_string_lossy().to_string(),
+            upstream: vec![],
+            downstream: vec![],
+        };
+        if format == "json" {
+            let json = serde_json::to_string_pretty(&result).map_err(|e| {
+                error::CodeWebError::ExportError {
+                    message: format!("JSON serialization: {}", e),
+                }
+            })?;
+            println_stdout!("{}", json);
+        } else {
+            print_impact_text(&result);
+        }
+        eprintln!(
+            "Warning: file '{}' has no graph nodes",
+            matched_path.display()
+        );
+        return Ok(());
+    }
+
+    let calls_filter = EdgeFilter::calls_only();
+    let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+    let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+
+    collect_impact_entries(
+        graph,
+        &file_node_indices,
+        Direction::Incoming,
+        depth,
+        &calls_filter,
+        &mut upstream_map,
+    );
+    collect_impact_entries(
+        graph,
+        &file_node_indices,
+        Direction::Outgoing,
+        depth,
+        &calls_filter,
+        &mut downstream_map,
+    );
+
+    let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
+    let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
+    upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+    downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+
+    let result = ImpactResult {
+        schema_version: 1,
+        file: matched_path.to_string_lossy().to_string(),
+        upstream,
+        downstream,
+    };
+
+    if format == "json" {
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            error::CodeWebError::ExportError {
+                message: format!("JSON serialization: {}", e),
+            }
+        })?;
+        println_stdout!("{}", json);
+    } else {
+        print_impact_text(&result);
+    }
+
+    Ok(())
+}
+
+/// Match user-supplied path against `file_nodes` keys.
+/// Tries canonicalize → absolute → ends_with fuzzy.
+/// Returns (matched_path, was_fuzzy).
+fn resolve_file_path<'a>(
+    input: &Path,
+    file_nodes: &'a HashMap<PathBuf, Vec<crate::graph::key::NodeKey>>,
+) -> Option<(&'a PathBuf, bool)> {
+    if let Ok(canon) = input.canonicalize() {
+        if let Some((k, _)) = file_nodes.get_key_value(canon.as_path()) {
+            return Some((k, false));
+        }
+    }
+
+    if input.is_absolute() {
+        if let Some((k, _)) = file_nodes.get_key_value(input) {
+            return Some((k, false));
+        }
+    }
+
+    let input_str = input.to_string_lossy();
+    file_nodes
+        .keys()
+        .find(|key| key.to_string_lossy().ends_with(input_str.as_ref()))
+        .map(|k| (k, true))
+}
+
+/// `Incoming` → upstream callers, `Outgoing` → downstream callees.
+fn collect_impact_entries(
+    graph: &crate::graph::CodeGraph,
+    start_nodes: &[NodeIndex],
+    direction: petgraph::Direction,
+    depth: usize,
+    edge_filter: &crate::graph::query::filter::EdgeFilter,
+    out: &mut HashMap<(Option<String>, String), ImpactEntry>,
+) {
+    use crate::graph::key::NodeKey;
+
+    if depth == 0 {
+        return;
+    }
+
+    let mut visited: std::collections::HashSet<NodeIndex> = start_nodes.iter().copied().collect();
+    let mut frontier: Vec<NodeIndex> = start_nodes.to_vec();
+
+    for _ in 0..depth {
+        let mut next_frontier: Vec<NodeIndex> = Vec::new();
+
+        for &node in &frontier {
+            let neighbors: Vec<_> = graph.neighbors_directed(node, direction).collect();
+
+            for neighbor in neighbors {
+                if visited.contains(&neighbor) {
+                    continue;
+                }
+
+                let (src, dst) = match direction {
+                    petgraph::Direction::Outgoing => (node, neighbor),
+                    petgraph::Direction::Incoming => (neighbor, node),
+                };
+
+                let matching_weight = graph
+                    .find_edge(src, dst)
+                    .and_then(|eid| graph.edge_weight(eid))
+                    .filter(|w| edge_filter.matches(w));
+
+                let Some(weight) = matching_weight else {
+                    continue;
+                };
+
+                visited.insert(neighbor);
+
+                let neighbor_node = &graph[neighbor];
+                let file_path = crate::graph::store::node_source_file(neighbor_node)
+                    .map(|p| p.to_string_lossy().to_string());
+                let symbol = NodeKey::from_node(neighbor_node).to_string();
+                let line = edge_location_line(weight);
+
+                out.entry((file_path.clone(), symbol.clone()))
+                    .or_insert(ImpactEntry {
+                        file_path,
+                        symbol,
+                        line,
+                    });
+
+                next_frontier.push(neighbor);
+            }
+        }
+
+        frontier = next_frontier;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+}
+
+fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
+    use crate::graph::Edge;
+    match edge {
+        Edge::DirectCall { location, .. } => Some(location.line),
+        Edge::DynamicCall { location, .. } => Some(location.line),
+        Edge::CallsProcedure { location, .. } => Some(location.line),
+        Edge::InvokesMapper { location, .. } => Some(location.line),
+        Edge::CallsJava { location, .. } => Some(location.line),
+        Edge::Extends { location, .. } => Some(location.line),
+        Edge::Implements { location, .. } => Some(location.line),
+        Edge::TableAccess { location, .. } => Some(location.line),
+        Edge::DependsOn { location, .. } => Some(location.line),
+        Edge::TriggersRoutine { location, .. } => Some(location.line),
+        Edge::ReferencesType { location, .. } => Some(location.line),
+        Edge::UsesSequence { location, .. } => Some(location.line),
+        Edge::IndexesTable { location, .. } => Some(location.line),
+        Edge::AliasesObject { location, .. } => Some(location.line),
+        Edge::CustomEdge { location, .. } => location.as_ref().map(|l| l.line),
+        Edge::ContainsMethod | Edge::ContainsRoutine => None,
+        #[cfg(feature = "jsp")]
+        Edge::ContainsSql => None,
+    }
+}
+
+fn print_impact_text(result: &ImpactResult) {
+    println_stdout!("File: {}", result.file);
+    println_stdout!();
+    println_stdout!("── UPSTREAM ({}) ──", result.upstream.len());
+    if result.upstream.is_empty() {
+        println_stdout!("  (none)");
+    } else {
+        for entry in &result.upstream {
+            let line_tag = entry.line.map(|l| format!(":{}", l)).unwrap_or_default();
+            let file = entry.file_path.as_deref().unwrap_or("<unknown>");
+            println_stdout!("  {}  {}{}", entry.symbol, file, line_tag);
+        }
+    }
+    println_stdout!();
+    println_stdout!("── DOWNSTREAM ({}) ──", result.downstream.len());
+    if result.downstream.is_empty() {
+        println_stdout!("  (none)");
+    } else {
+        for entry in &result.downstream {
+            let line_tag = entry.line.map(|l| format!(":{}", l)).unwrap_or_default();
+            let file = entry.file_path.as_deref().unwrap_or("<unknown>");
+            println_stdout!("  {}  {}{}", entry.symbol, file, line_tag);
+        }
+    }
 }
