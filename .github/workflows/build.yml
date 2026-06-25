@@ -85,7 +85,6 @@ jobs:
           for dir in */; do
             name="${dir%/}"
             archive_name="codeweb-${VERSION}-${name#codeweb-}"
-            tar czf "${archive_name}.tar.gz" -C "${name}" .
             7z a "${archive_name}.zip" "./${name}/"
           done
 
@@ -94,6 +93,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/*.tar.gz
             artifacts/*.zip
 
