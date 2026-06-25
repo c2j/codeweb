@@ -1410,6 +1410,11 @@ impl GraphBuilder {
                 .get(&callee_id)
                 .copied()
                 .or_else(|| {
+                    let func_id =
+                        RoutineId::from_qualified_name(&edge.callee_name, RoutineKind::Function);
+                    proc_index.get(&func_id).copied()
+                })
+                .or_else(|| {
                     if callee_id.schema.is_some() && callee_id.package.is_none() {
                         let alt_id = RoutineId {
                             schema: None,
@@ -3896,6 +3901,95 @@ mod tests {
             1,
             "duplicate JavaClassInfo with same FQN should produce exactly 1 JavaClass node, got {}",
             class_nodes.len()
+        );
+    }
+
+    #[test]
+    fn function_call_in_expression_creates_edge() {
+        let sql = r#"
+            CREATE FUNCTION calc_total(p INT) RETURNS INTEGER AS $$
+            BEGIN RETURN p * 2; END;
+            $$;
+            CREATE PROCEDURE process_order AS $$
+            DECLARE v INT;
+            BEGIN
+                v := calc_total(1);
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name == "calc_total"))
+            .expect("calc_total Function node should exist");
+
+        let proc_idx = graph
+            .node_indices()
+            .find(
+                |i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "process_order"),
+            )
+            .expect("process_order Procedure node should exist");
+
+        let has_edge = graph.edge_indices().any(|e| {
+            let (src, dst) = graph.edge_endpoints(e).unwrap();
+            src == proc_idx && dst == func_idx && matches!(&graph[e], Edge::DirectCall { .. })
+        });
+        assert!(
+            has_edge,
+            "Expected DirectCall edge from process_order to calc_total"
+        );
+    }
+
+    #[test]
+    fn function_call_via_perform_creates_edge() {
+        let sql = r#"
+            CREATE FUNCTION bar() RETURNS INTEGER AS $$
+            BEGIN RETURN 1; END;
+            $$;
+            CREATE PROCEDURE foo() AS $$
+            BEGIN
+                PERFORM bar();
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let bar_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name == "bar"))
+            .expect("bar Function node should exist");
+
+        let has_edge = graph.edge_indices().any(|e| {
+            let (_, dst) = graph.edge_endpoints(e).unwrap();
+            dst == bar_idx && matches!(&graph[e], Edge::DirectCall { .. })
+        });
+        assert!(has_edge, "Expected DirectCall edge to bar via PERFORM");
+    }
+
+    #[test]
+    fn builtin_function_not_captured_as_call() {
+        let sql = r#"
+            CREATE PROCEDURE aggregate_data AS $$
+            BEGIN
+                PERFORM COUNT(*) FROM dual;
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let call_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                matches!(
+                    &graph[*e],
+                    Edge::DirectCall { .. } | Edge::DynamicCall { .. }
+                )
+            })
+            .collect();
+        assert!(
+            call_edges.is_empty(),
+            "Built-in COUNT should not create call edges"
         );
     }
 
