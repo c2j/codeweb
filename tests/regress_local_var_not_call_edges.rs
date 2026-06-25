@@ -11,6 +11,12 @@ const SCOPE_RESET_ACROSS_PROCEDURES: &str =
     include_str!("regress/local_var_not_call_edges/cases/scope_reset_across_procedures.sql");
 const TYPE_CONSTRUCTOR_NOT_CAPTURED: &str =
     include_str!("regress/local_var_not_call_edges/cases/type_constructor_not_captured.sql");
+const PKG_BODY_SCOPE_LEAK: &str =
+    include_str!("regress/local_var_not_call_edges/cases/pkg_body_scope_leak.sql");
+const PKG_BODY_PARAM_NOT_CAPTURED: &str =
+    include_str!("regress/local_var_not_call_edges/cases/pkg_body_param_not_captured.sql");
+const NESTED_ROUTINE_SCOPE_LEAK: &str =
+    include_str!("regress/local_var_not_call_edges/cases/nested_routine_scope_leak.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -148,5 +154,37 @@ fn regress_type_constructor_not_captured() {
         unresolved, 0,
         "TYPE constructor account_record_table(), member method obj_account_record.equals(...), \
          and collection index aaa1(i)/aaa2(i) must NOT spawn Unresolved nodes; found {unresolved}"
+    );
+}
+
+#[test]
+fn regress_pkg_body_scope_leak() {
+    let json = analyze_json(PKG_BODY_SCOPE_LEAK);
+    assert!(
+        has_direct_edge(&json, "proc_b", "helper_fn"),
+        "proc_b must have a DirectCall edge to helper_fn — the real call is currently suppressed \
+         because proc_a's local variable 'helper_fn' leaks across sibling procedures in the package \
+         body (local_vars is not cleared between package items)"
+    );
+}
+
+#[test]
+fn regress_pkg_body_param_not_captured() {
+    let json = analyze_json(PKG_BODY_PARAM_NOT_CAPTURED);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "Package body parameter p_ids must NOT spawn an Unresolved node — parameters are currently \
+         never registered because visit_statement doesn't fire for package body items; found {unresolved}"
+    );
+}
+
+#[test]
+fn regress_nested_routine_scope_leak() {
+    let json = analyze_json(NESTED_ROUTINE_SCOPE_LEAK);
+    assert!(
+        has_direct_edge(&json, "outer_proc", "v_shadow"),
+        "outer_proc must have a DirectCall edge to v_shadow — the real call is currently suppressed \
+         because the nested procedure's local variable 'v_shadow' leaks into the enclosing scope"
     );
 }

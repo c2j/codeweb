@@ -25,7 +25,10 @@ local_var_not_call_edges/
     ├── collection_index_with_real_call.sql
     ├── param_shadows_procedure.sql
     ├── scope_reset_across_procedures.sql
-    └── type_constructor_not_captured.sql
+    ├── type_constructor_not_captured.sql
+    ├── pkg_body_scope_leak.sql
+    ├── pkg_body_param_not_captured.sql
+    └── nested_routine_scope_leak.sql
 ```
 
 ## 案例一览
@@ -37,6 +40,9 @@ local_var_not_call_edges/
 | `param_shadows_procedure` | 过程参数以括号语法出现在 WHERE 子句 | `batch_check → real_target`；参数 `p_ids` 不产生 Unresolved 节点 |
 | `scope_reset_across_procedures` | proc_a 局部变量 `v_date` 与全局函数同名；proc_b 调用该函数 | `proc_b → v_date` 存在；`proc_a → v_date` 不存在（局部变量被过滤） |
 | `type_constructor_not_captured` | TYPE 构造函数 `account_record_table()`、成员方法 `obj_account_record.equals(...)`、集合下标 `aaa1(i)` | 无 call edge（TYPE 名 + 局部变量双重过滤） |
+| `pkg_body_scope_leak` | 包体内 proc_a 局部变量 `helper_fn` 泄漏到 proc_b，抑制真实调用 | `proc_b → helper_fn` 存在（待修复：当前缺失） |
+| `pkg_body_param_not_captured` | 包体过程参数 `p_ids` 以 `(i)` 语法出现在 WHERE 子句 | 无 call edge（待修复：当前产生假阳性 Unresolved） |
+| `nested_routine_scope_leak` | 嵌套过程的局部变量 `v_shadow` 泄漏到外层作用域 | `outer_proc → v_shadow` 存在（待修复：当前缺失） |
 
 ## 添加新案例
 

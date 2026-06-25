@@ -78,3 +78,34 @@ description = "TYPE constructor, member method call, and collection index access
 sql = "cases/type_constructor_not_captured.sql"
 fixed_in = "v0.7.7"
 expected_no_call_edges = true
+
+# ── Package body scope bugs (pending fix) ─────────────────────
+# collect_package_call_edges walks each item via walk_pl_block directly,
+# bypassing visit_statement. local_vars is never cleared between items
+# and parameters are never collected.
+
+[case.pkg_body_scope_leak]
+description = "Local var in proc_a leaks into proc_b — suppresses real call edge"
+sql = "cases/pkg_body_scope_leak.sql"
+fixed_in = "v0.7.7"
+
+[[case.pkg_body_scope_leak.expected_edges]]
+from = "proc_b"
+to = "helper_fn"
+type = "direct"
+
+[case.pkg_body_param_not_captured]
+description = "Package body parameter used with (index) spawns false Unresolved node"
+sql = "cases/pkg_body_param_not_captured.sql"
+fixed_in = "v0.7.7"
+expected_no_call_edges = true
+
+[case.nested_routine_scope_leak]
+description = "Nested procedure's local var leaks into enclosing scope — suppresses real call edge"
+sql = "cases/nested_routine_scope_leak.sql"
+fixed_in = "v0.7.7"
+
+[[case.nested_routine_scope_leak.expected_edges]]
+from = "outer_proc"
+to = "v_shadow"
+type = "direct"
