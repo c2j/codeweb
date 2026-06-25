@@ -3,8 +3,8 @@ use ogsql_parser::ast::plpgsql::PlDeclaration;
 use ogsql_parser::ast::plpgsql::{PlCursorDecl, PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::{
     CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
-    ObjectName, SelectStatement, SelectTarget, SequenceFunc, Statement, TableRef as AstTableRef,
-    UpdateStatement, WhenClause,
+    ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
+    TableRef as AstTableRef, UpdateStatement, WhenClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
 use std::collections::{BTreeMap, HashSet};
@@ -186,6 +186,19 @@ impl CallExtractor {
         }
     }
 
+    /// Establish a fresh local-variable scope for a routine body.
+    /// Clears any previous locals and populates from the parameter list.
+    /// Must be called before walking every routine body — standalone
+    /// (visit_statement), package item (collect_package_call_edges), or
+    /// nested (visit_pl_declaration) — so identifiers don't leak across
+    /// sibling or enclosing scopes.
+    pub fn begin_routine_scope(&mut self, params: &[RoutineParam]) {
+        self.local_vars.clear();
+        for param in params {
+            self.local_vars.insert(param.name.to_lowercase());
+        }
+    }
+
     pub fn push_call(&mut self, callee: &str, is_dynamic: bool, line: usize) {
         self.edges.push(CallEdge {
             caller: self.current_procedure.clone(),
@@ -210,18 +223,12 @@ impl Visitor for CallExtractor {
     fn visit_statement(&mut self, stmt: &Statement) -> VisitorResult {
         match stmt {
             Statement::CreateProcedure(p) => {
-                self.local_vars.clear();
-                for param in &p.parameters {
-                    self.local_vars.insert(param.name.to_lowercase());
-                }
+                self.begin_routine_scope(&p.parameters);
                 let id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                 self.current_procedure = Some(id);
             }
             Statement::CreateFunction(f) => {
-                self.local_vars.clear();
-                for param in &f.parameters {
-                    self.local_vars.insert(param.name.to_lowercase());
-                }
+                self.begin_routine_scope(&f.parameters);
                 let id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                 self.current_procedure = Some(id);
             }
@@ -234,17 +241,42 @@ impl Visitor for CallExtractor {
         match decl {
             PlDeclaration::Variable(v) => {
                 self.local_vars.insert(v.name.to_lowercase());
+                VisitorResult::Continue
             }
             PlDeclaration::Cursor(c) => {
                 self.local_vars.insert(c.name.to_lowercase());
+                VisitorResult::Continue
             }
             PlDeclaration::Record(r) => {
                 self.local_vars.insert(r.name.to_lowercase());
+                VisitorResult::Continue
             }
-            // Type / NestedProcedure / NestedFunction / Pragma: not local data identifiers.
-            _ => {}
+            // Nested routines need their own fresh scope. The default walker
+            // recurses into walk_pl_block AFTER visit_pl_declaration returns,
+            // with no cleanup — causing inner locals to leak outward. We
+            // prevent this by returning SkipChildren and manually walking
+            // the nested block with a save/restore barrier.
+            PlDeclaration::NestedProcedure(p) => {
+                let saved = std::mem::take(&mut self.local_vars);
+                self.begin_routine_scope(&p.parameters);
+                if let Some(ref block) = p.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.local_vars = saved;
+                VisitorResult::SkipChildren
+            }
+            PlDeclaration::NestedFunction(f) => {
+                let saved = std::mem::take(&mut self.local_vars);
+                self.begin_routine_scope(&f.parameters);
+                if let Some(ref block) = f.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.local_vars = saved;
+                VisitorResult::SkipChildren
+            }
+            // Type / Pragma: not local data identifiers.
+            _ => VisitorResult::Continue,
         }
-        VisitorResult::Continue
     }
 
     fn visit_call(&mut self, call: &CallFuncStatement) -> VisitorResult {

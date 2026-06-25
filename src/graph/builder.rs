@@ -1341,6 +1341,7 @@ impl GraphBuilder {
             match item {
                 PackageItem::Procedure(p) => {
                     if let Some(ref block) = p.block {
+                        extractor.begin_routine_scope(&p.parameters);
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
@@ -1352,6 +1353,7 @@ impl GraphBuilder {
                 }
                 PackageItem::Function(f) => {
                     if let Some(ref block) = f.block {
+                        extractor.begin_routine_scope(&f.parameters);
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
