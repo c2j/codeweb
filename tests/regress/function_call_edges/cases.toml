@@ -1,0 +1,73 @@
+# Regression test cases for user-defined function call edge extraction.
+#
+# Each [case.<id>] section defines:
+#   description       — what the case verifies
+#   sql               — path to SQL fixture (relative to this file)
+#   fixed_in          — version that fixed the bug
+#   [[.expected_edges]] — expected graph edges (from, to, type)
+#   expected_no_call_edges — if true, assert zero DirectCall/DynamicCall edges
+
+# ── Positive: function call captured ──────────────────────────
+
+[case.expr_assignment]
+description = "Function call in PL/pgSQL assignment expression (v := func())"
+sql = "cases/expr_assignment.sql"
+fixed_in = "v0.7.3"
+
+[[case.expr_assignment.expected_edges]]
+from = "process_order"
+to = "calc_total"
+type = "direct"
+
+[case.perform_call]
+description = "Function call via PERFORM statement"
+sql = "cases/perform_call.sql"
+fixed_in = "v0.7.3"
+
+[[case.perform_call.expected_edges]]
+from = "foo"
+to = "bar"
+type = "direct"
+
+[case.select_target_and_where]
+description = "Function calls in SELECT output column and WHERE clause"
+sql = "cases/select_target_and_where.sql"
+fixed_in = "v0.7.3"
+
+[[case.select_target_and_where.expected_edges]]
+from = "report_users"
+to = "format_name"
+type = "direct"
+
+[[case.select_target_and_where.expected_edges]]
+from = "report_users"
+to = "get_priority"
+type = "direct"
+
+[case.schema_mismatch]
+description = "Schema-qualified definition (biz.func), unqualified call (func) — two-phase resolution"
+sql = "cases/schema_mismatch.sql"
+fixed_in = "v0.7.3"
+
+[[case.schema_mismatch.expected_edges]]
+from = "process_order"
+to = "calc_total"
+type = "direct"
+
+[case.where_subquery]
+description = "Function call inside subquery nested in WHERE clause right side"
+sql = "cases/where_subquery.sql"
+fixed_in = "v0.7.3"
+
+[[case.where_subquery.expected_edges]]
+from = "find_high_value_orders"
+to = "get_threshold"
+type = "direct"
+
+# ── Negative: built-in function NOT captured ──────────────────
+
+[case.builtin_not_captured]
+description = "Built-in COUNT must not be captured as a call edge (builtin filter)"
+sql = "cases/builtin_not_captured.sql"
+fixed_in = "v0.7.3"
+expected_no_call_edges = true

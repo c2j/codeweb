@@ -13,3 +13,4 @@ codeweb.toml
 .codeweb/
 .DS_Store
 .worktrees
+**/*/.codeweb
