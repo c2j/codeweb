@@ -1,21 +1,22 @@
 use std::fs;
 use tempfile::TempDir;
 
-const EXPR_ASSIGNMENT: &str =
-    include_str!("regress/function_call_edges/cases/expr_assignment.sql");
+const EXPR_ASSIGNMENT: &str = include_str!("regress/function_call_edges/cases/expr_assignment.sql");
 const PERFORM_CALL: &str = include_str!("regress/function_call_edges/cases/perform_call.sql");
 const SELECT_TARGET_AND_WHERE: &str =
     include_str!("regress/function_call_edges/cases/select_target_and_where.sql");
-const SCHEMA_MISMATCH: &str =
-    include_str!("regress/function_call_edges/cases/schema_mismatch.sql");
-const WHERE_SUBQUERY: &str =
-    include_str!("regress/function_call_edges/cases/where_subquery.sql");
+const SCHEMA_MISMATCH: &str = include_str!("regress/function_call_edges/cases/schema_mismatch.sql");
+const WHERE_SUBQUERY: &str = include_str!("regress/function_call_edges/cases/where_subquery.sql");
 const BUILTIN_NOT_CAPTURED: &str =
     include_str!("regress/function_call_edges/cases/builtin_not_captured.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    let bin_name = if cfg!(windows) { "codeweb.exe" } else { "codeweb" };
+    let bin_name = if cfg!(windows) {
+        "codeweb.exe"
+    } else {
+        "codeweb"
+    };
     let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
     for entry in entries.flatten() {
         let p = entry.path().join("debug").join(bin_name);
@@ -57,25 +58,24 @@ fn node_id_by_name(json: &serde_json::Value, name: &str) -> Option<usize> {
 }
 
 fn has_direct_edge(json: &serde_json::Value, source: &str, target: &str) -> bool {
-    let (Some(src_id), Some(dst_id)) = (node_id_by_name(json, source), node_id_by_name(json, target))
+    let (Some(src_id), Some(dst_id)) =
+        (node_id_by_name(json, source), node_id_by_name(json, target))
     else {
         return false;
     };
+    json["edges"].as_array().unwrap().iter().any(|e| {
+        e["source"].as_u64() == Some(src_id as u64)
+            && e["target"].as_u64() == Some(dst_id as u64)
+            && e["type"] == "direct"
+    })
+}
+
+fn has_any_direct_or_dynamic_edge(json: &serde_json::Value) -> bool {
     json["edges"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|e| {
-            e["source"].as_u64() == Some(src_id as u64)
-                && e["target"].as_u64() == Some(dst_id as u64)
-                && e["type"] == "direct"
-        })
-}
-
-fn has_any_direct_or_dynamic_edge(json: &serde_json::Value) -> bool {
-    json["edges"].as_array().unwrap().iter().any(|e| {
-        e["type"] == "direct" || e["type"] == "dynamic"
-    })
+        .any(|e| e["type"] == "direct" || e["type"] == "dynamic")
 }
 
 #[test]
