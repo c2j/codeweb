@@ -71,3 +71,8 @@ description = "Built-in COUNT must not be captured as a call edge (builtin filte
 sql = "cases/builtin_not_captured.sql"
 fixed_in = "v0.7.3"
 expected_no_call_edges = true
+
+[case.dbe_xmldom_builtin]
+description = "GaussDB system package dbe_xmldom.* must not spawn Unresolved nodes (builtin system call)"
+sql = "cases/dbe_xmldom_builtin.sql"
+expected_no_unresolved = true

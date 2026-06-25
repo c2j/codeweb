@@ -20,7 +20,8 @@ function_call_edges/
     ├── select_target_and_where.sql
     ├── schema_mismatch.sql
     ├── where_subquery.sql
-    └── builtin_not_captured.sql
+    ├── builtin_not_captured.sql
+    └── dbe_xmldom_builtin.sql
 ```
 
 ## 案例一览
@@ -33,6 +34,7 @@ function_call_edges/
 | `schema_mismatch` | 定义有 schema（`biz.calc_total`），调用无 schema | `process_order → calc_total`（两阶段解析） |
 | `where_subquery` | WHERE 右侧子查询内 | `find_high_value_orders → get_threshold` |
 | `builtin_not_captured` | 内置函数 `COUNT(*)` | 无 call edge（`builtin` 过滤） |
+| `dbe_xmldom_builtin` | GaussDB 系统包 `dbe_xmldom.*`（语句级调用） | 无 Unresolved 节点（系统内置识别） |
 
 ## 添加新案例
 
@@ -51,7 +53,8 @@ to = "callee_name"
 type = "direct"
 ```
 
-3. 负向案例（验证不产生边）使用 `expected_no_call_edges = true`
+3. 负向案例（验证不产生边）使用 `expected_no_call_edges = true`；
+   验证不产生 Unresolved 节点使用 `expected_no_unresolved = true`
 
 ## 运行测试
 
