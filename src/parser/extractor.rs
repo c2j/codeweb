@@ -252,6 +252,20 @@ impl Visitor for CallExtractor {
         }
         VisitorResult::Continue
     }
+
+    fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
+        if let Expr::FunctionCall {
+            name,
+            builtin: None,
+            ..
+        } = expr
+        {
+            if !name.is_empty() {
+                self.push_call(&name.join("."), false, 0);
+            }
+        }
+        VisitorResult::Continue
+    }
 }
 
 impl CallExtractor {
