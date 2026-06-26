@@ -1084,6 +1084,22 @@ impl GraphBuilder {
 
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
+        // Index package SPEC items by lowercased qualified package name so a
+        // package BODY can inherit the spec's public Variable/Type declarations
+        // into its call-edge extraction scope. Spec and body are parsed as
+        // independent statements; without this linkage, a spec-declared symbol
+        // (e.g. `vchar_array`) used in a body procedure is misread as a call.
+        let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
+        for file in files {
+            for info in &file.statements {
+                if let Statement::CreatePackage(pkg) = &info.statement {
+                    spec_items_by_pkg
+                        .entry(pkg_qualified_key(&pkg.name))
+                        .or_insert(&pkg.items);
+                }
+            }
+        }
+
         for file in files {
             let file_sw = std::time::Instant::now();
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -1091,10 +1107,24 @@ impl GraphBuilder {
                 let mut extractor = CallExtractor::new(file_arc.clone(), known_types.clone());
                 match &info.statement {
                     Statement::CreatePackage(pkg) => {
-                        Self::collect_package_call_edges(&pkg.name, &pkg.items, &mut extractor);
+                        Self::collect_package_call_edges(
+                            &pkg.name,
+                            &pkg.items,
+                            &[],
+                            &mut extractor,
+                        );
                     }
                     Statement::CreatePackageBody(pkg) => {
-                        Self::collect_package_call_edges(&pkg.name, &pkg.items, &mut extractor);
+                        let inherited: &[PackageItem] = spec_items_by_pkg
+                            .get(&pkg_qualified_key(&pkg.name))
+                            .copied()
+                            .unwrap_or(&[]);
+                        Self::collect_package_call_edges(
+                            &pkg.name,
+                            &pkg.items,
+                            inherited,
+                            &mut extractor,
+                        );
                     }
                     _ => {
                         walk_statement(&mut extractor, &info.statement);
@@ -1417,6 +1447,7 @@ impl GraphBuilder {
     fn collect_package_call_edges(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
+        inherited_items: &[PackageItem],
         extractor: &mut CallExtractor,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
@@ -1427,16 +1458,19 @@ impl GraphBuilder {
         };
 
         // Pre-pass: package-level Variable/Type names are visible to every
-        // routine in the package. Types are registered once (sticky); variables
-        // must be re-injected per routine because begin_routine_scope clears.
+        // routine in the package. For a BODY, `inherited_items` carries the
+        // matching SPEC's public Variable/Type declarations. Types are
+        // registered once (sticky); variables must be re-injected per routine
+        // because begin_routine_scope clears.
         let pkg_var_names: Vec<String> = pkg_items
             .iter()
+            .chain(inherited_items.iter())
             .filter_map(|item| match item {
                 PackageItem::Variable(v) => Some(v.name.to_lowercase()),
                 _ => None,
             })
             .collect();
-        for item in pkg_items {
+        for item in pkg_items.iter().chain(inherited_items.iter()) {
             if let PackageItem::Type(t) = item {
                 extractor.register_type_name(crate::parser::pl_type_decl_name(t));
             }
@@ -3228,6 +3262,23 @@ fn split_object_name(name: &[ogsql_parser::Ident]) -> (Option<String>, String) {
     }
 }
 
+// Lowercased qualified package name (`schema.pkg`) used as the case-insensitive
+// key for linking a package BODY to its SPEC. Mirrors the key built inline by
+// `create_package_nodes`; kept separate to avoid a wider refactor of that fn.
+fn pkg_qualified_key(name: &ogsql_parser::ast::ObjectName) -> String {
+    let pkg_part = name.last().cloned().unwrap_or_default().to_lowercase();
+    if name.len() > 1 {
+        let schema: String = name[..name.len() - 1]
+            .iter()
+            .map(|i| i.to_string().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{}.{}", schema, pkg_part)
+    } else {
+        pkg_part
+    }
+}
+
 fn edge_call_scope(
     graph: &CodeGraph,
     caller_idx: petgraph::graph::NodeIndex,
@@ -4737,6 +4788,73 @@ mod tests {
             unresolved.is_empty(),
             "package-level TYPE used as constructor in procedure body must not spawn unresolved \
              node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn spec_declared_collection_var_visible_in_body_no_unresolved() {
+        // TYPE + variable declared in the package SPEC; used in the package
+        // BODY. The body extractor must inherit the spec's public symbols so
+        // `vchar_array(1)` is not misread as a procedure call.
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE pkg_specdemo IS
+                TYPE vchartab IS TABLE OF VARCHAR2(4000) INDEX BY INTEGER;
+                vchar_array vchartab;
+            END pkg_specdemo;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_specdemo AS
+                PROCEDURE use_it IS
+                BEGIN
+                    vchar_array(1) := 'x';
+                END use_it;
+            END pkg_specdemo;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "spec-declared collection variable used in body must not spawn unresolved node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn spec_declared_var_visible_in_body_with_pkg_name_case_mismatch() {
+        // Spec and body use DIFFERENT casing for the package name. Spec↔body
+        // linkage must be case-insensitive so the spec's symbols still seed
+        // the body extractor's scope.
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE PKG_SPECCASE IS
+                TYPE vchartab IS TABLE OF VARCHAR2(4000) INDEX BY INTEGER;
+                vchar_array vchartab;
+            END PKG_SPECCASE;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_speccase AS
+                PROCEDURE use_it IS
+                BEGIN
+                    vchar_array(1) := 'x';
+                END use_it;
+            END pkg_speccase;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "spec-declared variable must remain visible to body even when package name casing \
+             differs; got unresolved: {:?}",
             unresolved
         );
     }
