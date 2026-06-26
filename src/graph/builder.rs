@@ -2236,6 +2236,10 @@ impl GraphBuilder {
         // ── Build comprehensive resolution indexes ──
         let mut lower_qualified: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut bare_name_lower: HashMap<String, Vec<petgraph::graph::NodeIndex>> = HashMap::new();
+        let mut bare_name_schemas: HashMap<
+            String,
+            Vec<(Option<String>, petgraph::graph::NodeIndex)>,
+        > = HashMap::new();
         let mut pkg_member_lower: HashMap<(String, String), petgraph::graph::NodeIndex> =
             HashMap::new();
 
@@ -2249,10 +2253,15 @@ impl GraphBuilder {
             // may have been inserted into proc_index during edge creation).
             lower_qualified.entry(qualified_lower).or_insert(idx);
 
+            let name_lower = routine_id.name.to_lowercase();
             bare_name_lower
-                .entry(routine_id.name.to_lowercase())
+                .entry(name_lower.clone())
                 .or_default()
                 .push(idx);
+            bare_name_schemas
+                .entry(name_lower)
+                .or_default()
+                .push((routine_id.schema.as_ref().map(|s| s.to_lowercase()), idx));
 
             if let Some(ref pkg) = routine_id.package {
                 pkg_member_lower
@@ -2290,17 +2299,37 @@ impl GraphBuilder {
                 continue;
             }
 
+            // ── Collect caller schemas from incoming edges for disambiguation ──
+            let caller_schemas: Vec<Option<String>> = graph
+                .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
+                .filter_map(|src| match &graph[src] {
+                    Node::Procedure { id, .. } | Node::Function { id, .. } => {
+                        Some(id.schema.as_ref().map(|s| s.to_lowercase()))
+                    }
+                    _ => None,
+                })
+                .collect();
+
             // ── Try to resolve ──
             if let Some(target_idx) = try_resolve_routine(
                 raw_expr,
                 &lower_qualified,
                 &bare_name_lower,
+                &bare_name_schemas,
                 &pkg_member_lower,
+                &caller_schemas,
             ) {
                 if target_idx == *unres_idx {
                     continue; // shouldn't happen, but guard
                 }
-                // Rewire all edges pointing to/from the unresolved node
+                // Rewire all incoming edges to the resolved target.
+                //
+                // Limitation: when multiple callers in different schemas share
+                // this unresolved node (via proc_index dedup), all edges are
+                // rewired to the SAME target. Strategy 5 picks the target based
+                // on the first caller's schema, so callers in other schemas get
+                // a potentially incorrect edge. Per-edge resolution would fix
+                // this but requires restructuring the rewiring logic.
                 let sources: Vec<_> = graph
                     .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
                     .collect();
@@ -2665,11 +2694,22 @@ fn is_noise_unresolved(raw_expr: &str) -> bool {
 }
 
 /// Multi-strategy routine resolution for unresolved nodes.
+///
+/// Resolution priority:
+/// 1. Case-insensitive exact qualified-name match
+/// 2. Qualified name → bare-name (unique match)
+/// 3. Qualified name → schema-as-package lookup
+/// 4. Unqualified bare name → unique match
+/// 5. Ambiguous bare name → caller-schema disambiguation
+/// 6. Ambiguous bare name → schema=None (default-schema) preference
+/// 7. Ambiguous bare name → first candidate (best-effort)
 fn try_resolve_routine(
     raw_name: &str,
     lower_qualified: &HashMap<String, petgraph::graph::NodeIndex>,
     bare_name_lower: &HashMap<String, Vec<petgraph::graph::NodeIndex>>,
+    bare_name_schemas: &HashMap<String, Vec<(Option<String>, petgraph::graph::NodeIndex)>>,
     pkg_member_lower: &HashMap<(String, String), petgraph::graph::NodeIndex>,
+    caller_schemas: &[Option<String>],
 ) -> Option<petgraph::graph::NodeIndex> {
     let name_lower = raw_name.to_lowercase();
 
@@ -2710,6 +2750,37 @@ fn try_resolve_routine(
             if matches.len() == 1 {
                 return Some(matches[0]);
             }
+        }
+    }
+
+    // Strategy 5–7: Ambiguous bare-name disambiguation.
+    // Extract the bare name to search (handles both qualified and unqualified raw_name).
+    let bare_lookup = raw_name
+        .rsplit_once('.')
+        .map(|(_, bare)| bare.to_lowercase())
+        .unwrap_or_else(|| name_lower.clone());
+
+    if let Some(candidates) = bare_name_schemas.get(&bare_lookup) {
+        if candidates.len() > 1 {
+            // Strategy 5: Prefer candidate in the caller's schema.
+            for caller_schema in caller_schemas.iter().flatten() {
+                if let Some(&(_, idx)) = candidates
+                    .iter()
+                    .find(|(s, _)| s.as_deref() == Some(caller_schema.as_str()))
+                {
+                    return Some(idx);
+                }
+            }
+
+            // Strategy 6: No caller-schema match — prefer schema=None (default schema).
+            if let Some(&(_, idx)) = candidates.iter().find(|(s, _)| s.is_none()) {
+                return Some(idx);
+            }
+
+            // Strategy 7: Truly ambiguous — best-effort: pick first candidate.
+            // For a static code graph this is better than leaving an Unresolved node,
+            // because the user gets a starting point for investigation.
+            return Some(candidates[0].1);
         }
     }
 
