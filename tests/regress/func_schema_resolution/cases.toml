@@ -1,0 +1,54 @@
+# Regression test cases for function/procedure schema-resolution failures.
+#
+# Each [case.<id>] section defines:
+#   description         — what the case verifies
+#   sql                 — path to SQL fixture (relative to this file)
+#   bug                 — which bug(s) this reproduces
+#   [[.expected_edges]] — expected graph edges after fix (from, to, type)
+#   expected_unresolved — expected unresolved node count after fix (0)
+
+# ── Ambiguous bare name: multiple schemas, same function name ──
+
+[case.ambiguous_bare_name]
+description = "Two schemas define same-named func; unqualified call becomes Unresolved (Strategy 4 gives up on ambiguity)"
+sql = "cases/ambiguous_bare_name.sql"
+bug = "#1+#2"
+expected_unresolved = 0
+
+[[case.ambiguous_bare_name.expected_edges]]
+from = "caller_proc"
+to = "util_func"
+type = "direct"
+
+[case.ambiguous_standalone_and_pkg]
+description = "Standalone schema func + package member share bare name; unqualified call unresolved"
+sql = "cases/ambiguous_standalone_and_pkg.sql"
+bug = "#1+#2+#6"
+expected_unresolved = 0
+
+[[case.ambiguous_standalone_and_pkg.expected_edges]]
+from = "do_work"
+to = "helper"
+type = "direct"
+
+[case.caller_schema_disambiguation]
+description = "Caller in schema s1; ambiguous compute() in s1+s2; should resolve to s1.compute via caller schema context"
+sql = "cases/caller_schema_disambiguation.sql"
+bug = "#2"
+expected_unresolved = 0
+
+[[case.caller_schema_disambiguation.expected_edges]]
+from = "run_it"
+to = "compute"
+type = "direct"
+
+[case.multi_schema_same_util]
+description = "Three schemas share same util func name (systemic); unqualified call unresolved"
+sql = "cases/multi_schema_same_util.sql"
+bug = "#1+#2"
+expected_unresolved = 0
+
+[[case.multi_schema_same_util.expected_edges]]
+from = "batch_run"
+to = "format_date"
+type = "direct"
