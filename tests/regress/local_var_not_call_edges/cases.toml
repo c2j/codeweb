@@ -109,3 +109,36 @@ fixed_in = "v0.7.7"
 from = "outer_proc"
 to = "v_shadow"
 type = "direct"
+
+# ── PL/SQL block-local TYPE declarations ─────────────────────
+# CallExtractor.visit_pl_declaration used to swallow PlDeclaration::Type
+# via a catch-all arm, so TYPE names declared inside a DECLARE block never
+# entered `known_types`. Constructor calls like `arr_type(...)` /
+# `t_work_array()` parsed as Expr::FunctionCall and spawned false Unresolved
+# nodes. Distinct from `type_constructor_not_captured`, which only covers
+# top-level CREATE TYPE DDL.
+
+[case.plsql_varray_type_constructor]
+description = "PL/SQL block-local VARRAY TYPE constructor arr_type(...) must NOT be a call edge"
+sql = "cases/plsql_varray_type_constructor.sql"
+fixed_in = "v0.7.8"
+expected_no_call_edges = true
+
+[case.plsql_table_of_type_constructor]
+description = "PL/SQL block-local TABLE OF TYPE constructor t_work_array() must NOT be a call edge"
+sql = "cases/plsql_table_of_type_constructor.sql"
+fixed_in = "v0.7.8"
+expected_no_call_edges = true
+
+# ── Package-level Variable/TYPE visibility ───────────────────
+# collect_package_call_edges skipped PackageItem::Variable / Type, so
+# package-level vars were absent from local_vars. Combined with
+# visit_procedure_call lacking the local_vars/known_types filter, any
+# collection indexing `pkg_var(i)` on a package-level associative array
+# produced a false Unresolved node.
+
+[case.plsql_index_by_pkg_variable]
+description = "Package-level INDEX BY collection variable indexed with pkg_var(i) must NOT be a call edge"
+sql = "cases/plsql_index_by_pkg_variable.sql"
+fixed_in = "v0.7.8"
+expected_no_call_edges = true
