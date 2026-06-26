@@ -31,7 +31,8 @@ local_var_not_call_edges/
     ├── nested_routine_scope_leak.sql
     ├── plsql_varray_type_constructor.sql
     ├── plsql_table_of_type_constructor.sql
-    └── plsql_index_by_pkg_variable.sql
+    ├── plsql_index_by_pkg_variable.sql
+    └── pkg_type_param_and_local_subscript.sql
 ```
 
 ## 案例一览
@@ -49,6 +50,7 @@ local_var_not_call_edges/
 | `plsql_varray_type_constructor` | DECLARE 块内 `TYPE arr_type IS VARRAY(4) OF VARCHAR2(100)` 后 `arr_type(...)` 构造 | 无 call edge（PL/SQL 块级 TYPE 名进入 `known_types`） |
 | `plsql_table_of_type_constructor` | DECLARE 块内 `TYPE t_work_array IS TABLE OF c_work%ROWTYPE` 后 `t_work_array()` 构造 | 无 call edge |
 | `plsql_index_by_pkg_variable` | 包级 `TYPE vchartab_pkg IS TABLE OF ... INDEX BY INTEGER` + 包级变量下标 `vchar_array_pkg(1)` | 无 call edge（包级变量进入 `local_vars`） |
+| `pkg_type_param_and_local_subscript` | 包级 TYPE 作过程参数数据类型 `i_a1 IN vchartab_pkg1` + 局部构造器 `vchartab_pkg1()` + 局部下标 `vchar(1)` | 无 call edge（参数 + 局部变量 + 构造器三重过滤） |
 
 ## 添加新案例
 
