@@ -1085,6 +1085,7 @@ impl GraphBuilder {
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
         for file in files {
+            let file_sw = std::time::Instant::now();
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
                 let mut extractor = CallExtractor::new(file_arc.clone(), known_types.clone());
@@ -1150,6 +1151,18 @@ impl GraphBuilder {
                     }
                     _ => {}
                 }
+            }
+            let extract_elapsed = file_sw.elapsed();
+            if extract_elapsed > crate::parse_log::SLOW_FILE_THRESHOLD {
+                crate::parse_log::warn(
+                    &file.path.display().to_string(),
+                    &format!(
+                        "slow extract: call-edge + table-access extraction took {:.2}s ({} \
+                         statements) — inspect for pathological EXECUTE IMMEDIATE / dynamic-SQL",
+                        extract_elapsed.as_secs_f64(),
+                        file.statements.len()
+                    ),
+                );
             }
         }
 

@@ -3,6 +3,12 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// A per-file parse or extraction step is flagged "slow" past this duration so
+/// future pathological inputs surface here immediately instead of presenting
+/// as a hang. Shared by the parse phase (`loader::parse_file`) and the extract
+/// phase (`builder::create_sql_edges`).
+pub const SLOW_FILE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
 static LOG: Mutex<Option<File>> = Mutex::new(None);
 static WARN_COUNT: Mutex<usize> = Mutex::new(0);
 static ERROR_COUNT: Mutex<usize> = Mutex::new(0);
