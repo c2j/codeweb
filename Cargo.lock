@@ -1144,8 +1144,8 @@ dependencies = [
 
 [[package]]
 name = "ogsql-parser"
-version = "0.8.7"
-source = "git+https://github.com/c2j/ogsql-parser?tag=v0.8.7#d5d552076c56ff816071994e6f653ab36028fb0d"
+version = "0.8.8"
+source = "git+https://github.com/c2j/ogsql-parser?tag=v0.8.8#87fae318c7595069e1c7b62926e8ac7212037d71"
 dependencies = [
  "encoding_rs",
  "phf",
