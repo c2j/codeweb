@@ -1,6 +1,6 @@
 [package]
 name = "codeweb"
-version = "0.7.10"
+version = "0.7.11"
 edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
 
@@ -20,7 +20,7 @@ jsp = []
 search-sql-v2 = []
 
 [dependencies]
-ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", tag = "v0.8.8", features = ["ibatis", "java"] }
+ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", tag = "v0.8.9", features = ["ibatis", "java"] }
 petgraph = { version = "0.7", features = ["serde-1"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
