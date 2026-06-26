@@ -1,0 +1,42 @@
+# Regression test cases for package head/body casing mismatch.
+#
+# Each [case.<id>] section defines:
+#   description       — what the case verifies
+#   sql               — path to SQL fixture (relative to this file)
+#   fixed_in          — version that fixed the bug
+#   [[.expected_edges]] — expected graph edges (from, to, type)
+
+[case.pkg_name_casing_mismatch]
+description = "Package name casing differs between head (my_pkg) and body (MY_PKG): must merge into 1 node"
+sql = "cases/pkg_name_casing_mismatch.sql"
+fixed_in = "v0.8.0"
+
+[case.proc_name_casing_mismatch]
+description = "Procedure name casing differs between head (proc_a) and body (Proc_A): must merge into 1 node"
+sql = "cases/proc_name_casing_mismatch.sql"
+fixed_in = "v0.8.0"
+
+[case.pkg_call_edge_casing]
+description = "Package head/body with mismatched casing + caller: call edge must resolve correctly"
+sql = "cases/pkg_call_edge_casing.sql"
+fixed_in = "v0.8.0"
+
+[[case.pkg_call_edge_casing.expected_edges]]
+from = "caller_proc"
+to = "helper"
+type = "direct"
+
+[case.procedure_casing_mismatch]
+description = "Standalone procedure name casing: my_test_proc vs MY_TEST_PROC must merge into 1 node"
+sql = "cases/procedure_casing_mismatch.sql"
+fixed_in = "v0.8.0"
+
+[case.type_casing_mismatch]
+description = "TYPE name casing: my_test_type vs MY_TEST_TYPE must merge into 1 node"
+sql = "cases/type_casing_mismatch.sql"
+fixed_in = "v0.8.0"
+
+[case.sequence_casing_mismatch]
+description = "SEQUENCE name casing: my_test_seq vs MY_TEST_SEQ must merge into 1 node"
+sql = "cases/sequence_casing_mismatch.sql"
+fixed_in = "v0.8.0"
