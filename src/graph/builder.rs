@@ -218,9 +218,9 @@ impl GraphBuilder {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        proc_index.entry(id.clone()).or_insert_with(|| {
+                        proc_index.entry(id.normalized()).or_insert_with(|| {
                             let node = Node::Procedure {
-                                id,
+                                id: id.normalized(),
                                 location: SourceLocation {
                                     file: file_arc.clone(),
                                     line: info.start_line,
@@ -247,9 +247,9 @@ impl GraphBuilder {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        proc_index.entry(id.clone()).or_insert_with(|| {
+                        proc_index.entry(id.normalized()).or_insert_with(|| {
                             let node = Node::Function {
-                                id,
+                                id: id.normalized(),
                                 location: SourceLocation {
                                     file: file_arc.clone(),
                                     line: info.start_line,
@@ -270,15 +270,25 @@ impl GraphBuilder {
                             proc_index,
                             package_index,
                         );
-                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_string();
+                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_lowercase();
                         for item in &pkg.items {
                             let (name, kind) = match item {
-                                PackageItem::Procedure(p) => {
-                                    (p.name.join("."), RoutineKind::Procedure)
-                                }
-                                PackageItem::Function(f) => {
-                                    (f.name.join("."), RoutineKind::Function)
-                                }
+                                PackageItem::Procedure(p) => (
+                                    p.name
+                                        .iter()
+                                        .map(|i| i.to_string().to_lowercase())
+                                        .collect::<Vec<_>>()
+                                        .join("."),
+                                    RoutineKind::Procedure,
+                                ),
+                                PackageItem::Function(f) => (
+                                    f.name
+                                        .iter()
+                                        .map(|i| i.to_string().to_lowercase())
+                                        .collect::<Vec<_>>()
+                                        .join("."),
+                                    RoutineKind::Function,
+                                ),
                                 PackageItem::Raw(_)
                                 | PackageItem::Variable(_)
                                 | PackageItem::Type(_) => continue,
@@ -297,11 +307,21 @@ impl GraphBuilder {
                             proc_index,
                             package_index,
                         );
-                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_string();
+                        let pkg_name = pkg.name.last().cloned().unwrap_or_default().to_lowercase();
                         for item in &pkg.items {
                             let name = match item {
-                                PackageItem::Procedure(p) => p.name.join("."),
-                                PackageItem::Function(f) => f.name.join("."),
+                                PackageItem::Procedure(p) => p
+                                    .name
+                                    .iter()
+                                    .map(|i| i.to_string().to_lowercase())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                PackageItem::Function(f) => f
+                                    .name
+                                    .iter()
+                                    .map(|i| i.to_string().to_lowercase())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
                                 PackageItem::Raw(_)
                                 | PackageItem::Variable(_)
                                 | PackageItem::Type(_) => continue,
@@ -322,7 +342,7 @@ impl GraphBuilder {
 
                         let func_id =
                             RoutineId::from_object_name(&t.func_name, RoutineKind::Function);
-                        let func_idx = proc_index.get(&func_id).copied().unwrap_or_else(|| {
+                        let func_idx = proc_index.get(&func_id.normalized()).copied().unwrap_or_else(|| {
                             let raw = t.func_name.join(".");
                             let snippet = crate::parser::snippet::read_snippet(
                                 &file.path,
@@ -353,7 +373,7 @@ impl GraphBuilder {
                                 context: Box::new(format!("trigger:{}", t.name)),
                             };
                             let idx = graph.add_node(unresolved);
-                            proc_index.insert(func_id, idx);
+                            proc_index.insert(func_id.normalized(), idx);
                             idx
                         });
 
@@ -433,50 +453,48 @@ impl GraphBuilder {
                     }
                     Statement::CreateType(t) => {
                         let (schema, name) = split_object_name(&t.name);
-                        let type_kind = match &t.type_kind {
-                            ogsql_parser::ast::TypeKind::Composite { .. } => "composite",
-                            ogsql_parser::ast::TypeKind::Enum { .. } => "enum",
-                            ogsql_parser::ast::TypeKind::Base { .. } => "base",
-                            ogsql_parser::ast::TypeKind::Table { .. } => "table",
-                            ogsql_parser::ast::TypeKind::Range { .. } => "range",
-                            ogsql_parser::ast::TypeKind::Shell => "shell",
-                        };
-                        let type_node = Node::Type {
-                            schema: schema.clone(),
-                            name: name.clone(),
-                            type_kind: type_kind.to_string(),
-                            location: SourceLocation {
-                                file: file_arc.clone(),
-                                line: info.start_line,
-                            },
-                        };
-                        let idx = graph.add_node(type_node);
-                        let short_key = name.clone();
-                        let full_key = match &schema {
-                            Some(s) => format!("{}.{}", s, name),
-                            None => name.clone(),
-                        };
-                        type_index.entry(short_key).or_insert(idx);
-                        type_index.entry(full_key).or_insert(idx);
+                        let short_key = normalize_object_key(None, &name);
+                        let full_key = normalize_object_key(schema.as_deref(), &name);
+                        if !type_index.contains_key(&full_key) {
+                            let type_kind = match &t.type_kind {
+                                ogsql_parser::ast::TypeKind::Composite { .. } => "composite",
+                                ogsql_parser::ast::TypeKind::Enum { .. } => "enum",
+                                ogsql_parser::ast::TypeKind::Base { .. } => "base",
+                                ogsql_parser::ast::TypeKind::Table { .. } => "table",
+                                ogsql_parser::ast::TypeKind::Range { .. } => "range",
+                                ogsql_parser::ast::TypeKind::Shell => "shell",
+                            };
+                            let type_node = Node::Type {
+                                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                                name: name.to_lowercase(),
+                                type_kind: type_kind.to_string(),
+                                location: SourceLocation {
+                                    file: file_arc.clone(),
+                                    line: info.start_line,
+                                },
+                            };
+                            let idx = graph.add_node(type_node);
+                            type_index.entry(short_key).or_insert(idx);
+                            type_index.insert(full_key, idx);
+                        }
                     }
                     Statement::CreateSequence(s) => {
                         let (schema, name) = split_object_name(&s.name);
-                        let seq_node = Node::Sequence {
-                            schema: schema.clone(),
-                            name: name.clone(),
-                            location: SourceLocation {
-                                file: file_arc.clone(),
-                                line: info.start_line,
-                            },
-                        };
-                        let idx = graph.add_node(seq_node);
-                        let short_key = name.clone();
-                        let full_key = match &schema {
-                            Some(sc) => format!("{}.{}", sc, name),
-                            None => name.clone(),
-                        };
-                        sequence_index.entry(short_key).or_insert(idx);
-                        sequence_index.entry(full_key).or_insert(idx);
+                        let short_key = normalize_object_key(None, &name);
+                        let full_key = normalize_object_key(schema.as_deref(), &name);
+                        if !sequence_index.contains_key(&full_key) {
+                            let seq_node = Node::Sequence {
+                                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                                name: name.to_lowercase(),
+                                location: SourceLocation {
+                                    file: file_arc.clone(),
+                                    line: info.start_line,
+                                },
+                            };
+                            let idx = graph.add_node(seq_node);
+                            sequence_index.entry(short_key).or_insert(idx);
+                            sequence_index.insert(full_key, idx);
+                        }
                     }
                     Statement::CreateIndex(i) => {
                         let idx_name = i
@@ -820,17 +838,23 @@ impl GraphBuilder {
                         let target_key =
                             normalize_table_key(target_schema.as_deref(), &target_name);
                         let target_idx = proc_index
-                            .get(&RoutineId::from_qualified_name(
-                                &target_key,
-                                RoutineKind::Procedure,
-                            ))
+                            .get(
+                                &RoutineId::from_qualified_name(
+                                    &target_key,
+                                    RoutineKind::Procedure,
+                                )
+                                .normalized(),
+                            )
                             .copied()
                             .or_else(|| {
                                 proc_index
-                                    .get(&RoutineId::from_qualified_name(
-                                        &target_key,
-                                        RoutineKind::Function,
-                                    ))
+                                    .get(
+                                        &RoutineId::from_qualified_name(
+                                            &target_key,
+                                            RoutineKind::Function,
+                                        )
+                                        .normalized(),
+                                    )
                                     .copied()
                             })
                             .or_else(|| table_index.get(&target_key).copied())
@@ -910,7 +934,9 @@ impl GraphBuilder {
                         name: routine_name.clone(),
                         kind: *kind,
                     };
-                    if !proc_index.contains_key(&routine_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        proc_index.entry(routine_id.normalized())
+                    {
                         let file_str = file.path.to_string_lossy().to_string();
                         crate::parse_log::warn(
                             &file_str,
@@ -921,7 +947,7 @@ impl GraphBuilder {
                         );
                         let node = match kind {
                             RoutineKind::Procedure => Node::Procedure {
-                                id: routine_id.clone(),
+                                id: routine_id.clone().normalized(),
                                 location: SourceLocation {
                                     file: file_arc.clone(),
                                     line: 0,
@@ -930,7 +956,7 @@ impl GraphBuilder {
                                 body_sql: Vec::new(),
                             },
                             RoutineKind::Function => Node::Function {
-                                id: routine_id.clone(),
+                                id: routine_id.clone().normalized(),
                                 location: SourceLocation {
                                     file: file_arc.clone(),
                                     line: 0,
@@ -940,7 +966,7 @@ impl GraphBuilder {
                             },
                         };
                         let idx = graph.add_node(node);
-                        proc_index.insert(routine_id.clone(), idx);
+                        e.insert(idx);
 
                         if let Some(&pkg_idx) = package_index.get(pkg_name) {
                             graph.add_edge(pkg_idx, idx, Edge::ContainsRoutine);
@@ -960,14 +986,20 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         package_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
+        let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_lowercase();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
-            Some(pkg_name[..pkg_name.len() - 1].join("."))
+            Some(
+                pkg_name[..pkg_name.len() - 1]
+                    .iter()
+                    .map(|i| i.to_string().to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
         } else {
             None
         };
         let qualified = match &schema_part {
-            Some(s) => format!("{}.{}", s, pkg_name_part),
+            Some(ref s) => format!("{}.{}", s, pkg_name_part),
             None => pkg_name_part.clone(),
         };
 
@@ -1011,10 +1043,10 @@ impl GraphBuilder {
                 name: proc_name,
                 kind,
             };
-            let proc_idx = proc_index.entry(proc_id.clone()).or_insert_with(|| {
+            let proc_idx = proc_index.entry(proc_id.normalized()).or_insert_with(|| {
                 let node = match kind {
                     RoutineKind::Procedure => Node::Procedure {
-                        id: proc_id.clone(),
+                        id: proc_id.clone().normalized(),
                         location: SourceLocation {
                             file: file_path.clone(),
                             line: start_line,
@@ -1023,7 +1055,7 @@ impl GraphBuilder {
                         body_sql,
                     },
                     RoutineKind::Function => Node::Function {
-                        id: proc_id.clone(),
+                        id: proc_id.clone().normalized(),
                         location: SourceLocation {
                             file: file_path.clone(),
                             line: start_line,
@@ -1050,7 +1082,7 @@ impl GraphBuilder {
     ) {
         let mut all_edges = Vec::new();
 
-        let known_types: HashSet<String> = type_index.keys().map(|k| k.to_lowercase()).collect();
+        let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -1072,7 +1104,7 @@ impl GraphBuilder {
                 match &info.statement {
                     Statement::CreateProcedure(p) => {
                         let proc_id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
-                        if let Some(&proc_idx) = proc_index.get(&proc_id) {
+                        if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
                             Self::collect_table_access_from_statements(
                                 std::slice::from_ref(info),
                                 &file_arc,
@@ -1084,7 +1116,7 @@ impl GraphBuilder {
                     }
                     Statement::CreateFunction(f) => {
                         let proc_id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
-                        if let Some(&proc_idx) = proc_index.get(&proc_id) {
+                        if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
                             Self::collect_table_access_from_statements(
                                 std::slice::from_ref(info),
                                 &file_arc,
@@ -1144,9 +1176,11 @@ impl GraphBuilder {
                         if let Some(ref block) = p.block {
                             walk_pl_block(&mut extractor, block);
                         }
-                        if let Some(&proc_idx) = proc_index.get(&proc_id) {
+                        if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
                             for param in &p.parameters {
-                                if let Some(&type_idx) = type_index.get(&param.data_type) {
+                                if let Some(&type_idx) =
+                                    type_index.get(&param.data_type.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         type_idx,
@@ -1160,7 +1194,9 @@ impl GraphBuilder {
                                 }
                             }
                             for type_ref in &extractor.type_refs {
-                                if let Some(&type_idx) = type_index.get(&type_ref.type_name) {
+                                if let Some(&type_idx) =
+                                    type_index.get(&type_ref.type_name.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         type_idx,
@@ -1174,7 +1210,9 @@ impl GraphBuilder {
                                 }
                             }
                             for seq_ref in &extractor.sequence_refs {
-                                if let Some(&seq_idx) = sequence_index.get(&seq_ref.sequence_name) {
+                                if let Some(&seq_idx) =
+                                    sequence_index.get(&seq_ref.sequence_name.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         seq_idx,
@@ -1195,9 +1233,11 @@ impl GraphBuilder {
                         if let Some(ref block) = f.block {
                             walk_pl_block(&mut extractor, block);
                         }
-                        if let Some(&proc_idx) = proc_index.get(&proc_id) {
+                        if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
                             for param in &f.parameters {
-                                if let Some(&type_idx) = type_index.get(&param.data_type) {
+                                if let Some(&type_idx) =
+                                    type_index.get(&param.data_type.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         type_idx,
@@ -1211,7 +1251,7 @@ impl GraphBuilder {
                                 }
                             }
                             if let Some(ref ret_type) = f.return_type {
-                                if let Some(&type_idx) = type_index.get(ret_type) {
+                                if let Some(&type_idx) = type_index.get(&ret_type.to_lowercase()) {
                                     graph.add_edge(
                                         proc_idx,
                                         type_idx,
@@ -1225,7 +1265,9 @@ impl GraphBuilder {
                                 }
                             }
                             for type_ref in &extractor.type_refs {
-                                if let Some(&type_idx) = type_index.get(&type_ref.type_name) {
+                                if let Some(&type_idx) =
+                                    type_index.get(&type_ref.type_name.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         type_idx,
@@ -1239,7 +1281,9 @@ impl GraphBuilder {
                                 }
                             }
                             for seq_ref in &extractor.sequence_refs {
-                                if let Some(&seq_idx) = sequence_index.get(&seq_ref.sequence_name) {
+                                if let Some(&seq_idx) =
+                                    sequence_index.get(&seq_ref.sequence_name.to_lowercase())
+                                {
                                     graph.add_edge(
                                         proc_idx,
                                         seq_idx,
@@ -1315,7 +1359,7 @@ impl GraphBuilder {
                 name: proc_name,
                 kind,
             };
-            let Some(proc_idx) = proc_index.get(&proc_id).copied() else {
+            let Some(proc_idx) = proc_index.get(&proc_id.normalized()).copied() else {
                 continue;
             };
             let Some(ref block) = block else {
@@ -1327,7 +1371,7 @@ impl GraphBuilder {
             walk_pl_block(&mut extractor, block);
 
             for type_ref in &extractor.type_refs {
-                if let Some(&type_idx) = type_index.get(&type_ref.type_name) {
+                if let Some(&type_idx) = type_index.get(&type_ref.type_name.to_lowercase()) {
                     graph.add_edge(
                         proc_idx,
                         type_idx,
@@ -1341,7 +1385,7 @@ impl GraphBuilder {
                 }
             }
             for seq_ref in &extractor.sequence_refs {
-                if let Some(&seq_idx) = sequence_index.get(&seq_ref.sequence_name) {
+                if let Some(&seq_idx) = sequence_index.get(&seq_ref.sequence_name.to_lowercase()) {
                     graph.add_edge(
                         proc_idx,
                         seq_idx,
@@ -1445,7 +1489,7 @@ impl GraphBuilder {
             seen.insert(key, edge.location.line);
 
             let caller_idx = edge.caller.as_ref().and_then(|id| {
-                proc_index.get(id).copied().or_else(|| {
+                proc_index.get(&id.normalized()).copied().or_else(|| {
                     let alt_kind = match id.kind {
                         RoutineKind::Procedure => RoutineKind::Function,
                         RoutineKind::Function => RoutineKind::Procedure,
@@ -1456,19 +1500,19 @@ impl GraphBuilder {
                         name: id.name.clone(),
                         kind: alt_kind,
                     };
-                    proc_index.get(&alt_id).copied()
+                    proc_index.get(&alt_id.normalized()).copied()
                 })
             });
 
             let callee_id =
                 RoutineId::from_qualified_name(&edge.callee_name, RoutineKind::Procedure);
             let callee_idx = proc_index
-                .get(&callee_id)
+                .get(&callee_id.normalized())
                 .copied()
                 .or_else(|| {
                     let func_id =
                         RoutineId::from_qualified_name(&edge.callee_name, RoutineKind::Function);
-                    proc_index.get(&func_id).copied()
+                    proc_index.get(&func_id.normalized()).copied()
                 })
                 .or_else(|| {
                     if callee_id.schema.is_some() && callee_id.package.is_none() {
@@ -1478,7 +1522,7 @@ impl GraphBuilder {
                             name: callee_id.name.clone(),
                             kind: RoutineKind::Procedure,
                         };
-                        proc_index.get(&alt_id).copied()
+                        proc_index.get(&alt_id.normalized()).copied()
                     } else {
                         None
                     }
@@ -1585,7 +1629,7 @@ impl GraphBuilder {
                         ),
                     };
                     let to = graph.add_node(unresolved_node);
-                    proc_index.insert(callee_id, to);
+                    proc_index.insert(callee_id.normalized(), to);
 
                     let g_edge = if edge.is_dynamic {
                         Edge::DynamicCall {
@@ -1670,7 +1714,7 @@ impl GraphBuilder {
                     for callee_name in calls {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
-                        let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                        let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
                             let snippet = crate::parser::snippet::read_snippet(
                                 xml_path.as_ref(),
                                 stmt.line,
@@ -1835,7 +1879,7 @@ impl GraphBuilder {
                     for callee_name in calls {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
-                        let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                        let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
                             let snippet = crate::parser::snippet::read_snippet(
                                 java_path.as_ref(),
                                 extraction.origin.line,
@@ -1959,7 +2003,7 @@ impl GraphBuilder {
                 name: proc_name,
                 kind,
             };
-            if let Some(&proc_idx) = proc_index.get(&proc_id) {
+            if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
                 if let Some(ref block) = block {
                     let block_stmt = ogsql_parser::StatementInfo {
                         sql_text: String::new(),
@@ -2099,7 +2143,7 @@ impl GraphBuilder {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
-                                ctx.proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                                ctx.proc_index.entry(callee_id.normalized()).or_insert_with(|| {
                                     let snippet = crate::parser::snippet::read_snippet(
                                         jsp_path.as_ref(),
                                         extraction.origin.line,
@@ -3149,6 +3193,14 @@ fn normalize_table_key(schema: Option<&str>, name: &str) -> String {
     }
 }
 
+/// Normalize a non-table object key for case-insensitive lookup.
+fn normalize_object_key(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", s.to_lowercase(), name.to_lowercase()),
+        None => name.to_lowercase(),
+    }
+}
+
 fn split_object_name(name: &[ogsql_parser::Ident]) -> (Option<String>, String) {
     if name.len() <= 1 {
         (
@@ -4041,10 +4093,10 @@ mod tests {
         let proc_create: Vec<_> = graph
             .node_indices()
             .filter(
-                |i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "MT_541_CREATE"),
+                |i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "mt_541_create"),
             )
             .collect();
-        assert_eq!(proc_create.len(), 1, "Expected MT_541_CREATE procedure");
+        assert_eq!(proc_create.len(), 1, "Expected mt_541_create procedure");
     }
 
     #[test]
