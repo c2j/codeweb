@@ -7,7 +7,7 @@ use ogsql_parser::ast::{
     TableRef as AstTableRef, UpdateStatement, WhenClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -166,6 +166,13 @@ pub struct CallExtractor {
     /// call or `type_name.method(...)` member call is not a procedure/function
     /// call edge and must be filtered.
     known_types: HashSet<String>,
+    /// Variable → set-of-literal-values mapping for tracking assignments.
+    /// `v_sql := 'CALL proc()'` stores {"CALL proc()"}.
+    /// At IF/ELSE merge points the set accumulates values from all branches
+    /// (sound over-approximation). Used to resolve EXECUTE IMMEDIATE v_sql
+    /// into DirectCall edges for every tracked value containing a CALL.
+    /// Cleared on begin_routine_scope.
+    var_values: HashMap<String, HashSet<String>>,
 }
 
 impl CallExtractor {
@@ -176,6 +183,7 @@ impl CallExtractor {
             file,
             local_vars: HashSet::new(),
             known_types,
+            var_values: HashMap::new(),
         }
     }
 
@@ -194,6 +202,7 @@ impl CallExtractor {
     /// sibling or enclosing scopes.
     pub fn begin_routine_scope(&mut self, params: &[RoutineParam]) {
         self.local_vars.clear();
+        self.var_values.clear();
         for param in params {
             self.local_vars.insert(param.name.to_lowercase());
         }
@@ -233,6 +242,59 @@ impl CallExtractor {
             }
         }
     }
+
+    /// Extract ALL possible concrete literal strings from an expression.
+    ///
+    /// Handles:
+    /// - Direct string literals
+    /// - `||` concatenation (cartesian product when both sides have multiple values)
+    /// - Variable chain resolution (looks up [`var_values`])
+    /// - `CASE` expressions (collects result values from all WHEN/ELSE branches)
+    ///
+    /// Returns an empty Vec when no literal value can be statically determined.
+    /// A Vec with multiple entries means the value is non-deterministic
+    /// (e.g. different IF/ELSE branches, CASE with different WHEN values).
+    fn extract_all_literal_strings(&self, expr: &Expr) -> Vec<String> {
+        match expr {
+            Expr::Literal(Literal::String(s)) => vec![s.clone()],
+            Expr::BinaryOp {
+                left, op, right, ..
+            } if op.trim() == "||" => {
+                let left_vals = self.extract_all_literal_strings(left);
+                let right_vals = self.extract_all_literal_strings(right);
+                if left_vals.is_empty() || right_vals.is_empty() {
+                    return vec![];
+                }
+                let mut result = Vec::with_capacity(left_vals.len() * right_vals.len());
+                for l in &left_vals {
+                    for r in &right_vals {
+                        result.push(format!("{}{}", l, r));
+                    }
+                }
+                result
+            }
+            Expr::PlVariable(names) => {
+                let var_name = names.join(".").to_lowercase();
+                self.var_values
+                    .get(&var_name)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default()
+            }
+            Expr::Case {
+                whens, else_expr, ..
+            } => {
+                let mut result = Vec::new();
+                for wc in whens {
+                    result.extend(self.extract_all_literal_strings(&wc.result));
+                }
+                if let Some(else_expr) = else_expr {
+                    result.extend(self.extract_all_literal_strings(else_expr));
+                }
+                result
+            }
+            _ => vec![],
+        }
+    }
 }
 
 /// Extract the declared name from any `PlTypeDecl` variant.
@@ -267,6 +329,13 @@ impl Visitor for CallExtractor {
         match decl {
             PlDeclaration::Variable(v) => {
                 self.local_vars.insert(v.name.to_lowercase());
+                if let Some(ref default) = v.default {
+                    let values = self.extract_all_literal_strings(default);
+                    if !values.is_empty() {
+                        self.var_values
+                            .insert(v.name.to_lowercase(), values.into_iter().collect());
+                    }
+                }
                 VisitorResult::Continue
             }
             PlDeclaration::Cursor(c) => {
@@ -283,21 +352,25 @@ impl Visitor for CallExtractor {
             // prevent this by returning SkipChildren and manually walking
             // the nested block with a save/restore barrier.
             PlDeclaration::NestedProcedure(p) => {
-                let saved = std::mem::take(&mut self.local_vars);
+                let saved_vars = std::mem::take(&mut self.local_vars);
+                let saved_values = std::mem::take(&mut self.var_values);
                 self.begin_routine_scope(&p.parameters);
                 if let Some(ref block) = p.block {
                     ogsql_parser::walk_pl_block(self, block);
                 }
-                self.local_vars = saved;
+                self.local_vars = saved_vars;
+                self.var_values = saved_values;
                 VisitorResult::SkipChildren
             }
             PlDeclaration::NestedFunction(f) => {
-                let saved = std::mem::take(&mut self.local_vars);
+                let saved_vars = std::mem::take(&mut self.local_vars);
+                let saved_values = std::mem::take(&mut self.var_values);
                 self.begin_routine_scope(&f.parameters);
                 if let Some(ref block) = f.block {
                     ogsql_parser::walk_pl_block(self, block);
                 }
-                self.local_vars = saved;
+                self.local_vars = saved_vars;
+                self.var_values = saved_values;
                 VisitorResult::SkipChildren
             }
             PlDeclaration::Type(t) => {
@@ -328,6 +401,89 @@ impl Visitor for CallExtractor {
 
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
         match stmt {
+            // ── Assignment: track variable values ──
+            // Target is a PL variable: v := expr
+            PlStatement::Assignment {
+                target: Expr::PlVariable(names),
+                expression,
+            } => {
+                let var_name = names.join(".").to_lowercase();
+                let values = self.extract_all_literal_strings(expression);
+                if !values.is_empty() {
+                    // Sequential assignment REPLACES the set (last wins)
+                    self.var_values
+                        .insert(var_name, values.into_iter().collect());
+                }
+            }
+            // Target is a record field: r.field := expr
+            PlStatement::Assignment {
+                target: Expr::FieldAccess { object, field },
+                expression,
+            } => {
+                if let Expr::PlVariable(record_name) = object.as_ref() {
+                    let compound = format!("{}.{}", record_name.join("."), field).to_lowercase();
+                    let values = self.extract_all_literal_strings(expression);
+                    if !values.is_empty() {
+                        self.var_values
+                            .insert(compound, values.into_iter().collect());
+                    }
+                }
+            }
+
+            // ── IF/ELSE: branch-aware value set merging ──
+            // NOTE: Must use walk_pl_statement (not visit_pl_statement) so that
+            // child-walking happens: visit_procedure_call for ProcedureCall,
+            // walk_expr for expression children, nested IF branch merging, etc.
+            // The walk function calls visit_pl_statement first, then walks
+            // children on Continue. Our SkipChildren from nested IF handlers
+            // is still respected (walk function short-circuits on SkipChildren).
+            PlStatement::If(spanned) => {
+                let node = &spanned.node;
+                // Snapshot state before IF
+                let pre_snapshot = self.var_values.clone();
+                let mut branch_states: Vec<HashMap<String, HashSet<String>>> = Vec::new();
+
+                // Walk THEN branch
+                self.var_values = pre_snapshot.clone();
+                for s in &node.then_stmts {
+                    ogsql_parser::walk_pl_statement(self, s);
+                }
+                branch_states.push(std::mem::take(&mut self.var_values));
+
+                // Walk ELSIF branches
+                for elsif in &node.elsifs {
+                    self.var_values = pre_snapshot.clone();
+                    for s in &elsif.stmts {
+                        ogsql_parser::walk_pl_statement(self, s);
+                    }
+                    branch_states.push(std::mem::take(&mut self.var_values));
+                }
+
+                // Walk ELSE branch (even if absent, restores baseline)
+                self.var_values = pre_snapshot.clone();
+                for s in &node.else_stmts {
+                    ogsql_parser::walk_pl_statement(self, s);
+                }
+                branch_states.push(std::mem::take(&mut self.var_values));
+
+                // Merge: for each variable, UNION values across all branches.
+                // Since each branch starts from the same pre-snapshot,
+                // variables assigned in AT LEAST one branch accumulate all
+                // branch-specific values — a sound over-approximation.
+                // Variables not assigned in any branch keep the pre-snapshot
+                // value (single, from every branch starting point).
+                let mut merged: HashMap<String, HashSet<String>> = HashMap::new();
+                for state in &branch_states {
+                    for (k, vals) in state {
+                        let entry = merged.entry(k.clone()).or_default();
+                        entry.extend(vals.iter().cloned());
+                    }
+                }
+                self.var_values = merged;
+                return VisitorResult::SkipChildren;
+            }
+
+            // ── EXECUTE IMMEDIATE: resolve variable content ──
             PlStatement::Execute(ogsql_parser::ast::Spanned {
                 node:
                     PlExecuteStmt {
@@ -337,12 +493,62 @@ impl Visitor for CallExtractor {
                     },
                 ..
             }) => {
-                let raw = format!("{:?}", peel_parenthesized(string_expr));
-                self.push_call(&raw, true, 0);
+                let mut peeled = peel_parenthesized(string_expr);
+                // Unwrap TypeCast to get the inner expression
+                // (e.g., CAST(v_sql AS VARCHAR2) → v_sql)
+                if let Expr::TypeCast { expr, .. } = peeled {
+                    peeled = expr.as_ref();
+                }
+                let mut resolved = false;
+
+                // Resolve via PL variable reference
+                if let Expr::PlVariable(names) = peeled {
+                    let var_name = names.join(".").to_lowercase();
+                    // Clone to avoid borrow conflict with extract_call_from_sql_text
+                    let candidates: Vec<String> = self
+                        .var_values
+                        .get(&var_name)
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default();
+                    for sql_text in &candidates {
+                        self.extract_call_from_sql_text(sql_text);
+                    }
+                    if !candidates.is_empty() {
+                        resolved = true;
+                    }
+                }
+
+                // Resolve via record.field reference: r.sql_text
+                if let Expr::FieldAccess { object, field } = peeled {
+                    if let Expr::PlVariable(record_name) = object.as_ref() {
+                        let compound =
+                            format!("{}.{}", record_name.join("."), field).to_lowercase();
+                        let candidates: Vec<String> = self
+                            .var_values
+                            .get(&compound)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or_default();
+                        for sql_text in &candidates {
+                            self.extract_call_from_sql_text(sql_text);
+                        }
+                        if !candidates.is_empty() {
+                            resolved = true;
+                        }
+                    }
+                }
+
+                // Fallback: unresolvable → dynamic call (noise_rule filters)
+                if !resolved {
+                    let raw = format!("{:?}", peeled);
+                    self.push_call(&raw, true, 0);
+                }
             }
+
+            // ── Direct SQL text ──
             PlStatement::Sql(sql_text) => {
                 self.extract_call_from_sql_text(sql_text);
             }
+
             _ => {}
         }
         VisitorResult::Continue
