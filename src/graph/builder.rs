@@ -324,11 +324,28 @@ impl GraphBuilder {
                             RoutineId::from_object_name(&t.func_name, RoutineKind::Function);
                         let func_idx = proc_index.get(&func_id).copied().unwrap_or_else(|| {
                             let raw = t.func_name.join(".");
+                            let snippet = crate::parser::snippet::read_snippet(
+                                &file.path,
+                                info.start_line,
+                                1,
+                            );
+                            let suffix = unresolved_creation_suffix(
+                                Some((
+                                    func_id.schema.as_deref(),
+                                    func_id.package.as_deref(),
+                                    &func_id.name,
+                                )),
+                                snippet.as_deref(),
+                            );
                             crate::parse_log::warn(
-                                &file.path.to_string_lossy(),
                                 &format!(
-                                    "unresolved: trigger '{}' references function '{}' not found in parsed files",
-                                    t.name, raw
+                                    "{}:{}",
+                                    file.path.to_string_lossy(),
+                                    info.start_line
+                                ),
+                                &format!(
+                                    "unresolved: trigger '{}' references function '{}' not found in parsed files{}",
+                                    t.name, raw, suffix
                                 ),
                             );
                             let unresolved = Node::Unresolved {
@@ -820,13 +837,27 @@ impl GraphBuilder {
                             .or_else(|| type_index.get(&target_key).copied())
                             .or_else(|| sequence_index.get(&target_key).copied())
                             .unwrap_or_else(|| {
+                                let snippet = crate::parser::snippet::read_snippet(
+                                    &file.path,
+                                    info.start_line,
+                                    1,
+                                );
+                                let (syn_schema, syn_name) = target_key
+                                    .rsplit_once('.')
+                                    .map(|(s, n)| (Some(s), n))
+                                    .unwrap_or((None, target_key.as_str()));
+                                let suffix = unresolved_creation_suffix(
+                                    Some((syn_schema, None, syn_name)),
+                                    snippet.as_deref(),
+                                );
                                 crate::parse_log::warn(
-                                    &file.path.to_string_lossy(),
+                                    &format!("{}:{}", file.path.to_string_lossy(), info.start_line),
                                     &format!(
-                                        "unresolved: synonym '{}.{}' target '{}' not found",
+                                        "unresolved: synonym '{}.{}' target '{}' not found{}",
                                         schema.as_deref().unwrap_or(""),
                                         name,
-                                        target_key
+                                        target_key,
+                                        suffix
                                     ),
                                 );
                                 let unresolved = Node::Unresolved {
@@ -1513,10 +1544,27 @@ impl GraphBuilder {
                     graph.add_edge(from, to, g_edge);
                 }
                 (Some(from), None) => {
+                    let snippet = crate::parser::snippet::read_snippet(
+                        edge.location.file.as_ref(),
+                        edge.location.line,
+                        1,
+                    );
+                    let suffix = unresolved_creation_suffix(
+                        Some((
+                            callee_id.schema.as_deref(),
+                            callee_id.package.as_deref(),
+                            &callee_id.name,
+                        )),
+                        snippet.as_deref(),
+                    );
                     crate::parse_log::warn(
-                        &edge.location.file.to_string_lossy(),
                         &format!(
-                            "unresolved: call target '{}' (from {}:{}) not found in parsed files",
+                            "{}:{}",
+                            edge.location.file.to_string_lossy(),
+                            edge.location.line
+                        ),
+                        &format!(
+                            "unresolved: call target '{}' (from {}:{}) not found in parsed files{}",
                             edge.callee_name,
                             edge.location
                                 .file
@@ -1524,6 +1572,7 @@ impl GraphBuilder {
                                 .map(|f| f.to_string_lossy().to_string())
                                 .unwrap_or_default(),
                             edge.location.line,
+                            suffix
                         ),
                     );
                     let unresolved_node = Node::Unresolved {
@@ -1622,11 +1671,24 @@ impl GraphBuilder {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                            let snippet = crate::parser::snippet::read_snippet(
+                                xml_path.as_ref(),
+                                stmt.line,
+                                1,
+                            );
+                            let suffix = unresolved_creation_suffix(
+                                Some((
+                                    callee_id.schema.as_deref(),
+                                    callee_id.package.as_deref(),
+                                    &callee_id.name,
+                                )),
+                                snippet.as_deref(),
+                            );
                             crate::parse_log::warn(
-                                &xml_path.to_string_lossy(),
+                                &format!("{}:{}", xml_path.to_string_lossy(), stmt.line),
                                 &format!(
-                                    "unresolved: mapper '{}.{}' calls '{}' not found in parsed files",
-                                    namespace, stmt.id, callee_name
+                                    "unresolved: mapper '{}.{}' calls '{}' not found in parsed files{}",
+                                    namespace, stmt.id, callee_name, suffix
                                 ),
                             );
                             let unresolved = Node::Unresolved {
@@ -1774,13 +1836,31 @@ impl GraphBuilder {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                            let snippet = crate::parser::snippet::read_snippet(
+                                java_path.as_ref(),
+                                extraction.origin.line,
+                                1,
+                            );
+                            let suffix = unresolved_creation_suffix(
+                                Some((
+                                    callee_id.schema.as_deref(),
+                                    callee_id.package.as_deref(),
+                                    &callee_id.name,
+                                )),
+                                snippet.as_deref(),
+                            );
                             crate::parse_log::warn(
-                                &java_path.to_string_lossy(),
                                 &format!(
-                                    "unresolved: Java '{}.{}' calls '{}' not found in parsed files",
+                                    "{}:{}",
+                                    java_path.to_string_lossy(),
+                                    extraction.origin.line
+                                ),
+                                &format!(
+                                    "unresolved: Java '{}.{}' calls '{}' not found in parsed files{}",
                                     extraction.origin.class_name.as_deref().unwrap_or("?"),
                                     extraction.origin.method_name.as_deref().unwrap_or("?"),
-                                    callee_name
+                                    callee_name,
+                                    suffix
                                 ),
                             );
                             let unresolved = Node::Unresolved {
@@ -2019,14 +2099,31 @@ impl GraphBuilder {
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
-                            ctx.proc_index.entry(callee_id.clone()).or_insert_with(|| {
-                                crate::parse_log::warn(
-                                    &jsp_path.to_string_lossy(),
-                                    &format!(
-                                        "unresolved: JSP '{}' calls '{}' not found in parsed files",
-                                        file_result.display_name, callee_name
-                                    ),
-                                );
+                                ctx.proc_index.entry(callee_id.clone()).or_insert_with(|| {
+                                    let snippet = crate::parser::snippet::read_snippet(
+                                        jsp_path.as_ref(),
+                                        extraction.origin.line,
+                                        1,
+                                    );
+                                    let suffix = unresolved_creation_suffix(
+                                        Some((
+                                            callee_id.schema.as_deref(),
+                                            callee_id.package.as_deref(),
+                                            &callee_id.name,
+                                        )),
+                                        snippet.as_deref(),
+                                    );
+                                    crate::parse_log::warn(
+                                        &format!(
+                                            "{}:{}",
+                                            jsp_path.to_string_lossy(),
+                                            extraction.origin.line
+                                        ),
+                                        &format!(
+                                            "unresolved: JSP '{}' calls '{}' not found in parsed files{}",
+                                            file_result.display_name, callee_name, suffix
+                                        ),
+                                    );
                                 let unresolved = Node::Unresolved {
                                     raw_expr: Box::new(callee_name.clone()),
                                     context: Box::new(file_result.display_name.clone()),
@@ -2310,10 +2407,16 @@ impl GraphBuilder {
             .collect();
 
         let mut to_remove: Vec<petgraph::graph::NodeIndex> = Vec::new();
+        let mut resolved_count: usize = 0;
+        let mut noise_count: usize = 0;
 
         for (unres_idx, raw_expr, _context) in &unresolved {
-            // ── Noise filtering: skip clearly non-routine patterns ──
-            if is_noise_unresolved(raw_expr) {
+            if let Some(rule) = noise_rule(raw_expr) {
+                crate::parse_log::info(
+                    "(post-pass)",
+                    &format!("noise-filtered '{}' (rule: {})", raw_expr, rule),
+                );
+                noise_count += 1;
                 to_remove.push(*unres_idx);
                 continue;
             }
@@ -2330,7 +2433,7 @@ impl GraphBuilder {
                 .collect();
 
             // ── Try to resolve ──
-            if let Some(target_idx) = try_resolve_routine(
+            match try_resolve_routine(
                 raw_expr,
                 &lower_qualified,
                 &bare_name_lower,
@@ -2338,32 +2441,53 @@ impl GraphBuilder {
                 &pkg_member_lower,
                 &caller_schemas,
             ) {
-                if target_idx == *unres_idx {
-                    continue; // shouldn't happen, but guard
-                }
-                // Rewire all incoming edges to the resolved target.
-                //
-                // Limitation: when multiple callers in different schemas share
-                // this unresolved node (via proc_index dedup), all edges are
-                // rewired to the SAME target. Strategy 5 picks the target based
-                // on the first caller's schema, so callers in other schemas get
-                // a potentially incorrect edge. Per-edge resolution would fix
-                // this but requires restructuring the rewiring logic.
-                let sources: Vec<_> = graph
-                    .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
-                    .collect();
-                for src in sources {
-                    let weights: Vec<_> = graph
-                        .edges_connecting(src, *unres_idx)
-                        .map(|e| e.weight().clone())
-                        .collect();
-                    for weight in weights {
-                        graph.add_edge(src, target_idx, weight);
+                ResolveOutcome::Resolved(target_idx) => {
+                    if target_idx == *unres_idx {
+                        continue; // shouldn't happen, but guard
                     }
+                    // Rewire all incoming edges to the resolved target.
+                    //
+                    // Limitation: when multiple callers in different schemas share
+                    // this unresolved node (via proc_index dedup), all edges are
+                    // rewired to the SAME target. Strategy 5 picks the target based
+                    // on the first caller's schema, so callers in other schemas get
+                    // a potentially incorrect edge. Per-edge resolution would fix
+                    // this but requires restructuring the rewiring logic.
+                    let sources: Vec<_> = graph
+                        .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
+                        .collect();
+                    for src in sources {
+                        let weights: Vec<_> = graph
+                            .edges_connecting(src, *unres_idx)
+                            .map(|e| e.weight().clone())
+                            .collect();
+                        for weight in weights {
+                            graph.add_edge(src, target_idx, weight);
+                        }
+                    }
+                    to_remove.push(*unres_idx);
+                    resolved_count += 1;
                 }
-                to_remove.push(*unres_idx);
+                ResolveOutcome::Miss(trace) => {
+                    let nearest =
+                        nearest_routine_candidates(raw_expr, &lower_qualified, graph, 3, 3);
+                    let formatted = format_survivor_diagnostic(raw_expr, &trace, &nearest);
+                    crate::parse_log::warn("(post-pass)", &formatted);
+                }
             }
         }
+
+        let survivors = unresolved.len() - resolved_count - noise_count;
+        crate::parse_log::info(
+            "(post-pass)",
+            &format!(
+                "resolve_unresolved_nodes: created={} resolved={} noise={} survivors={}",
+                unresolved.len(),
+                resolved_count,
+                noise_count,
+                survivors
+            ),
+        );
 
         // ── Remove resolved/filtered nodes ──
         // petgraph::Graph::remove_node swaps the last node into the freed slot,
@@ -2666,10 +2790,8 @@ fn names_match(field_name: &str, class_name: &str) -> bool {
 /// Filters out AST debug strings from dynamic SQL (PlVariable, BinaryOp,
 /// FunctionCall, Literal), object member access (SELF.xxx), PL/SQL collection
 /// methods (.EXTEND, .TRIM, .DELETE), and known system packages/functions.
-fn is_noise_unresolved(raw_expr: &str) -> bool {
+fn noise_rule(raw_expr: &str) -> Option<&'static str> {
     let trimmed = raw_expr.trim();
-
-    // AST debug strings from EXECUTE IMMEDIATE with non-literal expressions
     if trimmed.starts_with("PlVariable(")
         || trimmed.starts_with("BinaryOp ")
         || trimmed.starts_with("BinaryOp{")
@@ -2678,16 +2800,12 @@ fn is_noise_unresolved(raw_expr: &str) -> bool {
         || trimmed.starts_with("Literal(")
         || trimmed.starts_with("ColumnRef(")
     {
-        return true;
+        return Some("ast-debug-string");
     }
-
-    // Object member access (SELF.xxx) — not a procedure call
     let upper = trimmed.to_uppercase();
     if upper.starts_with("SELF.") {
-        return true;
+        return Some("self-member");
     }
-
-    // PL/SQL collection methods
     if upper.ends_with(".EXTEND")
         || upper.ends_with(".TRIM")
         || upper.ends_with(".DELETE")
@@ -2698,18 +2816,47 @@ fn is_noise_unresolved(raw_expr: &str) -> bool {
         || upper.ends_with(".PRIOR")
         || upper.ends_with(".EXISTS")
     {
-        return true;
+        return Some("collection-method");
     }
-
-    // GaussDB/openGauss built-in system functions — delegated to ogsql-parser's
-    // builtin registry (case-insensitive exact match, 449+ functions incl.
-    // dbe_xmldom / dbe_scheduler / dbms_* / pg_*), replacing a former local
-    // whitelist that was incomplete (e.g. missed dbe_xmldom).
     if ogsql_parser::parser::function_registry::lookup_builtin_meta(trimmed).is_some() {
-        return true;
+        return Some("builtin-function");
     }
+    None
+}
 
-    false
+/// Outcome of multi-strategy routine resolution.
+///
+/// Either `Resolved(idx)` on success, or `Miss(trace)` with a diagnostic trace
+/// explaining why all 7 strategies failed.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolveOutcome {
+    Resolved(petgraph::graph::NodeIndex),
+    Miss(StrategyTrace),
+}
+
+/// Diagnostic trace for a failed resolution attempt.
+///
+/// Records per-strategy state at the time each strategy ran, so that
+/// downstream consumers (logging, survivor reporting) can root-cause WHY
+/// a reference could not be resolved.
+///
+/// Field conventions:
+/// - `parsed_schema` / `parsed_name`: split of `raw_name` via `rsplit_once('.')`.
+/// - `s1_qualified_key`: the lowercased `raw_name` used as the key in S1.
+/// - `s1_hit` / `s3_hit`: whether that strategy's lookup succeeded.
+/// - `s3_lookup`: the `(pkg_part_lower, name_part_lower)` pair used in S3,
+///   or `None` when `raw_name` contained no dot.
+/// - `caller_schemas`: snapshot of the caller-schema slice passed in.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct StrategyTrace {
+    pub parsed_schema: Option<String>,
+    pub parsed_name: String,
+    pub s1_qualified_key: String,
+    pub s1_hit: bool,
+    pub s3_lookup: Option<(String, String)>,
+    pub s3_hit: bool,
+    pub caller_schemas: Vec<Option<String>>,
 }
 
 /// Multi-strategy routine resolution for unresolved nodes.
@@ -2729,13 +2876,31 @@ fn try_resolve_routine(
     bare_name_schemas: &HashMap<String, Vec<(Option<String>, petgraph::graph::NodeIndex)>>,
     pkg_member_lower: &HashMap<(String, String), petgraph::graph::NodeIndex>,
     caller_schemas: &[Option<String>],
-) -> Option<petgraph::graph::NodeIndex> {
+) -> ResolveOutcome {
     let name_lower = raw_name.to_lowercase();
+
+    // Parse raw_name for trace: split into (schema, name) via rsplit_once('.').
+    let (parsed_schema, parsed_name) = raw_name
+        .rsplit_once('.')
+        .map(|(s, n)| (Some(s.to_string()), n.to_string()))
+        .unwrap_or_else(|| (None, raw_name.to_string()));
+
+    // Initialize trace — fields are filled in as each strategy runs.
+    let mut trace = StrategyTrace {
+        parsed_schema,
+        parsed_name,
+        s1_qualified_key: name_lower.clone(),
+        s1_hit: false,
+        s3_lookup: None,
+        s3_hit: false,
+        caller_schemas: caller_schemas.to_vec(),
+    };
 
     // Strategy 1: Case-insensitive exact match (handles Procedure↔Function implicitly
     // because lower_qualified is keyed by display string which doesn't include kind)
     if let Some(&idx) = lower_qualified.get(&name_lower) {
-        return Some(idx);
+        trace.s1_hit = true;
+        return ResolveOutcome::Resolved(idx);
     }
 
     // Strategy 2: If raw_name is "schema.name", try bare name in bare_name_lower
@@ -2747,7 +2912,7 @@ fn try_resolve_routine(
         // Try case-insensitive bare name (single unambiguous match)
         if let Some(matches) = bare_name_lower.get(&bare_lower) {
             if matches.len() == 1 {
-                return Some(matches[0]);
+                return ResolveOutcome::Resolved(matches[0]);
             }
         }
     }
@@ -2756,10 +2921,12 @@ fn try_resolve_routine(
     if let Some(dot_pos) = raw_name.rfind('.') {
         let pkg_part = &raw_name[..dot_pos];
         let name_part = &raw_name[dot_pos + 1..];
-        if let Some(&idx) =
-            pkg_member_lower.get(&(pkg_part.to_lowercase(), name_part.to_lowercase()))
-        {
-            return Some(idx);
+        let pkg_part_lower = pkg_part.to_lowercase();
+        let name_part_lower = name_part.to_lowercase();
+        trace.s3_lookup = Some((pkg_part_lower.clone(), name_part_lower.clone()));
+        if let Some(&idx) = pkg_member_lower.get(&(pkg_part_lower, name_part_lower)) {
+            trace.s3_hit = true;
+            return ResolveOutcome::Resolved(idx);
         }
     }
 
@@ -2767,7 +2934,7 @@ fn try_resolve_routine(
     if !raw_name.contains('.') {
         if let Some(matches) = bare_name_lower.get(&name_lower) {
             if matches.len() == 1 {
-                return Some(matches[0]);
+                return ResolveOutcome::Resolved(matches[0]);
             }
         }
     }
@@ -2787,23 +2954,188 @@ fn try_resolve_routine(
                     .iter()
                     .find(|(s, _)| s.as_deref() == Some(caller_schema.as_str()))
                 {
-                    return Some(idx);
+                    return ResolveOutcome::Resolved(idx);
                 }
             }
 
             // Strategy 6: No caller-schema match — prefer schema=None (default schema).
             if let Some(&(_, idx)) = candidates.iter().find(|(s, _)| s.is_none()) {
-                return Some(idx);
+                return ResolveOutcome::Resolved(idx);
             }
 
             // Strategy 7: Truly ambiguous — best-effort: pick first candidate.
             // For a static code graph this is better than leaving an Unresolved node,
             // because the user gets a starting point for investigation.
-            return Some(candidates[0].1);
+            return ResolveOutcome::Resolved(candidates[0].1);
         }
     }
 
-    None
+    ResolveOutcome::Miss(trace)
+}
+
+/// Standard Levenshtein edit distance (case-sensitive).
+///
+/// Uses O(min(m,n)) memory with a two-row DP table.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr: Vec<usize> = vec![0; b_len + 1];
+
+    for i in 1..=a_len {
+        curr[0] = i;
+        for j in 1..=b_len {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = std::cmp::min(
+                std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
+                prev[j - 1] + cost,
+            );
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_len]
+}
+
+fn unresolved_creation_suffix(
+    parsed: Option<(Option<&str>, Option<&str>, &str)>,
+    snippet: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if let Some((schema, package, name)) = parsed {
+        out.push_str(&format!(
+            "\n  parsed: {{schema:{:?}, package:{:?}, name:{:?}}}",
+            schema, package, name
+        ));
+    }
+    if let Some(s) = snippet {
+        out.push('\n');
+        out.push_str(s);
+    }
+    out
+}
+
+/// Find nearest routine candidates by Levenshtein distance on the bare name.
+///
+/// Extracts the bare (unqualified) part of `raw_name` and compares it
+/// against each routine's `name` field (lowercased). Returns up to `limit`
+/// candidates within `max_distance`, sorted by ascending distance.
+fn nearest_routine_candidates(
+    raw_name: &str,
+    lower_qualified: &HashMap<String, petgraph::graph::NodeIndex>,
+    graph: &CodeGraph,
+    max_distance: usize,
+    limit: usize,
+) -> Vec<(usize, RoutineId)> {
+    let bare = raw_name
+        .rsplit_once('.')
+        .map(|(_, b)| b)
+        .unwrap_or(raw_name)
+        .to_lowercase();
+
+    let mut candidates: Vec<(usize, RoutineId)> = lower_qualified
+        .iter()
+        .filter_map(|(_key, &idx)| {
+            let routine_id = match &graph[idx] {
+                Node::Procedure { id, .. } | Node::Function { id, .. } => id,
+                _ => return None,
+            };
+            let name_lower = routine_id.name.to_lowercase();
+            let dist = levenshtein(&bare, &name_lower);
+            if dist <= max_distance {
+                Some((dist, routine_id.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    candidates.sort_by_key(|(dist, _)| *dist);
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Format a rich survivor diagnostic string for logging.
+///
+/// Pure function (no I/O). The caller is responsible for writing the
+/// returned string to the log via [`crate::parse_log::warn`].
+fn format_survivor_diagnostic(
+    raw_expr: &str,
+    trace: &StrategyTrace,
+    nearest: &[(usize, RoutineId)],
+) -> String {
+    let mut lines = Vec::new();
+
+    // First line: header
+    lines.push(format!(
+        "unresolved(post-pass): '{}' survived resolution",
+        raw_expr
+    ));
+
+    // Parsed expression breakdown
+    lines.push(format!(
+        "  parsed = {{schema:{:?}, package:None, name:{:?}}}",
+        trace.parsed_schema, trace.parsed_name,
+    ));
+
+    // Strategy 1
+    lines.push(format!(
+        "  S1 lower_qualified['{}'] -> miss",
+        trace.s1_qualified_key
+    ));
+
+    // Strategy 3 (only when raw_name had a dot)
+    if let Some((ref pkg, ref name)) = trace.s3_lookup {
+        lines.push(format!(
+            "  S3 pkg_member_lower[('{}','{}')] -> miss",
+            pkg, name
+        ));
+    }
+
+    // Nearest candidates by edit distance
+    if nearest.is_empty() {
+        lines.push("  nearest by edit distance: (none within edit-distance threshold)".to_string());
+    } else {
+        let nearest_fmt: Vec<String> = nearest
+            .iter()
+            .map(|(dist, id)| {
+                let fmt_opt = |o: &Option<String>| {
+                    o.as_deref()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "None".to_string())
+                };
+                format!(
+                    "'{}' {{schema:{},package:{},name:{},kind:{:?}}}(d={})",
+                    id,
+                    fmt_opt(&id.schema),
+                    fmt_opt(&id.package),
+                    id.name,
+                    id.kind,
+                    dist,
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "  nearest by edit distance: {}",
+            nearest_fmt.join(", ")
+        ));
+    }
+
+    lines.join("\n")
 }
 
 /// Normalize a table/view name for case-insensitive lookup in `table_index`.
@@ -2855,6 +3187,7 @@ mod tests {
     use crate::graph::builder::GraphBuilder;
     use crate::graph::{Edge, Node};
     use crate::parser::ParsedFile;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn parse_sql(sql: &str) -> Vec<ogsql_parser::StatementInfo> {
@@ -3762,23 +4095,38 @@ mod tests {
 
     #[test]
     fn noise_filter_recognizes_dbe_xmldom_builtins() {
-        assert!(super::is_noise_unresolved("dbe_xmldom.setattribute"));
-        assert!(super::is_noise_unresolved("dbe_xmldom.appendchild"));
-        assert!(super::is_noise_unresolved("DBE_XMLDOM.SETATTRIBUTE"));
+        assert!(super::noise_rule("dbe_xmldom.setattribute").is_some());
+        assert!(super::noise_rule("dbe_xmldom.appendchild").is_some());
+        assert!(super::noise_rule("DBE_XMLDOM.SETATTRIBUTE").is_some());
     }
 
     #[test]
     fn noise_filter_preserves_prior_system_package_coverage() {
-        assert!(super::is_noise_unresolved("dbe_scheduler.enable"));
-        assert!(super::is_noise_unresolved("dbe_output.put_line"));
-        assert!(super::is_noise_unresolved("DBE_OUTPUT.PUT_LINE"));
+        assert!(super::noise_rule("dbe_scheduler.enable").is_some());
+        assert!(super::noise_rule("dbe_output.put_line").is_some());
+        assert!(super::noise_rule("DBE_OUTPUT.PUT_LINE").is_some());
     }
 
     #[test]
     fn noise_filter_keeps_user_routines_unfiltered() {
-        assert!(!super::is_noise_unresolved("calc_total"));
-        assert!(!super::is_noise_unresolved("biz.calc_total"));
-        assert!(!super::is_noise_unresolved("my_pkg.do_work"));
+        assert!(super::noise_rule("calc_total").is_none());
+        assert!(super::noise_rule("biz.calc_total").is_none());
+        assert!(super::noise_rule("my_pkg.do_work").is_none());
+    }
+
+    #[test]
+    fn noise_rule_returns_reason_for_each_category() {
+        assert_eq!(super::noise_rule("PlVariable(x)"), Some("ast-debug-string"));
+        assert_eq!(super::noise_rule("SELF.foo"), Some("self-member"));
+        assert_eq!(
+            super::noise_rule("mylist.EXTEND"),
+            Some("collection-method")
+        );
+        assert_eq!(
+            super::noise_rule("dbe_output.put_line"),
+            Some("builtin-function")
+        );
+        assert_eq!(super::noise_rule("calc_total"), None);
     }
 
     #[test]
@@ -4367,5 +4715,418 @@ mod tests {
             1,
             "real_callee() call must still produce a DirectCall edge"
         );
+    }
+
+    // ── try_resolve_routine tests ────────────────────────────────────
+
+    /// Helper to build resolver indexes from a graph, matching the logic
+    /// in `resolve_unresolved_nodes`.
+    fn build_resolver_indexes(
+        graph: &crate::graph::CodeGraph,
+    ) -> (
+        HashMap<String, petgraph::graph::NodeIndex>,
+        HashMap<String, Vec<petgraph::graph::NodeIndex>>,
+        HashMap<String, Vec<(Option<String>, petgraph::graph::NodeIndex)>>,
+        HashMap<(String, String), petgraph::graph::NodeIndex>,
+    ) {
+        let mut lower_qualified: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut bare_name_lower: HashMap<String, Vec<petgraph::graph::NodeIndex>> = HashMap::new();
+        let mut bare_name_schemas: HashMap<
+            String,
+            Vec<(Option<String>, petgraph::graph::NodeIndex)>,
+        > = HashMap::new();
+        let mut pkg_member_lower: HashMap<(String, String), petgraph::graph::NodeIndex> =
+            HashMap::new();
+
+        for idx in graph.node_indices() {
+            let routine_id = match &graph[idx] {
+                crate::graph::Node::Procedure { id, .. }
+                | crate::graph::Node::Function { id, .. } => id,
+                _ => continue,
+            };
+            let qualified_lower = routine_id.to_string().to_lowercase();
+            lower_qualified.entry(qualified_lower).or_insert(idx);
+
+            let name_lower = routine_id.name.to_lowercase();
+            bare_name_lower
+                .entry(name_lower.clone())
+                .or_default()
+                .push(idx);
+            bare_name_schemas
+                .entry(name_lower)
+                .or_default()
+                .push((routine_id.schema.as_ref().map(|s| s.to_lowercase()), idx));
+
+            // Schema-as-package indexing (same logic as resolve_unresolved_nodes)
+            if let Some(ref schema) = routine_id.schema {
+                if routine_id.package.is_none() {
+                    pkg_member_lower
+                        .entry((schema.to_lowercase(), routine_id.name.to_lowercase()))
+                        .or_insert(idx);
+                }
+            }
+        }
+
+        (
+            lower_qualified,
+            bare_name_lower,
+            bare_name_schemas,
+            pkg_member_lower,
+        )
+    }
+
+    #[test]
+    fn try_resolve_routine_resolved_returns_correct_idx() {
+        // Test (a): a resolvable name returns Resolved(idx) with the SAME idx
+        // as the old code path (regression guard).
+        use crate::graph::{RoutineId, RoutineKind, SourceLocation};
+        use std::sync::Arc;
+
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "my_proc".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(std::path::PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+
+        let (lower_qualified, bare_name_lower, bare_name_schemas, pkg_member_lower) =
+            build_resolver_indexes(&graph);
+
+        let result = super::try_resolve_routine(
+            "public.my_proc",
+            &lower_qualified,
+            &bare_name_lower,
+            &bare_name_schemas,
+            &pkg_member_lower,
+            &[],
+        );
+
+        match result {
+            super::ResolveOutcome::Resolved(idx) => assert_eq!(
+                idx, proc_idx,
+                "Resolved index must match the known procedure node"
+            ),
+            super::ResolveOutcome::Miss(trace) => {
+                panic!("Expected Resolved but got Miss with trace: {trace:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn try_resolve_routine_miss_has_correct_trace() {
+        // Test (b): a name with no match returns Miss whose StrategyTrace
+        // fields are correct and s1_hit == false.
+        let lower_qualified = HashMap::new();
+        let bare_name_lower = HashMap::new();
+        let bare_name_schemas = HashMap::new();
+        let pkg_member_lower = HashMap::new();
+        let caller_schemas: Vec<Option<String>> = vec![];
+
+        let result = super::try_resolve_routine(
+            "nonexistent.proc",
+            &lower_qualified,
+            &bare_name_lower,
+            &bare_name_schemas,
+            &pkg_member_lower,
+            &caller_schemas,
+        );
+
+        match result {
+            super::ResolveOutcome::Resolved(_) => {
+                panic!("Expected Miss for a name with no matching nodes")
+            }
+            super::ResolveOutcome::Miss(trace) => {
+                // parsed_schema/name from rsplit_once('.')
+                assert_eq!(
+                    trace.parsed_schema,
+                    Some("nonexistent".to_string()),
+                    "parsed_schema should be the part before the last dot"
+                );
+                assert_eq!(
+                    trace.parsed_name, "proc",
+                    "parsed_name should be the part after the last dot"
+                );
+                // s1_qualified_key = raw_name.to_lowercase()
+                assert_eq!(
+                    trace.s1_qualified_key, "nonexistent.proc",
+                    "s1_qualified_key should be the lowercased raw_name"
+                );
+                assert!(!trace.s1_hit, "s1 must not have hit on empty indexes");
+                // raw_name contains '.' so s3_lookup should be set
+                assert_eq!(
+                    trace.s3_lookup,
+                    Some(("nonexistent".to_string(), "proc".to_string())),
+                    "s3_lookup should be (pkg_part_lower, name_part_lower)"
+                );
+                assert!(!trace.s3_hit, "s3 must not have hit on empty indexes");
+                assert!(
+                    trace.caller_schemas.is_empty(),
+                    "caller_schemas should match the passed slice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn try_resolve_routine_ambiguous_bare_resolves_via_s7() {
+        // Test (c): 2 procedures sharing the same name but different schemas.
+        // Old behavior resolves via S7 (first-candidate best-effort).
+        // New behavior must match.
+        use crate::graph::{RoutineId, RoutineKind, SourceLocation};
+        use std::sync::Arc;
+
+        let mut graph = crate::graph::CodeGraph::new();
+        let _idx_a = graph.add_node(crate::graph::Node::Procedure {
+            id: RoutineId {
+                schema: Some("schema_a".to_string()),
+                package: None,
+                name: "shared_name".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(std::path::PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+        let _idx_b = graph.add_node(crate::graph::Node::Procedure {
+            id: RoutineId {
+                schema: Some("schema_b".to_string()),
+                package: None,
+                name: "shared_name".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(std::path::PathBuf::from("test.sql")),
+                line: 2,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+
+        let (lower_qualified, bare_name_lower, bare_name_schemas, pkg_member_lower) =
+            build_resolver_indexes(&graph);
+
+        // Query by bare name (no qualifier) with no caller schemas.
+        // Old code: S4 sees 2 matches → ambiguous → S5/S6 no match → S7 picks first.
+        // S7 always resolves, so we assert Resolved.
+        let result = super::try_resolve_routine(
+            "shared_name",
+            &lower_qualified,
+            &bare_name_lower,
+            &bare_name_schemas,
+            &pkg_member_lower,
+            &[], // empty caller schemas
+        );
+
+        match result {
+            super::ResolveOutcome::Resolved(idx) => {
+                // S7 picks the first candidate registered (schema_a's entry).
+                assert_eq!(
+                    idx, _idx_a,
+                    "S7 should resolve to the first-registered candidate (schema_a)"
+                );
+            }
+            super::ResolveOutcome::Miss(trace) => {
+                panic!("Expected Resolved (S7 disambiguation) but got Miss: {trace:?}");
+            }
+        }
+    }
+
+    // ── survivor diagnostic tests ──
+
+    #[test]
+    fn levenshtein_identical() {
+        assert_eq!(super::levenshtein("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn levenshtein_one_edit() {
+        assert_eq!(super::levenshtein("hello", "hallo"), 1);
+    }
+
+    #[test]
+    fn levenshtein_empty_vs_nonempty() {
+        assert_eq!(super::levenshtein("", "hello"), 5);
+        assert_eq!(super::levenshtein("hello", ""), 5);
+    }
+
+    #[test]
+    fn levenshtein_insert_delete() {
+        assert_eq!(super::levenshtein("hello", "hell"), 1);
+        assert_eq!(super::levenshtein("hell", "hello"), 1);
+    }
+
+    #[test]
+    fn levenshtein_case_sensitive() {
+        // levenshtein is case-sensitive; callers lowercase inputs first
+        assert_eq!(super::levenshtein("Hello", "hello"), 1);
+    }
+
+    #[test]
+    fn format_survivor_diagnostic_with_s3() {
+        use crate::graph::{RoutineId, RoutineKind};
+
+        let trace = super::StrategyTrace {
+            parsed_schema: Some("S".to_string()),
+            parsed_name: "M".to_string(),
+            s1_qualified_key: "s.m".to_string(),
+            s1_hit: false,
+            s3_lookup: Some(("s".to_string(), "m".to_string())),
+            s3_hit: false,
+            caller_schemas: vec![],
+        };
+
+        let candidates = vec![(
+            1usize,
+            RoutineId {
+                schema: Some("S".to_string()),
+                package: Some("P".to_string()),
+                name: "M".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+        )];
+
+        let output = super::format_survivor_diagnostic("S.M", &trace, &candidates);
+
+        assert!(output.contains("'S.M' survived resolution"), "raw_expr");
+        assert!(output.contains("S1"), "s1 line");
+        assert!(output.contains("miss"), "miss indicator");
+        assert!(output.contains("S3"), "s3 line present");
+        assert!(output.contains("'S.P.M'"), "candidate display");
+        assert!(output.contains("(d=1)"), "distance");
+        assert!(output.contains("package:P"), "candidate package field");
+    }
+
+    #[test]
+    fn format_survivor_diagnostic_no_s3() {
+        use crate::graph::RoutineId;
+
+        let trace = super::StrategyTrace {
+            parsed_schema: None,
+            parsed_name: "M".to_string(),
+            s1_qualified_key: "m".to_string(),
+            s1_hit: false,
+            s3_lookup: None,
+            s3_hit: false,
+            caller_schemas: vec![],
+        };
+
+        let candidates: Vec<(usize, RoutineId)> = vec![];
+
+        let output = super::format_survivor_diagnostic("M", &trace, &candidates);
+
+        assert!(output.contains("'M' survived resolution"));
+        assert!(
+            !output.contains("S3"),
+            "must not contain S3 when s3_lookup is None"
+        );
+        assert!(
+            output.contains("(none within edit-distance threshold)"),
+            "none within threshold"
+        );
+    }
+
+    #[test]
+    fn unresolved_creation_suffix_includes_parsed_and_snippet() {
+        let suffix = super::unresolved_creation_suffix(
+            Some((Some("PKG"), None, "LOG_ORDER")),
+            Some(">  42 |   call"),
+        );
+        assert!(
+            suffix.contains(r#"parsed: {schema:Some("PKG"), package:None, name:"LOG_ORDER"}"#),
+            "got: {}",
+            suffix
+        );
+        assert!(
+            suffix.contains(">  42 |   call"),
+            "snippet missing: {}",
+            suffix
+        );
+    }
+
+    #[test]
+    fn unresolved_creation_suffix_none_yields_empty() {
+        assert_eq!(super::unresolved_creation_suffix(None, None), "");
+    }
+
+    #[test]
+    fn unresolved_creation_suffix_only_snippet_when_no_parsed() {
+        let suffix = super::unresolved_creation_suffix(None, Some("> 1 | x"));
+        assert!(!suffix.contains("parsed"), "no parsed line: {}", suffix);
+        assert!(suffix.contains("> 1 | x"));
+    }
+
+    #[test]
+    fn nearest_routine_candidates_finds_close() {
+        use crate::graph::{CodeGraph, Node, RoutineId, RoutineKind, SourceLocation};
+        use std::sync::Arc;
+
+        let mut graph = CodeGraph::new();
+        let idx = graph.add_node(Node::Procedure {
+            id: RoutineId {
+                schema: Some("S".to_string()),
+                package: None,
+                name: "process_order".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+
+        let mut lower_qualified = HashMap::new();
+        lower_qualified.insert("s.process_order".to_string(), idx);
+
+        // "process_orders" is 1 edit from "process_order"
+        let result =
+            super::nearest_routine_candidates("s.process_orders", &lower_qualified, &graph, 3, 3);
+
+        assert!(!result.is_empty(), "should find a close candidate");
+        assert_eq!(result[0].0, 1, "edit distance should be 1");
+        assert_eq!(result[0].1.name, "process_order");
+    }
+
+    #[test]
+    fn nearest_routine_candidates_distant_returns_empty() {
+        use crate::graph::{CodeGraph, Node, RoutineId, RoutineKind, SourceLocation};
+        use std::sync::Arc;
+
+        let mut graph = CodeGraph::new();
+        let idx = graph.add_node(Node::Procedure {
+            id: RoutineId {
+                schema: None,
+                package: None,
+                name: "calculate_total".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+
+        let mut lower_qualified = HashMap::new();
+        lower_qualified.insert("calculate_total".to_string(), idx);
+
+        // "xyzzy" is far from "calculate_total" (>3 edits at 10 chars)
+        let result = super::nearest_routine_candidates("xyzzy", &lower_qualified, &graph, 3, 3);
+
+        assert!(result.is_empty(), "distant name should return empty");
     }
 }
