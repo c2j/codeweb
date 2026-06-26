@@ -14,8 +14,8 @@ pub mod scanner;
 
 #[allow(unused_imports)]
 pub use extractor::{
-    extract_body_sql, CallEdge, CallExtractor, ColumnAccessExtractor, ColumnAnalysis,
-    ColumnContext, ColumnRef, EnumMapping, FilterOperator, FilterValue, HardFilter,
+    extract_body_sql, pl_type_decl_name, CallEdge, CallExtractor, ColumnAccessExtractor,
+    ColumnAnalysis, ColumnContext, ColumnRef, EnumMapping, FilterOperator, FilterValue, HardFilter,
     InsertColumnInfo, JoinCondition, JoinConditionSource, JoinType, ProcedureBodySql,
     ProcedureSqlExtractor, SelectIntoMapping, SequenceRef, SequenceRefVia, TableAccessExtractor,
     TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,

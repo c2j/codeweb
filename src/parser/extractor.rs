@@ -1,6 +1,6 @@
 use crate::graph::{AccessMode, RoutineId, RoutineKind, SourceLocation, WriteKind};
-use ogsql_parser::ast::plpgsql::PlDeclaration;
 use ogsql_parser::ast::plpgsql::{PlCursorDecl, PlExecuteStmt, PlProcedureCall, PlStatement};
+use ogsql_parser::ast::plpgsql::{PlDeclaration, PlTypeDecl};
 use ogsql_parser::ast::{
     CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
     ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
@@ -199,6 +199,22 @@ impl CallExtractor {
         }
     }
 
+    /// Extend the current routine's local scope with package-level identifiers.
+    /// Must be called AFTER `begin_routine_scope` so the names survive the clear.
+    pub fn extend_local_scope(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.local_vars.insert(name);
+        }
+    }
+
+    /// Register a TYPE name so that constructor calls `my_type(...)` are not
+    /// mistaken for procedure/function calls.
+    pub fn register_type_name(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.known_types.insert(name.to_lowercase());
+        }
+    }
+
     pub fn push_call(&mut self, callee: &str, is_dynamic: bool, line: usize) {
         self.edges.push(CallEdge {
             caller: self.current_procedure.clone(),
@@ -216,6 +232,16 @@ impl CallExtractor {
                 self.push_call(call_target, false, 0);
             }
         }
+    }
+}
+
+/// Extract the declared name from any `PlTypeDecl` variant.
+pub fn pl_type_decl_name(t: &PlTypeDecl) -> &str {
+    match t {
+        PlTypeDecl::Record { name, .. }
+        | PlTypeDecl::TableOf { name, .. }
+        | PlTypeDecl::VarrayOf { name, .. }
+        | PlTypeDecl::RefCursor { name } => name,
     }
 }
 
@@ -274,8 +300,11 @@ impl Visitor for CallExtractor {
                 self.local_vars = saved;
                 VisitorResult::SkipChildren
             }
-            // Type / Pragma: not local data identifiers.
-            _ => VisitorResult::Continue,
+            PlDeclaration::Type(t) => {
+                self.register_type_name(pl_type_decl_name(t));
+                VisitorResult::Continue
+            }
+            PlDeclaration::Pragma { .. } => VisitorResult::Continue,
         }
     }
 
@@ -286,6 +315,12 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_procedure_call(&mut self, call: &PlProcedureCall) -> VisitorResult {
+        if let Some(first) = call.name.first() {
+            let first_lower = first.to_lowercase();
+            if self.local_vars.contains(&first_lower) || self.known_types.contains(&first_lower) {
+                return VisitorResult::Continue;
+            }
+        }
         let name: String = call.name.join(".");
         self.push_call(&name, false, 0);
         VisitorResult::Continue
