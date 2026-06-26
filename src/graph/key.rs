@@ -207,23 +207,25 @@ impl NodeKey {
                 name: name.to_lowercase(),
             },
             super::Node::Package { schema, name, .. } => NodeKey::Package {
-                schema: schema.clone(),
-                name: name.clone(),
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
-            super::Node::Trigger { name, .. } => NodeKey::Trigger { name: name.clone() },
+            super::Node::Trigger { name, .. } => NodeKey::Trigger {
+                name: name.to_lowercase(),
+            },
             super::Node::Type { schema, name, .. } => NodeKey::Type {
-                schema: schema.clone(),
-                name: name.clone(),
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
             super::Node::Sequence { schema, name, .. } => NodeKey::Sequence {
-                schema: schema.clone(),
-                name: name.clone(),
+                schema: schema.as_ref().map(|s| s.to_lowercase()),
+                name: name.to_lowercase(),
             },
             super::Node::Index {
                 name, table_name, ..
             } => NodeKey::Index {
-                name: name.clone(),
-                table_name: table_name.clone(),
+                name: name.as_ref().map(|n| n.to_lowercase()),
+                table_name: table_name.to_lowercase(),
             },
             super::Node::MaterializedView { schema, name, .. } => NodeKey::MaterializedView {
                 schema: schema.as_ref().map(|s| s.to_lowercase()),
@@ -233,7 +235,9 @@ impl NodeKey {
                 schema: schema.as_ref().map(|s| s.to_lowercase()),
                 name: name.to_lowercase(),
             },
-            super::Node::Event { name, .. } => NodeKey::Event { name: name.clone() },
+            super::Node::Event { name, .. } => NodeKey::Event {
+                name: name.to_lowercase(),
+            },
             super::Node::JavaSql {
                 java_file, line, ..
             } => NodeKey::JavaSql {
@@ -302,6 +306,41 @@ impl NodeKey {
             } => Some(NodeKey::Function {
                 schema: None,
                 package: package.clone(),
+                name: name.clone(),
+            }),
+            NodeKey::Package {
+                schema: Some(_),
+                name,
+            } => Some(NodeKey::Package {
+                schema: None,
+                name: name.clone(),
+            }),
+            NodeKey::Type {
+                schema: Some(_),
+                name,
+            } => Some(NodeKey::Type {
+                schema: None,
+                name: name.clone(),
+            }),
+            NodeKey::Sequence {
+                schema: Some(_),
+                name,
+            } => Some(NodeKey::Sequence {
+                schema: None,
+                name: name.clone(),
+            }),
+            NodeKey::MaterializedView {
+                schema: Some(_),
+                name,
+            } => Some(NodeKey::MaterializedView {
+                schema: None,
+                name: name.clone(),
+            }),
+            NodeKey::Synonym {
+                schema: Some(_),
+                name,
+            } => Some(NodeKey::Synonym {
+                schema: None,
                 name: name.clone(),
             }),
             _ => None,
