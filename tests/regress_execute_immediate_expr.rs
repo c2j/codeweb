@@ -17,6 +17,8 @@ const EI_VAR_RESOLVE: &str =
 const EI_COMPLEX_EXPR: &str =
     include_str!("regress/execute_immediate_expr/cases/ei_complex_expr.sql");
 const EI_TYPECAST: &str = include_str!("regress/execute_immediate_expr/cases/ei_typecast.sql");
+const EI_CARTESIAN_EXPLOSION: &str =
+    include_str!("regress/execute_immediate_expr/cases/ei_cartesian_explosion.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -605,5 +607,29 @@ END; $$;"#;
         direct >= 4,
         "CALL inside IF/ELSIF/ELSE branches must produce DirectCall edges. \
          Expected >= 4 (proc_a then, proc_b else, proc_c elsif, proc_d nested). Got {direct}."
+    );
+}
+
+#[test]
+fn ei_cartesian_explosion_capped_not_oom() {
+    // Regression for v0.7.10 OOM: 20 CASE terms in a `||` chain → 2^20 literal
+    // variants without the cap. MAX_VALUE_SET (extractor.rs) must abort expansion,
+    // so analyze_json completes (no OOM) and the procedure node still exists.
+    let json = analyze_json(EI_CARTESIAN_EXPLOSION);
+    let has_proc = json["nodes"].as_array().unwrap().iter().any(|n| {
+        n["type"].as_str() == Some("procedure")
+            && n["name"].as_str() == Some("ei_cartesian_explosion")
+    });
+    assert!(
+        has_proc,
+        "procedure node must exist — cap should have prevented OOM during extraction"
+    );
+    // The cap degrades EXECUTE IMMEDIATE resolution to opaque (empty candidate
+    // set), so no direct edges should be synthesized — and definitely not the
+    // 2^20 that an unbounded cartesian product would produce.
+    let direct = edge_count(&json, "direct");
+    assert!(
+        direct <= 64,
+        "direct edges ({direct}) must stay within the MAX_VALUE_SET cap, not explode to 2^20"
     );
 }

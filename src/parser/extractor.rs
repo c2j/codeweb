@@ -154,6 +154,18 @@ pub struct CallEdge {
     pub location: SourceLocation,
 }
 
+/// Maximum number of literal-string variants to track per PL variable.
+///
+/// `extract_all_literal_strings` builds a cartesian product across `||`
+/// operands and IF/CASE branches. Without a cap, a long concatenation chain
+/// whose operands each carry multiple values (e.g. 30 `CASE WHEN ... END`
+/// terms) explodes to 2^30 strings → CPU spin + OOM (regression introduced in
+/// v0.7.10, fixed here). When the product would exceed this cap we abandon
+/// static expansion for that expression; the EXECUTE IMMEDIATE call then
+/// falls back to an opaque dynamic edge — a sound, lossy fallback that
+/// preserves call-graph correctness.
+pub const MAX_VALUE_SET: usize = 64;
+
 pub struct CallExtractor {
     pub current_procedure: Option<RoutineId>,
     pub edges: Vec<CallEdge>,
@@ -173,6 +185,9 @@ pub struct CallExtractor {
     /// into DirectCall edges for every tracked value containing a CALL.
     /// Cleared on begin_routine_scope.
     var_values: HashMap<String, HashSet<String>>,
+    /// Guards against log spam: once a routine hits the [`MAX_VALUE_SET`] cap,
+    /// further overflows in the same routine are silent.
+    value_overflow_warned: bool,
 }
 
 impl CallExtractor {
@@ -184,6 +199,7 @@ impl CallExtractor {
             local_vars: HashSet::new(),
             known_types,
             var_values: HashMap::new(),
+            value_overflow_warned: false,
         }
     }
 
@@ -203,6 +219,7 @@ impl CallExtractor {
     pub fn begin_routine_scope(&mut self, params: &[RoutineParam]) {
         self.local_vars.clear();
         self.var_values.clear();
+        self.value_overflow_warned = false;
         for param in params {
             self.local_vars.insert(param.name.to_lowercase());
         }
@@ -233,6 +250,25 @@ impl CallExtractor {
         });
     }
 
+    /// Record (once per routine) that value-set expansion was capped, surfacing
+    /// the file + cause in `parse.log` so future pathological inputs are
+    /// diagnosed instantly instead of presenting as a hang/OOM.
+    fn warn_value_overflow(&mut self) {
+        if self.value_overflow_warned {
+            return;
+        }
+        self.value_overflow_warned = true;
+        crate::parse_log::warn(
+            &self.file.display().to_string(),
+            &format!(
+                "value-set expansion capped at {} (EXECUTE IMMEDIATE dynamic-SQL resolution \
+                 degraded to opaque) — likely a long `||` concatenation chain or many \
+                 CASE/IF branches producing a combinatorial value explosion",
+                MAX_VALUE_SET
+            ),
+        );
+    }
+
     fn extract_call_from_sql_text(&mut self, sql_text: &str) {
         let normalized = sql_text.to_lowercase().replace(' ', "");
         if let Some(rest) = normalized.strip_prefix("call") {
@@ -254,7 +290,7 @@ impl CallExtractor {
     /// Returns an empty Vec when no literal value can be statically determined.
     /// A Vec with multiple entries means the value is non-deterministic
     /// (e.g. different IF/ELSE branches, CASE with different WHEN values).
-    fn extract_all_literal_strings(&self, expr: &Expr) -> Vec<String> {
+    fn extract_all_literal_strings(&mut self, expr: &Expr) -> Vec<String> {
         match expr {
             Expr::Literal(Literal::String(s)) => vec![s.clone()],
             Expr::BinaryOp {
@@ -265,7 +301,16 @@ impl CallExtractor {
                 if left_vals.is_empty() || right_vals.is_empty() {
                     return vec![];
                 }
-                let mut result = Vec::with_capacity(left_vals.len() * right_vals.len());
+                // Cap the cartesian product to prevent exponential blowup on
+                // long `||` chains whose operands each carry multiple values.
+                // Abandoning expansion degrades EXECUTE IMMEDIATE resolution to
+                // an opaque dynamic call — a sound, lossy fallback.
+                let product = left_vals.len().saturating_mul(right_vals.len());
+                if product > MAX_VALUE_SET {
+                    self.warn_value_overflow();
+                    return vec![];
+                }
+                let mut result = Vec::with_capacity(product);
                 for l in &left_vals {
                     for r in &right_vals {
                         result.push(format!("{}{}", l, r));
@@ -476,8 +521,16 @@ impl Visitor for CallExtractor {
                 for state in &branch_states {
                     for (k, vals) in state {
                         let entry = merged.entry(k.clone()).or_default();
-                        entry.extend(vals.iter().cloned());
+                        for v in vals {
+                            if entry.len() >= MAX_VALUE_SET {
+                                break;
+                            }
+                            entry.insert(v.clone());
+                        }
                     }
+                }
+                if merged.values().any(|s| s.len() >= MAX_VALUE_SET) {
+                    self.warn_value_overflow();
                 }
                 self.var_values = merged;
                 return VisitorResult::SkipChildren;
