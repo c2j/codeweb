@@ -23,6 +23,8 @@ const PLSQL_TABLE_OF_TYPE_CONSTRUCTOR: &str =
     include_str!("regress/local_var_not_call_edges/cases/plsql_table_of_type_constructor.sql");
 const PLSQL_INDEX_BY_PKG_VARIABLE: &str =
     include_str!("regress/local_var_not_call_edges/cases/plsql_index_by_pkg_variable.sql");
+const PKG_TYPE_PARAM_AND_LOCAL_SUBSCRIPT: &str =
+    include_str!("regress/local_var_not_call_edges/cases/pkg_type_param_and_local_subscript.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -237,5 +239,20 @@ fn regress_plsql_index_by_pkg_variable() {
     assert!(
         !has_any_direct_or_dynamic_edge(&json),
         "Package-level collection variable indexing must NOT produce any call edge"
+    );
+}
+
+#[test]
+fn regress_pkg_type_param_and_local_subscript() {
+    let json = analyze_json(PKG_TYPE_PARAM_AND_LOCAL_SUBSCRIPT);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "Package TYPE used as parameter datatype, local constructor vchartab_pkg1(), and local \
+         subscript vchar(1) must NOT spawn Unresolved nodes; found {unresolved}"
+    );
+    assert!(
+        !has_any_direct_or_dynamic_edge(&json),
+        "Package TYPE in parameter position + local collection subscript must NOT produce any call edge"
     );
 }
