@@ -337,7 +337,7 @@ impl Visitor for CallExtractor {
                     },
                 ..
             }) => {
-                let raw = format!("{:?}", string_expr);
+                let raw = format!("{:?}", peel_parenthesized(string_expr));
                 self.push_call(&raw, true, 0);
             }
             PlStatement::Sql(sql_text) => {
@@ -1625,6 +1625,18 @@ fn format_select_target(target: &SelectTarget) -> String {
             None => "*".to_string(),
         },
     }
+}
+
+/// Strip nested `Parenthesized` wrappers, returning the innermost `Expr`.
+///
+/// `EXECUTE IMMEDIATE (v_sql)` parses as `Parenthesized(PlVariable(...))`;
+/// without peeling, the Debug format prefix becomes `Parenthesized(` and
+/// evades `noise_rule`'s `starts_with("PlVariable(")` check.
+fn peel_parenthesized(mut expr: &Expr) -> &Expr {
+    while let Expr::Parenthesized(inner) = expr {
+        expr = inner;
+    }
+    expr
 }
 
 fn format_expr_short(expr: &Expr) -> String {
