@@ -11,14 +11,23 @@ const MULTI_SCHEMA_SAME_UTIL: &str =
     include_str!("regress/func_schema_resolution/cases/multi_schema_same_util.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
-    let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join(if cfg!(windows) {
-            "codeweb.exe"
-        } else {
-            "codeweb"
-        });
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let bin_name = if cfg!(windows) {
+        "codeweb.exe"
+    } else {
+        "codeweb"
+    };
+    let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
+    for entry in entries.flatten() {
+        let p = entry.path().join("debug").join(bin_name);
+        if p.exists() {
+            return std::process::Command::new(p)
+                .args(args)
+                .output()
+                .expect("failed to run codeweb");
+        }
+    }
+    let bin = base.join("debug").join(bin_name);
     std::process::Command::new(bin)
         .args(args)
         .output()
