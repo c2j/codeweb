@@ -171,6 +171,15 @@ impl RoutineId {
             },
         }
     }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            schema: self.schema.as_ref().map(|s| s.to_lowercase()),
+            package: self.package.as_ref().map(|p| p.to_lowercase()),
+            name: self.name.to_lowercase(),
+            kind: self.kind,
+        }
+    }
 }
 
 impl fmt::Display for RoutineId {
