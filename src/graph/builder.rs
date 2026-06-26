@@ -1337,11 +1337,29 @@ impl GraphBuilder {
         } else {
             None
         };
+
+        // Pre-pass: package-level Variable/Type names are visible to every
+        // routine in the package. Types are registered once (sticky); variables
+        // must be re-injected per routine because begin_routine_scope clears.
+        let pkg_var_names: Vec<String> = pkg_items
+            .iter()
+            .filter_map(|item| match item {
+                PackageItem::Variable(v) => Some(v.name.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        for item in pkg_items {
+            if let PackageItem::Type(t) = item {
+                extractor.register_type_name(crate::parser::pl_type_decl_name(t));
+            }
+        }
+
         for item in pkg_items {
             match item {
                 PackageItem::Procedure(p) => {
                     if let Some(ref block) = p.block {
                         extractor.begin_routine_scope(&p.parameters);
+                        extractor.extend_local_scope(pkg_var_names.iter().cloned());
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
@@ -1354,6 +1372,7 @@ impl GraphBuilder {
                 PackageItem::Function(f) => {
                     if let Some(ref block) = f.block {
                         extractor.begin_routine_scope(&f.parameters);
+                        extractor.extend_local_scope(pkg_var_names.iter().cloned());
                         extractor.current_procedure = Some(RoutineId {
                             schema: schema_part.clone(),
                             package: Some(pkg_name_part.clone()),
@@ -4162,6 +4181,191 @@ mod tests {
             1,
             "duplicate JavaMethodInfo with same FQN should produce exactly 1 JavaMethod node, got {}",
             method_nodes.len()
+        );
+    }
+
+    #[test]
+    fn plsql_varray_type_constructor_not_unresolved() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE PROC_VARRAY AS
+            BEGIN
+                DECLARE
+                    TYPE arr_type IS VARRAY(4) OF VARCHAR2(100);
+                    table_array arr_type := arr_type('A','B','C','D');
+                BEGIN
+                    NULL;
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "VARRAY type constructor must not spawn unresolved node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn plsql_table_of_type_constructor_not_unresolved() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE PROC_TABLEOF AS
+            BEGIN
+                DECLARE
+                    TYPE t_work_array IS TABLE OF VARCHAR2(100);
+                    v_work_array t_work_array := t_work_array();
+                BEGIN
+                    NULL;
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "TABLE OF type constructor must not spawn unresolved node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn plsql_index_by_type_declaration_no_unresolved() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE PROC_INDEXBY AS
+            BEGIN
+                DECLARE
+                    TYPE vchartab IS TABLE OF VARCHAR2(4000) INDEX BY INTEGER;
+                    vchar_array vchartab;
+                BEGIN
+                    vchar_array(1) := 'x';
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "INDEX BY collection indexing on local var must not spawn unresolved node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn plsql_package_variable_collection_index_not_unresolved() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY BIGFUND.PKG_CLR_RULE_OPT AS
+                TYPE vchartab_pkg IS TABLE OF VARCHAR2(4000) INDEX BY INTEGER;
+                vchar_array_pkg vchartab_pkg;
+
+                PROCEDURE use_pkg_var IS
+                BEGIN
+                    vchar_array_pkg(1) := 'x';
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "package-level variable used as collection index must not spawn unresolved node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn plsql_package_type_constructor_not_unresolved() {
+        // The constructor call must be inside a PROCEDURE body (not a
+        // package-level Variable initializer) so collect_package_call_edges
+        // actually walks it — package Variable initializers are never visited.
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY BIGFUND.PKG_DEMO AS
+                TYPE int_list IS TABLE OF INTEGER;
+
+                PROCEDURE init IS
+                    v int_list := int_list(1, 2, 3);
+                BEGIN
+                    NULL;
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "package-level TYPE used as constructor in procedure body must not spawn unresolved \
+             node: {:?}",
+            unresolved
+        );
+    }
+
+    #[test]
+    fn plsql_type_filter_does_not_suppress_real_call() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE real_callee AS BEGIN NULL; END;
+
+            CREATE OR REPLACE PROCEDURE caller AS
+            BEGIN
+                DECLARE
+                    TYPE local_type IS TABLE OF VARCHAR2(10);
+                    v local_type := local_type();
+                BEGIN
+                    real_callee();
+                END;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let unresolved: Vec<String> = graph
+            .node_indices()
+            .filter_map(|i| match &graph[i] {
+                Node::Unresolved { raw_expr, .. } => Some((**raw_expr).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "no unresolved nodes expected: {:?}",
+            unresolved
+        );
+
+        let call_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::DirectCall { .. }))
+            .collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "real_callee() call must still produce a DirectCall edge"
         );
     }
 }

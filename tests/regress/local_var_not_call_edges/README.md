@@ -28,7 +28,10 @@ local_var_not_call_edges/
     ├── type_constructor_not_captured.sql
     ├── pkg_body_scope_leak.sql
     ├── pkg_body_param_not_captured.sql
-    └── nested_routine_scope_leak.sql
+    ├── nested_routine_scope_leak.sql
+    ├── plsql_varray_type_constructor.sql
+    ├── plsql_table_of_type_constructor.sql
+    └── plsql_index_by_pkg_variable.sql
 ```
 
 ## 案例一览
@@ -43,6 +46,9 @@ local_var_not_call_edges/
 | `pkg_body_scope_leak` | 包体内 proc_a 局部变量 `helper_fn` 泄漏到 proc_b，抑制真实调用 | `proc_b → helper_fn` 存在（待修复：当前缺失） |
 | `pkg_body_param_not_captured` | 包体过程参数 `p_ids` 以 `(i)` 语法出现在 WHERE 子句 | 无 call edge（待修复：当前产生假阳性 Unresolved） |
 | `nested_routine_scope_leak` | 嵌套过程的局部变量 `v_shadow` 泄漏到外层作用域 | `outer_proc → v_shadow` 存在（待修复：当前缺失） |
+| `plsql_varray_type_constructor` | DECLARE 块内 `TYPE arr_type IS VARRAY(4) OF VARCHAR2(100)` 后 `arr_type(...)` 构造 | 无 call edge（PL/SQL 块级 TYPE 名进入 `known_types`） |
+| `plsql_table_of_type_constructor` | DECLARE 块内 `TYPE t_work_array IS TABLE OF c_work%ROWTYPE` 后 `t_work_array()` 构造 | 无 call edge |
+| `plsql_index_by_pkg_variable` | 包级 `TYPE vchartab_pkg IS TABLE OF ... INDEX BY INTEGER` + 包级变量下标 `vchar_array_pkg(1)` | 无 call edge（包级变量进入 `local_vars`） |
 
 ## 添加新案例
 

@@ -17,6 +17,12 @@ const PKG_BODY_PARAM_NOT_CAPTURED: &str =
     include_str!("regress/local_var_not_call_edges/cases/pkg_body_param_not_captured.sql");
 const NESTED_ROUTINE_SCOPE_LEAK: &str =
     include_str!("regress/local_var_not_call_edges/cases/nested_routine_scope_leak.sql");
+const PLSQL_VARRAY_TYPE_CONSTRUCTOR: &str =
+    include_str!("regress/local_var_not_call_edges/cases/plsql_varray_type_constructor.sql");
+const PLSQL_TABLE_OF_TYPE_CONSTRUCTOR: &str =
+    include_str!("regress/local_var_not_call_edges/cases/plsql_table_of_type_constructor.sql");
+const PLSQL_INDEX_BY_PKG_VARIABLE: &str =
+    include_str!("regress/local_var_not_call_edges/cases/plsql_index_by_pkg_variable.sql");
 
 fn run_codeweb(args: &[&str]) -> std::process::Output {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -186,5 +192,50 @@ fn regress_nested_routine_scope_leak() {
         has_direct_edge(&json, "outer_proc", "v_shadow"),
         "outer_proc must have a DirectCall edge to v_shadow — the real call is currently suppressed \
          because the nested procedure's local variable 'v_shadow' leaks into the enclosing scope"
+    );
+}
+
+#[test]
+fn regress_plsql_varray_type_constructor() {
+    let json = analyze_json(PLSQL_VARRAY_TYPE_CONSTRUCTOR);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "PL/SQL block-local VARRAY constructor arr_type(...) must NOT spawn an Unresolved node; \
+         found {unresolved}"
+    );
+    assert!(
+        !has_any_direct_or_dynamic_edge(&json),
+        "PL/SQL block-local VARRAY TYPE constructor must NOT produce any call edge"
+    );
+}
+
+#[test]
+fn regress_plsql_table_of_type_constructor() {
+    let json = analyze_json(PLSQL_TABLE_OF_TYPE_CONSTRUCTOR);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "PL/SQL block-local TABLE OF constructor t_work_array() must NOT spawn an Unresolved node; \
+         found {unresolved}"
+    );
+    assert!(
+        !has_any_direct_or_dynamic_edge(&json),
+        "PL/SQL block-local TABLE OF TYPE constructor must NOT produce any call edge"
+    );
+}
+
+#[test]
+fn regress_plsql_index_by_pkg_variable() {
+    let json = analyze_json(PLSQL_INDEX_BY_PKG_VARIABLE);
+    let unresolved = count_unresolved_nodes(&json);
+    assert_eq!(
+        unresolved, 0,
+        "Package-level INDEX BY collection variable indexed with vchar_array_pkg(i) must NOT spawn \
+         an Unresolved node; found {unresolved}"
+    );
+    assert!(
+        !has_any_direct_or_dynamic_edge(&json),
+        "Package-level collection variable indexing must NOT produce any call edge"
     );
 }
