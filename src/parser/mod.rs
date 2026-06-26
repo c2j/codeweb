@@ -11,6 +11,7 @@ pub mod jsp_preprocessor;
 pub mod jsp_types;
 mod loader;
 pub mod scanner;
+pub mod snippet;
 
 #[allow(unused_imports)]
 pub use extractor::{
