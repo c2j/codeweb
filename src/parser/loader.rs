@@ -82,6 +82,7 @@ pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
 }
 
 fn parse_file(path: &Path) -> std::result::Result<(Vec<StatementInfo>, String), String> {
+    let parse_sw = std::time::Instant::now();
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
     let content_hash = blake3::hash(&bytes).to_hex().to_string();
     let sql = String::from_utf8(bytes)
@@ -95,6 +96,18 @@ fn parse_file(path: &Path) -> std::result::Result<(Vec<StatementInfo>, String), 
     let stmts = parser.parse_with_text();
 
     let file_str = path.to_string_lossy().to_string();
+    let elapsed = parse_sw.elapsed();
+    if elapsed > crate::parse_log::SLOW_FILE_THRESHOLD {
+        crate::parse_log::warn(
+            &file_str,
+            &format!(
+                "slow parse: {:.2}s ({} statements) — inspect for pathological nesting / huge \
+                 statements",
+                elapsed.as_secs_f64(),
+                stmts.len()
+            ),
+        );
+    }
     if !parser.errors().is_empty() {
         for err in parser.errors() {
             crate::parse_log::warn(&file_str, &err.to_string());
