@@ -55,6 +55,8 @@ pub struct NodesParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct NodeDetailParams {
     pub id: usize,
+    #[serde(default)]
+    pub depth: Option<usize>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -196,7 +198,7 @@ impl McpState {
 
     /// Get detailed information about a specific node
     #[tool(
-        description = "Get detailed information about a node by ID, including its properties, callers, and callees"
+        description = "Get detailed information about a node by ID, including its properties, callers, and callees. Set depth to control traversal (default 1 = direct only, 0 = unlimited, N = N hops)"
     )]
     fn codeweb_node_detail(&self, Parameters(params): Parameters<NodeDetailParams>) -> String {
         let graph = self.graph();
@@ -209,31 +211,34 @@ impl McpState {
 
         let node = &graph[idx];
         let key = NodeKey::from_node(node);
+        let depth = params.depth.unwrap_or(1);
 
-        let callers: Vec<serde_json::Value> = graph
-            .neighbors_directed(idx, Direction::Incoming)
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.index(),
-                    "key": NodeKey::from_node(&graph[n]).to_string(),
-                    "type": node_type_tag(&graph[n]),
+        let callers: Vec<serde_json::Value> =
+            traverse::neighbors_at_depth(graph, idx, Direction::Incoming, depth)
+                .into_iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.index(),
+                        "key": NodeKey::from_node(&graph[n]).to_string(),
+                        "type": node_type_tag(&graph[n]),
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let callees: Vec<serde_json::Value> = graph
-            .neighbors_directed(idx, Direction::Outgoing)
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.index(),
-                    "key": NodeKey::from_node(&graph[n]).to_string(),
-                    "type": node_type_tag(&graph[n]),
+        let callees: Vec<serde_json::Value> =
+            traverse::neighbors_at_depth(graph, idx, Direction::Outgoing, depth)
+                .into_iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.index(),
+                        "key": NodeKey::from_node(&graph[n]).to_string(),
+                        "type": node_type_tag(&graph[n]),
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let in_deg = callers.len();
-        let out_deg = callees.len();
+        let in_deg = graph.neighbors_directed(idx, Direction::Incoming).count();
+        let out_deg = graph.neighbors_directed(idx, Direction::Outgoing).count();
 
         let mut properties: Vec<serde_json::Value> = Vec::new();
         match node {
