@@ -1863,7 +1863,6 @@ fn pick_richer_node(a: &Node, idx_a: NodeIndex, b: &Node, idx_b: NodeIndex) -> N
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Serialize)]
 pub struct StoreStats {
     pub procedures: usize,

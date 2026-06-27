@@ -26,6 +26,10 @@ pub struct GraphBuildContext {
     pub table_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub type_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub sequence_index: HashMap<String, petgraph::graph::NodeIndex>,
+    /// Shared dedup index for BuiltinFunction nodes (keyed by lowercased name).
+    /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
+    /// builtin called from multiple paths is a single graph node.
+    pub builtin_index: HashMap<String, petgraph::graph::NodeIndex>,
 }
 
 impl GraphBuildContext {
@@ -38,8 +42,20 @@ impl GraphBuildContext {
             table_index: HashMap::new(),
             type_index: HashMap::new(),
             sequence_index: HashMap::new(),
+            builtin_index: HashMap::new(),
         }
     }
+}
+
+/// A call extracted from a SQL statement (XML-mapper / Java / JSP path).
+///
+/// Carries builtin metadata so consumers can branch: builtins become
+/// `BuiltinFunction` nodes + `UsesBuiltinFunction` edges; everything else
+/// follows the existing `CallsProcedure` path.
+#[derive(Clone)]
+pub(crate) struct ExtractedCall {
+    pub callee_name: String,
+    pub builtin_meta: Option<ogsql_parser::ast::BuiltinFuncMeta>,
 }
 
 impl GraphBuilder {
@@ -87,6 +103,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_nodes_from_parsed(
             java_files,
@@ -94,6 +111,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_method_nodes_from_parsed(
             java_method_results,
@@ -123,6 +141,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_nodes_from_parsed(
             &all.java_files,
@@ -130,6 +149,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_method_nodes_from_parsed(
             &all.java_method_results,
@@ -163,6 +183,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.table_index,
             &ctx.type_index,
+            &mut ctx.builtin_index,
         );
         Self::create_object_ref_edges(
             sql_files,
@@ -1079,6 +1100,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let mut all_edges = Vec::new();
 
@@ -1196,7 +1218,7 @@ impl GraphBuilder {
             }
         }
 
-        Self::create_edges(&all_edges, graph, proc_index);
+        Self::create_edges(&all_edges, graph, proc_index, builtin_index);
     }
 
     fn create_object_ref_edges(
@@ -1509,10 +1531,75 @@ impl GraphBuilder {
         }
     }
 
+    /// Find an existing `BuiltinFunction` node by lowercased name, or create a new one.
+    ///
+    /// Shared across the SQL-proc, XML-mapper, Java, and JSP paths so that the same
+    /// builtin called from multiple sources collapses to a single node (dedup key:
+    /// lowercased name, matching `NodeKey::BuiltinFunction`).
+    fn find_or_create_builtin_node(
+        graph: &mut CodeGraph,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        name: &str,
+        meta: &ogsql_parser::ast::BuiltinFuncMeta,
+        location: SourceLocation,
+    ) -> petgraph::graph::NodeIndex {
+        let name_lower = name.to_lowercase();
+        let name_display = if name_lower != *name { format!("{} (raw={})", name_lower, name) } else { name_lower.clone() };
+        let loc_file = location.file.display().to_string();
+        let loc_line = location.line;
+        if let Some(&idx) = builtin_index.get(&name_lower) {
+            static REUSE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = REUSE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[builtin #{:<4} REUSE] {:>35} | domain={:>15} | {}:{}",
+                n, name_display, meta.domain, loc_file, loc_line,
+            );
+            return idx;
+        }
+        let idx = graph.add_node(Node::BuiltinFunction {
+            name: name.to_string(),
+            category: meta.category.clone(),
+            domain: meta.domain.clone(),
+            location,
+        });
+        builtin_index.insert(name_lower, idx);
+        static CREATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CREATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[builtin #{:<4} NEW  ] {:>35} | domain={:>15} category={:>12} | {}:{}",
+            n, name_display, meta.domain, meta.category, loc_file, loc_line,
+        );
+        idx
+    }
+
+    /// Debug helper: scan the graph and report all BuiltinFunction nodes,
+    /// showing duplicate names (same lowercased name → multiple NodeIndex).
+    pub fn debug_dump_builtin_nodes(graph: &CodeGraph) {
+        let mut by_name: HashMap<String, Vec<(petgraph::graph::NodeIndex, &Node)>> = HashMap::new();
+        for idx in graph.node_indices() {
+            if let n @ Node::BuiltinFunction { name, .. } = &graph[idx] {
+                by_name.entry(name.to_lowercase()).or_default().push((idx, n));
+            }
+        }
+        let total = by_name.values().map(|v| v.len()).sum::<usize>();
+        eprintln!("[builtin] === BuiltinFunction nodes in graph: {} distinct names, {} total nodes ===", by_name.len(), total);
+        for (name_lower, entries) in &by_name {
+            let dup_marker = if entries.len() > 1 { format!("  ⚠ DUPLICATE ×{}", entries.len()) } else { String::new() };
+            eprintln!("[builtin]   {:>35} → node_count={}{}", name_lower, entries.len(), dup_marker);
+            if entries.len() > 1 {
+                for (idx, node) in entries {
+                    let loc = &node.file();
+                    eprintln!("[builtin]     NodeIndex({:?})  file={}", idx.index(), loc.display());
+                }
+            }
+        }
+    }
+
     fn create_edges(
         edges: &[CallEdge],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let pkg_member_lower: HashMap<(String, String), petgraph::graph::NodeIndex> = proc_index
             .iter()
@@ -1524,7 +1611,6 @@ impl GraphBuilder {
             .collect();
 
         let mut seen: HashMap<(Option<String>, String), usize> = HashMap::new();
-        let mut builtin_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
         for edge in edges {
             let caller_key = edge.caller.as_ref().map(|c| c.to_string());
@@ -1554,19 +1640,13 @@ impl GraphBuilder {
 
             // ── Built-in function: create/reuse BuiltinFunction node, connect with UsesBuiltinFunction ──
             if let Some(meta) = &edge.builtin_meta {
-                let builtin_name_lower = edge.callee_name.to_lowercase();
-                let builtin_idx = if let Some(&idx) = builtin_index.get(&builtin_name_lower) {
-                    idx
-                } else {
-                    let idx = graph.add_node(Node::BuiltinFunction {
-                        name: edge.callee_name.clone(),
-                        category: meta.category.clone(),
-                        domain: meta.domain.clone(),
-                        location: edge.location.clone(),
-                    });
-                    builtin_index.insert(builtin_name_lower, idx);
-                    idx
-                };
+                let builtin_idx = Self::find_or_create_builtin_node(
+                    graph,
+                    builtin_index,
+                    &edge.callee_name,
+                    meta,
+                    edge.location.clone(),
+                );
                 if let Some(caller_idx) = caller_idx {
                     graph.add_edge(
                         caller_idx,
@@ -1730,6 +1810,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         Self::add_ibatis_nodes_from_parsed_with_source_paths(
             ibatis_files,
@@ -1737,6 +1818,7 @@ impl GraphBuilder {
             proc_index,
             mapper_index,
             table_index,
+            builtin_index,
             &[],
         )
     }
@@ -1748,6 +1830,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         source_paths: &[PathBuf],
     ) {
         for ibatis_file in ibatis_files {
@@ -1786,7 +1869,35 @@ impl GraphBuilder {
 
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
-                    for callee_name in calls {
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
+                    for call in calls {
+                        if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                graph,
+                                builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: xml_path.clone(),
+                                    line: stmt.line,
+                                },
+                            );
+                            graph.add_edge(
+                                node_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: xml_path.clone(),
+                                        line: stmt.line,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -1893,6 +2004,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         Self::add_java_nodes_from_parsed_with_source_paths(
             java_files,
@@ -1900,6 +2012,7 @@ impl GraphBuilder {
             proc_index,
             mapper_index,
             table_index,
+            builtin_index,
             &[],
         )
     }
@@ -1912,6 +2025,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         source_paths: &[PathBuf],
     ) {
         let mut javasql_seen: HashSet<(PathBuf, usize)> = HashSet::new();
@@ -1951,7 +2065,35 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &java_path);
-                    for callee_name in calls {
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
+                    for call in calls {
+                        if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                graph,
+                                builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: java_path.clone(),
+                                    line: extraction.origin.line,
+                                },
+                            );
+                            graph.add_edge(
+                                node_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: java_path.clone(),
+                                        line: extraction.origin.line,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -2038,15 +2180,16 @@ impl GraphBuilder {
     fn extract_calls_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
-    ) -> Vec<String> {
+    ) -> Vec<ExtractedCall> {
         let mut calls = Vec::new();
         for info in statements {
             let mut extractor = CallExtractor::new(file_path.clone(), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             for edge in extractor.edges {
-                if edge.builtin_meta.is_none() {
-                    calls.push(edge.callee_name);
-                }
+                calls.push(ExtractedCall {
+                    callee_name: edge.callee_name,
+                    builtin_meta: edge.builtin_meta,
+                });
             }
         }
         calls
@@ -2216,7 +2359,35 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
-                    for callee_name in calls {
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
+                    for call in calls {
+                        if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                &mut ctx.graph,
+                                &mut ctx.builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: jsp_path.clone(),
+                                    line: extraction.origin.line,
+                                },
+                            );
+                            ctx.graph.add_edge(
+                                sql_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: jsp_path.clone(),
+                                        line: extraction.origin.line,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
@@ -4372,6 +4543,7 @@ mod tests {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
 
         let mapper_nodes: Vec<_> = ctx
@@ -4391,6 +4563,68 @@ mod tests {
             1,
             "duplicate ibatis files with same namespace.statement_id should produce exactly 1 MappedStatement node, got {}",
             mapper_nodes.len()
+        );
+    }
+
+    #[test]
+    fn builtin_function_captured_from_mapper_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        // SQL containing a builtin aggregate function
+        let sql = "SELECT COUNT(*) FROM orders";
+        // Parse it to get StatementInfo carrying builtin metadata (ogsql-parser v0.8.11 tags builtins during parsing)
+        let statements = parse_sql(sql);
+
+        let stmt = ParsedStatement {
+            id: "countOrders".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((statements, vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        // Assert a BuiltinFunction node named "count" exists (case-insensitive)
+        let has_count = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        });
+        assert!(has_count, "expected a BuiltinFunction node for COUNT");
+
+        // Assert a UsesBuiltinFunction edge connects the mapper to the builtin
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the mapper"
         );
     }
 
@@ -4444,6 +4678,7 @@ mod tests {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
 
         let javasql_nodes: Vec<_> = ctx
@@ -4465,6 +4700,246 @@ mod tests {
             1,
             "duplicate Java extractions with same file+line should produce exactly 1 JavaSql node, got {}",
             javasql_nodes.len()
+        );
+    }
+
+    #[test]
+    fn builtin_function_captured_from_java_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::java::{
+            ExtractedSql, ExtractionMethod, JavaExtractResult, ParameterStyle, SqlKind, SqlOrigin,
+            SqlParseResult,
+        };
+
+        let sql = "SELECT SUBSTR(name, 1, 3) FROM users";
+        let statements = parse_sql(sql);
+
+        let extraction = ExtractedSql {
+            sql: sql.to_string(),
+            origin: SqlOrigin {
+                method: ExtractionMethod::Annotation,
+                class_name: Some("UserDao".to_string()),
+                method_name: Some("findUsers".to_string()),
+                annotation_name: None,
+                api_method_name: None,
+                variable_name: None,
+                line: 10,
+                column: 0,
+            },
+            sql_kind: SqlKind::NativeSql,
+            parameter_style: ParameterStyle::None,
+            is_concatenated: false,
+            is_text_block: false,
+            parse_result: Some(SqlParseResult {
+                statements,
+                errors: vec![],
+            }),
+        };
+
+        let java_file = crate::parser::java_loader::JavaParsedFile {
+            path: PathBuf::from("/dao/UserDao.java"),
+            result: JavaExtractResult {
+                file_path: "/src/UserDao.java".to_string(),
+                extractions: vec![extraction],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_java_nodes_from_parsed(
+            std::slice::from_ref(&java_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        let has_substr = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("substr"))
+        });
+        assert!(has_substr, "expected a BuiltinFunction node for SUBSTR");
+
+        // Assert a UsesBuiltinFunction edge connects the JavaSql node to the builtin
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the JavaSql node"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "jsp")]
+    fn builtin_function_captured_from_jsp_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::jsp_loader::load_jsp_string;
+        use ogsql_parser::java::JavaExtractConfig;
+
+        let jsp_source = r#"<%@ page import="java.sql.*" %>
+<%
+Connection conn = DriverManager.getConnection("jdbc:default:connection");
+Statement stmt = conn.createStatement();
+ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
+%>"#;
+        let config = JavaExtractConfig {
+            extra_sql_methods: vec![],
+            extra_sql_var_patterns: vec![],
+        };
+        let jsp_result = load_jsp_string(
+            jsp_source.to_string(),
+            std::path::Path::new("/web/products.jsp"),
+            &config,
+        );
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_jsp_nodes_from_parsed(std::slice::from_ref(&jsp_result), &mut ctx);
+
+        let has_count = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        });
+        assert!(has_count, "expected a BuiltinFunction node for COUNT");
+
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the JspSql node"
+        );
+    }
+
+    #[test]
+    fn builtin_node_cross_path_dedup() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::ParsedFile;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        let proc_sql = r#"
+            CREATE PROCEDURE use_count AS $$
+            BEGIN
+                PERFORM COUNT(*) FROM dual;
+            END;
+            $$;
+        "#;
+        let parsed_sql = vec![ParsedFile {
+            path: PathBuf::from("proc.sql"),
+            statements: parse_sql(proc_sql),
+            content_hash: String::new(),
+        }];
+
+        let mapper_sql = "SELECT COUNT(*) FROM orders";
+        let mapper_stmt = ParsedStatement {
+            id: "countOrders".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: mapper_sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((parse_sql(mapper_sql), vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![mapper_stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::build_sql_chunk(&mut ctx, &parsed_sql);
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        let count_nodes = ctx.graph.node_weights().filter(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        }).count();
+        assert_eq!(
+            count_nodes, 1,
+            "cross-path dedup: one COUNT node shared between proc and mapper"
+        );
+
+        let builtin_edges = ctx
+            .graph
+            .edge_weights()
+            .filter(|e| matches!(e, Edge::UsesBuiltinFunction { .. }))
+            .count();
+        assert_eq!(
+            builtin_edges, 2,
+            "two callers (proc + mapper) should produce two UsesBuiltinFunction edges"
+        );
+    }
+
+    #[test]
+    fn builtin_edge_dedup_within_single_statement() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        let sql = "SELECT COUNT(*) + COUNT(*) FROM orders";
+        let stmt = ParsedStatement {
+            id: "doubleCount".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((parse_sql(sql), vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        let count_nodes = ctx.graph.node_weights().filter(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        }).count();
+        assert_eq!(count_nodes, 1, "one COUNT node");
+
+        let builtin_edges = ctx
+            .graph
+            .edge_weights()
+            .filter(|e| matches!(e, Edge::UsesBuiltinFunction { .. }))
+            .count();
+        assert_eq!(
+            builtin_edges, 1,
+            "COUNT appearing twice in one statement should produce one edge (dedup)"
         );
     }
 

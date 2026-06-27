@@ -294,6 +294,7 @@ impl Project {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
             &source_paths,
         );
         GraphBuilder::add_java_nodes_from_parsed_with_source_paths(
@@ -302,6 +303,7 @@ impl Project {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
             &source_paths,
         );
         GraphBuilder::add_java_method_nodes_from_parsed(
@@ -333,6 +335,8 @@ impl Project {
         }
 
         GraphBuilder::finalize_graph(&mut ctx);
+
+        GraphBuilder::debug_dump_builtin_nodes(&ctx.graph);
 
         // Expand dynamic SQL variants for fingerprint index
         let variant_map = GraphBuilder::add_ibatis_structured_variants(
