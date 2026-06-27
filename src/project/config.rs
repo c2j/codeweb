@@ -93,7 +93,10 @@ impl ProjectConfig {
     pub fn template_with_paths(name: &str, paths: &[String]) -> String {
         let paths_toml = paths
             .iter()
-            .map(|p| format!("\"{}\"", p))
+            .map(|p| {
+                let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!(
