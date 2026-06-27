@@ -303,6 +303,7 @@ impl Project {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
             &source_paths,
         );
         GraphBuilder::add_java_method_nodes_from_parsed(

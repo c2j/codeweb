@@ -111,6 +111,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_method_nodes_from_parsed(
             java_method_results,
@@ -148,6 +149,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_method_nodes_from_parsed(
             &all.java_method_results,
@@ -1960,6 +1962,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         Self::add_java_nodes_from_parsed_with_source_paths(
             java_files,
@@ -1967,6 +1970,7 @@ impl GraphBuilder {
             proc_index,
             mapper_index,
             table_index,
+            builtin_index,
             &[],
         )
     }
@@ -1979,6 +1983,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         source_paths: &[PathBuf],
     ) {
         let mut javasql_seen: HashSet<(PathBuf, usize)> = HashSet::new();
@@ -2019,10 +2024,30 @@ impl GraphBuilder {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &java_path);
                     for call in calls {
-                        let callee_name = call.callee_name;
-                        if call.builtin_meta.is_some() {
+                        if let Some(meta) = &call.builtin_meta {
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                graph,
+                                builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: java_path.clone(),
+                                    line: extraction.origin.line,
+                                },
+                            );
+                            graph.add_edge(
+                                node_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: java_path.clone(),
+                                        line: extraction.origin.line,
+                                    },
+                                },
+                            );
                             continue;
                         }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -4583,6 +4608,7 @@ mod tests {
             &mut ctx.proc_index,
             &ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
 
         let javasql_nodes: Vec<_> = ctx
@@ -4604,6 +4630,77 @@ mod tests {
             1,
             "duplicate Java extractions with same file+line should produce exactly 1 JavaSql node, got {}",
             javasql_nodes.len()
+        );
+    }
+
+    #[test]
+    fn builtin_function_captured_from_java_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::java::{
+            ExtractedSql, ExtractionMethod, JavaExtractResult, ParameterStyle, SqlKind,
+            SqlOrigin, SqlParseResult,
+        };
+
+        // SQL containing a builtin function — UPPER is tagged by ogsql-parser as a String/Scalar builtin
+        let sql = "SELECT * FROM users WHERE UPPER(name) = 'ALICE'";
+        let statements = parse_sql(sql);
+
+        let extraction = ExtractedSql {
+            sql: sql.to_string(),
+            origin: SqlOrigin {
+                method: ExtractionMethod::Annotation,
+                class_name: Some("UserDao".to_string()),
+                method_name: Some("findUsers".to_string()),
+                annotation_name: None,
+                api_method_name: None,
+                variable_name: None,
+                line: 10,
+                column: 0,
+            },
+            sql_kind: SqlKind::NativeSql,
+            parameter_style: ParameterStyle::None,
+            is_concatenated: false,
+            is_text_block: false,
+            parse_result: Some(SqlParseResult {
+                statements,
+                errors: vec![],
+            }),
+        };
+
+        let java_file = crate::parser::java_loader::JavaParsedFile {
+            path: PathBuf::from("/dao/UserDao.java"),
+            result: JavaExtractResult {
+                file_path: "/src/UserDao.java".to_string(),
+                extractions: vec![extraction],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_java_nodes_from_parsed(
+            std::slice::from_ref(&java_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        // Assert a BuiltinFunction node named "upper" exists (case-insensitive)
+        let has_upper = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("upper"))
+        });
+        assert!(has_upper, "expected a BuiltinFunction node for UPPER");
+
+        // Assert a UsesBuiltinFunction edge connects the JavaSql node to the builtin
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the JavaSql node"
         );
     }
 
