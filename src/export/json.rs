@@ -159,6 +159,13 @@ enum NodeKindJson {
         file: String,
         line: usize,
     },
+    BuiltinFunction {
+        name: String,
+        category: String,
+        domain: String,
+        file: String,
+        line: usize,
+    },
     Custom {
         custom_type: String,
         label: String,
@@ -214,6 +221,8 @@ enum EdgeKindJson {
     InvokesMapper { file: String, line: usize },
     #[serde(rename = "calls_java")]
     CallsJava { file: String, line: usize },
+    #[serde(rename = "uses_builtin_function")]
+    UsesBuiltinFunction { file: String, line: usize },
     #[serde(rename = "contains_method")]
     ContainsMethod,
     #[serde(rename = "extends")]
@@ -521,6 +530,21 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.line,
                 },
             },
+            Node::BuiltinFunction {
+                name,
+                category,
+                domain,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::BuiltinFunction {
+                    name: name.clone(),
+                    category: category.clone(),
+                    domain: domain.clone(),
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
             Node::Custom {
                 type_name,
                 label,
@@ -624,6 +648,14 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::CallsJava {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                },
+            },
+            Edge::UsesBuiltinFunction { location } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::UsesBuiltinFunction {
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },

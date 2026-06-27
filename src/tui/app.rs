@@ -201,7 +201,7 @@ impl App {
             lines.push(Line::from(""));
         }
 
-        let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
+        let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX, false);
         let chain_lines = match self.chain_style {
             traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
             traverse::ChainStyle::Path => {
@@ -629,7 +629,7 @@ impl App {
 
         // Preview panel: show call chain for selected node
         if let Some(idx) = self.selected_node() {
-            let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX);
+            let (chain, _) = traverse::trace_chain(graph, idx, 50, usize::MAX, false);
             let preview_lines = match self.chain_style {
                 traverse::ChainStyle::Tree => self.render_chain_tree_tui(&chain, graph, idx),
                 traverse::ChainStyle::Path => {
@@ -893,6 +893,7 @@ fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
         Node::MaterializedView { .. } => (std::borrow::Cow::Borrowed("mview"), Color::Cyan),
         Node::Synonym { .. } => (std::borrow::Cow::Borrowed("synonym"), Color::Magenta),
         Node::Event { .. } => (std::borrow::Cow::Borrowed("event"), Color::LightRed),
+        Node::BuiltinFunction { .. } => (std::borrow::Cow::Borrowed("builtin"), Color::LightCyan),
         Node::Custom { type_name, .. } => (
             std::borrow::Cow::Owned((**type_name).clone()),
             Color::DarkGray,

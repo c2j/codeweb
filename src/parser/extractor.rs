@@ -152,6 +152,7 @@ pub struct CallEdge {
     pub callee_name: String,
     pub is_dynamic: bool,
     pub location: SourceLocation,
+    pub builtin_meta: Option<ogsql_parser::ast::BuiltinFuncMeta>,
 }
 
 /// Maximum number of literal-string variants to track per PL variable.
@@ -247,6 +248,22 @@ impl CallExtractor {
             callee_name: callee.to_string(),
             is_dynamic,
             location: self.make_location(line),
+            builtin_meta: None,
+        });
+    }
+
+    pub fn push_builtin_call(
+        &mut self,
+        callee: &str,
+        meta: ogsql_parser::ast::BuiltinFuncMeta,
+        line: usize,
+    ) {
+        self.edges.push(CallEdge {
+            caller: self.current_procedure.clone(),
+            callee_name: callee.to_string(),
+            is_dynamic: false,
+            location: self.make_location(line),
+            builtin_meta: Some(meta),
         });
     }
 
@@ -428,7 +445,11 @@ impl Visitor for CallExtractor {
 
     fn visit_call(&mut self, call: &CallFuncStatement) -> VisitorResult {
         let name: String = call.func_name.join(".");
-        self.push_call(&name, false, 0);
+        if let Some(meta) = &call.builtin {
+            self.push_builtin_call(&name, meta.clone(), 0);
+        } else {
+            self.push_call(&name, false, 0);
+        }
         VisitorResult::Continue
     }
 
@@ -440,7 +461,11 @@ impl Visitor for CallExtractor {
             }
         }
         let name: String = call.name.join(".");
-        self.push_call(&name, false, 0);
+        if let Some(meta) = &call.builtin {
+            self.push_builtin_call(&name, meta.clone(), 0);
+        } else {
+            self.push_call(&name, false, 0);
+        }
         VisitorResult::Continue
     }
 
@@ -615,16 +640,22 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
-        if let Expr::FunctionCall {
-            name,
-            builtin: None,
-            ..
-        } = expr
-        {
-            if !name.is_empty() {
-                let first = name[0].to_lowercase();
-                if !self.local_vars.contains(&first) && !self.known_types.contains(&first) {
+        if let Expr::FunctionCall { name, builtin, .. } = expr {
+            if name.is_empty() {
+                return VisitorResult::Continue;
+            }
+            let first = name[0].to_lowercase();
+            if self.local_vars.contains(&first) || self.known_types.contains(&first) {
+                return VisitorResult::Continue;
+            }
+            match builtin {
+                None => {
+                    // User-defined function — existing behavior
                     self.push_call(&name.join("."), false, 0);
+                }
+                Some(meta) => {
+                    // Built-in function — new path
+                    self.push_builtin_call(&name.join("."), meta.clone(), 0);
                 }
             }
         }

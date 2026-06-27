@@ -397,6 +397,16 @@ pub enum Node {
         name: String,
         location: SourceLocation,
     },
+    /// A built-in SQL function (COUNT, SUBSTR, DBE_OUTPUT.PUT_LINE, ...).
+    ///
+    /// Created on-demand when a FunctionCall tagged `builtin: Some(..)` is
+    /// encountered during extraction. Deduplication key: lowercased `name`.
+    BuiltinFunction {
+        name: String,
+        category: String,
+        domain: String,
+        location: SourceLocation,
+    },
     #[allow(clippy::box_collection)]
     Custom {
         type_name: Box<String>,
@@ -447,6 +457,7 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::MaterializedView { .. } => "mview",
         Node::Synonym { .. } => "synonym",
         Node::Event { .. } => "event",
+        Node::BuiltinFunction { .. } => "builtin",
         Node::Custom { .. } => "custom",
         #[cfg(feature = "jsp")]
         Node::JspPage { .. } => "jsp",
@@ -476,6 +487,10 @@ pub enum Edge {
     },
 
     CallsJava {
+        location: SourceLocation,
+    },
+    /// A procedure/function calls a built-in SQL function.
+    UsesBuiltinFunction {
         location: SourceLocation,
     },
     ContainsMethod,
@@ -531,7 +546,8 @@ impl Edge {
             | Edge::DynamicCall { .. }
             | Edge::CallsProcedure { .. }
             | Edge::InvokesMapper { .. }
-            | Edge::CallsJava { .. } => EdgeCategory::Call,
+            | Edge::CallsJava { .. }
+            | Edge::UsesBuiltinFunction { .. } => EdgeCategory::Call,
             Edge::ContainsRoutine | Edge::ContainsMethod => EdgeCategory::Composition,
             #[cfg(feature = "jsp")]
             Edge::ContainsSql => EdgeCategory::Composition,
@@ -589,6 +605,7 @@ impl Node {
             Node::MaterializedView { location, .. } => &location.file,
             Node::Synonym { location, .. } => &location.file,
             Node::Event { location, .. } => &location.file,
+            Node::BuiltinFunction { location, .. } => &location.file,
             Node::Custom { location, .. } => location
                 .as_ref()
                 .map(|l| l.file.as_path())
