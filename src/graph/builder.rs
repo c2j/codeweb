@@ -1831,8 +1831,12 @@ impl GraphBuilder {
 
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
                     for call in calls {
                         if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
                             let builtin_idx = Self::find_or_create_builtin_node(
                                 graph,
                                 builtin_index,
@@ -2023,8 +2027,12 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &java_path);
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
                     for call in calls {
                         if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
                             let builtin_idx = Self::find_or_create_builtin_node(
                                 graph,
                                 builtin_index,
@@ -2313,8 +2321,12 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
+                    let mut seen_builtin: HashSet<String> = HashSet::new();
                     for call in calls {
                         if let Some(meta) = &call.builtin_meta {
+                            if !seen_builtin.insert(call.callee_name.to_lowercase()) {
+                                continue;
+                            }
                             let builtin_idx = Self::find_or_create_builtin_node(
                                 &mut ctx.graph,
                                 &mut ctx.builtin_index,
@@ -4836,6 +4848,62 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         assert_eq!(
             builtin_edges, 2,
             "two callers (proc + mapper) should produce two UsesBuiltinFunction edges"
+        );
+    }
+
+    #[test]
+    fn builtin_edge_dedup_within_single_statement() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        let sql = "SELECT COUNT(*) + COUNT(*) FROM orders";
+        let stmt = ParsedStatement {
+            id: "doubleCount".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((parse_sql(sql), vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        let count_nodes = ctx.graph.node_weights().filter(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        }).count();
+        assert_eq!(count_nodes, 1, "one COUNT node");
+
+        let builtin_edges = ctx
+            .graph
+            .edge_weights()
+            .filter(|e| matches!(e, Edge::UsesBuiltinFunction { .. }))
+            .count();
+        assert_eq!(
+            builtin_edges, 1,
+            "COUNT appearing twice in one statement should produce one edge (dedup)"
         );
     }
 
