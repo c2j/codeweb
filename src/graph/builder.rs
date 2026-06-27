@@ -2314,10 +2314,30 @@ impl GraphBuilder {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
                     for call in calls {
-                        let callee_name = call.callee_name;
-                        if call.builtin_meta.is_some() {
+                        if let Some(meta) = &call.builtin_meta {
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                &mut ctx.graph,
+                                &mut ctx.builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: jsp_path.clone(),
+                                    line: extraction.origin.line,
+                                },
+                            );
+                            ctx.graph.add_edge(
+                                sql_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: jsp_path.clone(),
+                                        line: extraction.origin.line,
+                                    },
+                                },
+                            );
                             continue;
                         }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
@@ -4637,8 +4657,8 @@ mod tests {
     fn builtin_function_captured_from_java_sql() {
         use crate::graph::builder::GraphBuildContext;
         use ogsql_parser::java::{
-            ExtractedSql, ExtractionMethod, JavaExtractResult, ParameterStyle, SqlKind,
-            SqlOrigin, SqlParseResult,
+            ExtractedSql, ExtractionMethod, JavaExtractResult, ParameterStyle, SqlKind, SqlOrigin,
+            SqlParseResult,
         };
 
         // SQL containing a builtin function — UPPER is tagged by ogsql-parser as a String/Scalar builtin
@@ -4701,6 +4721,47 @@ mod tests {
         assert!(
             has_edge,
             "expected a UsesBuiltinFunction edge from the JavaSql node"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "jsp")]
+    fn builtin_function_captured_from_jsp_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::jsp_loader::load_jsp_string;
+        use ogsql_parser::java::JavaExtractConfig;
+
+        let jsp_source = r#"<%@ page import="java.sql.*" %>
+<%
+Connection conn = DriverManager.getConnection("jdbc:default:connection");
+Statement stmt = conn.createStatement();
+ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
+%>"#;
+        let config = JavaExtractConfig {
+            extra_sql_methods: vec![],
+            extra_sql_var_patterns: vec![],
+        };
+        let jsp_result = load_jsp_string(
+            jsp_source.to_string(),
+            std::path::Path::new("/web/products.jsp"),
+            &config,
+        );
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_jsp_nodes_from_parsed(std::slice::from_ref(&jsp_result), &mut ctx);
+
+        let has_count = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        });
+        assert!(has_count, "expected a BuiltinFunction node for COUNT");
+
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the JspSql node"
         );
     }
 
