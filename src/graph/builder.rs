@@ -26,6 +26,11 @@ pub struct GraphBuildContext {
     pub table_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub type_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub sequence_index: HashMap<String, petgraph::graph::NodeIndex>,
+    /// Shared dedup index for BuiltinFunction nodes (keyed by lowercased name).
+    /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
+    /// builtin called from multiple paths is a single graph node.
+    #[allow(dead_code)]
+    pub builtin_index: HashMap<String, petgraph::graph::NodeIndex>,
 }
 
 impl GraphBuildContext {
@@ -38,8 +43,20 @@ impl GraphBuildContext {
             table_index: HashMap::new(),
             type_index: HashMap::new(),
             sequence_index: HashMap::new(),
+            builtin_index: HashMap::new(),
         }
     }
+}
+
+/// A call extracted from a SQL statement (XML-mapper / Java / JSP path).
+///
+/// Carries builtin metadata so consumers can branch: builtins become
+/// `BuiltinFunction` nodes + `UsesBuiltinFunction` edges; everything else
+/// follows the existing `CallsProcedure` path.
+#[derive(Clone)]
+pub(crate) struct ExtractedCall {
+    pub callee_name: String,
+    pub builtin_meta: Option<ogsql_parser::ast::BuiltinFuncMeta>,
 }
 
 impl GraphBuilder {
@@ -1509,6 +1526,33 @@ impl GraphBuilder {
         }
     }
 
+    /// Find an existing `BuiltinFunction` node by lowercased name, or create a new one.
+    ///
+    /// Shared across the SQL-proc, XML-mapper, Java, and JSP paths so that the same
+    /// builtin called from multiple sources collapses to a single node (dedup key:
+    /// lowercased name, matching `NodeKey::BuiltinFunction`).
+    #[allow(dead_code)]
+    fn find_or_create_builtin_node(
+        graph: &mut CodeGraph,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        name: &str,
+        meta: &ogsql_parser::ast::BuiltinFuncMeta,
+        location: SourceLocation,
+    ) -> petgraph::graph::NodeIndex {
+        let name_lower = name.to_lowercase();
+        if let Some(&idx) = builtin_index.get(&name_lower) {
+            return idx;
+        }
+        let idx = graph.add_node(Node::BuiltinFunction {
+            name: name.to_string(),
+            category: meta.category.clone(),
+            domain: meta.domain.clone(),
+            location,
+        });
+        builtin_index.insert(name_lower, idx);
+        idx
+    }
+
     fn create_edges(
         edges: &[CallEdge],
         graph: &mut CodeGraph,
@@ -1786,7 +1830,11 @@ impl GraphBuilder {
 
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
-                    for callee_name in calls {
+                    for call in calls {
+                        let callee_name = call.callee_name;
+                        if call.builtin_meta.is_some() {
+                            continue;
+                        }
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -1951,7 +1999,11 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &java_path);
-                    for callee_name in calls {
+                    for call in calls {
+                        let callee_name = call.callee_name;
+                        if call.builtin_meta.is_some() {
+                            continue;
+                        }
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -2038,15 +2090,16 @@ impl GraphBuilder {
     fn extract_calls_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
-    ) -> Vec<String> {
+    ) -> Vec<ExtractedCall> {
         let mut calls = Vec::new();
         for info in statements {
             let mut extractor = CallExtractor::new(file_path.clone(), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             for edge in extractor.edges {
-                if edge.builtin_meta.is_none() {
-                    calls.push(edge.callee_name);
-                }
+                calls.push(ExtractedCall {
+                    callee_name: edge.callee_name,
+                    builtin_meta: edge.builtin_meta,
+                });
             }
         }
         calls
@@ -2216,7 +2269,11 @@ impl GraphBuilder {
                 if let Some(parse_result) = &extraction.parse_result {
                     let calls =
                         Self::extract_calls_from_statements(&parse_result.statements, &jsp_path);
-                    for callee_name in calls {
+                    for call in calls {
+                        let callee_name = call.callee_name;
+                        if call.builtin_meta.is_some() {
+                            continue;
+                        }
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx =
