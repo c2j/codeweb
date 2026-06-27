@@ -4766,6 +4766,80 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
     }
 
     #[test]
+    fn builtin_node_cross_path_dedup() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::ParsedFile;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        let proc_sql = r#"
+            CREATE PROCEDURE use_count AS $$
+            BEGIN
+                PERFORM COUNT(*) FROM dual;
+            END;
+            $$;
+        "#;
+        let parsed_sql = vec![ParsedFile {
+            path: PathBuf::from("proc.sql"),
+            statements: parse_sql(proc_sql),
+            content_hash: String::new(),
+        }];
+
+        let mapper_sql = "SELECT COUNT(*) FROM orders";
+        let mapper_stmt = ParsedStatement {
+            id: "countOrders".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: mapper_sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((parse_sql(mapper_sql), vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![mapper_stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::build_sql_chunk(&mut ctx, &parsed_sql);
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        let count_nodes = ctx.graph.node_weights().filter(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        }).count();
+        assert_eq!(
+            count_nodes, 1,
+            "cross-path dedup: one COUNT node shared between proc and mapper"
+        );
+
+        let builtin_edges = ctx
+            .graph
+            .edge_weights()
+            .filter(|e| matches!(e, Edge::UsesBuiltinFunction { .. }))
+            .count();
+        assert_eq!(
+            builtin_edges, 2,
+            "two callers (proc + mapper) should produce two UsesBuiltinFunction edges"
+        );
+    }
+
+    #[test]
     fn duplicate_java_classes_produce_single_class_node() {
         use crate::graph::builder::GraphBuildContext;
         use crate::parser::java_method::{JavaClassInfo, JavaParseResult};
