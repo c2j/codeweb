@@ -318,6 +318,10 @@ enum Commands {
         #[arg(short, long, default_value = "tree", value_parser = ["tree", "path"])]
         style: String,
 
+        /// Traversal depth: 1 = direct callers/callees only, 0 = unlimited
+        #[arg(short = 'd', long, default_value = "1")]
+        depth: usize,
+
         /// Show source files involved in the upstream/downstream chain
         #[arg(short, long)]
         files: bool,
@@ -582,9 +586,10 @@ fn run() -> Result<()> {
             name,
             project,
             style,
+            depth,
             files,
             builtfunc,
-        }) => cmd_detail(&name, &project, &style, files, builtfunc),
+        }) => cmd_detail(&name, &project, &style, depth, files, builtfunc),
         Some(Commands::Import {
             file,
             output,
@@ -1026,6 +1031,7 @@ fn cmd_detail(
     name: &str,
     project: &Path,
     style: &str,
+    depth: usize,
     show_files: bool,
     show_builtins: bool,
 ) -> Result<()> {
@@ -1069,7 +1075,18 @@ fn cmd_detail(
     let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
     let skip_builtins = !show_builtins && !target_is_builtin;
 
-    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX, skip_builtins);
+    let (chain_max_depth, chain_max_nodes) = if depth == 0 {
+        (50, usize::MAX)
+    } else {
+        (depth.saturating_sub(1), usize::MAX)
+    };
+    let (chain, _) = graph::traverse::trace_chain(
+        graph,
+        *start_idx,
+        chain_max_depth,
+        chain_max_nodes,
+        skip_builtins,
+    );
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
         "{}",
