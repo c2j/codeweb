@@ -1524,6 +1524,7 @@ impl GraphBuilder {
             .collect();
 
         let mut seen: HashMap<(Option<String>, String), usize> = HashMap::new();
+        let mut builtin_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
         for edge in edges {
             let caller_key = edge.caller.as_ref().map(|c| c.to_string());
@@ -1550,6 +1551,33 @@ impl GraphBuilder {
                     proc_index.get(&alt_id.normalized()).copied()
                 })
             });
+
+            // ── Built-in function: create/reuse BuiltinFunction node, connect with UsesBuiltinFunction ──
+            if let Some(meta) = &edge.builtin_meta {
+                let builtin_name_lower = edge.callee_name.to_lowercase();
+                let builtin_idx = if let Some(&idx) = builtin_index.get(&builtin_name_lower) {
+                    idx
+                } else {
+                    let idx = graph.add_node(Node::BuiltinFunction {
+                        name: edge.callee_name.clone(),
+                        category: meta.category.clone(),
+                        domain: meta.domain.clone(),
+                        location: edge.location.clone(),
+                    });
+                    builtin_index.insert(builtin_name_lower, idx);
+                    idx
+                };
+                if let Some(caller_idx) = caller_idx {
+                    graph.add_edge(
+                        caller_idx,
+                        builtin_idx,
+                        Edge::UsesBuiltinFunction {
+                            location: edge.location.clone(),
+                        },
+                    );
+                }
+                continue;
+            }
 
             let callee_id =
                 RoutineId::from_qualified_name(&edge.callee_name, RoutineKind::Procedure);
@@ -2016,7 +2044,9 @@ impl GraphBuilder {
             let mut extractor = CallExtractor::new(file_path.clone(), HashSet::new());
             walk_statement(&mut extractor, &info.statement);
             for edge in extractor.edges {
-                calls.push(edge.callee_name);
+                if edge.builtin_meta.is_none() {
+                    calls.push(edge.callee_name);
+                }
             }
         }
         calls
@@ -4580,6 +4610,126 @@ mod tests {
         assert!(
             call_edges.is_empty(),
             "Built-in COUNT should not create call edges"
+        );
+    }
+
+    #[test]
+    fn builtin_function_captured_as_node() {
+        let sql = r#"
+            CREATE PROCEDURE aggregate_data AS $$
+            BEGIN
+                PERFORM COUNT(*) FROM dual;
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        // Assert a BuiltinFunction node exists for COUNT
+        let builtin_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &graph[*i],
+                    Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count")
+                )
+            })
+            .collect();
+        assert_eq!(
+            builtin_nodes.len(),
+            1,
+            "Expected exactly one BuiltinFunction node for 'count'"
+        );
+
+        // Verify category and domain are populated (from AST builtin meta)
+        let builtin_idx = builtin_nodes[0];
+        match &graph[builtin_idx] {
+            Node::BuiltinFunction {
+                category, domain, ..
+            } => {
+                assert!(!category.is_empty(), "category should not be empty");
+                assert!(!domain.is_empty(), "domain should not be empty");
+            }
+            _ => panic!("expected BuiltinFunction node"),
+        }
+
+        // Assert a UsesBuiltinFunction edge exists from the procedure
+        let has_uses_edge = graph
+            .edge_indices()
+            .any(|e| matches!(&graph[e], Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_uses_edge,
+            "Expected at least one UsesBuiltinFunction edge"
+        );
+
+        // Verify the edge connects the procedure to the builtin node
+        let procedure_idx = graph
+            .node_indices()
+            .find(
+                |i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "aggregate_data"),
+            )
+            .expect("Procedure node aggregate_data should exist");
+        let edge_connects_proc_to_builtin = graph.edge_indices().any(|e| {
+            let (src, dst) = graph.edge_endpoints(e).unwrap();
+            src == procedure_idx
+                && dst == builtin_idx
+                && matches!(&graph[e], Edge::UsesBuiltinFunction { .. })
+        });
+        assert!(
+            edge_connects_proc_to_builtin,
+            "Expected UsesBuiltinFunction edge from aggregate_data to count"
+        );
+    }
+
+    #[test]
+    fn procedure_call_builtin_captured_as_node() {
+        let sql = r#"
+            CREATE PROCEDURE log_msg AS $$
+            BEGIN
+                dbe_output.put_line('hello');
+            END;
+            $$;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let builtin_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(
+                    &graph[*i],
+                    Node::BuiltinFunction { name, .. }
+                        if name.eq_ignore_ascii_case("dbe_output.put_line")
+                )
+            })
+            .collect();
+        assert_eq!(
+            builtin_nodes.len(),
+            1,
+            "Expected one BuiltinFunction node for dbe_output.put_line (procedure call path)"
+        );
+
+        match &graph[builtin_nodes[0]] {
+            Node::BuiltinFunction {
+                category, domain, ..
+            } => {
+                assert!(!category.is_empty(), "category should not be empty");
+                assert!(!domain.is_empty(), "domain should not be empty");
+            }
+            _ => panic!("expected BuiltinFunction node"),
+        }
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "log_msg"))
+            .expect("Procedure log_msg should exist");
+        let has_edge = graph.edge_indices().any(|e| {
+            let (src, dst) = graph.edge_endpoints(e).unwrap();
+            src == proc_idx
+                && dst == builtin_nodes[0]
+                && matches!(&graph[e], Edge::UsesBuiltinFunction { .. })
+        });
+        assert!(
+            has_edge,
+            "Expected UsesBuiltinFunction edge from log_msg to dbe_output.put_line"
         );
     }
 

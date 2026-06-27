@@ -468,6 +468,7 @@ impl GraphStore {
                 Node::MaterializedView { .. } => s.materialized_views += 1,
                 Node::Synonym { .. } => s.synonyms += 1,
                 Node::Event { .. } => s.events += 1,
+                Node::BuiltinFunction { .. } => s.builtin_functions += 1,
                 Node::Custom { .. } => s.custom_nodes += 1,
                 #[cfg(feature = "jsp")]
                 Node::JspPage { .. } => s.jsp_pages += 1,
@@ -1790,6 +1791,7 @@ pub fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::MaterializedView { location, .. } => Some(location.file.to_path_buf()),
         Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
         Node::Event { location, .. } => Some(location.file.to_path_buf()),
+        Node::BuiltinFunction { location, .. } => Some(location.file.to_path_buf()),
         Node::Custom { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
         #[cfg(feature = "jsp")]
         Node::JspPage { path, .. } => Some(path.clone()),
@@ -1817,6 +1819,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::CallsProcedure { .. } => "calls_procedure",
         crate::graph::Edge::InvokesMapper { .. } => "invokes_mapper",
         crate::graph::Edge::CallsJava { .. } => "calls_java",
+        crate::graph::Edge::UsesBuiltinFunction { .. } => "uses_builtin_function",
         crate::graph::Edge::ContainsMethod => "contains_method",
         #[cfg(feature = "jsp")]
         crate::graph::Edge::ContainsSql => "contains_sql",
@@ -1880,6 +1883,7 @@ pub struct StoreStats {
     pub materialized_views: usize,
     pub synonyms: usize,
     pub events: usize,
+    pub builtin_functions: usize,
     pub custom_nodes: usize,
     pub custom_edges: usize,
     pub edges: usize,

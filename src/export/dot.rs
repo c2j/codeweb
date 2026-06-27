@@ -190,6 +190,7 @@ fn node_dot_line(graph: &CodeGraph, idx: NodeIndex) -> Option<String> {
             (format!("{}→{}", label, target), "trapezium", "")
         }
         Node::Event { name, .. } => (name.clone(), "octagon", ""),
+        Node::BuiltinFunction { name, .. } => (name.clone(), "ellipse", ", style=dashed"),
         Node::Custom { label, .. } => (
             (**label).clone(),
             "box",
@@ -303,6 +304,7 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
         Edge::CallsProcedure { .. } => (String::new(), "color=blue,".to_string()),
         Edge::InvokesMapper { .. } => (String::new(), "color=green,".to_string()),
         Edge::CallsJava { .. } => (String::new(), "color=orange,".to_string()),
+        Edge::UsesBuiltinFunction { .. } => (String::new(), "color=cyan,".to_string()),
         Edge::ContainsMethod => (String::new(), "style=dotted,".to_string()),
         #[cfg(feature = "jsp")]
         Edge::ContainsSql => (String::new(), "style=dotted,".to_string()),

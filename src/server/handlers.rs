@@ -413,7 +413,7 @@ async fn trace(
     let (start_idx, _) = &matches[0];
     let depth = query.depth.unwrap_or(2).min(10);
     let max_nodes = query.max_nodes.unwrap_or(500);
-    let (chain, visited) = traverse::trace_chain(graph, *start_idx, depth, max_nodes);
+    let (chain, visited) = traverse::trace_chain(graph, *start_idx, depth, max_nodes, false);
 
     let target_key = NodeKey::from_node(&graph[chain.target]);
     let result = serde_json::json!({

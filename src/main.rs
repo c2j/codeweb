@@ -231,6 +231,10 @@ enum Commands {
         /// Display style for call chain output
         #[arg(short, long, default_value = "tree", value_parser = ["tree", "path"])]
         style: String,
+
+        /// Show built-in function calls in the chain (default: hidden)
+        #[arg(long = "builtfunc")]
+        builtfunc: bool,
     },
 
     /// Show project statistics
@@ -317,6 +321,10 @@ enum Commands {
         /// Show source files involved in the upstream/downstream chain
         #[arg(short, long)]
         files: bool,
+
+        /// Show built-in function calls in the chain (default: hidden)
+        #[arg(long = "builtfunc")]
+        builtfunc: bool,
     },
 
     /// Search MappedStatement and JavaSql nodes by SQL fragment, then
@@ -549,7 +557,8 @@ fn run() -> Result<()> {
             from,
             project,
             style,
-        }) => cmd_trace(&from, &project, &style),
+            builtfunc,
+        }) => cmd_trace(&from, &project, &style, builtfunc),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -574,7 +583,8 @@ fn run() -> Result<()> {
             project,
             style,
             files,
-        }) => cmd_detail(&name, &project, &style, files),
+            builtfunc,
+        }) => cmd_detail(&name, &project, &style, files, builtfunc),
         Some(Commands::Import {
             file,
             output,
@@ -754,7 +764,7 @@ fn cmd_tui(project: &Path) -> Result<()> {
     tui::run(project)
 }
 
-fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
+fn cmd_trace(from: &str, project: &Path, style: &str, show_builtins: bool) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
 
@@ -777,7 +787,10 @@ fn cmd_trace(from: &str, project: &Path, style: &str) -> Result<()> {
     let (start_idx, start_name) = &matches[0];
     eprintln!("Tracing from: {}", start_name);
 
-    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
+    let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
+    let skip_builtins = !show_builtins && !target_is_builtin;
+
+    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX, skip_builtins);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
         "{}",
@@ -887,6 +900,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
         Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
         Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
+        Node::BuiltinFunction { .. } => std::borrow::Cow::Borrowed("builtin"),
         Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
         #[cfg(feature = "jsp")]
         Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
@@ -1005,7 +1019,13 @@ fn is_partial(node: &Node) -> bool {
     )
 }
 
-fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Result<()> {
+fn cmd_detail(
+    name: &str,
+    project: &Path,
+    style: &str,
+    show_files: bool,
+    show_builtins: bool,
+) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
     let graph = store.graph();
@@ -1043,7 +1063,10 @@ fn cmd_detail(name: &str, project: &Path, style: &str, show_files: bool) -> Resu
     print_node_details(&graph[*start_idx]);
     println_stdout!();
 
-    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX);
+    let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
+    let skip_builtins = !show_builtins && !target_is_builtin;
+
+    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 50, usize::MAX, skip_builtins);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
         "{}",
@@ -2100,6 +2123,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut materialized_views = 0usize;
     let mut synonyms = 0usize;
     let mut events = 0usize;
+    let mut builtin_functions = 0usize;
     let mut partial = 0usize;
     let mut custom_nodes = 0usize;
     #[cfg(feature = "jsp")]
@@ -2134,6 +2158,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::MaterializedView { .. } => materialized_views += 1,
             Node::Synonym { .. } => synonyms += 1,
             Node::Event { .. } => events += 1,
+            Node::BuiltinFunction { .. } => builtin_functions += 1,
             Node::Custom { .. } => custom_nodes += 1,
             #[cfg(feature = "jsp")]
             Node::JspPage { .. } => jsp_pages += 1,
@@ -2163,6 +2188,9 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, edges,
             jsp_fragment
         );
+    }
+    if builtin_functions > 0 {
+        eprintln!("  ℹ {} builtin functions", builtin_functions);
     }
     if partial > 0 {
         eprintln!("  ⚠ {} partial nodes (unparsed body)", partial);
@@ -2417,6 +2445,7 @@ fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
         Edge::CallsProcedure { location, .. } => Some(location.line),
         Edge::InvokesMapper { location, .. } => Some(location.line),
         Edge::CallsJava { location, .. } => Some(location.line),
+        Edge::UsesBuiltinFunction { location, .. } => Some(location.line),
         Edge::Extends { location, .. } => Some(location.line),
         Edge::Implements { location, .. } => Some(location.line),
         Edge::TableAccess { location, .. } => Some(location.line),

@@ -117,6 +117,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 (format!("{}→{}", label, target), ("[\\", "/]"))
             }
             Node::Event { name, .. } => (name.clone(), ("{{", "}}")),
+            Node::BuiltinFunction { name, .. } => (name.clone(), ("{{\"", "\"}}")),
             Node::Custom {
                 label, type_name, ..
             } => (format!("{}:{}", **type_name, **label), ("[\"", "\"]")),
@@ -149,6 +150,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::CallsProcedure { .. } => "==>",
             Edge::InvokesMapper { .. } => "-->",
             Edge::CallsJava { .. } => "-.->",
+            Edge::UsesBuiltinFunction { .. } => "-->",
             Edge::ContainsMethod => "-.->",
             #[cfg(feature = "jsp")]
             Edge::ContainsSql => "-.->",

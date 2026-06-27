@@ -63,6 +63,9 @@ pub enum NodeKey {
     Event {
         name: String,
     },
+    BuiltinFunction {
+        name: String,
+    },
     JavaSql {
         file: String,
         line: usize,
@@ -150,6 +153,7 @@ impl fmt::Display for NodeKey {
                 None => write!(f, "syn:{}", name),
             },
             NodeKey::Event { name } => write!(f, "event:{}", name),
+            NodeKey::BuiltinFunction { name } => write!(f, "builtin:{}", name),
             NodeKey::JavaSql { file, line } => write!(f, "javasql:{}:{}", file, line),
             NodeKey::Unresolved { raw_expr, context } => {
                 write!(f, "unresolved:{} (in {})", raw_expr, context)
@@ -236,6 +240,9 @@ impl NodeKey {
                 name: name.to_lowercase(),
             },
             super::Node::Event { name, .. } => NodeKey::Event {
+                name: name.to_lowercase(),
+            },
+            super::Node::BuiltinFunction { name, .. } => NodeKey::BuiltinFunction {
                 name: name.to_lowercase(),
             },
             super::Node::JavaSql {

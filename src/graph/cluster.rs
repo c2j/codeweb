@@ -30,6 +30,7 @@ pub enum NodeKind {
     MaterializedView,
     Synonym,
     Event,
+    BuiltinFunction,
     Custom,
     #[cfg(feature = "jsp")]
     JspPage,
@@ -57,6 +58,7 @@ impl NodeKind {
             Node::MaterializedView { .. } => NodeKind::MaterializedView,
             Node::Synonym { .. } => NodeKind::Synonym,
             Node::Event { .. } => NodeKind::Event,
+            Node::BuiltinFunction { .. } => NodeKind::BuiltinFunction,
             Node::Custom { .. } => NodeKind::Custom,
             #[cfg(feature = "jsp")]
             Node::JspPage { .. } => NodeKind::JspPage,
@@ -85,6 +87,7 @@ impl NodeKind {
             NodeKind::MaterializedView => "mview",
             NodeKind::Synonym => "synonym",
             NodeKind::Event => "event",
+            NodeKind::BuiltinFunction => "builtin",
             NodeKind::Custom => "custom",
             #[cfg(feature = "jsp")]
             NodeKind::JspPage => "jsp",
@@ -124,6 +127,7 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
         Edge::CallsProcedure { .. } | Edge::InvokesMapper { .. } | Edge::CallsJava { .. } => {
             Some(config.call)
         }
+        Edge::UsesBuiltinFunction { .. } => Some(config.call),
         Edge::Extends { .. } | Edge::Implements { .. } => Some(config.inheritance),
         Edge::TableAccess { .. } | Edge::DependsOn { .. } => Some(config.data_flow),
         Edge::TriggersRoutine { .. }

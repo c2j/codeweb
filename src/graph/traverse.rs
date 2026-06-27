@@ -110,6 +110,7 @@ fn edge_label_for(
         }
         Edge::DependsOn { .. } => Some("[depends_on]".into()),
         Edge::DynamicCall { .. } => Some("[dynamic]".into()),
+        Edge::UsesBuiltinFunction { .. } => Some("[builtin]".into()),
         _ => None,
     }
 }
@@ -124,6 +125,7 @@ fn build_tree_dfs(
     max_depth: usize,
     max_nodes: usize,
     visited: &mut usize,
+    skip_builtins: bool,
 ) -> Vec<TreeNode> {
     if *visited >= max_nodes {
         return Vec::new();
@@ -141,6 +143,9 @@ fn build_tree_dfs(
     let neighbors: Vec<NodeIndex> = graph
         .neighbors_directed(start, direction)
         .filter(|n| !ancestors.contains(n))
+        .filter(|n| {
+            !skip_builtins || !matches!(graph[*n], crate::graph::Node::BuiltinFunction { .. })
+        })
         .collect();
 
     for neighbor in neighbors {
@@ -163,6 +168,7 @@ fn build_tree_dfs(
             max_depth,
             max_nodes,
             visited,
+            skip_builtins,
         );
         ancestors.remove(&neighbor);
         roots.push(TreeNode {
@@ -179,6 +185,7 @@ pub fn trace_chain(
     start: NodeIndex,
     max_depth: usize,
     max_nodes: usize,
+    skip_builtins: bool,
 ) -> (CallChain, usize) {
     let mut visited = 0usize;
 
@@ -193,6 +200,7 @@ pub fn trace_chain(
         max_depth,
         max_nodes,
         &mut visited,
+        skip_builtins,
     );
 
     let mut callee_ancestors = HashSet::new();
@@ -206,6 +214,7 @@ pub fn trace_chain(
         max_depth,
         max_nodes,
         &mut visited,
+        skip_builtins,
     );
 
     (
@@ -634,5 +643,113 @@ mod tests {
         let rank_boundary = MatchRank::classify(query, candidate_boundary).unwrap();
         let rank_mid = MatchRank::classify(query, candidate_mid).unwrap();
         assert!(rank_boundary < rank_mid);
+    }
+
+    // ── builtin function filter tests ──
+
+    /// Helper: collect all node keys from a tree into a set.
+    fn tree_node_keys(nodes: &[TreeNode], graph: &crate::graph::CodeGraph) -> Vec<String> {
+        let mut keys = Vec::new();
+        for node in nodes {
+            keys.push(NodeKey::from_node(&graph[node.idx]).to_string());
+            keys.extend(tree_node_keys(&node.children, graph));
+        }
+        keys
+    }
+
+    fn make_test_graph() -> (
+        crate::graph::CodeGraph,
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+    ) {
+        use crate::graph::{Edge, RoutineId, RoutineKind, SourceLocation};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let mut graph = petgraph::Graph::new();
+        let loc = SourceLocation {
+            file: Arc::new(PathBuf::from("test.sql")),
+            line: 1,
+        };
+
+        let proc_a = graph.add_node(crate::graph::Node::Procedure {
+            id: RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_a".into(),
+                kind: RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: vec![],
+        });
+
+        let builtin_count = graph.add_node(crate::graph::Node::BuiltinFunction {
+            name: "count".into(),
+            category: "aggregate".into(),
+            domain: "sql".into(),
+            location: loc.clone(),
+        });
+
+        graph.add_edge(
+            proc_a,
+            builtin_count,
+            Edge::UsesBuiltinFunction { location: loc },
+        );
+
+        (graph, proc_a, builtin_count)
+    }
+
+    #[test]
+    fn trace_chain_hides_builtins_when_skip() {
+        let (graph, proc_a, _builtin) = make_test_graph();
+
+        let (chain, _) = trace_chain(&graph, proc_a, 10, 100, true);
+
+        // Proc_a's callees tree should NOT contain the builtin node
+        let callee_keys = tree_node_keys(&chain.callees, &graph);
+        assert!(
+            !callee_keys.iter().any(|k| k == "builtin:count"),
+            "Expected builtin:count to be filtered out from callees, but found it in: {:?}",
+            callee_keys
+        );
+
+        // Callers should still be empty (no incoming edges to proc_a)
+        assert!(chain.callers.is_empty(), "Expected no callers");
+    }
+
+    #[test]
+    fn trace_chain_shows_builtins_when_not_skip() {
+        let (graph, proc_a, _builtin) = make_test_graph();
+
+        let (chain, _) = trace_chain(&graph, proc_a, 10, 100, false);
+
+        // Callees tree SHOULD contain the builtin node
+        let callee_keys = tree_node_keys(&chain.callees, &graph);
+        assert!(
+            callee_keys.iter().any(|k| k == "builtin:count"),
+            "Expected builtin:count to be present in callees when skip_builtins=false, got: {:?}",
+            callee_keys
+        );
+    }
+
+    #[test]
+    fn trace_chain_from_builtin_shows_callers() {
+        let (graph, _proc_a, builtin_count) = make_test_graph();
+
+        // Start from builtin, skip_builtins=true — the builtin node itself
+        // should still be traversed (it's the start node), and its callers
+        // (incoming neighbors) should include proc_a regardless of skip_builtins
+        // because skip_builtins only filters the *neighbors* of the current node,
+        // not the start node.
+        let (chain, _) = trace_chain(&graph, builtin_count, 10, 100, true);
+
+        // Callers should include proc_a
+        let caller_keys = tree_node_keys(&chain.callers, &graph);
+        assert!(
+            caller_keys.iter().any(|k| k == "proc:proc_a"),
+            "Expected proc_a to be in callers when tracing from builtin, got: {:?}",
+            caller_keys
+        );
     }
 }
