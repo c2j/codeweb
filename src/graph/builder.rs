@@ -103,6 +103,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_nodes_from_parsed(
             java_files,
@@ -139,6 +140,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
         Self::add_java_nodes_from_parsed(
             &all.java_files,
@@ -1768,6 +1770,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         Self::add_ibatis_nodes_from_parsed_with_source_paths(
             ibatis_files,
@@ -1775,6 +1778,7 @@ impl GraphBuilder {
             proc_index,
             mapper_index,
             table_index,
+            builtin_index,
             &[],
         )
     }
@@ -1786,6 +1790,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         mapper_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         source_paths: &[PathBuf],
     ) {
         for ibatis_file in ibatis_files {
@@ -1825,10 +1830,30 @@ impl GraphBuilder {
                 if let Some((statements, _errors)) = &stmt.parse_result {
                     let calls = Self::extract_calls_from_statements(statements, &xml_path);
                     for call in calls {
-                        let callee_name = call.callee_name;
-                        if call.builtin_meta.is_some() {
+                        if let Some(meta) = &call.builtin_meta {
+                            let builtin_idx = Self::find_or_create_builtin_node(
+                                graph,
+                                builtin_index,
+                                &call.callee_name,
+                                meta,
+                                SourceLocation {
+                                    file: xml_path.clone(),
+                                    line: stmt.line,
+                                },
+                            );
+                            graph.add_edge(
+                                node_idx,
+                                builtin_idx,
+                                Edge::UsesBuiltinFunction {
+                                    location: SourceLocation {
+                                        file: xml_path.clone(),
+                                        line: stmt.line,
+                                    },
+                                },
+                            );
                             continue;
                         }
+                        let callee_name = call.callee_name;
                         let callee_id =
                             RoutineId::from_qualified_name(&callee_name, RoutineKind::Procedure);
                         let callee_idx = proc_index.entry(callee_id.normalized()).or_insert_with(|| {
@@ -4423,6 +4448,7 @@ mod tests {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
 
         let mapper_nodes: Vec<_> = ctx
@@ -4442,6 +4468,68 @@ mod tests {
             1,
             "duplicate ibatis files with same namespace.statement_id should produce exactly 1 MappedStatement node, got {}",
             mapper_nodes.len()
+        );
+    }
+
+    #[test]
+    fn builtin_function_captured_from_mapper_sql() {
+        use crate::graph::builder::GraphBuildContext;
+        use ogsql_parser::ibatis::{ParsedMapper, ParsedStatement, StatementKind};
+
+        // SQL containing a builtin aggregate function
+        let sql = "SELECT COUNT(*) FROM orders";
+        // Parse it to get StatementInfo carrying builtin metadata (ogsql-parser v0.8.11 tags builtins during parsing)
+        let statements = parse_sql(sql);
+
+        let stmt = ParsedStatement {
+            id: "countOrders".to_string(),
+            kind: StatementKind::Select,
+            parameter_type: None,
+            result_type: None,
+            flat_sql: sql.to_string(),
+            parameters: vec![],
+            has_dynamic_elements: false,
+            line: 5,
+            parse_result: Some((statements, vec![])),
+            database_id: None,
+            statement_type: None,
+        };
+
+        let ibatis_file = crate::parser::ibatis_loader::IbatisParsedFile {
+            path: PathBuf::from("/mapper/OrderMapper.xml"),
+            result: ParsedMapper {
+                file_path: Some("/mapper/OrderMapper.xml".to_string()),
+                namespace: "com.example.OrderMapper".to_string(),
+                statements: vec![stmt],
+                errors: vec![],
+            },
+            content_hash: "abc".to_string(),
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        GraphBuilder::add_ibatis_nodes_from_parsed(
+            std::slice::from_ref(&ibatis_file),
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+
+        // Assert a BuiltinFunction node named "count" exists (case-insensitive)
+        let has_count = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("count"))
+        });
+        assert!(has_count, "expected a BuiltinFunction node for COUNT");
+
+        // Assert a UsesBuiltinFunction edge connects the mapper to the builtin
+        let has_edge = ctx
+            .graph
+            .edge_weights()
+            .any(|e| matches!(e, Edge::UsesBuiltinFunction { .. }));
+        assert!(
+            has_edge,
+            "expected a UsesBuiltinFunction edge from the mapper"
         );
     }
 

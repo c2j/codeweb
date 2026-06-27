@@ -294,6 +294,7 @@ impl Project {
             &mut ctx.proc_index,
             &mut ctx.mapper_index,
             &mut ctx.table_index,
+            &mut ctx.builtin_index,
             &source_paths,
         );
         GraphBuilder::add_java_nodes_from_parsed_with_source_paths(
