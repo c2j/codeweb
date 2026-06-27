@@ -4673,8 +4673,7 @@ mod tests {
             SqlParseResult,
         };
 
-        // SQL containing a builtin function — UPPER is tagged by ogsql-parser as a String/Scalar builtin
-        let sql = "SELECT * FROM users WHERE UPPER(name) = 'ALICE'";
+        let sql = "SELECT SUBSTR(name, 1, 3) FROM users";
         let statements = parse_sql(sql);
 
         let extraction = ExtractedSql {
@@ -4719,11 +4718,10 @@ mod tests {
             &mut ctx.builtin_index,
         );
 
-        // Assert a BuiltinFunction node named "upper" exists (case-insensitive)
-        let has_upper = ctx.graph.node_weights().any(|n| {
-            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("upper"))
+        let has_substr = ctx.graph.node_weights().any(|n| {
+            matches!(n, Node::BuiltinFunction { name, .. } if name.eq_ignore_ascii_case("substr"))
         });
-        assert!(has_upper, "expected a BuiltinFunction node for UPPER");
+        assert!(has_substr, "expected a BuiltinFunction node for SUBSTR");
 
         // Assert a UsesBuiltinFunction edge connects the JavaSql node to the builtin
         let has_edge = ctx
