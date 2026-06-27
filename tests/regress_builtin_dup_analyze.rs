@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 fn codeweb_bin() -> std::path::PathBuf {
@@ -18,10 +19,11 @@ fn codeweb_bin() -> std::path::PathBuf {
     base.join("debug").join(bin_name)
 }
 
-fn run(args: &[&str]) -> std::process::Output {
+fn run_in(args: &[&str], cwd: &Path) -> std::process::Output {
     let bin = codeweb_bin();
     std::process::Command::new(&bin)
         .args(args)
+        .current_dir(cwd)
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {}", bin.display(), e))
 }
@@ -47,30 +49,33 @@ fn analyze_command_builtin_dedup_across_files() {
 
     let proj_dir = tmp.path().join("test-proj");
     let sql_dir_abs = fs::canonicalize(&sql_dir).unwrap();
+    let _ = proj_dir;
 
-    let output = run(&[
-        "init", "test-proj",
-        "-d", sql_dir_abs.to_str().unwrap(),
-    ]);
+    // Gotcha: `init <name>` writes codeweb.toml to the subprocess CWD, NOT to a
+    // `<name>/` subdir. Always run init with CWD = tmp/ so the project lands at
+    // tmp/codeweb.toml regardless of whether the test runner's own CWD (cargo's
+    // repo root) already has a codeweb.toml (local dev: yes; fresh CI: no, since
+    // codeweb.toml is gitignored).
+    let output = run_in(
+        &["init", "test-proj", "-d", sql_dir_abs.to_str().unwrap()],
+        tmp.path(),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("=== init stderr ===\n{}", stderr);
-    if !output.status.success() {
-        // `init` creates the project dir in CWD, and the repo root already has a codeweb.toml.
-        // Retry with CWD = tmp dir.
-        let output_retry = std::process::Command::new(codeweb_bin())
-            .args(&["init", "test-proj", "-d", sql_dir_abs.to_str().unwrap()])
-            .current_dir(tmp.path())
-            .output()
-            .expect("init failed");
-        let stderr_retry = String::from_utf8_lossy(&output_retry.stderr);
-        eprintln!("=== init retry stderr ===\n{}", stderr_retry);
-        assert!(output_retry.status.success(), "init retry failed: {}", stderr_retry);
-    }
+    assert!(output.status.success(), "init failed: {}", stderr);
 
-    let output2 = run(&[
-        "export", "--format", "json", "--project",
-        proj_dir.to_str().unwrap(),
-    ]);
+    // Project::find walks up from --project until it sees codeweb.toml; point it
+    // at tmp/ where init actually wrote it.
+    let output2 = run_in(
+        &[
+            "export",
+            "--format",
+            "json",
+            "--project",
+            tmp.path().to_str().unwrap(),
+        ],
+        tmp.path(),
+    );
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     eprintln!("=== export stderr ===\n{}", stderr2);
@@ -87,7 +92,17 @@ fn analyze_command_builtin_dedup_across_files() {
 
     eprintln!("Builtin nodes after analyze+export: {:?}", builtin_names);
 
-    let ascii_count = builtin_names.iter().filter(|n| n.to_lowercase() == "ascii").count();
-    assert_eq!(ascii_count, 1, "Expected 1 'ascii' BuiltinFunction after analyze, found {}", ascii_count);
-    assert!(builtin_names.iter().any(|n| n.to_lowercase() == "substr"), "Expected 'substr' to be present");
+    let ascii_count = builtin_names
+        .iter()
+        .filter(|n| n.to_lowercase() == "ascii")
+        .count();
+    assert_eq!(
+        ascii_count, 1,
+        "Expected 1 'ascii' BuiltinFunction after analyze, found {}",
+        ascii_count
+    );
+    assert!(
+        builtin_names.iter().any(|n| n.to_lowercase() == "substr"),
+        "Expected 'substr' to be present"
+    );
 }
