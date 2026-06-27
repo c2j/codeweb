@@ -827,6 +827,9 @@ fn cmd_stats(project: &Path) -> Result<()> {
     if stats.unresolved > 0 {
         println_stdout!("  {:>12}  unresolved", stats.unresolved,);
     }
+    if stats.builtin_functions > 0 {
+        println_stdout!("  {:>12}  builtin functions", stats.builtin_functions);
+    }
     if stats.custom_nodes > 0 {
         println_stdout!("  {:>12}  custom nodes", stats.custom_nodes,);
     }
@@ -2178,19 +2181,16 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} edges{}",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, edges,
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} builtin, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, builtin_functions, edges,
             jsp_fragment
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} edges{}",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, edges,
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} builtin, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, builtin_functions, edges,
             jsp_fragment
         );
-    }
-    if builtin_functions > 0 {
-        eprintln!("  ℹ {} builtin functions", builtin_functions);
     }
     if partial > 0 {
         eprintln!("  ⚠ {} partial nodes (unparsed body)", partial);

@@ -336,6 +336,8 @@ impl Project {
 
         GraphBuilder::finalize_graph(&mut ctx);
 
+        GraphBuilder::debug_dump_builtin_nodes(&ctx.graph);
+
         // Expand dynamic SQL variants for fingerprint index
         let variant_map = GraphBuilder::add_ibatis_structured_variants(
             &structured_ibatis_files,

@@ -120,6 +120,7 @@ impl McpState {
             "materialized_views": stats.materialized_views,
             "synonyms": stats.synonyms,
             "events": stats.events,
+            "builtin_functions": stats.builtin_functions,
             "custom_nodes": stats.custom_nodes,
             "edges": stats.edges,
             "files": stats.files,

@@ -1544,7 +1544,16 @@ impl GraphBuilder {
         location: SourceLocation,
     ) -> petgraph::graph::NodeIndex {
         let name_lower = name.to_lowercase();
+        let name_display = if name_lower != *name { format!("{} (raw={})", name_lower, name) } else { name_lower.clone() };
+        let loc_file = location.file.display().to_string();
+        let loc_line = location.line;
         if let Some(&idx) = builtin_index.get(&name_lower) {
+            static REUSE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = REUSE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[builtin #{:<4} REUSE] {:>35} | domain={:>15} | {}:{}",
+                n, name_display, meta.domain, loc_file, loc_line,
+            );
             return idx;
         }
         let idx = graph.add_node(Node::BuiltinFunction {
@@ -1554,7 +1563,36 @@ impl GraphBuilder {
             location,
         });
         builtin_index.insert(name_lower, idx);
+        static CREATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CREATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[builtin #{:<4} NEW  ] {:>35} | domain={:>15} category={:>12} | {}:{}",
+            n, name_display, meta.domain, meta.category, loc_file, loc_line,
+        );
         idx
+    }
+
+    /// Debug helper: scan the graph and report all BuiltinFunction nodes,
+    /// showing duplicate names (same lowercased name → multiple NodeIndex).
+    pub fn debug_dump_builtin_nodes(graph: &CodeGraph) {
+        let mut by_name: HashMap<String, Vec<(petgraph::graph::NodeIndex, &Node)>> = HashMap::new();
+        for idx in graph.node_indices() {
+            if let n @ Node::BuiltinFunction { name, .. } = &graph[idx] {
+                by_name.entry(name.to_lowercase()).or_default().push((idx, n));
+            }
+        }
+        let total = by_name.values().map(|v| v.len()).sum::<usize>();
+        eprintln!("[builtin] === BuiltinFunction nodes in graph: {} distinct names, {} total nodes ===", by_name.len(), total);
+        for (name_lower, entries) in &by_name {
+            let dup_marker = if entries.len() > 1 { format!("  ⚠ DUPLICATE ×{}", entries.len()) } else { String::new() };
+            eprintln!("[builtin]   {:>35} → node_count={}{}", name_lower, entries.len(), dup_marker);
+            if entries.len() > 1 {
+                for (idx, node) in entries {
+                    let loc = &node.file();
+                    eprintln!("[builtin]     NodeIndex({:?})  file={}", idx.index(), loc.display());
+                }
+            }
+        }
     }
 
     fn create_edges(
