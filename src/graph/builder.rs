@@ -29,7 +29,6 @@ pub struct GraphBuildContext {
     /// Shared dedup index for BuiltinFunction nodes (keyed by lowercased name).
     /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
     /// builtin called from multiple paths is a single graph node.
-    #[allow(dead_code)]
     pub builtin_index: HashMap<String, petgraph::graph::NodeIndex>,
 }
 
@@ -180,6 +179,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &mut ctx.table_index,
             &ctx.type_index,
+            &mut ctx.builtin_index,
         );
         Self::create_object_ref_edges(
             sql_files,
@@ -1096,6 +1096,7 @@ impl GraphBuilder {
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let mut all_edges = Vec::new();
 
@@ -1213,7 +1214,7 @@ impl GraphBuilder {
             }
         }
 
-        Self::create_edges(&all_edges, graph, proc_index);
+        Self::create_edges(&all_edges, graph, proc_index, builtin_index);
     }
 
     fn create_object_ref_edges(
@@ -1531,7 +1532,6 @@ impl GraphBuilder {
     /// Shared across the SQL-proc, XML-mapper, Java, and JSP paths so that the same
     /// builtin called from multiple sources collapses to a single node (dedup key:
     /// lowercased name, matching `NodeKey::BuiltinFunction`).
-    #[allow(dead_code)]
     fn find_or_create_builtin_node(
         graph: &mut CodeGraph,
         builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
@@ -1557,6 +1557,7 @@ impl GraphBuilder {
         edges: &[CallEdge],
         graph: &mut CodeGraph,
         proc_index: &mut HashMap<RoutineId, petgraph::graph::NodeIndex>,
+        builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let pkg_member_lower: HashMap<(String, String), petgraph::graph::NodeIndex> = proc_index
             .iter()
@@ -1568,7 +1569,6 @@ impl GraphBuilder {
             .collect();
 
         let mut seen: HashMap<(Option<String>, String), usize> = HashMap::new();
-        let mut builtin_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
         for edge in edges {
             let caller_key = edge.caller.as_ref().map(|c| c.to_string());
@@ -1598,19 +1598,13 @@ impl GraphBuilder {
 
             // ── Built-in function: create/reuse BuiltinFunction node, connect with UsesBuiltinFunction ──
             if let Some(meta) = &edge.builtin_meta {
-                let builtin_name_lower = edge.callee_name.to_lowercase();
-                let builtin_idx = if let Some(&idx) = builtin_index.get(&builtin_name_lower) {
-                    idx
-                } else {
-                    let idx = graph.add_node(Node::BuiltinFunction {
-                        name: edge.callee_name.clone(),
-                        category: meta.category.clone(),
-                        domain: meta.domain.clone(),
-                        location: edge.location.clone(),
-                    });
-                    builtin_index.insert(builtin_name_lower, idx);
-                    idx
-                };
+                let builtin_idx = Self::find_or_create_builtin_node(
+                    graph,
+                    builtin_index,
+                    &edge.callee_name,
+                    meta,
+                    edge.location.clone(),
+                );
                 if let Some(caller_idx) = caller_idx {
                     graph.add_edge(
                         caller_idx,
