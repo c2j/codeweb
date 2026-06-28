@@ -2337,6 +2337,10 @@ fn resolve_file_target(
     };
 
     let Some((matched_path, was_fuzzy)) = resolve_file_path(path, file_nodes) else {
+        eprintln!(
+            "Warning: file '{}' not found in graph (no nodes analyzed for this file)",
+            path.display()
+        );
         return Ok((vec![], target));
     };
 
