@@ -2250,8 +2250,182 @@ fn cmd_impact(
     format: &str,
     depth: usize,
 ) -> Result<()> {
-    let _ = (file, node, project, format, depth);
-    todo!("impact dispatch — implemented in Task 4")
+    use crate::graph::query::filter::EdgeFilter;
+    use petgraph::Direction;
+
+    let mut proj = project::Project::find(project)?;
+    // Note: `load_store()` returns single-layer `Result<&GraphStore>` (not nested).
+    // See project/mod.rs:420. Match without `?` to handle "not yet analyzed" gracefully.
+    let store = match proj.load_store() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Project not analyzed. Run `codeweb analyze` first.");
+            return Ok(());
+        }
+    };
+
+    let graph = store.graph();
+    let calls_filter = EdgeFilter::calls_only();
+
+    // ── 解析起点节点 ───────────────────────────────────────────────
+    // 返回 (start_nodes, ImpactTarget)
+    let (start_nodes, target) = match (file, node) {
+        (Some(path), None) => {
+            let file_nodes = store.file_nodes();
+            let key_index = store.node_key_index();
+            resolve_file_target(graph, file_nodes, key_index, path)?
+        }
+        (None, Some(name)) => {
+            resolve_node_target(store, name)?
+        }
+        // 不可达:clap 分发层已校验互斥
+        _ => unreachable!("clap layer guarantees exactly one of --file/--node is set"),
+    };
+
+    if start_nodes.is_empty() {
+        emit_empty_result(&target, format)?;
+        return Ok(());
+    }
+
+    // ── 双向遍历 ──────────────────────────────────────────────────
+    let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+    let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+
+    collect_impact_entries(
+        graph,
+        &start_nodes,
+        Direction::Incoming,
+        depth,
+        &calls_filter,
+        &mut upstream_map,
+    );
+    collect_impact_entries(
+        graph,
+        &start_nodes,
+        Direction::Outgoing,
+        depth,
+        &calls_filter,
+        &mut downstream_map,
+    );
+
+    let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
+    let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
+    upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+    downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+
+    let result = build_impact_result(&target, upstream, downstream);
+    emit_result(&result, format)?;
+    Ok(())
+}
+
+/// `cmd_impact` 的目标解析结果
+enum ImpactTarget {
+    File { path: String },
+    Node { name: String },
+}
+
+/// 从文件入口解析出起始节点列表。
+/// 文件不在图中或无节点时返回 Ok((vec![], ImpactTarget::File{...})),由调用方走空结果路径。
+fn resolve_file_target(
+    _graph: &crate::graph::CodeGraph,
+    file_nodes: &HashMap<PathBuf, Vec<crate::graph::key::NodeKey>>,
+    key_index: &HashMap<crate::graph::key::NodeKey, NodeIndex>,
+    path: &Path,
+) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
+    let target = ImpactTarget::File {
+        path: path.to_string_lossy().to_string(),
+    };
+
+    let Some((matched_path, was_fuzzy)) = resolve_file_path(path, file_nodes) else {
+        return Ok((vec![], target));
+    };
+
+    if was_fuzzy {
+        eprintln!(
+            "Warning: '{}' resolved via fuzzy match to '{}'",
+            path.display(),
+            matched_path.display()
+        );
+    }
+
+    let nodes: Vec<NodeIndex> = file_nodes
+        .get(matched_path)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|k| key_index.get(k).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 注意:这里把 matched_path 的字符串回填到 target,以便 JSON 里的 file 字段显示规范化后的路径
+    let target = ImpactTarget::File {
+        path: matched_path.to_string_lossy().to_string(),
+    };
+    Ok((nodes, target))
+}
+
+/// 从节点名入口解析出起始节点列表(单个节点)。
+/// 复用 store.search_nodes(),与 cmd_trace / cmd_detail 一致。
+fn resolve_node_target(
+    store: &crate::graph::store::GraphStore,
+    name: &str,
+) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
+    let matches = store.search_nodes(name);
+
+    if matches.is_empty() {
+        eprintln!("No nodes matching '{}'", name);
+        return Ok((vec![], ImpactTarget::Node { name: name.to_string() }));
+    }
+
+    if matches.len() > 1 {
+        eprintln!("Multiple matches found for '{}':", name);
+        for (i, (_, n)) in matches.iter().enumerate() {
+            eprintln!("  {}: {}", i + 1, n);
+        }
+        eprintln!("Using first match: {}", matches[0].1);
+    } else {
+        eprintln!("Impact from: {}", matches[0].1);
+    }
+
+    let start_idx = matches[0].0;
+    Ok((vec![start_idx], ImpactTarget::Node { name: matches[0].1.clone() }))
+}
+
+fn build_impact_result(
+    target: &ImpactTarget,
+    upstream: Vec<ImpactEntry>,
+    downstream: Vec<ImpactEntry>,
+) -> ImpactResult {
+    let (file, node) = match target {
+        ImpactTarget::File { path } => (Some(path.clone()), None),
+        ImpactTarget::Node { name } => (None, Some(name.clone())),
+    };
+    ImpactResult {
+        schema_version: 2,
+        file,
+        node,
+        upstream,
+        downstream,
+    }
+}
+
+fn emit_result(result: &ImpactResult, format: &str) -> Result<()> {
+    if format == "json" {
+        let json = serde_json::to_string_pretty(result).map_err(|e| {
+            error::CodeWebError::ExportError {
+                message: format!("JSON serialization: {}", e),
+            }
+        })?;
+        println_stdout!("{}", json);
+    } else {
+        print_impact_text(result);
+    }
+    Ok(())
+}
+
+fn emit_empty_result(target: &ImpactTarget, format: &str) -> Result<()> {
+    let result = build_impact_result(target, vec![], vec![]);
+    emit_result(&result, format)
 }
 
 /// Match user-supplied path against `file_nodes` keys.
