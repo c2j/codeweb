@@ -2275,9 +2275,7 @@ fn cmd_impact(
             let key_index = store.node_key_index();
             resolve_file_target(graph, file_nodes, key_index, path)?
         }
-        (None, Some(name)) => {
-            resolve_node_target(store, name)?
-        }
+        (None, Some(name)) => resolve_node_target(store, name)?,
         // 不可达:clap 分发层已校验互斥
         _ => unreachable!("clap layer guarantees exactly one of --file/--node is set"),
     };
@@ -2378,7 +2376,12 @@ fn resolve_node_target(
 
     if matches.is_empty() {
         eprintln!("No nodes matching '{}'", name);
-        return Ok((vec![], ImpactTarget::Node { name: name.to_string() }));
+        return Ok((
+            vec![],
+            ImpactTarget::Node {
+                name: name.to_string(),
+            },
+        ));
     }
 
     if matches.len() > 1 {
@@ -2392,7 +2395,12 @@ fn resolve_node_target(
     }
 
     let start_idx = matches[0].0;
-    Ok((vec![start_idx], ImpactTarget::Node { name: matches[0].1.clone() }))
+    Ok((
+        vec![start_idx],
+        ImpactTarget::Node {
+            name: matches[0].1.clone(),
+        },
+    ))
 }
 
 fn build_impact_result(
@@ -2415,11 +2423,10 @@ fn build_impact_result(
 
 fn emit_result(result: &ImpactResult, format: &str) -> Result<()> {
     if format == "json" {
-        let json = serde_json::to_string_pretty(result).map_err(|e| {
-            error::CodeWebError::ExportError {
+        let json =
+            serde_json::to_string_pretty(result).map_err(|e| error::CodeWebError::ExportError {
                 message: format!("JSON serialization: {}", e),
-            }
-        })?;
+            })?;
         println_stdout!("{}", json);
     } else {
         print_impact_text(result);

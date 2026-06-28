@@ -185,10 +185,7 @@ fn test_impact_node_json_schema() {
     // proc_a 调用 proc_b → 对 proc_a 查 node:
     //   upstream 为空(没人调用 proc_a)
     //   downstream 含 proc_b
-    let output = run_in_dir(
-        &dir,
-        &["impact", "--node", "proc_a", "--format", "json"],
-    );
+    let output = run_in_dir(&dir, &["impact", "--node", "proc_a", "--format", "json"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -233,10 +230,7 @@ fn test_impact_node_upstream_direction() {
     let dir = setup_project();
 
     // 对 proc_b 查 node:被 proc_a 调用 → upstream 含 proc_a,downstream 为空
-    let output = run_in_dir(
-        &dir,
-        &["impact", "--node", "proc_b", "--format", "json"],
-    );
+    let output = run_in_dir(&dir, &["impact", "--node", "proc_b", "--format", "json"]);
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -289,10 +283,7 @@ fn test_impact_node_not_found() {
 fn test_impact_node_text_format() {
     let dir = setup_project();
 
-    let output = run_in_dir(
-        &dir,
-        &["impact", "--node", "proc_b", "--format", "text"],
-    );
+    let output = run_in_dir(&dir, &["impact", "--node", "proc_b", "--format", "text"]);
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -315,13 +306,7 @@ fn test_impact_mutual_exclusion_error() {
     // 同时给 --file 和 --node → 退出码 2
     let output = run_in_dir(
         &dir,
-        &[
-            "impact",
-            "--file",
-            "proc_a.sql",
-            "--node",
-            "proc_a",
-        ],
+        &["impact", "--file", "proc_a.sql", "--node", "proc_a"],
     );
     assert!(
         !output.status.success(),
