@@ -61,11 +61,16 @@ struct ImpactEntry {
     line: Option<usize>,
 }
 
-/// `impact --file` JSON output schema (schema_version=1, frozen contract)
+/// `impact --file` / `impact --node` JSON output schema (schema_version=2)
 #[derive(Serialize)]
 struct ImpactResult {
     schema_version: u32,
-    file: String,
+    /// `--file` 入口时为 Some,`--node` 入口时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    /// `--node` 入口时为 Some,`--file` 入口时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
     upstream: Vec<ImpactEntry>,
     downstream: Vec<ImpactEntry>,
 }
@@ -2231,8 +2236,9 @@ fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result
         Some((p, fuzzy)) => (p, fuzzy),
         None => {
             let result = ImpactResult {
-                schema_version: 1,
-                file: file.to_string_lossy().to_string(),
+                schema_version: 2,
+                file: Some(file.to_string_lossy().to_string()),
+                node: None,
                 upstream: vec![],
                 downstream: vec![],
             };
@@ -2273,8 +2279,9 @@ fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result
 
     if file_node_indices.is_empty() {
         let result = ImpactResult {
-            schema_version: 1,
-            file: matched_path.to_string_lossy().to_string(),
+            schema_version: 2,
+            file: Some(matched_path.to_string_lossy().to_string()),
+            node: None,
             upstream: vec![],
             downstream: vec![],
         };
@@ -2322,8 +2329,9 @@ fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result
     downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
 
     let result = ImpactResult {
-        schema_version: 1,
-        file: matched_path.to_string_lossy().to_string(),
+        schema_version: 2,
+        file: Some(matched_path.to_string_lossy().to_string()),
+        node: None,
         upstream,
         downstream,
     };
@@ -2463,7 +2471,12 @@ fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
 }
 
 fn print_impact_text(result: &ImpactResult) {
-    println_stdout!("File: {}", result.file);
+    // 头部:File 或 Node 二选一显示
+    if let Some(file) = &result.file {
+        println_stdout!("File: {}", file);
+    } else if let Some(node) = &result.node {
+        println_stdout!("Node: {}", node);
+    }
     println_stdout!();
     println_stdout!("── UPSTREAM ({}) ──", result.upstream.len());
     if result.upstream.is_empty() {
