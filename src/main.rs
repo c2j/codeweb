@@ -428,15 +428,22 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Show upstream callers and downstream callees for all nodes in a file
+    /// Show upstream callers and downstream callees for a file or a node
     ///
-    /// Aggregates impact analysis across all nodes (methods, mappers, procedures)
-    /// defined in the given file. Designed for subprocess integration (e.g.
-    /// CodeRoughcollie) — outputs stable JSON by default.
+    /// Pass `--file <path>` to aggregate impact across all nodes defined in
+    /// that file (useful for subprocess integration with `git diff`).
+    /// Pass `--node <name>` to query a single symbol (e.g. a procedure,
+    /// Java method, or mapper id). The two flags are mutually exclusive.
     Impact {
-        /// File path to analyze (relative to CWD or absolute)
+        /// File path to analyze (relative to CWD or absolute).
+        /// Mutually exclusive with --node.
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
+
+        /// Node symbol name to analyze (e.g. "proc_create_order").
+        /// Supports fuzzy match like `trace`/`detail`. Mutually exclusive with --file.
+        #[arg(long)]
+        node: Option<String>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -633,10 +640,24 @@ fn run() -> Result<()> {
         ),
         Some(Commands::Impact {
             file,
+            node,
             project,
             format,
             depth,
-        }) => cmd_impact(&file, &project, &format, depth),
+        }) => {
+            // 互斥校验:恰好一个必须是 Some
+            match (&file, &node) {
+                (Some(_), Some(_)) => {
+                    eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
+                    std::process::exit(2);
+                }
+                (None, None) => {
+                    eprintln!("Error: must pass exactly one of --file <path> or --node <name>.");
+                    std::process::exit(2);
+                }
+                _ => cmd_impact(file.as_deref(), node.as_deref(), &project, &format, depth),
+            }
+        }
     }
 }
 
@@ -2222,132 +2243,15 @@ fn jsp_count_fragment() -> String {
     String::new()
 }
 
-fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result<()> {
-    use crate::graph::query::filter::EdgeFilter;
-    use petgraph::Direction;
-
-    let mut proj = project::Project::find(project)?;
-    let store = proj.load_store()?;
-    let graph = store.graph();
-    let file_nodes = store.file_nodes();
-    let key_index = store.node_key_index();
-
-    let (matched_path, was_fuzzy) = match resolve_file_path(file, file_nodes) {
-        Some((p, fuzzy)) => (p, fuzzy),
-        None => {
-            let result = ImpactResult {
-                schema_version: 2,
-                file: Some(file.to_string_lossy().to_string()),
-                node: None,
-                upstream: vec![],
-                downstream: vec![],
-            };
-            if format == "json" {
-                let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                    error::CodeWebError::ExportError {
-                        message: format!("JSON serialization: {}", e),
-                    }
-                })?;
-                println_stdout!("{}", json);
-            } else {
-                print_impact_text(&result);
-            }
-            eprintln!(
-                "Warning: file '{}' not found in graph (no nodes analyzed for this file)",
-                file.display()
-            );
-            return Ok(());
-        }
-    };
-
-    if was_fuzzy {
-        eprintln!(
-            "Warning: '{}' resolved via fuzzy match to '{}'",
-            file.display(),
-            matched_path.display()
-        );
-    }
-
-    let file_node_indices: Vec<NodeIndex> = file_nodes
-        .get(matched_path)
-        .map(|keys| {
-            keys.iter()
-                .filter_map(|k| key_index.get(k).copied())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if file_node_indices.is_empty() {
-        let result = ImpactResult {
-            schema_version: 2,
-            file: Some(matched_path.to_string_lossy().to_string()),
-            node: None,
-            upstream: vec![],
-            downstream: vec![],
-        };
-        if format == "json" {
-            let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                error::CodeWebError::ExportError {
-                    message: format!("JSON serialization: {}", e),
-                }
-            })?;
-            println_stdout!("{}", json);
-        } else {
-            print_impact_text(&result);
-        }
-        eprintln!(
-            "Warning: file '{}' has no graph nodes",
-            matched_path.display()
-        );
-        return Ok(());
-    }
-
-    let calls_filter = EdgeFilter::calls_only();
-    let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
-    let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
-
-    collect_impact_entries(
-        graph,
-        &file_node_indices,
-        Direction::Incoming,
-        depth,
-        &calls_filter,
-        &mut upstream_map,
-    );
-    collect_impact_entries(
-        graph,
-        &file_node_indices,
-        Direction::Outgoing,
-        depth,
-        &calls_filter,
-        &mut downstream_map,
-    );
-
-    let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
-    let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
-    upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
-    downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
-
-    let result = ImpactResult {
-        schema_version: 2,
-        file: Some(matched_path.to_string_lossy().to_string()),
-        node: None,
-        upstream,
-        downstream,
-    };
-
-    if format == "json" {
-        let json = serde_json::to_string_pretty(&result).map_err(|e| {
-            error::CodeWebError::ExportError {
-                message: format!("JSON serialization: {}", e),
-            }
-        })?;
-        println_stdout!("{}", json);
-    } else {
-        print_impact_text(&result);
-    }
-
-    Ok(())
+fn cmd_impact(
+    file: Option<&Path>,
+    node: Option<&str>,
+    project: &Path,
+    format: &str,
+    depth: usize,
+) -> Result<()> {
+    let _ = (file, node, project, format, depth);
+    todo!("impact dispatch — implemented in Task 4")
 }
 
 /// Match user-supplied path against `file_nodes` keys.
