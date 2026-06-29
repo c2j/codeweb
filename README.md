@@ -113,6 +113,8 @@ codeweb trace-sql "SELECT * FROM orders WHERE"
 codeweb nodes -s order -t proc
 codeweb nodes --orphan
 codeweb nodes --has-partition
+codeweb nodes --sort-by total:desc
+codeweb nodes --sort-by in:asc,out:desc
 
 # Deduplicate graph nodes and edges
 codeweb dedup --dry-run
@@ -441,6 +443,8 @@ codeweb trace-sql "SELECT * FROM orders WHERE"
 codeweb nodes -s order -t proc
 codeweb nodes --orphan
 codeweb nodes --has-partition
+codeweb nodes --sort-by total:desc
+codeweb nodes --sort-by in:asc,out:desc
 
 # 去重图谱节点和边
 codeweb dedup --dry-run

@@ -53,6 +53,85 @@ use error::Result;
 use graph::Node;
 use serde::Serialize;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortKey {
+    Name,
+    Type,
+    In,
+    Out,
+    Total,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SortSpec {
+    key: SortKey,
+    dir: SortDir,
+}
+
+fn parse_sort_spec(s: &str) -> std::result::Result<SortSpec, String> {
+    let (key_str, dir_str) = match s.split_once(':') {
+        Some((k, d)) => (k, d),
+        None => (s, "asc"),
+    };
+    let key = match key_str.to_ascii_lowercase().as_str() {
+        "name" => SortKey::Name,
+        "type" => SortKey::Type,
+        "in" => SortKey::In,
+        "out" => SortKey::Out,
+        "total" => SortKey::Total,
+        other => {
+            return Err(format!(
+                "unknown sort key '{other}' (allowed: name, type, in, out, total)"
+            ))
+        }
+    };
+    let dir = match dir_str.to_ascii_lowercase().as_str() {
+        "asc" => SortDir::Asc,
+        "desc" => SortDir::Desc,
+        other => {
+            return Err(format!(
+                "unknown sort direction '{other}' (allowed: asc, desc)"
+            ))
+        }
+    };
+    Ok(SortSpec { key, dir })
+}
+
+struct NodeRow {
+    in_deg: usize,
+    out_deg: usize,
+    total: usize,
+    tag: String,
+    name: String,
+}
+
+fn compare_rows(a: &NodeRow, b: &NodeRow, specs: &[SortSpec]) -> std::cmp::Ordering {
+    for spec in specs {
+        let raw = match spec.key {
+            SortKey::Name => a.name.cmp(&b.name),
+            SortKey::Type => a.tag.cmp(&b.tag),
+            SortKey::In => a.in_deg.cmp(&b.in_deg),
+            SortKey::Out => a.out_deg.cmp(&b.out_deg),
+            SortKey::Total => a.total.cmp(&b.total),
+        };
+        let ord = if spec.dir == SortDir::Desc {
+            raw.reverse()
+        } else {
+            raw
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// JSON output schema entry for upstream/downstream
 #[derive(Serialize, PartialEq, Eq, Hash, Clone)]
 struct ImpactEntry {
@@ -281,6 +360,15 @@ enum Commands {
         /// Show only distributed tables
         #[arg(long)]
         has_distribute: bool,
+
+        /// Sort keys (comma-separated, left=primary). Format: key[:dir].
+        /// Keys: name, type, in, out, total. Dir: asc (default), desc.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_parser = parse_sort_spec,
+        )]
+        sort_by: Option<Vec<SortSpec>>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -584,6 +672,7 @@ fn run() -> Result<()> {
             node_type,
             has_partition,
             has_distribute,
+            sort_by,
             project,
         }) => cmd_nodes(
             search.as_deref(),
@@ -592,6 +681,7 @@ fn run() -> Result<()> {
             node_type.as_deref(),
             has_partition,
             has_distribute,
+            sort_by.as_deref(),
             &project,
         ),
         Some(Commands::Detail {
@@ -943,6 +1033,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_nodes(
     search: Option<&str>,
     orphan: bool,
@@ -950,6 +1041,7 @@ fn cmd_nodes(
     node_type: Option<&str>,
     has_partition: bool,
     has_distribute: bool,
+    sort_by: Option<&[SortSpec]>,
     project: &Path,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
@@ -971,7 +1063,7 @@ fn cmd_nodes(
         graph.node_indices().collect()
     };
 
-    let filtered: Vec<_> = indices
+    let mut filtered: Vec<NodeRow> = indices
         .into_iter()
         .filter(|idx| {
             if let Some(ref tf) = type_filter {
@@ -1014,9 +1106,19 @@ fn cmd_nodes(
                 }
             }
 
-            Some((idx, in_deg, out_deg, total))
+            Some(NodeRow {
+                in_deg,
+                out_deg,
+                total,
+                tag: node_type_tag(&graph[idx]).into_owned(),
+                name: graph::key::NodeKey::from_node(&graph[idx]).to_string(),
+            })
         })
         .collect();
+
+    if let Some(specs) = sort_by {
+        filtered.sort_by(|a, b| compare_rows(a, b, specs));
+    }
 
     if let Some(max) = max_degree {
         let label = if orphan { "orphan" } else { "low-degree" };
@@ -1025,16 +1127,14 @@ fn cmd_nodes(
     }
 
     println_stdout!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
-    for (idx, in_deg, out_deg, total) in &filtered {
-        let tag = node_type_tag(&graph[*idx]);
-        let key = graph::key::NodeKey::from_node(&graph[*idx]);
+    for row in &filtered {
         println_stdout!(
             "{:<8} {:>3} {:>3} {:>3}  {}",
-            tag,
-            in_deg,
-            out_deg,
-            total,
-            key
+            row.tag,
+            row.in_deg,
+            row.out_deg,
+            row.total,
+            row.name
         );
     }
 
@@ -2604,5 +2704,164 @@ fn print_impact_text(result: &ImpactResult) {
             let file = entry.file_path.as_deref().unwrap_or("<unknown>");
             println_stdout!("  {}  {}{}", entry.symbol, file, line_tag);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn row(in_deg: usize, out_deg: usize, tag: &str, name: &str) -> NodeRow {
+        NodeRow {
+            in_deg,
+            out_deg,
+            total: in_deg + out_deg,
+            tag: tag.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_sort_spec_defaults_dir_to_asc() {
+        assert_eq!(
+            parse_sort_spec("name").unwrap(),
+            SortSpec {
+                key: SortKey::Name,
+                dir: SortDir::Asc
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sort_spec_explicit_dir() {
+        assert_eq!(
+            parse_sort_spec("total:desc").unwrap(),
+            SortSpec {
+                key: SortKey::Total,
+                dir: SortDir::Desc
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sort_spec_case_insensitive() {
+        assert_eq!(
+            parse_sort_spec("IN:ASC").unwrap(),
+            SortSpec {
+                key: SortKey::In,
+                dir: SortDir::Asc
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sort_spec_rejects_unknown_key() {
+        assert!(parse_sort_spec("foo").is_err());
+        assert!(parse_sort_spec("foo:asc").is_err());
+    }
+
+    #[test]
+    fn parse_sort_spec_rejects_unknown_dir() {
+        assert!(parse_sort_spec("name:up").is_err());
+    }
+
+    #[test]
+    fn parse_sort_spec_rejects_empty_key() {
+        assert!(parse_sort_spec("").is_err());
+        assert!(parse_sort_spec(":asc").is_err());
+    }
+
+    #[test]
+    fn compare_rows_single_key_asc() {
+        let a = row(5, 1, "proc", "alpha");
+        let b = row(3, 9, "proc", "beta");
+        let specs = [SortSpec {
+            key: SortKey::In,
+            dir: SortDir::Asc,
+        }];
+        assert_eq!(compare_rows(&a, &b, &specs), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_rows_single_key_desc() {
+        let a = row(5, 1, "proc", "alpha");
+        let b = row(3, 9, "proc", "beta");
+        let specs = [SortSpec {
+            key: SortKey::In,
+            dir: SortDir::Desc,
+        }];
+        assert_eq!(compare_rows(&a, &b, &specs), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_rows_multi_key_primary_wins() {
+        let a = row(5, 1, "proc", "alpha");
+        let b = row(3, 9, "proc", "beta");
+        let specs = [
+            SortSpec {
+                key: SortKey::In,
+                dir: SortDir::Asc,
+            },
+            SortSpec {
+                key: SortKey::Out,
+                dir: SortDir::Desc,
+            },
+        ];
+        assert_eq!(
+            compare_rows(&a, &b, &specs),
+            Ordering::Greater,
+            "primary in:asc (5 vs 3) decides; out never consulted"
+        );
+    }
+
+    #[test]
+    fn compare_rows_multi_key_tiebreaker_kicks_in() {
+        let a = row(5, 1, "proc", "alpha");
+        let b = row(5, 9, "proc", "beta");
+        let specs = [
+            SortSpec {
+                key: SortKey::In,
+                dir: SortDir::Asc,
+            },
+            SortSpec {
+                key: SortKey::Out,
+                dir: SortDir::Desc,
+            },
+        ];
+        assert_eq!(
+            compare_rows(&a, &b, &specs),
+            Ordering::Greater,
+            "in tied; out:desc puts b (out=9) before a (out=1), so a > b"
+        );
+        assert_eq!(
+            compare_rows(&b, &a, &specs),
+            Ordering::Less,
+            "symmetry: b < a"
+        );
+    }
+
+    #[test]
+    fn compare_rows_all_equal_returns_equal() {
+        let a = row(5, 9, "proc", "alpha");
+        let b = row(5, 9, "proc", "alpha");
+        let specs = [
+            SortSpec {
+                key: SortKey::In,
+                dir: SortDir::Asc,
+            },
+            SortSpec {
+                key: SortKey::Name,
+                dir: SortDir::Desc,
+            },
+        ];
+        assert_eq!(compare_rows(&a, &b, &specs), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_rows_no_specs_returns_equal() {
+        let a = row(5, 9, "proc", "alpha");
+        let b = row(3, 1, "func", "beta");
+        assert_eq!(compare_rows(&a, &b, &[]), Ordering::Equal);
     }
 }
