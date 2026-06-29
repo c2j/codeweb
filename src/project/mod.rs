@@ -268,16 +268,8 @@ impl Project {
             parser::ibatis_loader::load_ibatis_structured_files_from_paths(&all_xml_paths);
         pb.inc(all_xml_paths.len() as u64);
 
-        pb.finish_with_message(format!(
-            "Parsed {} files ({} SQL, {} Java, {} XML)",
-            total_sql + java_files.len() + ibatis_files.len(),
-            total_sql,
-            java_files.len(),
-            ibatis_files.len(),
-        ));
-
         // Phase 5: Add non-SQL nodes to graph
-        eprintln!("  Building graph...");
+        pb.set_message("Building graph...");
         let source_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
             vec![self.root.clone()]
         } else {
@@ -334,9 +326,27 @@ impl Project {
             }
         }
 
-        GraphBuilder::finalize_graph(&mut ctx);
+        // Finish AFTER all parsing phases — JSP calls pb.inc() below; finishing
+        // earlier leaves a dead bar being updated.
+        #[cfg(not(feature = "jsp"))]
+        pb.finish_with_message(format!(
+            "Parsed {} files ({} SQL, {} Java, {} XML)",
+            total_sql + java_files.len() + ibatis_files.len(),
+            total_sql,
+            java_files.len(),
+            ibatis_files.len(),
+        ));
+        #[cfg(feature = "jsp")]
+        pb.finish_with_message(format!(
+            "Parsed {} files ({} SQL, {} Java, {} XML, {} JSP)",
+            total_sql + java_files.len() + ibatis_files.len() + all_jsp_paths.len(),
+            total_sql,
+            java_files.len(),
+            ibatis_files.len(),
+            all_jsp_paths.len(),
+        ));
 
-        GraphBuilder::debug_dump_builtin_nodes(&ctx.graph);
+        GraphBuilder::finalize_graph(&mut ctx);
 
         // Expand dynamic SQL variants for fingerprint index
         let variant_map = GraphBuilder::add_ibatis_structured_variants(
