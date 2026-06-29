@@ -61,11 +61,16 @@ struct ImpactEntry {
     line: Option<usize>,
 }
 
-/// `impact --file` JSON output schema (schema_version=1, frozen contract)
+/// `impact --file` / `impact --node` JSON output schema (schema_version=2)
 #[derive(Serialize)]
 struct ImpactResult {
     schema_version: u32,
-    file: String,
+    /// `--file` 入口时为 Some,`--node` 入口时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    /// `--node` 入口时为 Some,`--file` 入口时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
     upstream: Vec<ImpactEntry>,
     downstream: Vec<ImpactEntry>,
 }
@@ -427,15 +432,22 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Show upstream callers and downstream callees for all nodes in a file
+    /// Show upstream callers and downstream callees for a file or a node
     ///
-    /// Aggregates impact analysis across all nodes (methods, mappers, procedures)
-    /// defined in the given file. Designed for subprocess integration (e.g.
-    /// CodeRoughcollie) — outputs stable JSON by default.
+    /// Pass `--file <path>` to aggregate impact across all nodes defined in
+    /// that file (useful for subprocess integration with `git diff`).
+    /// Pass `--node <name>` to query a single symbol (e.g. a procedure,
+    /// Java method, or mapper id). The two flags are mutually exclusive.
     Impact {
-        /// File path to analyze (relative to CWD or absolute)
+        /// File path to analyze (relative to CWD or absolute).
+        /// Mutually exclusive with --node.
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
+
+        /// Node symbol name to analyze (e.g. "proc_create_order").
+        /// Supports fuzzy match like `trace`/`detail`. Mutually exclusive with --file.
+        #[arg(long)]
+        node: Option<String>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -633,10 +645,24 @@ fn run() -> Result<()> {
         ),
         Some(Commands::Impact {
             file,
+            node,
             project,
             format,
             depth,
-        }) => cmd_impact(&file, &project, &format, depth),
+        }) => {
+            // 互斥校验:恰好一个必须是 Some
+            match (&file, &node) {
+                (Some(_), Some(_)) => {
+                    eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
+                    std::process::exit(2);
+                }
+                (None, None) => {
+                    eprintln!("Error: must pass exactly one of --file <path> or --node <name>.");
+                    std::process::exit(2);
+                }
+                _ => cmd_impact(file.as_deref(), node.as_deref(), &project, &format, depth),
+            }
+        }
     }
 }
 
@@ -2234,91 +2260,55 @@ fn jsp_count_fragment() -> String {
     String::new()
 }
 
-fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result<()> {
+fn cmd_impact(
+    file: Option<&Path>,
+    node: Option<&str>,
+    project: &Path,
+    format: &str,
+    depth: usize,
+) -> Result<()> {
     use crate::graph::query::filter::EdgeFilter;
     use petgraph::Direction;
 
     let mut proj = project::Project::find(project)?;
-    let store = proj.load_store()?;
-    let graph = store.graph();
-    let file_nodes = store.file_nodes();
-    let key_index = store.node_key_index();
-
-    let (matched_path, was_fuzzy) = match resolve_file_path(file, file_nodes) {
-        Some((p, fuzzy)) => (p, fuzzy),
-        None => {
-            let result = ImpactResult {
-                schema_version: 1,
-                file: file.to_string_lossy().to_string(),
-                upstream: vec![],
-                downstream: vec![],
-            };
-            if format == "json" {
-                let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                    error::CodeWebError::ExportError {
-                        message: format!("JSON serialization: {}", e),
-                    }
-                })?;
-                println_stdout!("{}", json);
-            } else {
-                print_impact_text(&result);
-            }
-            eprintln!(
-                "Warning: file '{}' not found in graph (no nodes analyzed for this file)",
-                file.display()
-            );
+    // Note: `load_store()` returns single-layer `Result<&GraphStore>` (not nested).
+    // See project/mod.rs:420. Match without `?` to handle "not yet analyzed" gracefully.
+    let store = match proj.load_store() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Project not analyzed. Run `codeweb analyze` first.");
             return Ok(());
         }
     };
 
-    if was_fuzzy {
-        eprintln!(
-            "Warning: '{}' resolved via fuzzy match to '{}'",
-            file.display(),
-            matched_path.display()
-        );
-    }
+    let graph = store.graph();
+    let calls_filter = EdgeFilter::calls_only();
 
-    let file_node_indices: Vec<NodeIndex> = file_nodes
-        .get(matched_path)
-        .map(|keys| {
-            keys.iter()
-                .filter_map(|k| key_index.get(k).copied())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if file_node_indices.is_empty() {
-        let result = ImpactResult {
-            schema_version: 1,
-            file: matched_path.to_string_lossy().to_string(),
-            upstream: vec![],
-            downstream: vec![],
-        };
-        if format == "json" {
-            let json = serde_json::to_string_pretty(&result).map_err(|e| {
-                error::CodeWebError::ExportError {
-                    message: format!("JSON serialization: {}", e),
-                }
-            })?;
-            println_stdout!("{}", json);
-        } else {
-            print_impact_text(&result);
+    // ── 解析起点节点 ───────────────────────────────────────────────
+    // 返回 (start_nodes, ImpactTarget)
+    let (start_nodes, target) = match (file, node) {
+        (Some(path), None) => {
+            let file_nodes = store.file_nodes();
+            let key_index = store.node_key_index();
+            resolve_file_target(graph, file_nodes, key_index, path)?
         }
-        eprintln!(
-            "Warning: file '{}' has no graph nodes",
-            matched_path.display()
-        );
+        (None, Some(name)) => resolve_node_target(store, name)?,
+        // 不可达:clap 分发层已校验互斥
+        _ => unreachable!("clap layer guarantees exactly one of --file/--node is set"),
+    };
+
+    if start_nodes.is_empty() {
+        emit_empty_result(&target, format)?;
         return Ok(());
     }
 
-    let calls_filter = EdgeFilter::calls_only();
+    // ── 双向遍历 ──────────────────────────────────────────────────
     let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
     let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
 
     collect_impact_entries(
         graph,
-        &file_node_indices,
+        &start_nodes,
         Direction::Incoming,
         depth,
         &calls_filter,
@@ -2326,7 +2316,7 @@ fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result
     );
     collect_impact_entries(
         graph,
-        &file_node_indices,
+        &start_nodes,
         Direction::Outgoing,
         depth,
         &calls_filter,
@@ -2338,25 +2328,132 @@ fn cmd_impact(file: &Path, project: &Path, format: &str, depth: usize) -> Result
     upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
     downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
 
-    let result = ImpactResult {
-        schema_version: 1,
-        file: matched_path.to_string_lossy().to_string(),
-        upstream,
-        downstream,
+    let result = build_impact_result(&target, upstream, downstream);
+    emit_result(&result, format)?;
+    Ok(())
+}
+
+/// `cmd_impact` 的目标解析结果
+enum ImpactTarget {
+    File { path: String },
+    Node { name: String },
+}
+
+/// 从文件入口解析出起始节点列表。
+/// 文件不在图中或无节点时返回 Ok((vec![], ImpactTarget::File{...})),由调用方走空结果路径。
+fn resolve_file_target(
+    _graph: &crate::graph::CodeGraph,
+    file_nodes: &HashMap<PathBuf, Vec<crate::graph::key::NodeKey>>,
+    key_index: &HashMap<crate::graph::key::NodeKey, NodeIndex>,
+    path: &Path,
+) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
+    let target = ImpactTarget::File {
+        path: path.to_string_lossy().to_string(),
     };
 
-    if format == "json" {
-        let json = serde_json::to_string_pretty(&result).map_err(|e| {
-            error::CodeWebError::ExportError {
-                message: format!("JSON serialization: {}", e),
-            }
-        })?;
-        println_stdout!("{}", json);
-    } else {
-        print_impact_text(&result);
+    let Some((matched_path, was_fuzzy)) = resolve_file_path(path, file_nodes) else {
+        eprintln!(
+            "Warning: file '{}' not found in graph (no nodes analyzed for this file)",
+            path.display()
+        );
+        return Ok((vec![], target));
+    };
+
+    if was_fuzzy {
+        eprintln!(
+            "Warning: '{}' resolved via fuzzy match to '{}'",
+            path.display(),
+            matched_path.display()
+        );
     }
 
+    let nodes: Vec<NodeIndex> = file_nodes
+        .get(matched_path)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|k| key_index.get(k).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 注意:这里把 matched_path 的字符串回填到 target,以便 JSON 里的 file 字段显示规范化后的路径
+    let target = ImpactTarget::File {
+        path: matched_path.to_string_lossy().to_string(),
+    };
+    Ok((nodes, target))
+}
+
+/// 从节点名入口解析出起始节点列表(单个节点)。
+/// 复用 store.search_nodes(),与 cmd_trace / cmd_detail 一致。
+fn resolve_node_target(
+    store: &crate::graph::store::GraphStore,
+    name: &str,
+) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
+    let matches = store.search_nodes(name);
+
+    if matches.is_empty() {
+        eprintln!("No nodes matching '{}'", name);
+        return Ok((
+            vec![],
+            ImpactTarget::Node {
+                name: name.to_string(),
+            },
+        ));
+    }
+
+    if matches.len() > 1 {
+        eprintln!("Multiple matches found for '{}':", name);
+        for (i, (_, n)) in matches.iter().enumerate() {
+            eprintln!("  {}: {}", i + 1, n);
+        }
+        eprintln!("Using first match: {}", matches[0].1);
+    } else {
+        eprintln!("Impact from: {}", matches[0].1);
+    }
+
+    let start_idx = matches[0].0;
+    Ok((
+        vec![start_idx],
+        ImpactTarget::Node {
+            name: matches[0].1.clone(),
+        },
+    ))
+}
+
+fn build_impact_result(
+    target: &ImpactTarget,
+    upstream: Vec<ImpactEntry>,
+    downstream: Vec<ImpactEntry>,
+) -> ImpactResult {
+    let (file, node) = match target {
+        ImpactTarget::File { path } => (Some(path.clone()), None),
+        ImpactTarget::Node { name } => (None, Some(name.clone())),
+    };
+    ImpactResult {
+        schema_version: 2,
+        file,
+        node,
+        upstream,
+        downstream,
+    }
+}
+
+fn emit_result(result: &ImpactResult, format: &str) -> Result<()> {
+    if format == "json" {
+        let json =
+            serde_json::to_string_pretty(result).map_err(|e| error::CodeWebError::ExportError {
+                message: format!("JSON serialization: {}", e),
+            })?;
+        println_stdout!("{}", json);
+    } else {
+        print_impact_text(result);
+    }
     Ok(())
+}
+
+fn emit_empty_result(target: &ImpactTarget, format: &str) -> Result<()> {
+    let result = build_impact_result(target, vec![], vec![]);
+    emit_result(&result, format)
 }
 
 /// Match user-supplied path against `file_nodes` keys.
@@ -2480,7 +2577,12 @@ fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
 }
 
 fn print_impact_text(result: &ImpactResult) {
-    println_stdout!("File: {}", result.file);
+    // 头部:File 或 Node 二选一显示
+    if let Some(file) = &result.file {
+        println_stdout!("File: {}", file);
+    } else if let Some(node) = &result.node {
+        println_stdout!("Node: {}", node);
+    }
     println_stdout!();
     println_stdout!("── UPSTREAM ({}) ──", result.upstream.len());
     if result.upstream.is_empty() {

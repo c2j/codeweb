@@ -121,6 +121,9 @@ codeweb dedup
 # Show file-level impact analysis (JSON for integration)
 codeweb impact --file src/main/java/com/example/Mapper.java --format json
 
+# Show impact analysis for a single node (by symbol name)
+codeweb impact --node "proc_create_order" --format json
+
 # Execute declarative JSON QuerySpec
 codeweb query --spec '{"start":{"type":"proc","name":"order"},"collect":"nodes"}'
 
@@ -162,6 +165,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb merge` | Merge multiple graph stores |
 | `codeweb dedup` | Deduplicate graph nodes and edges |
 | `codeweb impact --file <path>` | Show upstream/downstream impact for all nodes in a file |
+| `codeweb impact --node <name>` | Show upstream/downstream impact for a single node symbol |
 | `codeweb tui` | Open interactive TUI |
 | `codeweb serve` | Start HTTP server with browser UI |
 | `codeweb mcp` | Start MCP server (stdio JSON-RPC for LLM clients) |
@@ -445,6 +449,9 @@ codeweb dedup
 # 显示文件级影响分析（JSON 供集成）
 codeweb impact --file src/main/java/com/example/Mapper.java --format json
 
+# 按节点名查询影响分析
+codeweb impact --node "proc_create_order" --format json
+
 # 执行声明式 JSON QuerySpec
 codeweb query --spec '{"start":{"type":"proc","name":"order"},"collect":"nodes"}'
 
@@ -483,6 +490,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb merge` | 合并多个图谱存储 |
 | `codeweb dedup` | 去重图谱节点和边 |
 | `codeweb impact --file <path>` | 显示文件内所有节点的上下游影响 |
+| `codeweb impact --node <name>` | 显示单个节点符号的上下游影响 |
 | `codeweb tui` | 打开交互式 TUI |
 | `codeweb serve` | 启动 HTTP 服务器 + 浏览器 UI |
 | `codeweb mcp` | 启动 MCP 服务器（stdio JSON-RPC，供 LLM 客户端调用） |
