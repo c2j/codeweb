@@ -232,6 +232,7 @@ pub fn trace_chain(
 /// Returns a flat list excluding `start` itself. Each node appears at most once
 /// (first discovery wins). `depth=1` returns direct neighbors only;
 /// `depth=0` means unlimited (expands until the connected component is exhausted).
+#[cfg(any(feature = "serve", feature = "mcp"))]
 pub fn neighbors_at_depth(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
