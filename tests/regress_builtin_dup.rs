@@ -103,7 +103,11 @@ fn standalone_and_procedure_body_calls_same_builtin_produces_single_node() {
         "--sql-only",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "codeweb failed. stderr:\n{}", stderr);
+    assert!(
+        output.status.success(),
+        "codeweb failed. stderr:\n{}",
+        stderr
+    );
 
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
@@ -142,7 +146,11 @@ fn four_files_with_ascii_and_substr_should_not_duplicate() {
         "--sql-only",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "codeweb failed. stderr:\n{}", stderr);
+    assert!(
+        output.status.success(),
+        "codeweb failed. stderr:\n{}",
+        stderr
+    );
 
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
@@ -159,7 +167,11 @@ fn four_files_with_ascii_and_substr_should_not_duplicate() {
         "Expected 1 'ascii' node across 4 files, found {}. stderr:\n{:>80}",
         ascii_count, stderr
     );
-    assert_eq!(substr_count, 1, "Expected 1 'substr' node, found {}", substr_count);
+    assert_eq!(
+        substr_count, 1,
+        "Expected 1 'substr' node, found {}",
+        substr_count
+    );
 
     let total_builtins = builtins.len();
     assert_eq!(

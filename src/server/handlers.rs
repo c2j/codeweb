@@ -196,6 +196,7 @@ async fn search_sql(
 async fn node_detail(
     State(state): State<AppState>,
     Path(id): Path<usize>,
+    Query(query): Query<DetailQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let graph = state.graph();
     let idx = NodeIndex::new(id);
@@ -205,6 +206,7 @@ async fn node_detail(
     }
 
     let node = &graph[idx];
+    let depth = query.depth.unwrap_or(1);
     let in_deg = graph
         .neighbors_directed(idx, petgraph::Direction::Incoming)
         .count();
@@ -212,29 +214,31 @@ async fn node_detail(
         .neighbors_directed(idx, petgraph::Direction::Outgoing)
         .count();
 
-    let callers: Vec<Value> = graph
-        .neighbors_directed(idx, petgraph::Direction::Incoming)
-        .map(|n| {
-            let key = NodeKey::from_node(&graph[n]);
-            serde_json::json!({
-                "id": n.index(),
-                "key": key.to_string(),
-                "type": node_type_tag(&graph[n]),
+    let callers: Vec<Value> =
+        traverse::neighbors_at_depth(graph, idx, petgraph::Direction::Incoming, depth)
+            .into_iter()
+            .map(|n| {
+                let key = NodeKey::from_node(&graph[n]);
+                serde_json::json!({
+                    "id": n.index(),
+                    "key": key.to_string(),
+                    "type": node_type_tag(&graph[n]),
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    let callees: Vec<Value> = graph
-        .neighbors_directed(idx, petgraph::Direction::Outgoing)
-        .map(|n| {
-            let key = NodeKey::from_node(&graph[n]);
-            serde_json::json!({
-                "id": n.index(),
-                "key": key.to_string(),
-                "type": node_type_tag(&graph[n]),
+    let callees: Vec<Value> =
+        traverse::neighbors_at_depth(graph, idx, petgraph::Direction::Outgoing, depth)
+            .into_iter()
+            .map(|n| {
+                let key = NodeKey::from_node(&graph[n]);
+                serde_json::json!({
+                    "id": n.index(),
+                    "key": key.to_string(),
+                    "type": node_type_tag(&graph[n]),
+                })
             })
-        })
-        .collect();
+            .collect();
 
     let key = NodeKey::from_node(node);
     let mut properties: Vec<Value> = Vec::new();
@@ -398,6 +402,11 @@ struct TraceQuery {
     max_nodes: Option<usize>,
 }
 
+#[derive(serde::Deserialize)]
+struct DetailQuery {
+    depth: Option<usize>,
+}
+
 async fn trace(
     State(state): State<AppState>,
     Query(query): Query<TraceQuery>,
@@ -447,6 +456,7 @@ async fn execute_query(
 struct NeighborsQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    depth: Option<usize>,
 }
 
 async fn node_callers(
@@ -461,17 +471,19 @@ async fn node_callers(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let all: Vec<Value> = graph
-        .neighbors_directed(idx, petgraph::Direction::Incoming)
-        .map(|n| {
-            let key = NodeKey::from_node(&graph[n]);
-            serde_json::json!({
-                "id": n.index(),
-                "key": key.to_string(),
-                "type": node_type_tag(&graph[n]),
+    let depth = query.depth.unwrap_or(1);
+    let all: Vec<Value> =
+        traverse::neighbors_at_depth(graph, idx, petgraph::Direction::Incoming, depth)
+            .into_iter()
+            .map(|n| {
+                let key = NodeKey::from_node(&graph[n]);
+                serde_json::json!({
+                    "id": n.index(),
+                    "key": key.to_string(),
+                    "type": node_type_tag(&graph[n]),
+                })
             })
-        })
-        .collect();
+            .collect();
 
     let total = all.len();
     let limit_val = query.limit.unwrap_or(50);
@@ -499,17 +511,19 @@ async fn node_callees(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let all: Vec<Value> = graph
-        .neighbors_directed(idx, petgraph::Direction::Outgoing)
-        .map(|n| {
-            let key = NodeKey::from_node(&graph[n]);
-            serde_json::json!({
-                "id": n.index(),
-                "key": key.to_string(),
-                "type": node_type_tag(&graph[n]),
+    let depth = query.depth.unwrap_or(1);
+    let all: Vec<Value> =
+        traverse::neighbors_at_depth(graph, idx, petgraph::Direction::Outgoing, depth)
+            .into_iter()
+            .map(|n| {
+                let key = NodeKey::from_node(&graph[n]);
+                serde_json::json!({
+                    "id": n.index(),
+                    "key": key.to_string(),
+                    "type": node_type_tag(&graph[n]),
+                })
             })
-        })
-        .collect();
+            .collect();
 
     let total = all.len();
     let limit_val = query.limit.unwrap_or(50);

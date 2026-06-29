@@ -227,6 +227,40 @@ pub fn trace_chain(
     )
 }
 
+/// Collect all unique nodes within `depth` hops of `start` in the given direction.
+///
+/// Returns a flat list excluding `start` itself. Each node appears at most once
+/// (first discovery wins). `depth=1` returns direct neighbors only;
+/// `depth=0` means unlimited (expands until the connected component is exhausted).
+pub fn neighbors_at_depth(
+    graph: &crate::graph::CodeGraph,
+    start: NodeIndex,
+    direction: Direction,
+    depth: usize,
+) -> Vec<NodeIndex> {
+    let depth = if depth == 0 { usize::MAX } else { depth };
+    let mut visited = HashSet::new();
+    visited.insert(start);
+    let mut frontier = vec![start];
+    let mut result = Vec::new();
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for &node in &frontier {
+            for neighbor in graph.neighbors_directed(node, direction) {
+                if visited.insert(neighbor) {
+                    result.push(neighbor);
+                    next.push(neighbor);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    result
+}
+
 /// Collect all unique source files involved in a call chain.
 ///
 /// Returns a sorted list of `(file_path, node_labels)` tuples, ordered by
