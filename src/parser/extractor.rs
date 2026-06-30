@@ -1200,17 +1200,20 @@ impl Visitor for TableAccessExtractor {
             .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
             .unwrap_or_default();
 
-        self.push_cte_scope(cte_names);
-
-        if let Some(ref w) = update.with {
-            self.walk_cte_bodies(w);
+        if !cte_names.is_empty() {
+            self.push_cte_scope(cte_names);
+            if let Some(ref w) = update.with {
+                self.walk_cte_bodies(w);
+            }
+            self.extract_writes_from_table_refs(&update.tables, WriteKind::Update);
+            self.extract_reads_from_table_refs(&update.from);
+            self.pop_cte_scope();
+        } else {
+            self.extract_writes_from_table_refs(&update.tables, WriteKind::Update);
+            self.extract_reads_from_table_refs(&update.from);
         }
 
-        self.extract_writes_from_table_refs(&update.tables, WriteKind::Update);
-        self.extract_reads_from_table_refs(&update.from);
-        self.pop_cte_scope();
-
-        VisitorResult::SkipChildren
+        VisitorResult::Continue
     }
 
     fn visit_delete(&mut self, delete: &ogsql_parser::ast::DeleteStatement) -> VisitorResult {
@@ -1220,17 +1223,20 @@ impl Visitor for TableAccessExtractor {
             .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
             .unwrap_or_default();
 
-        self.push_cte_scope(cte_names);
-
-        if let Some(ref w) = delete.with {
-            self.walk_cte_bodies(w);
+        if !cte_names.is_empty() {
+            self.push_cte_scope(cte_names);
+            if let Some(ref w) = delete.with {
+                self.walk_cte_bodies(w);
+            }
+            self.extract_writes_from_table_refs(&delete.tables, WriteKind::Delete);
+            self.extract_reads_from_table_refs(&delete.using);
+            self.pop_cte_scope();
+        } else {
+            self.extract_writes_from_table_refs(&delete.tables, WriteKind::Delete);
+            self.extract_reads_from_table_refs(&delete.using);
         }
 
-        self.extract_writes_from_table_refs(&delete.tables, WriteKind::Delete);
-        self.extract_reads_from_table_refs(&delete.using);
-        self.pop_cte_scope();
-
-        VisitorResult::SkipChildren
+        VisitorResult::Continue
     }
 }
 
