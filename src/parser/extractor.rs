@@ -909,18 +909,45 @@ impl TableAccessExtractor {
         });
     }
 
+    fn is_cte_reference(&self, name: &ObjectName, cte_names: &HashSet<String>) -> bool {
+        if name.is_empty() || cte_names.is_empty() {
+            return false;
+        }
+        let table_name = name[name.len() - 1].to_lowercase();
+        cte_names.contains(&table_name)
+    }
+
     fn extract_reads_from_table_refs(&mut self, table_refs: &[AstTableRef]) {
+        self.extract_reads_from_table_refs_filtered(table_refs, &HashSet::new());
+    }
+
+    fn extract_reads_from_table_refs_filtered(
+        &mut self,
+        table_refs: &[AstTableRef],
+        cte_names: &HashSet<String>,
+    ) {
         for tr in table_refs {
             match tr {
                 AstTableRef::Table { name, .. } => {
-                    self.add_access(name, AccessMode::Read, None);
+                    if !self.is_cte_reference(name, cte_names) {
+                        self.add_access(name, AccessMode::Read, None);
+                    }
                 }
                 AstTableRef::Join { left, right, .. } => {
-                    self.extract_reads_from_table_refs(std::slice::from_ref(left));
-                    self.extract_reads_from_table_refs(std::slice::from_ref(right));
+                    self.extract_reads_from_table_refs_filtered(
+                        std::slice::from_ref(left),
+                        cte_names,
+                    );
+                    self.extract_reads_from_table_refs_filtered(
+                        std::slice::from_ref(right),
+                        cte_names,
+                    );
                 }
                 AstTableRef::Pivot { source, .. } | AstTableRef::Unpivot { source, .. } => {
-                    self.extract_reads_from_table_refs(std::slice::from_ref(source));
+                    self.extract_reads_from_table_refs_filtered(
+                        std::slice::from_ref(source),
+                        cte_names,
+                    );
                 }
                 AstTableRef::Subquery { query, .. } => {
                     let stmt = Statement::Select(ogsql_parser::ast::Spanned {
@@ -935,17 +962,40 @@ impl TableAccessExtractor {
     }
 
     fn extract_writes_from_table_refs(&mut self, table_refs: &[AstTableRef], kind: WriteKind) {
+        self.extract_writes_from_table_refs_filtered(table_refs, kind, &HashSet::new());
+    }
+
+    fn extract_writes_from_table_refs_filtered(
+        &mut self,
+        table_refs: &[AstTableRef],
+        kind: WriteKind,
+        cte_names: &HashSet<String>,
+    ) {
         for tr in table_refs {
             match tr {
                 AstTableRef::Table { name, .. } => {
-                    self.add_access(name, AccessMode::Write, Some(kind));
+                    if !self.is_cte_reference(name, cte_names) {
+                        self.add_access(name, AccessMode::Write, Some(kind));
+                    }
                 }
                 AstTableRef::Join { left, right, .. } => {
-                    self.extract_writes_from_table_refs(std::slice::from_ref(left), kind);
-                    self.extract_writes_from_table_refs(std::slice::from_ref(right), kind);
+                    self.extract_writes_from_table_refs_filtered(
+                        std::slice::from_ref(left),
+                        kind,
+                        cte_names,
+                    );
+                    self.extract_writes_from_table_refs_filtered(
+                        std::slice::from_ref(right),
+                        kind,
+                        cte_names,
+                    );
                 }
                 AstTableRef::Pivot { source, .. } | AstTableRef::Unpivot { source, .. } => {
-                    self.extract_writes_from_table_refs(std::slice::from_ref(source), kind);
+                    self.extract_writes_from_table_refs_filtered(
+                        std::slice::from_ref(source),
+                        kind,
+                        cte_names,
+                    );
                 }
                 AstTableRef::Subquery { query, .. } => {
                     let stmt = Statement::Select(ogsql_parser::ast::Spanned {
@@ -1026,6 +1076,12 @@ impl Visitor for TableAccessExtractor {
     }
 
     fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
+        let cte_names: HashSet<String> = select
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+
         if let Some(ref into) = select.into_table {
             self.add_access(
                 &into.table_name,
@@ -1037,37 +1093,39 @@ impl Visitor for TableAccessExtractor {
         if let Some(ref lock) = select.lock_clause {
             match lock {
                 ogsql_parser::ast::LockClause::Update { tables, .. } if tables.is_empty() => {
-                    self.extract_reads_from_table_refs(&select.from);
+                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
                     for tr in &select.from {
                         if let AstTableRef::Table { name, .. } = tr {
-                            self.extract_lock_read_from_object_name(name);
+                            if !self.is_cte_reference(name, &cte_names) {
+                                self.extract_lock_read_from_object_name(name);
+                            }
                         }
                     }
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::Update { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
+                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::Share { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
+                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::NoKeyUpdate { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
+                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::KeyShare { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
+                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
@@ -1076,7 +1134,7 @@ impl Visitor for TableAccessExtractor {
             }
         }
 
-        self.extract_reads_from_table_refs(&select.from);
+        self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
         VisitorResult::Continue
     }
 
