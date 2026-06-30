@@ -863,12 +863,20 @@ pub struct TableAccessInfo {
 
 pub struct TableAccessExtractor {
     pub accesses: Vec<TableAccessInfo>,
+    /// Stack of CTE names per nesting level. Each `visit_select` /
+    /// `visit_insert` / `visit_update` / `visit_delete` pushes its local
+    /// WITH-clause CTE names; when children (CTE bodies, subqueries,
+    /// source SELECTs) are walked, the full stack is consulted so that
+    /// recursive CTE self-references and INSERT...WITH source references
+    /// are correctly filtered.
+    cte_scope: Vec<HashSet<String>>,
 }
 
 impl TableAccessExtractor {
     pub fn new() -> Self {
         Self {
             accesses: Vec::new(),
+            cte_scope: Vec::new(),
         }
     }
 
@@ -909,45 +917,31 @@ impl TableAccessExtractor {
         });
     }
 
-    fn is_cte_reference(&self, name: &ObjectName, cte_names: &HashSet<String>) -> bool {
-        if name.is_empty() || cte_names.is_empty() {
+    /// Check whether `name` matches any CTE name currently in scope.
+    fn is_cte_reference(&self, name: &ObjectName) -> bool {
+        if name.is_empty() {
             return false;
         }
         let table_name = name[name.len() - 1].to_lowercase();
-        cte_names.contains(&table_name)
+        self.cte_scope
+            .iter()
+            .any(|scope| scope.contains(&table_name))
     }
 
     fn extract_reads_from_table_refs(&mut self, table_refs: &[AstTableRef]) {
-        self.extract_reads_from_table_refs_filtered(table_refs, &HashSet::new());
-    }
-
-    fn extract_reads_from_table_refs_filtered(
-        &mut self,
-        table_refs: &[AstTableRef],
-        cte_names: &HashSet<String>,
-    ) {
         for tr in table_refs {
             match tr {
                 AstTableRef::Table { name, .. } => {
-                    if !self.is_cte_reference(name, cte_names) {
+                    if !self.is_cte_reference(name) {
                         self.add_access(name, AccessMode::Read, None);
                     }
                 }
                 AstTableRef::Join { left, right, .. } => {
-                    self.extract_reads_from_table_refs_filtered(
-                        std::slice::from_ref(left),
-                        cte_names,
-                    );
-                    self.extract_reads_from_table_refs_filtered(
-                        std::slice::from_ref(right),
-                        cte_names,
-                    );
+                    self.extract_reads_from_table_refs(std::slice::from_ref(left));
+                    self.extract_reads_from_table_refs(std::slice::from_ref(right));
                 }
                 AstTableRef::Pivot { source, .. } | AstTableRef::Unpivot { source, .. } => {
-                    self.extract_reads_from_table_refs_filtered(
-                        std::slice::from_ref(source),
-                        cte_names,
-                    );
+                    self.extract_reads_from_table_refs(std::slice::from_ref(source));
                 }
                 AstTableRef::Subquery { query, .. } => {
                     let stmt = Statement::Select(ogsql_parser::ast::Spanned {
@@ -962,40 +956,19 @@ impl TableAccessExtractor {
     }
 
     fn extract_writes_from_table_refs(&mut self, table_refs: &[AstTableRef], kind: WriteKind) {
-        self.extract_writes_from_table_refs_filtered(table_refs, kind, &HashSet::new());
-    }
-
-    fn extract_writes_from_table_refs_filtered(
-        &mut self,
-        table_refs: &[AstTableRef],
-        kind: WriteKind,
-        cte_names: &HashSet<String>,
-    ) {
         for tr in table_refs {
             match tr {
                 AstTableRef::Table { name, .. } => {
-                    if !self.is_cte_reference(name, cte_names) {
+                    if !self.is_cte_reference(name) {
                         self.add_access(name, AccessMode::Write, Some(kind));
                     }
                 }
                 AstTableRef::Join { left, right, .. } => {
-                    self.extract_writes_from_table_refs_filtered(
-                        std::slice::from_ref(left),
-                        kind,
-                        cte_names,
-                    );
-                    self.extract_writes_from_table_refs_filtered(
-                        std::slice::from_ref(right),
-                        kind,
-                        cte_names,
-                    );
+                    self.extract_writes_from_table_refs(std::slice::from_ref(left), kind);
+                    self.extract_writes_from_table_refs(std::slice::from_ref(right), kind);
                 }
                 AstTableRef::Pivot { source, .. } | AstTableRef::Unpivot { source, .. } => {
-                    self.extract_writes_from_table_refs_filtered(
-                        std::slice::from_ref(source),
-                        kind,
-                        cte_names,
-                    );
+                    self.extract_writes_from_table_refs(std::slice::from_ref(source), kind);
                 }
                 AstTableRef::Subquery { query, .. } => {
                     let stmt = Statement::Select(ogsql_parser::ast::Spanned {
@@ -1011,6 +984,16 @@ impl TableAccessExtractor {
 
     fn extract_lock_read_from_object_name(&mut self, name: &ObjectName) {
         self.add_access(name, AccessMode::LockRead, None);
+    }
+
+    /// Push local CTE names onto the scope stack. Children walked while
+    /// this scope is active will see these names and filter them.
+    fn push_cte_scope(&mut self, names: HashSet<String>) {
+        self.cte_scope.push(names);
+    }
+
+    fn pop_cte_scope(&mut self) {
+        self.cte_scope.pop();
     }
 }
 
@@ -1076,11 +1059,13 @@ impl Visitor for TableAccessExtractor {
     }
 
     fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
-        let cte_names: HashSet<String> = select
+        let local_cte_names: HashSet<String> = select
             .with
             .as_ref()
             .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
             .unwrap_or_default();
+
+        self.push_cte_scope(local_cte_names);
 
         if let Some(ref into) = select.into_table {
             self.add_access(
@@ -1093,57 +1078,96 @@ impl Visitor for TableAccessExtractor {
         if let Some(ref lock) = select.lock_clause {
             match lock {
                 ogsql_parser::ast::LockClause::Update { tables, .. } if tables.is_empty() => {
-                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
+                    self.extract_reads_from_table_refs(&select.from);
                     for tr in &select.from {
                         if let AstTableRef::Table { name, .. } = tr {
-                            if !self.is_cte_reference(name, &cte_names) {
+                            if !self.is_cte_reference(name) {
                                 self.extract_lock_read_from_object_name(name);
                             }
                         }
                     }
+                    self.pop_cte_scope();
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::Update { tables, .. } => {
-                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
+                    self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    self.pop_cte_scope();
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::Share { tables, .. } => {
-                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
+                    self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    self.pop_cte_scope();
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::NoKeyUpdate { tables, .. } => {
-                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
+                    self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    self.pop_cte_scope();
                     return VisitorResult::Continue;
                 }
                 ogsql_parser::ast::LockClause::KeyShare { tables, .. } => {
-                    self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
+                    self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    self.pop_cte_scope();
                     return VisitorResult::Continue;
                 }
             }
         }
 
-        self.extract_reads_from_table_refs_filtered(&select.from, &cte_names);
-        VisitorResult::Continue
+        self.extract_reads_from_table_refs(&select.from);
+
+        // Manually walk CTE bodies while the outer scope is still active
+        // so that recursive CTE self-references are filtered.
+        if let Some(ref with_clause) = select.with {
+            for cte in &with_clause.ctes {
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+                    node: cte.query.as_ref().clone(),
+                    span: None,
+                });
+                ogsql_parser::walk_statement(self, &stmt);
+            }
+        }
+
+        self.pop_cte_scope();
+        VisitorResult::SkipChildren
     }
 
     fn visit_insert(&mut self, insert: &ogsql_parser::ast::InsertStatement) -> VisitorResult {
+        let cte_names: HashSet<String> = insert
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+
+        self.push_cte_scope(cte_names);
+
         let write_kind = match &insert.source {
             ogsql_parser::ast::InsertSource::Select(_) => WriteKind::InsertSelect,
             _ => WriteKind::Insert,
         };
         self.add_access(&insert.table, AccessMode::Write, Some(write_kind));
+
+        // Walk CTE bodies first so their internal table refs are captured
+        // with the CTE scope active.
+        if let Some(ref with_clause) = insert.with {
+            for cte in &with_clause.ctes {
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+                    node: cte.query.as_ref().clone(),
+                    span: None,
+                });
+                ogsql_parser::walk_statement(self, &stmt);
+            }
+        }
 
         if let ogsql_parser::ast::InsertSource::Select(ref select_stmt) = insert.source {
             let stmt = Statement::Select(ogsql_parser::ast::Spanned {
@@ -1152,19 +1176,61 @@ impl Visitor for TableAccessExtractor {
             });
             ogsql_parser::walk_statement(self, &stmt);
         }
-        VisitorResult::Continue
+
+        self.pop_cte_scope();
+        VisitorResult::SkipChildren
     }
 
     fn visit_update(&mut self, update: &ogsql_parser::ast::UpdateStatement) -> VisitorResult {
+        let cte_names: HashSet<String> = update
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+
+        self.push_cte_scope(cte_names);
+
+        if let Some(ref with_clause) = update.with {
+            for cte in &with_clause.ctes {
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+                    node: cte.query.as_ref().clone(),
+                    span: None,
+                });
+                ogsql_parser::walk_statement(self, &stmt);
+            }
+        }
+
         self.extract_writes_from_table_refs(&update.tables, WriteKind::Update);
         self.extract_reads_from_table_refs(&update.from);
-        VisitorResult::Continue
+        self.pop_cte_scope();
+
+        VisitorResult::SkipChildren
     }
 
     fn visit_delete(&mut self, delete: &ogsql_parser::ast::DeleteStatement) -> VisitorResult {
+        let cte_names: HashSet<String> = delete
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+
+        self.push_cte_scope(cte_names);
+
+        if let Some(ref with_clause) = delete.with {
+            for cte in &with_clause.ctes {
+                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+                    node: cte.query.as_ref().clone(),
+                    span: None,
+                });
+                ogsql_parser::walk_statement(self, &stmt);
+            }
+        }
+
         self.extract_writes_from_table_refs(&delete.tables, WriteKind::Delete);
         self.extract_reads_from_table_refs(&delete.using);
-        VisitorResult::Continue
+        self.pop_cte_scope();
+
+        VisitorResult::SkipChildren
     }
 }
 

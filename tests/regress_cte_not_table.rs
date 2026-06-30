@@ -93,21 +93,31 @@ fn regress_cte_not_table_node() {
         node_exists_by_name_and_type(&json, "customers", "table"),
         "Real table 'customers' must appear as a table node"
     );
-
     assert!(
-        node_exists_by_name_and_type(&json, "process_orders", "procedure"),
-        "Procedure 'process_orders' must appear"
-    );
-    assert!(
-        node_exists_by_name_and_type(&json, "process_multiple", "procedure"),
-        "Procedure 'process_multiple' must appear"
-    );
-    assert!(
-        node_exists_by_name_and_type(&json, "process_joined", "procedure"),
-        "Procedure 'process_joined' must appear"
+        node_exists_by_name_and_type(&json, "audit_log", "table"),
+        "Real table 'audit_log' must appear as a table node"
     );
 
-    let cte_names = ["cte_orders", "cte_customers", "cte_joined"];
+    for proc_name in &[
+        "process_orders",
+        "process_multiple",
+        "process_joined",
+        "process_recursive",
+        "process_insert_with_cte",
+    ] {
+        assert!(
+            node_exists_by_name_and_type(&json, proc_name, "procedure"),
+            "Procedure '{proc_name}' must appear"
+        );
+    }
+
+    let cte_names = [
+        "cte_orders",
+        "cte_customers",
+        "cte_joined",
+        "rec_cte",
+        "ins_cte",
+    ];
     for cte_name in &cte_names {
         assert!(
             !node_exists_by_name_and_type(&json, cte_name, "table"),
@@ -126,6 +136,11 @@ fn regress_cte_not_table_node() {
         "Expected 'customers' in table nodes, got: {:?}",
         tables
     );
+    assert!(
+        tables.contains(&"audit_log".to_string()),
+        "Expected 'audit_log' in table nodes, got: {:?}",
+        tables
+    );
     for cte_name in &cte_names {
         assert!(
             !tables.contains(&cte_name.to_string()),
@@ -139,29 +154,41 @@ fn regress_cte_not_table_node() {
 fn regress_cte_table_access_edges_to_real_tables() {
     let json = analyze_json(CTE_BASIC);
 
-    assert!(
-        has_table_access_edge(&json, "process_orders", "orders"),
-        "process_orders must have table_access edge to orders (table inside CTE body)"
-    );
-    assert!(
-        has_table_access_edge(&json, "process_multiple", "orders"),
-        "process_multiple must have table_access edge to orders"
-    );
-    assert!(
-        has_table_access_edge(&json, "process_multiple", "customers"),
-        "process_multiple must have table_access edge to customers"
-    );
-    assert!(
-        has_table_access_edge(&json, "process_joined", "orders"),
-        "process_joined must have table_access edge to orders"
-    );
-    assert!(
-        has_table_access_edge(&json, "process_joined", "customers"),
-        "process_joined must have table_access edge to customers"
-    );
+    assert!(has_table_access_edge(&json, "process_orders", "orders"));
+    assert!(has_table_access_edge(&json, "process_multiple", "orders"));
+    assert!(has_table_access_edge(
+        &json,
+        "process_multiple",
+        "customers"
+    ));
+    assert!(has_table_access_edge(&json, "process_joined", "orders"));
+    assert!(has_table_access_edge(&json, "process_joined", "customers"));
+    assert!(has_table_access_edge(&json, "process_recursive", "orders"));
+    assert!(has_table_access_edge(
+        &json,
+        "process_insert_with_cte",
+        "orders"
+    ));
+    assert!(has_table_access_edge(
+        &json,
+        "process_insert_with_cte",
+        "audit_log"
+    ));
 
-    for proc_name in &["process_orders", "process_multiple", "process_joined"] {
-        for cte_name in &["cte_orders", "cte_customers", "cte_joined"] {
+    for proc_name in &[
+        "process_orders",
+        "process_multiple",
+        "process_joined",
+        "process_recursive",
+        "process_insert_with_cte",
+    ] {
+        for cte_name in &[
+            "cte_orders",
+            "cte_customers",
+            "cte_joined",
+            "rec_cte",
+            "ins_cte",
+        ] {
             assert!(
                 !has_table_access_edge(&json, proc_name, cte_name),
                 "'{proc_name}' must NOT have table_access edge to CTE '{cte_name}'"

@@ -56,3 +56,32 @@ BEGIN
     SELECT SUM(amount) INTO v_total FROM cte_joined;
 END;
 $$;
+
+-- Case 4: Recursive CTE (self-reference in CTE body)
+CREATE PROCEDURE process_recursive() AS $$
+DECLARE
+    v_count INT;
+BEGIN
+    WITH RECURSIVE rec_cte AS (
+        SELECT id, customer_id FROM orders WHERE id = 1
+        UNION ALL
+        SELECT o.id, o.customer_id
+        FROM orders o
+        JOIN rec_cte r ON o.id = r.id + 1
+    )
+    SELECT COUNT(*) INTO v_count FROM rec_cte;
+END;
+$$;
+
+-- Case 5: INSERT WITH CTE
+CREATE TABLE audit_log (order_id INT, total DECIMAL);
+
+CREATE PROCEDURE process_insert_with_cte() AS $$
+BEGIN
+    WITH ins_cte AS (
+        SELECT id, amount FROM orders WHERE amount > 100
+    )
+    INSERT INTO audit_log (order_id, total)
+    SELECT id, amount FROM ins_cte;
+END;
+$$;
