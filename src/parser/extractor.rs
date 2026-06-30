@@ -4,7 +4,7 @@ use ogsql_parser::ast::plpgsql::{PlDeclaration, PlTypeDecl};
 use ogsql_parser::ast::{
     CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
     ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
-    TableRef as AstTableRef, UpdateStatement, WhenClause,
+    TableRef as AstTableRef, UpdateStatement, WhenClause, WithClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -995,6 +995,19 @@ impl TableAccessExtractor {
     fn pop_cte_scope(&mut self) {
         self.cte_scope.pop();
     }
+
+    /// Walk the bodies of all CTEs in a WITH clause. Must be called
+    /// while the CTE scope is active so that recursive CTE
+    /// self-references inside the bodies are filtered.
+    fn walk_cte_bodies(&mut self, with_clause: &WithClause) {
+        for cte in &with_clause.ctes {
+            let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+                node: cte.query.as_ref().clone(),
+                span: None,
+            });
+            ogsql_parser::walk_statement(self, &stmt);
+        }
+    }
 }
 
 impl Visitor for TableAccessExtractor {
@@ -1086,56 +1099,63 @@ impl Visitor for TableAccessExtractor {
                             }
                         }
                     }
+                    if let Some(ref w) = select.with {
+                        self.walk_cte_bodies(w);
+                    }
                     self.pop_cte_scope();
-                    return VisitorResult::Continue;
+                    return VisitorResult::SkipChildren;
                 }
                 ogsql_parser::ast::LockClause::Update { tables, .. } => {
                     self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    if let Some(ref w) = select.with {
+                        self.walk_cte_bodies(w);
+                    }
                     self.pop_cte_scope();
-                    return VisitorResult::Continue;
+                    return VisitorResult::SkipChildren;
                 }
                 ogsql_parser::ast::LockClause::Share { tables, .. } => {
                     self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    if let Some(ref w) = select.with {
+                        self.walk_cte_bodies(w);
+                    }
                     self.pop_cte_scope();
-                    return VisitorResult::Continue;
+                    return VisitorResult::SkipChildren;
                 }
                 ogsql_parser::ast::LockClause::NoKeyUpdate { tables, .. } => {
                     self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    if let Some(ref w) = select.with {
+                        self.walk_cte_bodies(w);
+                    }
                     self.pop_cte_scope();
-                    return VisitorResult::Continue;
+                    return VisitorResult::SkipChildren;
                 }
                 ogsql_parser::ast::LockClause::KeyShare { tables, .. } => {
                     self.extract_reads_from_table_refs(&select.from);
                     for name in tables {
                         self.extract_lock_read_from_object_name(name);
                     }
+                    if let Some(ref w) = select.with {
+                        self.walk_cte_bodies(w);
+                    }
                     self.pop_cte_scope();
-                    return VisitorResult::Continue;
+                    return VisitorResult::SkipChildren;
                 }
             }
         }
 
         self.extract_reads_from_table_refs(&select.from);
 
-        // Manually walk CTE bodies while the outer scope is still active
-        // so that recursive CTE self-references are filtered.
-        if let Some(ref with_clause) = select.with {
-            for cte in &with_clause.ctes {
-                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
-                    node: cte.query.as_ref().clone(),
-                    span: None,
-                });
-                ogsql_parser::walk_statement(self, &stmt);
-            }
+        if let Some(ref w) = select.with {
+            self.walk_cte_bodies(w);
         }
 
         self.pop_cte_scope();
@@ -1157,16 +1177,8 @@ impl Visitor for TableAccessExtractor {
         };
         self.add_access(&insert.table, AccessMode::Write, Some(write_kind));
 
-        // Walk CTE bodies first so their internal table refs are captured
-        // with the CTE scope active.
-        if let Some(ref with_clause) = insert.with {
-            for cte in &with_clause.ctes {
-                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
-                    node: cte.query.as_ref().clone(),
-                    span: None,
-                });
-                ogsql_parser::walk_statement(self, &stmt);
-            }
+        if let Some(ref w) = insert.with {
+            self.walk_cte_bodies(w);
         }
 
         if let ogsql_parser::ast::InsertSource::Select(ref select_stmt) = insert.source {
@@ -1190,14 +1202,8 @@ impl Visitor for TableAccessExtractor {
 
         self.push_cte_scope(cte_names);
 
-        if let Some(ref with_clause) = update.with {
-            for cte in &with_clause.ctes {
-                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
-                    node: cte.query.as_ref().clone(),
-                    span: None,
-                });
-                ogsql_parser::walk_statement(self, &stmt);
-            }
+        if let Some(ref w) = update.with {
+            self.walk_cte_bodies(w);
         }
 
         self.extract_writes_from_table_refs(&update.tables, WriteKind::Update);
@@ -1216,14 +1222,8 @@ impl Visitor for TableAccessExtractor {
 
         self.push_cte_scope(cte_names);
 
-        if let Some(ref with_clause) = delete.with {
-            for cte in &with_clause.ctes {
-                let stmt = Statement::Select(ogsql_parser::ast::Spanned {
-                    node: cte.query.as_ref().clone(),
-                    span: None,
-                });
-                ogsql_parser::walk_statement(self, &stmt);
-            }
+        if let Some(ref w) = delete.with {
+            self.walk_cte_bodies(w);
         }
 
         self.extract_writes_from_table_refs(&delete.tables, WriteKind::Delete);
