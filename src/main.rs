@@ -361,6 +361,14 @@ enum Commands {
         #[arg(long)]
         has_distribute: bool,
 
+        /// Show only inferred nodes (tables/views without DDL definition)
+        #[arg(long)]
+        inferred: bool,
+
+        /// Show only system tables/views (pg_catalog, sys, dbe_*, etc.)
+        #[arg(long)]
+        system: bool,
+
         /// Sort keys (comma-separated, left=primary). Format: key[:dir].
         /// Keys: name, type, in, out, total. Dir: asc (default), desc.
         #[arg(
@@ -672,6 +680,8 @@ fn run() -> Result<()> {
             node_type,
             has_partition,
             has_distribute,
+            inferred,
+            system,
             sort_by,
             project,
         }) => cmd_nodes(
@@ -681,6 +691,8 @@ fn run() -> Result<()> {
             node_type.as_deref(),
             has_partition,
             has_distribute,
+            inferred,
+            system,
             sort_by.as_deref(),
             &project,
         ),
@@ -1041,6 +1053,8 @@ fn cmd_nodes(
     node_type: Option<&str>,
     has_partition: bool,
     has_distribute: bool,
+    inferred: bool,
+    system: bool,
     sort_by: Option<&[SortSpec]>,
     project: &Path,
 ) -> Result<()> {
@@ -1087,6 +1101,20 @@ fn cmd_nodes(
                     }
                     _ => false,
                 }
+            } else {
+                true
+            }
+        })
+        .filter(|idx| {
+            if inferred {
+                is_inferred_node(&graph[*idx])
+            } else {
+                true
+            }
+        })
+        .filter(|idx| {
+            if system {
+                is_system_node(&graph[*idx])
             } else {
                 true
             }
@@ -1153,6 +1181,30 @@ fn is_partial(node: &Node) -> bool {
     )
 }
 
+fn is_inferred_node(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Table {
+            explicit: false,
+            ..
+        } | Node::View {
+            explicit: false,
+            ..
+        }
+    )
+}
+
+fn is_inferred(node: &Node) -> bool {
+    is_inferred_node(node)
+}
+
+fn is_system_node(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Table { system: true, .. } | Node::View { system: true, .. }
+    )
+}
+
 fn cmd_detail(
     name: &str,
     project: &Path,
@@ -1193,6 +1245,12 @@ fn cmd_detail(
     println_stdout!("  {} {}", tag, start_name);
     if is_partial(&graph[*start_idx]) {
         println_stdout!("  ⚠ partial node — body implementation could not be parsed");
+    }
+    if is_inferred(&graph[*start_idx]) {
+        println_stdout!("  ⚠ inferred node — no DDL definition found");
+    }
+    if is_system_node(&graph[*start_idx]) {
+        println_stdout!("  ⚙ system object — belongs to a known system schema");
     }
     println_stdout!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
     print_node_details(&graph[*start_idx]);
