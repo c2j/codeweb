@@ -239,6 +239,8 @@ mod tests {
         Node::Table {
             schema: None,
             name: name.to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -470,7 +472,7 @@ mod tests {
 
         let nodes = GraphTraversal::new(&graph, proc)
             .outgoing()
-            .node_filter(NodeFilter::new().with_type("table"))
+            .node_filter(NodeFilter::new().with_type("table*"))
             .collect_nodes();
 
         assert_eq!(nodes.len(), 1);

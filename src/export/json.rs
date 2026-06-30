@@ -79,6 +79,10 @@ enum NodeKindJson {
     Table {
         schema: Option<String>,
         name: String,
+        #[serde(skip_serializing_if = "is_false")]
+        explicit: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        system: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +103,10 @@ enum NodeKindJson {
     View {
         schema: Option<String>,
         name: String,
+        #[serde(skip_serializing_if = "is_false")]
+        explicit: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        system: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -377,6 +385,8 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 },
             },
             Node::Table {
+                explicit,
+                system,
                 schema,
                 name,
                 location,
@@ -390,6 +400,8 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Table {
+                    explicit: *explicit,
+                    system: *system,
                     schema: schema.clone(),
                     name: name.clone(),
                     file: location
@@ -405,6 +417,8 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 },
             },
             Node::View {
+                explicit,
+                system,
                 schema,
                 name,
                 location,
@@ -412,6 +426,8 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::View {
+                    explicit: *explicit,
+                    system: *system,
                     schema: schema.clone(),
                     name: name.clone(),
                     file: location

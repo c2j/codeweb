@@ -208,6 +208,8 @@ impl CgefParser {
                 Ok(Node::Table {
                     schema: key_get_str(key, "schema").map(String::from),
                     name: name.to_string(),
+                    explicit: false,
+                    system: false,
                     location: None,
                     columns: Box::new(vec![]),
                     partition_by: None,
@@ -227,6 +229,8 @@ impl CgefParser {
                 Ok(Node::View {
                     schema: key_get_str(key, "schema").map(String::from),
                     name: name.to_string(),
+                    explicit: false,
+                    system: false,
                     location: None,
                 })
             }

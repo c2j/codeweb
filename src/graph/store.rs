@@ -2137,6 +2137,8 @@ mod tests {
         let table = crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2191,6 +2193,8 @@ mod tests {
         let table = crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2263,6 +2267,8 @@ mod tests {
         let table = crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![
                 crate::graph::ColumnSummary {
@@ -2373,6 +2379,8 @@ mod tests {
             graph.add_node(crate::graph::Node::Table {
                 schema: Some("public".to_string()),
                 name: format!("table{}", i),
+                explicit: false,
+                system: false,
                 location: None,
                 columns: Box::new(vec![]),
                 partition_by: None,
@@ -2397,7 +2405,7 @@ mod tests {
 
         let store = GraphStore::from_graph("test", graph);
         assert_eq!(store.nodes_by_type("proc").len(), 3);
-        assert_eq!(store.nodes_by_type("table").len(), 2);
+        assert_eq!(store.nodes_by_type("table*").len(), 2);
         assert_eq!(store.nodes_by_type("func").len(), 1);
         assert_eq!(store.nodes_by_type("view").len(), 0);
     }
@@ -2422,6 +2430,8 @@ mod tests {
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "apple".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2474,6 +2484,8 @@ mod tests {
         graph.add_node(crate::graph::Node::Table {
             schema: Some("schema_a".to_string()),
             name: "t1".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2497,6 +2509,8 @@ mod tests {
         graph.add_node(crate::graph::Node::View {
             schema: Some("schema_b".to_string()),
             name: "v1".to_string(),
+            explicit: false,
+            system: false,
             location: None,
         });
         graph.add_node(crate::graph::Node::Trigger {
@@ -2532,6 +2546,8 @@ mod tests {
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2637,6 +2653,8 @@ mod tests {
         let table = graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -2960,6 +2978,8 @@ mod tests {
         let table = graph_b.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "t_orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -3103,6 +3123,8 @@ mod tests {
         let table = graph_a.add_node(crate::graph::Node::Table {
             schema: Some("public".into()),
             name: "orders".into(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -3152,7 +3174,7 @@ mod tests {
         assert_eq!(proc_summary.in_degree, 0);
 
         let table_summary = summaries.iter().find(|s| s.key.contains("orders")).unwrap();
-        assert_eq!(table_summary.type_tag, "table");
+        assert_eq!(table_summary.type_tag, "table*");
         assert_eq!(table_summary.in_degree, 1);
         assert_eq!(table_summary.out_degree, 0);
 
@@ -3798,6 +3820,8 @@ mod tests {
         crate::graph::Node::View {
             schema: schema.map(String::from),
             name: name.to_string(),
+            explicit: false,
+            system: false,
             location: None,
         }
     }
@@ -4420,6 +4444,8 @@ mod tests {
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,
@@ -4433,6 +4459,8 @@ mod tests {
         graph.add_node(crate::graph::Node::Table {
             schema: Some("public".to_string()),
             name: "orders".to_string(),
+            explicit: true,
+            system: false,
             location: Some(crate::graph::SourceLocation {
                 file: std::sync::Arc::new(std::path::PathBuf::from("ddl.sql")),
                 line: 10,
