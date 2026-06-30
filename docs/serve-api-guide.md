@@ -391,13 +391,13 @@ curl "http://127.0.0.1:3000/api/v1/nodes/search-sql?q=user_id=?%20AND%20status=?
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `from` | string | 是 | — | 节点名称搜索（子串匹配，取第一个匹配结果） |
-| `depth` | number | 否 | `2` | 追踪深度（最大 10） |
+| `depth` | number | 否 | `2` | 追踪深度：0=仅目标，1=直接调用方/被调用方，N=N层（最大 10） |
 | `max_nodes` | number | 否 | `500` | 最大访问节点数（防止图过大） |
 
 ### 请求示例
 
 ```bash
-# 追踪 calculate_order 的 2 层调用链
+# 追踪 calculate_order 的 3 层调用链
 curl "http://127.0.0.1:3000/api/v1/trace?from=calculate_order&depth=3"
 
 # 指定最大节点数
