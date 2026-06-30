@@ -68,8 +68,8 @@ codeweb 采用分层架构，数据从源码文件流入，经过解析、图构
 |------|---------|------|---------|
 | `Procedure` | `proc` / `proc*` | 存储过程 | `id`（NodeId）, `location`, `body_sql`, `partial` |
 | `Function` | `func` / `func*` | 函数 | 同上 |
-| `Table` | `table` | 数据库表 | `schema`, `name`, `columns`, `partition_by`, `distribute_by`, `temporary`, `unlogged` |
-| `View` | `view` | 视图 | `schema`, `name` |
+| `Table` | `table` / `table*` | 数据库表 | `schema`, `name`, `explicit`, `system`, `columns`, `partition_by`, `distribute_by`, `temporary`, `unlogged` |
+| `View` | `view` / `view*` | 视图 | `schema`, `name`, `explicit`, `system` |
 | `MaterializedView` | `mview` | 物化视图 | `schema`, `name` |
 | `MappedStatement` | `mapper` | MyBatis 映射语句 | `namespace`, `statement_id`, `kind`, `xml_file`, `line`, `sql` |
 | `JavaMethod` | `method` | Java 方法 | `fqn`, `class_fqn`, `name`, `signature`, `file`, `line` |

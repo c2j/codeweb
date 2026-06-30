@@ -488,6 +488,12 @@ codeweb detail <节点名称> [-p <项目目录>] [-s <风格>] [-d <深度>] [-
 | `--files` | 同时列出调用链涉及的文件 |
 | `--builtfunc` | 显示内建函数调用 |
 
+**输出注意事项**：
+
+- `proc*` / `func*` 标签表示部分解析节点 —— `⚠ partial node` 警告
+- `table*` / `view*` 标签表示推测型节点 —— `⚠ inferred node — no DDL definition found` 警告
+- 系统对象 —— `⚙ system object — belongs to a known system schema` 提示
+
 **示例**：
 
 ```bash
@@ -503,8 +509,8 @@ codeweb detail "OrderMapper.insert" --depth 3 --files
 
 ```bash
 codeweb nodes [-s <搜索词>] [-t <类型>] [--orphan] [--low-degree <N>]
-              [--has-partition] [--has-distribute] [--sort-by <规则>]
-              [-p <项目目录>]
+              [--has-partition] [--has-distribute] [--inferred] [--system]
+              [--sort-by <规则>] [-p <项目目录>]
 ```
 
 | 参数 | 说明 |
@@ -515,6 +521,8 @@ codeweb nodes [-s <搜索词>] [-t <类型>] [--orphan] [--low-degree <N>]
 | `--low-degree <N>` | 只显示总连接度 ≤ N 的节点 |
 | `--has-partition` | 只显示分区表 |
 | `--has-distribute` | 只显示分布式表 |
+| `--inferred` | 只显示推测型节点（在 DML 中引用但无 DDL 定义的表/视图） |
+| `--system` | 只显示系统对象（`pg_catalog`、`sys`、`dbe_*` 等 schema 下的表/视图，或 `dual`/`sys_dummy` 等已知系统名） |
 | `--sort-by <规则>` | 排序规则，逗号分隔。键：`name`、`type`、`in`、`out`、`total`。方向：`asc`（默认）/`desc` |
 
 **示例**：
@@ -539,10 +547,13 @@ codeweb nodes -t method --sort-by in:desc,out:asc
 TYPE     IN OUT TOT  NAME
 proc      5   3   8  proc:public.create_order
 proc      3   2   5  proc:public.update_order
-proc      1   0   1  proc:public.archive_order
+table*    2   0   2  table:public.legacy_temp
+table     0   1   1  table:public.orders
 
-3 nodes
+4 nodes
 ```
+
+> Note: `table*` 和 `view*` 标签表示推测型节点——在 DML 中被引用但源文件中没有对应的 `CREATE TABLE` / `CREATE VIEW` 定义。
 
 ---
 
@@ -1108,8 +1119,10 @@ codeweb --lang zh-CN stats   # 中文（默认）
 | 存储过程（partial） | `proc*` | 存储过程 body 未完整解析 |
 | 函数 | `func` | Function |
 | 函数（partial） | `func*` | 函数 body 未完整解析 |
-| 表 | `table` | Database Table |
-| 视图 | `view` | View |
+| 表 | `table` | Database Table（有 DDL 定义） |
+| 表（推测型） | `table*` | 在 DML 中引用，无对应 DDL |
+| 视图 | `view` | View（有 DDL 定义） |
+| 视图（推测型） | `view*` | 在 DML 中引用，无对应 DDL |
 | 物化视图 | `mview` | Materialized View |
 | 包 | `pkg` | Database Package |
 | 触发器 | `trigger` | Database Trigger |
