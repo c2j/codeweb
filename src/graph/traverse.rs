@@ -131,11 +131,14 @@ fn build_tree_dfs(
         return Vec::new();
     }
     if depth > max_depth {
-        let key = crate::graph::key::NodeKey::from_node(&graph[start]);
-        eprintln!(
-            "  ⚠ trace depth exceeded {} at '{}' — possible runaway chain, stopping",
-            max_depth, key
-        );
+        if max_depth > 20 {
+            // Warn only at high limits — small limits are intentional, not runaway chains.
+            let key = crate::graph::key::NodeKey::from_node(&graph[start]);
+            eprintln!(
+                "  ⚠ trace depth exceeded {} at '{}' — possible runaway chain, stopping",
+                max_depth, key
+            );
+        }
         return Vec::new();
     }
 
@@ -189,33 +192,41 @@ pub fn trace_chain(
 ) -> (CallChain, usize) {
     let mut visited = 0usize;
 
-    let mut caller_ancestors = HashSet::new();
-    caller_ancestors.insert(start);
-    let callers = build_tree_dfs(
-        graph,
-        start,
-        Direction::Incoming,
-        &mut caller_ancestors,
-        0,
-        max_depth,
-        max_nodes,
-        &mut visited,
-        skip_builtins,
-    );
+    let callers = if max_depth == 0 {
+        Vec::new()
+    } else {
+        let mut caller_ancestors = HashSet::new();
+        caller_ancestors.insert(start);
+        build_tree_dfs(
+            graph,
+            start,
+            Direction::Incoming,
+            &mut caller_ancestors,
+            1,
+            max_depth,
+            max_nodes,
+            &mut visited,
+            skip_builtins,
+        )
+    };
 
-    let mut callee_ancestors = HashSet::new();
-    callee_ancestors.insert(start);
-    let callees = build_tree_dfs(
-        graph,
-        start,
-        Direction::Outgoing,
-        &mut callee_ancestors,
-        0,
-        max_depth,
-        max_nodes,
-        &mut visited,
-        skip_builtins,
-    );
+    let callees = if max_depth == 0 {
+        Vec::new()
+    } else {
+        let mut callee_ancestors = HashSet::new();
+        callee_ancestors.insert(start);
+        build_tree_dfs(
+            graph,
+            start,
+            Direction::Outgoing,
+            &mut callee_ancestors,
+            1,
+            max_depth,
+            max_nodes,
+            &mut visited,
+            skip_builtins,
+        )
+    };
 
     (
         CallChain {
