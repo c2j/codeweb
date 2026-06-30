@@ -101,7 +101,7 @@ codeweb files
 codeweb diff
 
 # Trace call chain from a node
-codeweb trace --from "process_order"
+codeweb trace "process_order"
 
 # Show node details with callers/callees
 codeweb detail "calculate_total"
@@ -156,7 +156,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb analyze` | Analyze project (full or incremental) |
 | `codeweb diff` | Show changes since last analysis |
 | `codeweb export` | Export graph to DOT/JSON/Mermaid |
-| `codeweb trace --from <node>` | Trace complete call chain from a node |
+| `codeweb trace <node>` | Trace complete call chain from a node |
 | `codeweb detail <node>` | Show callers/callees detail for a node |
 | `codeweb stats` | Show project statistics |
 | `codeweb files` | List analyzed files with node counts |
@@ -431,7 +431,7 @@ codeweb files
 codeweb diff
 
 # 从节点追踪调用链
-codeweb trace --from "process_order"
+codeweb trace "process_order"
 
 # 查看节点详情（含上游/下游）
 codeweb detail "calculate_total"
@@ -483,7 +483,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb analyze` | 分析项目（全量或增量） |
 | `codeweb diff` | 显示自上次分析以来的变更 |
 | `codeweb export` | 导出图谱为 DOT/JSON/Mermaid |
-| `codeweb trace --from <node>` | 从节点追踪完整调用链 |
+| `codeweb trace <node>` | 从节点追踪完整调用链 |
 | `codeweb detail <node>` | 查看节点的调用方/被调用方详情 |
 | `codeweb stats` | 查看项目统计 |
 | `codeweb files` | 列出已分析文件及节点数 |
