@@ -320,6 +320,12 @@ pub enum Node {
     Table {
         schema: Option<String>,
         name: String,
+        /// true when table has a DDL definition (CREATE TABLE), false when only inferred from DML references.
+        #[serde(default)]
+        explicit: bool,
+        /// true when table belongs to a known system schema (pg_catalog, sys, dbe_*, etc.).
+        #[serde(default)]
+        system: bool,
         /// None when table node was created implicitly (referenced but not parsed from DDL).
         #[serde(default)]
         location: Option<SourceLocation>,
@@ -342,6 +348,12 @@ pub enum Node {
     View {
         schema: Option<String>,
         name: String,
+        /// true when view has a DDL definition (CREATE VIEW), false when only inferred from DML references.
+        #[serde(default)]
+        explicit: bool,
+        /// true when view belongs to a known system schema (pg_catalog, sys, information_schema, etc.).
+        #[serde(default)]
+        system: bool,
         #[serde(default)]
         location: Option<SourceLocation>,
     },
@@ -447,7 +459,13 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::JavaSql { .. } => "sql",
         Node::JavaMethod { .. } => "method",
         Node::JavaClass { .. } => "class",
+        Node::Table {
+            explicit: false, ..
+        } => "table*",
         Node::Table { .. } => "table",
+        Node::View {
+            explicit: false, ..
+        } => "view*",
         Node::View { .. } => "view",
         Node::Package { .. } => "pkg",
         Node::Trigger { .. } => "trigger",
@@ -841,6 +859,8 @@ mod tests {
     fn table_node_with_location_and_columns() {
         let file = Arc::new(PathBuf::from("create_tables.sql"));
         let table = Node::Table {
+            explicit: true,
+            system: false,
             schema: Some("public".to_string()),
             name: "orders".to_string(),
             location: Some(SourceLocation {
@@ -884,6 +904,8 @@ mod tests {
     fn table_node_minimal_implicit() {
         let table = Node::Table {
             schema: None,
+            explicit: false,
+            system: false,
             name: "my_table".to_string(),
             location: None,
             columns: Box::new(vec![]),
@@ -1001,6 +1023,8 @@ mod tests {
             let node = Node::Table {
                 schema: Some("bench".to_string()),
                 name: format!("table_{}", i),
+                explicit: false,
+                system: false,
                 location: None,
                 columns: Box::new(vec![ColumnSummary {
                     name: "id".to_string(),
