@@ -1487,6 +1487,8 @@ mod tests {
         Node::Table {
             schema: None,
             name: name.to_string(),
+            explicit: false,
+            system: false,
             location: None,
             columns: Box::new(vec![]),
             partition_by: None,

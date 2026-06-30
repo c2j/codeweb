@@ -15,6 +15,34 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Known GaussDB/openGauss system schemas.
+/// Tables/views in these schemas are marked `system: true`.
+const SYSTEM_SCHEMAS: &[&str] = &[
+    "pg_catalog",
+    "information_schema",
+    "sys",
+    "dbe_perf",
+    "dbe_pldebugger",
+    "dbe_scheduler",
+    "dbe_session",
+    "db4ai",
+    "snapshot",
+    "wdr_snapshot",
+    "cstore",
+];
+
+/// Known system table/view names that lack a schema qualifier (e.g. `dual`).
+const KNOWN_SYSTEM_NAMES: &[&str] = &["dual", "sys_dummy"];
+
+fn is_system(schema: Option<&str>, name: &str) -> bool {
+    if KNOWN_SYSTEM_NAMES.contains(&name.to_lowercase().as_str()) {
+        return true;
+    }
+    schema
+        .map(|s| SYSTEM_SCHEMAS.contains(&s.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 pub struct GraphBuilder;
 
 /// Accumulated indexing state for incremental graph building across chunks.
@@ -419,6 +447,8 @@ impl GraphBuilder {
                         let view_node = Node::View {
                             schema: view_schema.clone(),
                             name: view_name.clone(),
+                            explicit: true,
+                            system: is_system(view_schema.as_deref(), &view_name),
                             location: None,
                         };
                         let view_idx = graph.add_node(view_node);
@@ -444,6 +474,8 @@ impl GraphBuilder {
                                 let node = Node::Table {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
+                                    explicit: false,
+                                    system: is_system(access.schema.as_deref(), &access.name),
                                     location: None,
                                     columns: Box::new(vec![]),
                                     partition_by: None,
@@ -541,6 +573,8 @@ impl GraphBuilder {
                                 let node = Node::Table {
                                     schema: table_schema.clone(),
                                     name: table_name.clone(),
+                                    explicit: false,
+                                    system: is_system(table_schema.as_deref(), &table_name),
                                     location: None,
                                     columns: Box::new(vec![]),
                                     partition_by: None,
@@ -647,6 +681,8 @@ impl GraphBuilder {
                         let table_node = Node::Table {
                             schema: schema.clone(),
                             name: name.clone(),
+                            explicit: true,
+                            system: is_system(schema.as_deref(), &name),
                             location: Some(SourceLocation {
                                 file: file_arc.clone(),
                                 line: info.start_line,
@@ -668,6 +704,8 @@ impl GraphBuilder {
                         // If the node already existed (implicit), replace its data
                         if let Node::Table {
                             location,
+                            explicit,
+                            system,
                             columns,
                             partition_by,
                             distribute_by,
@@ -677,6 +715,8 @@ impl GraphBuilder {
                             ..
                         } = &mut graph[idx]
                         {
+                            *explicit = true;
+                            *system = is_system(schema.as_deref(), &name);
                             *location = Some(SourceLocation {
                                 file: file_arc.clone(),
                                 line: info.start_line,
@@ -813,6 +853,8 @@ impl GraphBuilder {
                                 let node = Node::Table {
                                     schema: access.schema.clone(),
                                     name: access.name.clone(),
+                                    explicit: false,
+                                    system: is_system(access.schema.as_deref(), &access.name),
                                     location: None,
                                     columns: Box::new(vec![]),
                                     partition_by: None,
@@ -2266,6 +2308,8 @@ impl GraphBuilder {
                     let node = Node::Table {
                         schema: access.schema.clone(),
                         name: access.name.clone(),
+                        explicit: false,
+                        system: is_system(access.schema.as_deref(), &access.name),
                         location: None,
                         columns: Box::new(vec![]),
                         partition_by: None,

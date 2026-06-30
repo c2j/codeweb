@@ -174,12 +174,18 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 
 ## Node Types
 
+Tags with `*` suffix indicate inferred nodes (referenced in DML but without DDL definition).
+
 | Type | Tag | Description |
 |------|-----|-------------|
 | Procedure | `proc` | Stored procedure |
+| Procedure (partial) | `proc*` | Stored procedure with incomplete body parsing |
 | Function | `func` | Function |
-| Table | `table` | Database table |
-| View | `view` | View |
+| Function (partial) | `func*` | Function with incomplete body parsing |
+| Table | `table` | Database table (with DDL) |
+| Table (inferred) | `table*` | Database table referenced in DML, no DDL found |
+| View | `view` | View (with DDL) |
+| View (inferred) | `view*` | View referenced in DML, no DDL found |
 | MappedStatement | `mapper` | MyBatis/iBatis mapped statement |
 | JavaMethod | `method` | Java method |
 | JavaClass | `class` | Java class |
@@ -194,7 +200,10 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | MaterializedView | `mview` | Materialized view |
 | Synonym | `synonym` | Synonym |
 | Event | `event` | Event |
+| BuiltinFunction | `builtin` | Built-in SQL function (COUNT, SUBSTR, etc.) |
 | Unresolved | `unres` | Unresolved reference |
+
+System tables/views in known system schemas (`pg_catalog`, `sys`, `dbe_*`, etc.) and well-known system names (`dual`, `sys_dummy`) are marked with `system: true` in JSON output. Use `--system` flag to filter them.
 
 ## HTTP API (serve mode)
 
@@ -501,12 +510,18 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 
 ## 节点类型
 
+带 `*` 后缀的标签表示推测型节点（在 DML 中引用但无对应 DDL 定义）。
+
 | 类型 | 标签 | 说明 |
 |------|------|------|
 | 存储过程 | `proc` | Stored Procedure |
+| 存储过程（部分解析） | `proc*` | 存储过程 body 未完整解析 |
 | 函数 | `func` | Function |
-| 表 | `table` | Database Table |
-| 视图 | `view` | View |
+| 函数（部分解析） | `func*` | 函数 body 未完整解析 |
+| 表 | `table` | Database Table（有 DDL） |
+| 表（推测型） | `table*` | 在 DML 中引用，无对应 DDL |
+| 视图 | `view` | View（有 DDL） |
+| 视图（推测型） | `view*` | 在 DML 中引用，无对应 DDL |
 | 映射语句 | `mapper` | MyBatis/iBatis MappedStatement |
 | Java 方法 | `method` | Java Method |
 | Java 类 | `class` | Java Class |
@@ -521,7 +536,10 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | 物化视图 | `mview` | Materialized View |
 | 同义词 | `synonym` | Synonym |
 | 事件 | `event` | Event |
+| 内建函数 | `builtin` | 内置 SQL 函数（COUNT、SUBSTR 等） |
 | 未解析引用 | `unres` | Unresolved Reference |
+
+已知系统 schema（`pg_catalog`、`sys`、`dbe_*` 等）和系统表名（`dual`、`sys_dummy`）中的表/视图会标记 `system: true`。可使用 `--system` 过滤。
 
 ## HTTP API（serve 模式）
 

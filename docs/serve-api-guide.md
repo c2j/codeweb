@@ -136,10 +136,14 @@ curl http://127.0.0.1:3000/api/v1/files
 | `node_type` | string | 否 | — | 按类型过滤（见下方类型标签表） |
 | `orphan` | boolean | 否 | `false` | 设为 `true` 只显示孤立节点（无任何连接） |
 | `low_degree` | number | 否 | — | 只显示总连接度 ≤ N 的节点 |
+| `inferred` | boolean | 否 | `false` | 设为 `true` 只显示推测型节点（表/视图无 DDL 定义） |
+| `system` | boolean | 否 | `false` | 设为 `true` 只显示系统对象（pg_catalog、sys、dbe_* 等 schema） |
 | `limit` | number | 否 | `100` | 返回结果数量上限 |
 | `offset` | number | 否 | `0` | 分页偏移量 |
 
 ### 节点类型标签
+
+> 带 `*` 后缀的标签表示推测型节点（在 DML 中引用但无对应 DDL 定义）。
 
 | node_type 值 | 说明 |
 |--------------|------|
@@ -147,8 +151,10 @@ curl http://127.0.0.1:3000/api/v1/files
 | `proc*` | 存储过程（partial，body 未解析） |
 | `func` | 函数 |
 | `func*` | 函数（partial） |
-| `table` | 表 |
-| `view` | 视图 |
+| `table` | 表（有 DDL 定义） |
+| `table*` | 表（推测型，无 DDL） |
+| `view` | 视图（有 DDL 定义） |
+| `view*` | 视图（推测型，无 DDL） |
 | `mapper` | MyBatis/iBatis MappedStatement |
 | `sql` | Java 中内嵌的 SQL |
 | `method` | Java 方法 |
@@ -161,6 +167,7 @@ curl http://127.0.0.1:3000/api/v1/files
 | `mview` | 物化视图 |
 | `synonym` | 同义词 |
 | `event` | 事件 |
+| `builtin` | 内建函数 |
 | `unres` | 未解析引用 |
 
 ### 请求示例
