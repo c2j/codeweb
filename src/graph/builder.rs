@@ -340,7 +340,8 @@ impl GraphBuilder {
                                 ),
                                 PackageItem::Raw(_)
                                 | PackageItem::Variable(_)
-                                | PackageItem::Type(_) => continue,
+                                | PackageItem::Type(_)
+                                | PackageItem::Cursor(_) => continue,
                             };
                             spec_decls.push((pkg_name.clone(), name, kind));
                         }
@@ -373,7 +374,8 @@ impl GraphBuilder {
                                     .join("."),
                                 PackageItem::Raw(_)
                                 | PackageItem::Variable(_)
-                                | PackageItem::Type(_) => continue,
+                                | PackageItem::Type(_)
+                                | PackageItem::Cursor(_) => continue,
                             };
                             body_impls.push((pkg_name.clone(), name));
                         }
@@ -1082,7 +1084,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
             };
             let Some(_block) = block else {
                 continue;
@@ -1458,7 +1460,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
@@ -1568,7 +1570,7 @@ impl GraphBuilder {
                         walk_pl_block(extractor, block);
                     }
                 }
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) => {}
+                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => {}
             }
         }
     }
@@ -2245,7 +2247,7 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) => continue,
+                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
