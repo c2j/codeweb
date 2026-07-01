@@ -5277,6 +5277,239 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
     }
 
     #[test]
+    fn operator_any_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_any() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col > ANY(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let any_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, category, .. }
+                    if name.eq_ignore_ascii_case("any") && category == "Operator")
+            })
+            .collect();
+        assert_eq!(
+            any_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for ANY"
+        );
+        let has_edge = graph
+            .edge_indices()
+            .any(|e| matches!(&graph[e], Edge::UsesBuiltinFunction { .. }));
+        assert!(has_edge, "expected UsesBuiltinFunction edge");
+    }
+
+    #[test]
+    fn operator_exists_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_exists() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE EXISTS(SELECT 1 FROM t2 WHERE t2.id = t1.id)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let exists_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, category, domain, .. }
+                    if name.eq_ignore_ascii_case("exists")
+                    && category == "Operator"
+                    && domain == "Predicate")
+            })
+            .collect();
+        assert_eq!(
+            exists_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for EXISTS"
+        );
+    }
+
+    #[test]
+    fn operator_in_subquery_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_in() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col IN (SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let in_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, domain, .. }
+                    if name.eq_ignore_ascii_case("in") && domain == "Predicate")
+            })
+            .collect();
+        assert_eq!(
+            in_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for IN"
+        );
+    }
+
+    #[test]
+    fn operator_all_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_all() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col > ALL(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let all_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, domain, .. }
+                    if name.eq_ignore_ascii_case("all") && domain == "Comparison")
+            })
+            .collect();
+        assert_eq!(
+            all_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for ALL"
+        );
+    }
+
+    #[test]
+    fn operator_some_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_some() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col = SOME(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let some_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, .. }
+                    if name.eq_ignore_ascii_case("some"))
+            })
+            .collect();
+        assert_eq!(
+            some_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for SOME"
+        );
+        let any_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, .. }
+                    if name.eq_ignore_ascii_case("any"))
+            })
+            .collect();
+        assert!(any_nodes.is_empty(), "SOME should NOT create an ANY node");
+    }
+
+    #[test]
+    fn operator_not_in_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_not_in() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col NOT IN (SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let not_in_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, domain, .. }
+                    if name.eq_ignore_ascii_case("not_in") && domain == "Predicate")
+            })
+            .collect();
+        assert_eq!(
+            not_in_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for NOT_IN"
+        );
+    }
+
+    #[test]
+    fn operator_extraction_does_not_break_function_call() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_with_count() AS $$
+        BEGIN
+            PERFORM COUNT(*) FROM dual;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let count_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, .. }
+                    if name.eq_ignore_ascii_case("count"))
+            })
+            .collect();
+        assert_eq!(
+            count_nodes.len(),
+            1,
+            "COUNT should still be extracted as BuiltinFunction"
+        );
+        for idx in graph.node_indices() {
+            if let Node::BuiltinFunction { name, category, .. } = &graph[idx] {
+                if category == "Operator" {
+                    panic!(
+                        "unexpected Operator node '{}' from FunctionCall-only SQL",
+                        name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hint_tablescan_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_hint() AS $$
+        BEGIN
+            FOR r IN (SELECT /*+ tablescan(t1) */ * FROM t1) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let hint_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, category, .. }
+                    if name.eq_ignore_ascii_case("tablescan") && category == "Hint")
+            })
+            .collect();
+        assert_eq!(
+            hint_nodes.len(),
+            1,
+            "expected one BuiltinFunction node for tablescan hint"
+        );
+    }
+
+    #[test]
+    fn hint_nestloop_creates_builtin_node() {
+        let sql = "CREATE OR REPLACE PROCEDURE proc_hints() AS $$
+        BEGIN
+            FOR r IN (SELECT /*+ nestloop(t1 t2) */ * FROM t1 JOIN t2 ON t1.id = t2.id) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let nestloop: Vec<_> = graph
+            .node_indices()
+            .filter(
+                |i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "nestloop"),
+            )
+            .collect();
+        assert_eq!(nestloop.len(), 1, "expected nestloop node");
+    }
+
+    #[test]
     fn duplicate_java_methods_produce_single_method_node() {
         use crate::graph::builder::GraphBuildContext;
         use crate::parser::java_method::{JavaClassInfo, JavaMethodInfo, JavaParseResult};
