@@ -26,7 +26,9 @@ pub struct JspFileResult {
 }
 
 pub fn load_jsp_file(path: &Path, config: &JavaExtractConfig) -> Result<JspFileResult, String> {
-    let source = std::fs::read_to_string(path).map_err(|e| format!("read {:?}: {}", path, e))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {:?}: {}", path, e))?;
+    let source = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     Ok(load_jsp_string(source, path, config))
 }
 
