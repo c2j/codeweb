@@ -1156,15 +1156,11 @@ fn cmd_nodes(
         println_stdout!();
     }
 
-    println_stdout!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
+    println_stdout!("{:<15} {:>5} {:>5} {:>5}  NAME", "TYPE", "IN", "OUT", "TOTAL");
     for row in &filtered {
         println_stdout!(
-            "{:<8} {:>3} {:>3} {:>3}  {}",
-            row.tag,
-            row.in_deg,
-            row.out_deg,
-            row.total,
-            row.name
+            "{:<15} {:>5} {:>5} {:>5}  {}",
+            row.tag, row.in_deg, row.out_deg, row.total, row.name
         );
     }
 
