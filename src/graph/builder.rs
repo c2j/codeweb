@@ -2525,6 +2525,12 @@ impl GraphBuilder {
             }
         }
 
+        // Track from_idx nodes already targeted by Phase 1 to avoid
+        // double-merge panics (removing a node twice causes petgraph
+        // "node indices out of bounds" on the second attempt).
+        let phase1_targets: std::collections::HashSet<petgraph::graph::NodeIndex> =
+            merges.iter().map(|(from, _)| *from).collect();
+
         // Phase 2: merge bare-name Table nodes into schema-qualified Table nodes
         {
             // bare_name_lower → (schema, idx)
@@ -2533,6 +2539,10 @@ impl GraphBuilder {
             let mut bare: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
 
             for idx in graph.node_indices() {
+                // Skip Table nodes already scheduled for merge in Phase 1
+                if phase1_targets.contains(&idx) {
+                    continue;
+                }
                 let (schema, name) = match &graph[idx] {
                     Node::Table { schema, name, .. } => (schema.clone(), name.clone()),
                     _ => continue,
@@ -2562,6 +2572,11 @@ impl GraphBuilder {
         if merges.is_empty() {
             return;
         }
+
+        // Defense-in-depth: deduplicate by from_idx — keep first occurrence
+        // (Phase 1 merges are appended first, so they take priority).
+        let mut seen_from = std::collections::HashSet::new();
+        merges.retain(|(from, _)| seen_from.insert(*from));
 
         for (from_idx, into_idx) in merges {
             let sources: Vec<_> = graph
@@ -4209,6 +4224,38 @@ mod tests {
                 "Should keep the schema-qualified node"
             );
         }
+    }
+
+    /// Regression test: a bare Table targeted by both Phase 1 (Table→View merge)
+    /// and Phase 2 (bare→schema-qualified merge) caused petgraph panic.
+    /// The crash requires multi-chunk processing where table_index dedup
+    /// doesn't suppress the bare Table node — this test exercises the code
+    /// path to ensure the dedup + defense-in-depth guard work correctly.
+    #[test]
+    fn bare_table_merged_into_view_and_schema_qualified_no_panic() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p1() AS $$
+            BEGIN
+                SELECT * FROM orders;
+            END;
+            $$;
+
+            CREATE OR REPLACE PROCEDURE p2() AS $$
+            BEGIN
+                INSERT INTO bigfund.orders VALUES (1);
+            END;
+            $$;
+
+            CREATE VIEW orders AS
+            SELECT * FROM another_table;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::View { name, .. } if name.to_lowercase() == "orders"))
+            .collect();
+        assert_eq!(view_nodes.len(), 1, "View 'orders' should exist");
     }
 
     #[test]
