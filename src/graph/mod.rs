@@ -484,6 +484,24 @@ pub fn node_type_tag(node: &Node) -> &'static str {
     }
 }
 
+/// Returns a detailed sub-type tag for nodes that have internal categories.
+///
+/// For [`Node::BuiltinFunction`], the sub-tag distinguishes operators,
+/// hints, and regular functions (e.g. "builtin:op", "builtin:hint",
+/// "builtin:func"). Falls back to [`node_type_tag`] for all other node
+/// types.
+pub fn node_sub_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
+    if let Node::BuiltinFunction { category, .. } = node {
+        match category.as_str() {
+            "Operator" => return std::borrow::Cow::Borrowed("builtin:op"),
+            "Hint" => return std::borrow::Cow::Borrowed("builtin:hint"),
+            "Special" => return std::borrow::Cow::Borrowed("builtin:special"),
+            _ => return std::borrow::Cow::Borrowed("builtin:func"),
+        }
+    }
+    std::borrow::Cow::Borrowed(node_type_tag(node))
+}
+
 /// An edge in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]

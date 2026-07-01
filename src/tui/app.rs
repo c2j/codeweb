@@ -893,7 +893,15 @@ fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
         Node::MaterializedView { .. } => (std::borrow::Cow::Borrowed("mview"), Color::Cyan),
         Node::Synonym { .. } => (std::borrow::Cow::Borrowed("synonym"), Color::Magenta),
         Node::Event { .. } => (std::borrow::Cow::Borrowed("event"), Color::LightRed),
-        Node::BuiltinFunction { .. } => (std::borrow::Cow::Borrowed("builtin"), Color::LightCyan),
+        Node::BuiltinFunction { category, .. } => match category.as_str() {
+            "Operator" => (std::borrow::Cow::Borrowed("builtin:op"), Color::LightCyan),
+            "Hint" => (std::borrow::Cow::Borrowed("builtin:hint"), Color::LightCyan),
+            "Special" => (
+                std::borrow::Cow::Borrowed("builtin:special"),
+                Color::LightCyan,
+            ),
+            _ => (std::borrow::Cow::Borrowed("builtin:func"), Color::LightCyan),
+        },
         Node::Custom { type_name, .. } => (
             std::borrow::Cow::Owned((**type_name).clone()),
             Color::DarkGray,
