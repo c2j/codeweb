@@ -186,3 +186,54 @@ fn hint_not_confused_with_regular_builtin() {
         set_config_count
     );
 }
+
+#[test]
+fn multi_hint_not_combined_into_single_node() {
+    let dir = TempDir::new().unwrap();
+
+    fs::write(
+        dir.path().join("multi.sql"),
+        "CREATE OR REPLACE PROCEDURE proc_multi_hint() AS $$
+        BEGIN
+            FOR r IN (SELECT /*+ use_cplan indexscan(t1) */ * FROM t1) LOOP NULL; END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;\n",
+    )
+    .unwrap();
+
+    let output = run_codeweb(&[
+        dir.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--sql-only",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "codeweb failed. stderr:\n{}",
+        stderr
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let builtins = count_builtins(&json);
+
+    let counts = name_counts(&builtins);
+    assert_eq!(
+        counts.get("use_cplan").copied().unwrap_or(0),
+        1,
+        "use_cplan should be a separate node"
+    );
+    assert_eq!(
+        counts.get("indexscan").copied().unwrap_or(0),
+        1,
+        "indexscan should be a separate node"
+    );
+    let combined_count = counts.get("use_cplan indexscan").copied().unwrap_or(0);
+    assert_eq!(
+        combined_count,
+        0,
+        "no combined node should exist. builtins: {:?}",
+        builtins
+    );
+}

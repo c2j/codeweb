@@ -5622,6 +5622,33 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
     }
 
     #[test]
+    fn multi_hint_use_cplan_indexscan_not_combined() {
+        let sql = "CREATE OR REPLACE PROCEDURE p() AS $$
+        BEGIN
+            FOR r IN (SELECT /*+ use_cplan indexscan(t1) */ * FROM t1) LOOP NULL; END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let graph = build_from_sql(sql);
+        let use_cplan: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "use_cplan"))
+            .collect();
+        let indexscan: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "indexscan"))
+            .collect();
+        assert_eq!(use_cplan.len(), 1, "use_cplan should be a separate node");
+        assert_eq!(indexscan.len(), 1, "indexscan should be a separate node");
+        let combined: Vec<_> = graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name.contains(' '))
+            })
+            .collect();
+        assert!(combined.is_empty(), "no hint node should contain spaces");
+    }
+
+    #[test]
     fn duplicate_java_methods_produce_single_method_node() {
         use crate::graph::builder::GraphBuildContext;
         use crate::parser::java_method::{JavaClassInfo, JavaMethodInfo, JavaParseResult};

@@ -633,23 +633,21 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
-        // ── Hint extraction from SelectStatement.hints ──
-        for hint_name in select.hints.iter() {
-            if hint_name.is_empty() {
+        for hint_text in select.hints.iter() {
+            if hint_text.is_empty() {
                 continue;
             }
-            if let Some(paren) = hint_name.find('(') {
-                self.push_builtin_call(
-                    &hint_name[..paren],
-                    ogsql_parser::ast::BuiltinFuncMeta {
-                        category: "Hint".into(),
-                        domain: "QueryPlan".into(),
-                    },
-                    0,
-                );
+            let names = if let Some(paren) = hint_text.find('(') {
+                &hint_text[..paren]
             } else {
+                hint_text.as_str()
+            };
+            for name in names.split_whitespace() {
+                if name.is_empty() {
+                    continue;
+                }
                 self.push_builtin_call(
-                    hint_name,
+                    name,
                     ogsql_parser::ast::BuiltinFuncMeta {
                         category: "Hint".into(),
                         domain: "QueryPlan".into(),
@@ -658,7 +656,6 @@ impl Visitor for CallExtractor {
                 );
             }
         }
-
         for tr in &select.from {
             self.extract_func_from_table_ref(tr);
         }
