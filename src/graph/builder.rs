@@ -4266,6 +4266,63 @@ mod tests {
         assert_eq!(view_nodes.len(), 1, "View 'orders' should exist");
     }
 
+    /// Simulates the chunked-processing crash: Phase 1 removes a qualified
+    /// Table (merged into View), then Phase 2 tries to merge a bare Table
+    /// into that now-removed qualified Table → add_edge panics on dead idx.
+    ///
+    /// View query table references (unlike procedure body references) do NOT
+    /// insert bare-name entries into table_index, so the chunk-1 qualified
+    /// Table does not suppress the chunk-2 bare Table creation.
+    #[test]
+    fn qualified_table_into_view_merged_then_bare_into_qualified() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::parser::ParsedFile;
+        use std::path::PathBuf;
+
+        let mut ctx = GraphBuildContext::new();
+
+        // Chunk 1: View query creates qualified Table "bigfund.orders"
+        // without polluting table_index["orders"] (View query handler
+        // lacks the bare-name insertion present in procedure-body handler).
+        let file1 = ParsedFile {
+            path: PathBuf::from("chunk1.sql"),
+            statements: parse_sql(
+                "CREATE VIEW v1 AS SELECT * FROM bigfund.orders;",
+            ),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file1]);
+
+        // Chunk 2: View "bigfund.orders" + bare Table "orders" from procedure
+        let file2 = ParsedFile {
+            path: PathBuf::from("chunk2.sql"),
+            statements: parse_sql(
+                "\
+                CREATE VIEW bigfund.orders AS SELECT * FROM x;\n\
+                CREATE OR REPLACE PROCEDURE p2() AS $$\n\
+                BEGIN\n\
+                    SELECT * FROM orders;\n\
+                END;\n\
+                $$;",
+            ),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file2]);
+
+        // This would panic before the fix. After the fix, it completes.
+        GraphBuilder::finalize_graph(&mut ctx);
+
+        let view_nodes: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|i| {
+                matches!(&ctx.graph[*i], Node::View { schema, name, .. }
+                    if *schema == Some("bigfund".to_string()) && name.to_lowercase() == "orders")
+            })
+            .collect();
+        assert_eq!(view_nodes.len(), 1, "View 'bigfund.orders' should exist");
+    }
+
     #[test]
     fn create_table_produces_rich_table_node() {
         let sql = r#"
