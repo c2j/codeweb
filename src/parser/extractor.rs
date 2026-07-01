@@ -724,7 +724,9 @@ impl Visitor for CallExtractor {
                     self.push_call(&name.join("."), false, 0);
                 }
                 Some(meta) => {
-                    self.push_builtin_call(&name.join("."), meta.clone(), 0);
+                    if meta.category != "Hint" {
+                        self.push_builtin_call(&name.join("."), meta.clone(), 0);
+                    }
                 }
             }
         } else if let Expr::SpecialFunction {
