@@ -186,6 +186,7 @@ impl GraphBuilder {
             &ctx.mapper_index,
         );
         Self::add_jsp_nodes_from_parsed(jsp_files, &mut ctx);
+        Self::bridge_jsp_to_java_methods(&mut ctx.graph, jsp_files, &all.java_method_results);
         Self::dedup_table_view_nodes(&mut ctx.graph);
         Self::merge_table_access_edges(&mut ctx.graph);
         Self::resolve_unresolved_nodes(&mut ctx.graph);
@@ -1084,7 +1085,10 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
+                PackageItem::Raw(_)
+                | PackageItem::Variable(_)
+                | PackageItem::Type(_)
+                | PackageItem::Cursor(_) => continue,
             };
             let Some(_block) = block else {
                 continue;
@@ -1460,7 +1464,10 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
+                PackageItem::Raw(_)
+                | PackageItem::Variable(_)
+                | PackageItem::Type(_)
+                | PackageItem::Cursor(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
@@ -1570,7 +1577,10 @@ impl GraphBuilder {
                         walk_pl_block(extractor, block);
                     }
                 }
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => {}
+                PackageItem::Raw(_)
+                | PackageItem::Variable(_)
+                | PackageItem::Type(_)
+                | PackageItem::Cursor(_) => {}
             }
         }
     }
@@ -2247,7 +2257,10 @@ impl GraphBuilder {
             let (proc_name, block, kind) = match item {
                 PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
                 PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
-                PackageItem::Raw(_) | PackageItem::Variable(_) | PackageItem::Type(_) | PackageItem::Cursor(_) => continue,
+                PackageItem::Raw(_)
+                | PackageItem::Variable(_)
+                | PackageItem::Type(_)
+                | PackageItem::Cursor(_) => continue,
             };
             let proc_id = RoutineId {
                 schema: schema_part.clone(),
@@ -2365,6 +2378,7 @@ impl GraphBuilder {
             let page_node = Node::JspPage {
                 path: file_result.file.clone(),
                 display_name: file_result.display_name.clone(),
+                line: file_result.line,
                 url_pattern: None,
             };
             let page_idx = ctx.graph.add_node(page_node);
@@ -2564,9 +2578,7 @@ impl GraphBuilder {
             // Only merge if there's exactly one schema for the bare name
             for (name_lower, &bare_idx) in &bare {
                 if let Some(&(_, qual_idx)) = qualified.get(name_lower) {
-                    if bare_idx != qual_idx
-                        && !phase1_targets.contains(&qual_idx)
-                    {
+                    if bare_idx != qual_idx && !phase1_targets.contains(&qual_idx) {
                         merges.push((bare_idx, qual_idx));
                     }
                 }
@@ -3115,6 +3127,106 @@ impl GraphBuilder {
                     target_class_idx,
                     Edge::CallsJava { location },
                 );
+            }
+        }
+
+        // Bridge: connect JavaSql nodes to their parent JavaMethod.
+        // JavaSql nodes are created in a prior pass (add_java_nodes_from_parsed)
+        // without method edges. Now that JavaMethod nodes exist, link them.
+        let mut javasql_indices: Vec<petgraph::graph::NodeIndex> = Vec::new();
+        for idx in graph.node_indices() {
+            if matches!(graph[idx], Node::JavaSql { .. }) {
+                javasql_indices.push(idx);
+            }
+        }
+        for idx in javasql_indices {
+            if let Node::JavaSql {
+                ref class_name,
+                ref method_name,
+                ..
+            } = graph[idx]
+            {
+                let m = match method_name {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let c = class_name.as_deref().unwrap_or("");
+                // Resolve short class name to FQN, then build method FQN
+                let class_fqn = simple_name_to_fqn
+                    .get(c)
+                    .cloned()
+                    .unwrap_or_else(|| c.to_string());
+                let method_fqn = format!("{}.{}", class_fqn, m);
+                if let Some(&method_idx) = method_index.get(&method_fqn) {
+                    graph.add_edge(method_idx, idx, Edge::ContainsSql);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "jsp")]
+    pub(crate) fn bridge_jsp_to_java_methods(
+        graph: &mut CodeGraph,
+        jsp_files: &[crate::parser::jsp_loader::JspFileResult],
+        java_method_results: &[crate::parser::java_method::JavaParseResult],
+    ) {
+        let mut simple_to_fqn: HashMap<String, String> = HashMap::new();
+        for result in java_method_results {
+            for class in &result.classes {
+                simple_to_fqn.insert(class.name.clone(), class.fqn.clone());
+            }
+        }
+
+        let mut method_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut class_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        for idx in graph.node_indices() {
+            match &graph[idx] {
+                Node::JavaMethod { ref fqn, .. } => {
+                    method_index.insert(fqn.clone(), idx);
+                }
+                Node::JavaClass { ref fqn, .. } => {
+                    class_index.insert(fqn.clone(), idx);
+                }
+                _ => {}
+            }
+        }
+
+        // Map file path → JspPage node index
+        let mut file_to_jsp: HashMap<PathBuf, petgraph::graph::NodeIndex> = HashMap::new();
+        for idx in graph.node_indices() {
+            if let Node::JspPage { ref path, .. } = graph[idx] {
+                file_to_jsp.insert(path.clone(), idx);
+            }
+        }
+
+        for jsp_file in jsp_files {
+            if jsp_file.java_refs.is_empty() {
+                continue;
+            }
+            let Some(&jsp_idx) = file_to_jsp.get(&jsp_file.file) else {
+                continue;
+            };
+            for r in &jsp_file.java_refs {
+                let class_fqn = simple_to_fqn
+                    .get(&r.class_name)
+                    .cloned()
+                    .unwrap_or_else(|| r.class_name.clone());
+                let location = crate::graph::SourceLocation {
+                    file: Arc::new(PathBuf::new()),
+                    line: r.line,
+                };
+                if r.method_name == "<init>" {
+                    // Constructor → edge to JavaClass
+                    if let Some(&class_idx) = class_index.get(&class_fqn) {
+                        graph.add_edge(jsp_idx, class_idx, Edge::CallsJava { location });
+                    }
+                } else {
+                    // Static method call → edge to JavaMethod
+                    let method_fqn = format!("{}.{}", class_fqn, r.method_name);
+                    if let Some(&method_idx) = method_index.get(&method_fqn) {
+                        graph.add_edge(jsp_idx, method_idx, Edge::CallsJava { location });
+                    }
+                }
             }
         }
     }
@@ -4288,9 +4400,7 @@ mod tests {
         // lacks the bare-name insertion present in procedure-body handler).
         let file1 = ParsedFile {
             path: PathBuf::from("chunk1.sql"),
-            statements: parse_sql(
-                "CREATE VIEW v1 AS SELECT * FROM bigfund.orders;",
-            ),
+            statements: parse_sql("CREATE VIEW v1 AS SELECT * FROM bigfund.orders;"),
             content_hash: String::new(),
         };
         GraphBuilder::build_sql_chunk(&mut ctx, &[file1]);
@@ -5633,19 +5743,23 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         let graph = build_from_sql(sql);
         let use_cplan: Vec<_> = graph
             .node_indices()
-            .filter(|i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "use_cplan"))
+            .filter(
+                |i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "use_cplan"),
+            )
             .collect();
         let indexscan: Vec<_> = graph
             .node_indices()
-            .filter(|i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "indexscan"))
+            .filter(
+                |i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name == "indexscan"),
+            )
             .collect();
         assert_eq!(use_cplan.len(), 1, "use_cplan should be a separate node");
         assert_eq!(indexscan.len(), 1, "indexscan should be a separate node");
         let combined: Vec<_> = graph
             .node_indices()
-            .filter(|i| {
-                matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name.contains(' '))
-            })
+            .filter(
+                |i| matches!(&graph[*i], Node::BuiltinFunction { name, .. } if name.contains(' ')),
+            )
             .collect();
         assert!(combined.is_empty(), "no hint node should contain spaces");
     }

@@ -57,7 +57,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 5,
+            version: 6,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -239,7 +239,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 5,
+            version: 6,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -1303,6 +1303,58 @@ impl GraphStore {
             }
         }
 
+        // 3. JspPage display_name fallback
+        //
+        // When query is "jsp:legacy/customer-detail.jsp", the name_index won't
+        // match (it stores "jsp:/absolute/path/to/file.jsp" via NodeKey Display).
+        // Search JspPage nodes by their display_name.
+        #[cfg(feature = "jsp")]
+        if let Some(stripped) = lower.strip_prefix("jsp:") {
+            let semantic_query = stripped.trim();
+            if !semantic_query.is_empty() {
+                for idx in self.nodes_by_type("jsp") {
+                    if results.iter().any(|(i, _, _)| i == idx) {
+                        continue;
+                    }
+                    if let Node::JspPage {
+                        ref display_name, ..
+                    } = self.graph[*idx]
+                    {
+                        let candidate = display_name.to_lowercase();
+                        if let Some(rank) = MatchRank::classify(semantic_query, &candidate) {
+                            let display = NodeKey::from_node(&self.graph[*idx]).to_string();
+                            results.push((*idx, display, rank));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. JspSql display_name fallback
+        //
+        // When query is "jspsql:jsp/legacy/page.jsp:44", the name_index won't
+        // match (it stores "jspsql:/absolute/path:line:hash").
+        // Search JspSql nodes by shortened file path + line.
+        #[cfg(feature = "jsp")]
+        if let Some(stripped) = lower.strip_prefix("jspsql:") {
+            let semantic_query = stripped.trim();
+            if !semantic_query.is_empty() {
+                for idx in self.nodes_by_type("jspsql") {
+                    if results.iter().any(|(i, _, _)| i == idx) {
+                        continue;
+                    }
+                    if let Node::JspSql { ref file, line, .. } = self.graph[*idx] {
+                        let short = crate::parser::jsp_preprocessor::compute_display_name(file);
+                        let candidate = format!("{}:{}", short.to_lowercase(), line);
+                        if let Some(rank) = MatchRank::classify(semantic_query, &candidate) {
+                            let display = NodeKey::from_node(&self.graph[*idx]).to_string();
+                            results.push((*idx, display, rank));
+                        }
+                    }
+                }
+            }
+        }
+
         results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
         results
             .into_iter()
@@ -1351,10 +1403,10 @@ impl GraphStore {
             bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
             })?;
-        if store.version != 5 {
+        if store.version != 6 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 5 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });
@@ -1391,10 +1443,10 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 5 {
+        if store.version != 6 {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 5 — run `codeweb analyze` to regenerate",
+                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
                     store.version
                 ),
             });

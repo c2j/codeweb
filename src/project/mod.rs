@@ -323,6 +323,11 @@ impl Project {
                 }
 
                 GraphBuilder::add_jsp_nodes_from_parsed(&jsp_results, &mut ctx);
+                GraphBuilder::bridge_jsp_to_java_methods(
+                    &mut ctx.graph,
+                    &jsp_results,
+                    &java_method_results,
+                );
             }
         }
 
