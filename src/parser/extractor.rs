@@ -710,7 +710,7 @@ impl Visitor for CallExtractor {
             _ => {}
         }
 
-        // ── Existing FunctionCall handling ──
+        // ── Existing FunctionCall + SpecialFunction handling ──
         if let Expr::FunctionCall { name, builtin, .. } = expr {
             if name.is_empty() {
                 return VisitorResult::Continue;
@@ -727,6 +727,13 @@ impl Visitor for CallExtractor {
                     self.push_builtin_call(&name.join("."), meta.clone(), 0);
                 }
             }
+        } else if let Expr::SpecialFunction {
+            name,
+            builtin: Some(meta),
+            ..
+        } = expr
+        {
+            self.push_builtin_call(name, meta.clone(), 0);
         }
         VisitorResult::Continue
     }

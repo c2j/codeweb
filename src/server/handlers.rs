@@ -11,7 +11,7 @@ use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
 use crate::graph::key::NodeKey;
-use crate::graph::node_type_tag;
+use crate::graph::node_sub_type_tag;
 use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::{CodeGraph, Node};
@@ -149,7 +149,7 @@ async fn search_sql(
         .into_iter()
         .map(|(idx, display_key, score)| {
             let node = &graph[idx];
-            let detail = node_type_tag(node);
+            let detail = node_sub_type_tag(node);
             let in_deg = graph
                 .neighbors_directed(idx, petgraph::Direction::Incoming)
                 .count();
@@ -222,7 +222,7 @@ async fn node_detail(
                 serde_json::json!({
                     "id": n.index(),
                     "key": key.to_string(),
-                    "type": node_type_tag(&graph[n]),
+                    "type": node_sub_type_tag(&graph[n]),
                 })
             })
             .collect();
@@ -235,7 +235,7 @@ async fn node_detail(
                 serde_json::json!({
                     "id": n.index(),
                     "key": key.to_string(),
-                    "type": node_type_tag(&graph[n]),
+                    "type": node_sub_type_tag(&graph[n]),
                 })
             })
             .collect();
@@ -384,7 +384,7 @@ async fn node_detail(
     let result = serde_json::json!({
         "id": idx.index(),
         "key": key.to_string(),
-        "type": node_type_tag(node),
+        "type": node_sub_type_tag(node),
         "in_degree": in_deg,
         "out_degree": out_deg,
         "callers": callers,
@@ -429,7 +429,7 @@ async fn trace(
         "target": {
             "id": chain.target.index(),
             "key": target_key.to_string(),
-            "type": node_type_tag(&graph[chain.target]),
+            "type": node_sub_type_tag(&graph[chain.target]),
         },
         "callers": tree_nodes_to_json(&chain.callers, graph),
         "callees": tree_nodes_to_json(&chain.callees, graph),
@@ -480,7 +480,7 @@ async fn node_callers(
                 serde_json::json!({
                     "id": n.index(),
                     "key": key.to_string(),
-                    "type": node_type_tag(&graph[n]),
+                    "type": node_sub_type_tag(&graph[n]),
                 })
             })
             .collect();
@@ -520,7 +520,7 @@ async fn node_callees(
                 serde_json::json!({
                     "id": n.index(),
                     "key": key.to_string(),
-                    "type": node_type_tag(&graph[n]),
+                    "type": node_sub_type_tag(&graph[n]),
                 })
             })
             .collect();
@@ -614,7 +614,7 @@ fn tree_nodes_to_json(nodes: &[TreeNode], graph: &CodeGraph) -> Vec<Value> {
             serde_json::json!({
                 "id": node.idx.index(),
                 "key": key.to_string(),
-                "type": node_type_tag(&graph[node.idx]),
+                "type": node_sub_type_tag(&graph[node.idx]),
                 "edge_label": node.edge_label,
                 "children": tree_nodes_to_json(&node.children, graph),
             })

@@ -1033,7 +1033,12 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
         Node::Synonym { .. } => std::borrow::Cow::Borrowed("synonym"),
         Node::Event { .. } => std::borrow::Cow::Borrowed("event"),
-        Node::BuiltinFunction { .. } => std::borrow::Cow::Borrowed("builtin"),
+        Node::BuiltinFunction { category, .. } => match category.as_str() {
+            "Operator" => std::borrow::Cow::Borrowed("builtin:op"),
+            "Hint" => std::borrow::Cow::Borrowed("builtin:hint"),
+            "Special" => std::borrow::Cow::Borrowed("builtin:special"),
+            _ => std::borrow::Cow::Borrowed("builtin:func"),
+        },
         Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
         #[cfg(feature = "jsp")]
         Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
