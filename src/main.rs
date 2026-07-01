@@ -1084,7 +1084,7 @@ fn cmd_nodes(
         .filter(|idx| {
             if let Some(ref tf) = type_filter {
                 let tag = node_type_tag(&graph[*idx]).to_lowercase();
-                if tag != *tf {
+                if !tag.starts_with(tf.as_str()) && tag != *tf {
                     return false;
                 }
             }
