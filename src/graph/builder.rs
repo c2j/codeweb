@@ -2562,7 +2562,9 @@ impl GraphBuilder {
             // Only merge if there's exactly one schema for the bare name
             for (name_lower, &bare_idx) in &bare {
                 if let Some(&(_, qual_idx)) = qualified.get(name_lower) {
-                    if bare_idx != qual_idx {
+                    if bare_idx != qual_idx
+                        && !phase1_targets.contains(&qual_idx)
+                    {
                         merges.push((bare_idx, qual_idx));
                     }
                 }
@@ -2579,6 +2581,12 @@ impl GraphBuilder {
         merges.retain(|(from, _)| seen_from.insert(*from));
 
         for (from_idx, into_idx) in merges {
+            // Guard: skip if the target was already removed in a previous
+            // merge iteration (can happen when a Phase 2 qualified node
+            // was also Phase 1's from_idx and got removed first).
+            if graph.node_weight(into_idx).is_none() {
+                continue;
+            }
             let sources: Vec<_> = graph
                 .neighbors_directed(from_idx, petgraph::Direction::Incoming)
                 .collect();
