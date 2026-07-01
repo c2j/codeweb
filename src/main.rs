@@ -963,6 +963,14 @@ fn cmd_stats(project: &Path) -> Result<()> {
     if stats.custom_nodes > 0 {
         println_stdout!("  {:>12}  custom nodes", stats.custom_nodes,);
     }
+    #[cfg(feature = "jsp")]
+    if stats.jsp_pages > 0 {
+        println_stdout!("  {:>12}  jsp pages", stats.jsp_pages);
+    }
+    #[cfg(feature = "jsp")]
+    if stats.jsp_sql > 0 {
+        println_stdout!("  {:>12}  jsp sql sources", stats.jsp_sql);
+    }
     println_stdout!();
     println_stdout!("  {:>12}  edges", stats.edges,);
     println_stdout!("  {:>12}  files", stats.files,);
@@ -1043,7 +1051,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         #[cfg(feature = "jsp")]
         Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
         #[cfg(feature = "jsp")]
-        Node::JspSql { .. } => std::borrow::Cow::Borrowed("jsql"),
+        Node::JspSql { .. } => std::borrow::Cow::Borrowed("jspsql"),
     }
 }
 
@@ -1141,7 +1149,7 @@ fn cmd_nodes(
                 out_deg,
                 total,
                 tag: node_type_tag(&graph[idx]).into_owned(),
-                name: graph::key::NodeKey::from_node(&graph[idx]).to_string(),
+                name: graph::node_display_name(&graph[idx]),
             })
         })
         .collect();
@@ -1156,10 +1164,16 @@ fn cmd_nodes(
         println_stdout!();
     }
 
-    println_stdout!("{:<8} {:>3} {:>3} {:>3}  NAME", "TYPE", "IN", "OUT", "TOT");
+    println_stdout!(
+        "{:<15} {:>5} {:>5} {:>5}  NAME",
+        "TYPE",
+        "IN",
+        "OUT",
+        "TOTAL"
+    );
     for row in &filtered {
         println_stdout!(
-            "{:<8} {:>3} {:>3} {:>3}  {}",
+            "{:<15} {:>5} {:>5} {:>5}  {}",
             row.tag,
             row.in_deg,
             row.out_deg,
@@ -1234,7 +1248,7 @@ fn cmd_detail(
         eprintln!("Using first match: {}", matches[0].1);
     }
 
-    let (start_idx, start_name) = &matches[0];
+    let (start_idx, _start_name) = &matches[0];
 
     let tag = node_type_tag(&graph[*start_idx]);
     let in_deg = graph
@@ -1244,7 +1258,8 @@ fn cmd_detail(
         .neighbors_directed(*start_idx, petgraph::Direction::Outgoing)
         .count();
 
-    println_stdout!("  {} {}", tag, start_name);
+    let display_name = graph::node_display_name(&graph[*start_idx]);
+    println_stdout!("  {} {}", tag, display_name);
     if is_partial(&graph[*start_idx]) {
         println_stdout!("  ⚠ partial node — body implementation could not be parsed");
     }

@@ -10,7 +10,7 @@ default_locale = "zh-CN"
 fallback_locale = "en"
 
 [features]
-default = ["cli", "tui"]
+default = ["cli", "tui", "jsp"]
 full = ["cli", "tui", "serve", "mcp", "jsp", "search-sql-v2"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]

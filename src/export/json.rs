@@ -187,10 +187,11 @@ enum NodeKindJson {
     JspPage {
         file: String,
         display_name: String,
+        line: usize,
         url_pattern: Option<String>,
     },
     #[cfg(feature = "jsp")]
-    #[serde(rename = "jsql")]
+    #[serde(rename = "jspsql")]
     JspSql {
         sql: String,
         file: String,
@@ -586,12 +587,14 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             Node::JspPage {
                 path,
                 display_name,
+                line,
                 url_pattern,
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::JspPage {
                     file: path.to_string_lossy().to_string(),
                     display_name: display_name.clone(),
+                    line: *line,
                     url_pattern: url_pattern.clone(),
                 },
             },

@@ -290,7 +290,7 @@ pub fn collect_chain_files(
     ) {
         let file = graph[idx].file();
         if !file.as_os_str().is_empty() {
-            let key = NodeKey::from_node(&graph[idx]).to_string();
+            let key = crate::graph::node_display_name(&graph[idx]);
             let entry = file_nodes.entry(file.to_path_buf()).or_default();
             if !entry.contains(&key) {
                 entry.push(key);
@@ -423,7 +423,7 @@ fn format_tree_node(
     lines: &mut Vec<String>,
 ) {
     let connector = if is_last { "└── " } else { "├── " };
-    let key = NodeKey::from_node(&graph[node.idx]);
+    let key = crate::graph::node_display_name(&graph[node.idx]);
     let label = node
         .edge_label
         .as_deref()
@@ -453,7 +453,7 @@ pub fn format_chain_tree(chain: &CallChain, graph: &crate::graph::CodeGraph) -> 
             let is_last = i == chain.callers.len() - 1;
             let prefix = "  ";
             let connector = if is_last { "└── " } else { "├── " };
-            let key = NodeKey::from_node(&graph[caller.idx]);
+            let key = crate::graph::node_display_name(&graph[caller.idx]);
             let label = caller
                 .edge_label
                 .as_deref()
@@ -471,7 +471,7 @@ pub fn format_chain_tree(chain: &CallChain, graph: &crate::graph::CodeGraph) -> 
 
     lines.push(String::new());
     lines.push("── TARGET ──".to_string());
-    let key = NodeKey::from_node(&graph[chain.target]);
+    let key = crate::graph::node_display_name(&graph[chain.target]);
     lines.push(format!("  {}", key));
 
     lines.push(String::new());
@@ -483,7 +483,7 @@ pub fn format_chain_tree(chain: &CallChain, graph: &crate::graph::CodeGraph) -> 
             let is_last = i == chain.callees.len() - 1;
             let prefix = "  ";
             let connector = if is_last { "└── " } else { "├── " };
-            let key = NodeKey::from_node(&graph[callee.idx]);
+            let key = crate::graph::node_display_name(&graph[callee.idx]);
             let label = callee
                 .edge_label
                 .as_deref()
@@ -538,7 +538,7 @@ fn collect_paths_recursive(
 
 pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) -> String {
     let mut lines = Vec::new();
-    let target_key = NodeKey::from_node(&graph[chain.target]);
+    let target_key = crate::graph::node_display_name(&graph[chain.target]);
 
     // --- CALLERS: each path from farthest caller → direct caller → T0 ---
     let caller_paths = collect_leaf_paths(&chain.callers);
@@ -563,7 +563,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
             lines.push(format!("Path {:<4} {:>3} hops", path_num, hops));
             for (depth, step) in path.iter().enumerate() {
                 let indent = "    ".repeat(depth);
-                let key = NodeKey::from_node(&graph[step.idx]);
+                let key = crate::graph::node_display_name(&graph[step.idx]);
                 let label = step
                     .edge_label
                     .as_deref()
@@ -594,7 +594,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
         lines.push("── CONVERGENCE ──".to_string());
         for (idx, count) in &conv_entries {
             if *count > 1 {
-                let key = NodeKey::from_node(&graph[*idx]);
+                let key = crate::graph::node_display_name(&graph[*idx]);
                 lines.push(format!("  {} ← {} paths", key, count));
             }
         }
@@ -621,7 +621,7 @@ pub fn format_chain_paths(chain: &CallChain, graph: &crate::graph::CodeGraph) ->
             lines.push(format!("Path {:<4} {:>3} hops", path_num, hops));
             for (depth, step) in path.iter().enumerate() {
                 let indent = "    ".repeat(depth);
-                let key = NodeKey::from_node(&graph[step.idx]);
+                let key = crate::graph::node_display_name(&graph[step.idx]);
                 let label = step
                     .edge_label
                     .as_deref()

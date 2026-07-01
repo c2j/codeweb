@@ -231,8 +231,7 @@ fn multi_hint_not_combined_into_single_node() {
     );
     let combined_count = counts.get("use_cplan indexscan").copied().unwrap_or(0);
     assert_eq!(
-        combined_count,
-        0,
+        combined_count, 0,
         "no combined node should exist. builtins: {:?}",
         builtins
     );

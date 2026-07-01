@@ -52,6 +52,17 @@ pub struct JspParseResult {
     pub warnings: Vec<String>,
 }
 
+/// A reference from JSP to a Java class/method (extracted from synthesized Java).
+#[derive(Debug, Clone)]
+pub struct JspJavaRef {
+    /// Simple class name as it appears in the JSP (e.g. "FilmJdbcDao").
+    pub class_name: String,
+    /// Method name: actual method name, or "&lt;init&gt;" for constructor calls.
+    pub method_name: String,
+    /// Line in the synthesized Java source (approximate).
+    pub line: usize,
+}
+
 /// JSP SQL 的来源子类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JspSqlKind {

@@ -4,7 +4,7 @@
 //! 后续 `synthesize_java` 把片段缝合为合法 Java 源以供 ogsql-parser 处理。
 
 use crate::parser::jsp_types::{JspParseResult, JspSegment, JspSegmentKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct JspLexer<'a> {
     source: &'a [u8],
@@ -165,11 +165,7 @@ impl<'a> JspLexer<'a> {
 pub fn lex_jsp(source: &str, file: &Path) -> JspParseResult {
     let mut lexer = JspLexer::new(source);
     let segments = lexer.tokenize();
-    let display_name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown.jsp")
-        .to_string();
+    let display_name = compute_display_name(file);
 
     let mut page_directives = Vec::new();
     for seg in &segments {
@@ -197,6 +193,47 @@ fn extract_attr(content: &str, name: &str) -> Option<String> {
     let rest = &content[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+/// Compute a human-readable display_name for a JSP file.
+///
+/// Priority:
+/// 1. Relative to WEB-INF directory (if path contains WEB-INF)
+/// 2. Relative to git repository root (if inside a git working tree)
+/// 3. Fallback to file name only
+pub fn compute_display_name(file: &Path) -> String {
+    // 1. Try WEB-INF (most meaningful for JSP files)
+    let path_str = file.to_string_lossy();
+    if let Some(pos) = path_str.find("WEB-INF") {
+        let after = &path_str[pos + "WEB-INF".len()..];
+        let trimmed = after.trim_start_matches(std::path::MAIN_SEPARATOR);
+        return trimmed.to_string();
+    }
+
+    // 2. Try git root
+    if let Some(git_root) = find_git_root(file) {
+        if let Ok(rel) = file.strip_prefix(&git_root) {
+            return rel.to_string_lossy().to_string();
+        }
+    }
+
+    // 3. Fallback: file name only
+    file.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown.jsp")
+        .to_string()
+}
+
+/// Walk up from `file` to find the nearest `.git` directory, returning the parent of `.git`.
+fn find_git_root(file: &Path) -> Option<PathBuf> {
+    let mut current = file.parent()?;
+    for _ in 0..16 {
+        if current.join(".git").is_dir() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 #[derive(Debug, Clone)]

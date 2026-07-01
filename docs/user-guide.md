@@ -1136,7 +1136,7 @@ codeweb --lang zh-CN stats   # 中文（默认）
 | Java 类 | `class` | Java Class |
 | Java 内嵌 SQL | `sql` | Java 中的 SQL（注解、JDBC） |
 | JSP 页面 | `jsp` | JSP 页面（需 `jsp` feature） |
-| JSP 内嵌 SQL | `jsql` | JSP 中的 SQL（需 `jsp` feature） |
+| JSP 内嵌 SQL | `jspsql` | JSP 中的 SQL（需 `jsp` feature） |
 | 内建函数 | `builtin` | Built-in Function |
 | 未解析引用 | `unres` | Unresolved Reference |
 | 自定义节点 | *自定义* | 通过 CGEF 导入的自定义节点类型 |

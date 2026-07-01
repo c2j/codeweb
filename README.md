@@ -77,7 +77,7 @@ cargo build --features full
 | `tui` | Interactive terminal UI | ✅ |
 | `serve` | HTTP server + browser UI | ❌ |
 | `mcp` | MCP server for LLM integration (Claude Desktop, Cursor, etc.) | ❌ |
-| `jsp` | JSP embedded SQL extraction (scriptlet JDBC, declarations) | ❌ |
+| `jsp` | JSP embedded SQL extraction (scriptlet JDBC, declarations) | ✅ |
 | `full` | All features (cli + tui + serve + mcp + jsp + search-sql-v2) | ❌ |
 | `search-sql-v2` | Enhanced SQL search with fingerprint-based indexing | ❌ |
 
@@ -191,7 +191,7 @@ Tags with `*` suffix indicate inferred nodes (referenced in DML but without DDL 
 | JavaClass | `class` | Java class |
 | JavaSql | `sql` | SQL embedded in Java (annotations, JDBC) |
 | JspPage | `jsp` | JSP page (only with `jsp` feature) |
-| JspSql | `jsql` | SQL embedded in JSP (only with `jsp` feature) |
+| JspSql | `jspsql` | SQL embedded in JSP (only with `jsp` feature) |
 | Package | `pkg` | Database package |
 | Trigger | `trigger` | Database trigger |
 | Type | `type` | Custom type |
@@ -416,7 +416,7 @@ cargo build --features full
 | `tui` | 交互式终端 UI | ✅ |
 | `serve` | HTTP 服务器 + 浏览器 UI | ❌ |
 | `mcp` | MCP 服务器，用于 LLM 集成（Claude Desktop、Cursor 等） | ❌ |
-| `jsp` | JSP 内嵌 SQL 抽取（scriptlet JDBC、declaration） | ❌ |
+| `jsp` | JSP 内嵌 SQL 抽取（scriptlet JDBC、declaration） | ✅ |
 | `full` | 全部功能（cli + tui + serve + mcp + jsp + search-sql-v2） | ❌ |
 | `search-sql-v2` | 增强 SQL 搜索（基于指纹索引） | ❌ |
 
@@ -527,7 +527,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | Java 类 | `class` | Java Class |
 | Java 内嵌 SQL | `sql` | Java 中的 SQL（注解、JDBC） |
 | JSP 页面 | `jsp` | JSP 页面（需启用 `jsp` feature） |
-| JSP 内嵌 SQL | `jsql` | JSP 中的 SQL（需启用 `jsp` feature） |
+| JSP 内嵌 SQL | `jspsql` | JSP 中的 SQL（需启用 `jsp` feature） |
 | 包 | `pkg` | Database Package |
 | 触发器 | `trigger` | Database Trigger |
 | 自定义类型 | `type` | Custom Type |

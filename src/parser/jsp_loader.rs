@@ -9,7 +9,7 @@
 //! 需要后续在 jsp_loader 内追加后处理（已记入 follow-up）。
 
 use crate::parser::jsp_preprocessor::{lex_jsp, synthesize_java, SynthesizedJava};
-use crate::parser::jsp_types::{JspParseResult, JspSqlKind};
+use crate::parser::jsp_types::{JspJavaRef, JspParseResult, JspSegmentKind, JspSqlKind};
 use ogsql_parser::java::{
     extract_sql_from_java, ExtractedSql, ExtractionMethod, JavaExtractConfig, JavaExtractResult,
 };
@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 pub struct JspFileResult {
     pub file: PathBuf,
     pub display_name: String,
+    pub line: usize,
     pub parse_result: JspParseResult,
     pub synthesized: SynthesizedJava,
     pub extractions: Vec<ExtractedSql>,
+    pub java_refs: Vec<JspJavaRef>,
     pub errors: Vec<String>,
 }
 
@@ -36,6 +38,18 @@ pub fn load_jsp_string(source: String, path: &Path, config: &JavaExtractConfig) 
     let parse_result = lex_jsp(&source, path);
     let synthesized = synthesize_java(&parse_result);
 
+    let first_line = parse_result
+        .segments
+        .iter()
+        .find(|s| {
+            !matches!(
+                s.kind,
+                JspSegmentKind::Text | JspSegmentKind::Comment | JspSegmentKind::Directive
+            )
+        })
+        .map(|s| s.start_line)
+        .unwrap_or(1);
+
     let synthetic_path = format!("{}/__synthetic__.java", path.display());
     let JavaExtractResult {
         extractions,
@@ -45,12 +59,16 @@ pub fn load_jsp_string(source: String, path: &Path, config: &JavaExtractConfig) 
 
     let errors = errors.into_iter().map(|e| format!("{:?}", e)).collect();
 
+    let java_refs = extract_java_refs_from_synthetic(&synthesized.source, &parse_result);
+
     JspFileResult {
         file: path.to_path_buf(),
         display_name: parse_result.display_name.clone(),
+        line: first_line,
         parse_result,
         synthesized,
         extractions,
+        java_refs,
         errors,
     }
 }
@@ -76,6 +94,87 @@ pub fn load_jsp_files_from_paths(
         }
     }
     results
+}
+
+/// Parse the synthesized Java source with tree-sitter to find Java class/method
+/// references. Extracts:
+/// - Constructor calls: `new ClassName(...)`  →  method="&lt;init&gt;"
+/// - Static method calls: `ClassName.method(...)`  →  preserves method name
+fn extract_java_refs_from_synthetic(
+    source: &str,
+    _parse_result: &JspParseResult,
+) -> Vec<JspJavaRef> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut refs = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let source_bytes = source.as_bytes();
+    collect_java_refs_recursive(tree.root_node(), source_bytes, &mut refs, &mut seen);
+    refs
+}
+
+fn collect_java_refs_recursive(
+    node: tree_sitter::Node,
+    source: &[u8],
+    refs: &mut Vec<JspJavaRef>,
+    seen: &mut std::collections::HashSet<(usize, usize)>,
+) {
+    match node.kind() {
+        "object_creation_expression" => {
+            let pos = node.start_position();
+            if seen.insert((pos.row, pos.column)) {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    if let Ok(name) = type_node.utf8_text(source) {
+                        let line = pos.row + 1;
+                        refs.push(JspJavaRef {
+                            class_name: name.to_string(),
+                            method_name: "<init>".to_string(),
+                            line,
+                        });
+                    }
+                }
+            }
+        }
+        "method_invocation" => {
+            let pos = node.start_position();
+            if seen.insert((pos.row, pos.column)) {
+                // Extract object (class name for static calls like ClassName.method())
+                let object = node
+                    .child_by_field_name("object")
+                    .and_then(|n| n.utf8_text(source).ok());
+                let method = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                if let (Some(obj), m) = (object, method) {
+                    if !m.is_empty() && obj.chars().next().map_or(false, |c| c.is_uppercase()) {
+                        // Static method call: ClassName.method()
+                        refs.push(JspJavaRef {
+                            class_name: obj.to_string(),
+                            method_name: m.to_string(),
+                            line: pos.row + 1,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_java_refs_recursive(child, source, refs, seen);
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,6 @@
+CREATE TABLE posts (
+    id BIGINT PRIMARY KEY,
+    title VARCHAR(500),
+    author_id BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

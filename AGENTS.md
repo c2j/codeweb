@@ -37,9 +37,13 @@ Bridge rules:
 
 ### Phase 3b: + JSP Scriptlet SQL Extraction
 
-Extend SQL extraction to JSP files. Legacy Java Web systems often embed SQL directly in JSP via scriptlets (`<% %>`), declarations (`<%! %>`), and expressions (`<%= %>`). The `jsp` Cargo feature (default off) preprocesses JSP into synthetic Java and reuses ogsql-parser's `extract_sql_from_java()` — zero ogsql-parser changes.
+Extend SQL extraction to JSP files. Legacy Java Web systems often embed SQL directly in JSP via scriptlets (`<% %>`), declarations (`<%! %>`), and expressions (`<%= %>`). The `jsp` Cargo feature preprocesses JSP into synthetic Java and reuses ogsql-parser's `extract_sql_from_java()` — zero ogsql-parser changes.
 
-Bridge rule: `JspPage → JspSql → Procedure` (via reused `CallsProcedure` edges).
+Bridge rules:
+- `JspPage → JspSql → Procedure/Table` (via reused `CallsProcedure`/`TableAccess` edges)
+- `JspPage → JavaClass/JavaMethod` (constructor calls detected via tree-sitter on synthesized Java)
+- `JavaMethod → JavaSql` (via `contains_sql` edge, linking method to its embedded SQL)
+- `JspPage` `display_name` uses WEB-INF-relative path, with `line` pointing to first scriptlet/declaration
 
 Limitation: JDBC escape syntax `{call pkg.x(...)}` is filtered by ogsql-parser's keyword gate (only SELECT/INSERT/UPDATE/DELETE/MERGE/WITH pass through). Direct stored procedure calls from JSP require a follow-up post-processor.
 
