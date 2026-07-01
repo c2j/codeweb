@@ -3057,6 +3057,41 @@ impl GraphBuilder {
                 }
             }
         }
+
+        for result in java_results {
+            if result.di_injections.is_empty() {
+                continue;
+            }
+            let file_imports = import_map.get(&result.file);
+            let owning_class = result.classes.first();
+            let Some(owning_class) = owning_class else {
+                continue;
+            };
+            let Some(&owning_class_idx) = class_index.get(&owning_class.fqn) else {
+                continue;
+            };
+
+            for injection in &result.di_injections {
+                let target_fqn =
+                    resolve_fqn(&injection.type_name, &simple_name_to_fqn, file_imports);
+                let Some(target_fqn) = target_fqn else {
+                    continue;
+                };
+                let Some(&target_class_idx) = class_index.get(&target_fqn) else {
+                    continue;
+                };
+
+                let location = SourceLocation {
+                    file: Arc::new(result.file.clone()),
+                    line: injection.line,
+                };
+                graph.add_edge(
+                    owning_class_idx,
+                    target_class_idx,
+                    Edge::CallsJava { location },
+                );
+            }
+        }
     }
 }
 
@@ -4996,6 +5031,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             imports: vec![],
             classes: vec![class.clone()],
             methods: vec![],
+            di_injections: vec![],
             content_hash: "abc".to_string(),
         };
 
@@ -5270,6 +5306,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             imports: vec![],
             classes: vec![class.clone()],
             methods: vec![method.clone()],
+            di_injections: vec![],
             content_hash: "abc".to_string(),
         };
 

@@ -48,12 +48,26 @@ pub struct JavaMethodInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiInjection {
+    pub type_name: String,
+    pub source: DiSource,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DiSource {
+    ConstructorParam,
+    Field,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaParseResult {
     pub file: PathBuf,
     pub package: String,
     pub imports: Vec<String>,
     pub classes: Vec<JavaClassInfo>,
     pub methods: Vec<JavaMethodInfo>,
+    pub di_injections: Vec<DiInjection>,
     pub content_hash: String,
 }
 
@@ -67,6 +81,7 @@ struct JavaTreeWalker<'a> {
     imports: Vec<String>,
     classes: Vec<JavaClassInfo>,
     methods: Vec<JavaMethodInfo>,
+    di_injections: Vec<DiInjection>,
     current_class_stack: Vec<String>,
 }
 
@@ -79,6 +94,7 @@ impl<'a> JavaTreeWalker<'a> {
             imports: Vec::new(),
             classes: Vec::new(),
             methods: Vec::new(),
+            di_injections: Vec::new(),
             current_class_stack: Vec::new(),
         }
     }
@@ -331,8 +347,98 @@ impl<'a> JavaTreeWalker<'a> {
                 "class_declaration" | "interface_declaration" => {
                     self.handle_type_with_methods(child);
                 }
+                "field_declaration" => {
+                    self.handle_field_declaration(child);
+                }
+                "constructor_declaration" => {
+                    self.handle_constructor_declaration(child);
+                }
                 _ => {
                     self.walk_type_body(child);
+                }
+            }
+        }
+    }
+
+    fn is_di_annotation(&self, modifier_node: tree_sitter::Node) -> bool {
+        let kind = modifier_node.kind();
+        if kind != "annotation" && kind != "marker_annotation" {
+            return false;
+        }
+        let mut cursor = modifier_node.walk();
+        for child in modifier_node.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                if let Ok(text) = child.utf8_text(self.source) {
+                    return matches!(text, "Autowired" | "Inject" | "Resource");
+                }
+            }
+        }
+        false
+    }
+
+    fn extract_type_name(&self, node: tree_sitter::Node) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "type_identifier" | "scoped_type_identifier" => {
+                    return child.utf8_text(self.source).ok().map(|s| s.to_string());
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn handle_field_declaration(&mut self, node: tree_sitter::Node) {
+        let line = node.start_position().row + 1;
+
+        let has_di_annotation = {
+            let mut cursor = node.walk();
+            let mut found = false;
+            for child in node.children(&mut cursor) {
+                if child.kind() == "modifiers" {
+                    let mut mc = child.walk();
+                    for mod_child in child.children(&mut mc) {
+                        if self.is_di_annotation(mod_child) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        if !has_di_annotation {
+            return;
+        }
+
+        if let Some(type_name) = self.extract_type_name(node) {
+            self.di_injections.push(DiInjection {
+                type_name,
+                source: DiSource::Field,
+                line,
+            });
+        }
+    }
+
+    fn handle_constructor_declaration(&mut self, node: tree_sitter::Node) {
+        let line = node.start_position().row + 1;
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "formal_parameters" {
+                let mut pc = child.walk();
+                for param in child.children(&mut pc) {
+                    if param.kind() == "formal_parameter" {
+                        if let Some(type_name) = self.extract_type_name(param) {
+                            self.di_injections.push(DiInjection {
+                                type_name,
+                                source: DiSource::ConstructorParam,
+                                line,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -369,6 +475,7 @@ pub fn parse_java_source(path: &Path, source_bytes: &[u8]) -> Result<JavaParseRe
         imports: walker.imports,
         classes: walker.classes,
         methods: walker.methods,
+        di_injections: walker.di_injections,
         content_hash,
     })
 }
@@ -414,6 +521,7 @@ mod tests {
             imports: walker.imports,
             classes: walker.classes,
             methods: walker.methods,
+            di_injections: walker.di_injections,
             content_hash: String::new(),
         }
     }
@@ -513,5 +621,93 @@ public class Foo {
         assert_eq!(result.imports.len(), 2);
         assert_eq!(result.imports[0], "java.util.List");
         assert_eq!(result.imports[1], "java.util.ArrayList");
+    }
+
+    #[test]
+    fn test_extract_di_constructor_param() {
+        let source = r#"
+package com.example;
+
+import com.other.Service;
+
+public class Controller {
+    public Controller(Service svc) {
+    }
+}
+"#;
+        let result = parse_source(source);
+        assert_eq!(result.di_injections.len(), 1);
+        let inj = &result.di_injections[0];
+        assert_eq!(inj.type_name, "Service");
+        assert!(matches!(inj.source, DiSource::ConstructorParam));
+    }
+
+    #[test]
+    fn test_extract_di_field_with_annotation() {
+        let source = r#"
+package com.example;
+
+import com.other.Service;
+
+public class Controller {
+    @Autowired
+    private Service svc;
+}
+"#;
+        let result = parse_source(source);
+        assert_eq!(result.di_injections.len(), 1);
+        let inj = &result.di_injections[0];
+        assert_eq!(inj.type_name, "Service");
+        assert!(matches!(inj.source, DiSource::Field));
+    }
+
+    #[test]
+    fn test_extract_di_field_without_annotation_ignored() {
+        let source = r#"
+package com.example;
+
+import com.other.Service;
+
+public class Controller {
+    private Service svc;
+}
+"#;
+        let result = parse_source(source);
+        assert!(
+            result.di_injections.is_empty(),
+            "plain field without @Autowired should not create DI injection"
+        );
+    }
+
+    #[test]
+    fn test_extract_di_inject_annotation() {
+        let source = r#"
+package com.example;
+
+import com.other.Service;
+
+public class Controller {
+    @Inject
+    private Service svc;
+}
+"#;
+        let result = parse_source(source);
+        assert_eq!(result.di_injections.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_di_resource_annotation() {
+        let source = r#"
+package com.example;
+
+import com.other.Service;
+
+public class Controller {
+    @Resource
+    private Service svc;
+}
+"#;
+        let result = parse_source(source);
+        assert_eq!(result.di_injections.len(), 1);
     }
 }

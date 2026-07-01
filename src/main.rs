@@ -535,10 +535,10 @@ enum Commands {
     /// Pass `--node <name>` to query a single symbol (e.g. a procedure,
     /// Java method, or mapper id). The two flags are mutually exclusive.
     Impact {
-        /// File path to analyze (relative to CWD or absolute).
-        /// Mutually exclusive with --node.
-        #[arg(long)]
-        file: Option<PathBuf>,
+        /// File path(s) to analyze (relative to CWD or absolute).
+        /// Repeatable for batch queries. Mutually exclusive with --node.
+        #[arg(long, action = clap::ArgAction::Append)]
+        file: Vec<PathBuf>,
 
         /// Node symbol name to analyze (e.g. "proc_create_order").
         /// Supports fuzzy match like `trace`/`detail`. Mutually exclusive with --file.
@@ -752,18 +752,15 @@ fn run() -> Result<()> {
             format,
             depth,
         }) => {
-            // 互斥校验:恰好一个必须是 Some
-            match (&file, &node) {
-                (Some(_), Some(_)) => {
-                    eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
-                    std::process::exit(2);
-                }
-                (None, None) => {
-                    eprintln!("Error: must pass exactly one of --file <path> or --node <name>.");
-                    std::process::exit(2);
-                }
-                _ => cmd_impact(file.as_deref(), node.as_deref(), &project, &format, depth),
+            if !file.is_empty() && node.is_some() {
+                eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
+                std::process::exit(2);
             }
+            if file.is_empty() && node.is_none() {
+                eprintln!("Error: must pass exactly one of --file <path> or --node <name>.");
+                std::process::exit(2);
+            }
+            cmd_impact(&file, node.as_deref(), &project, &format, depth)
         }
     }
 }
@@ -2419,7 +2416,7 @@ fn jsp_count_fragment() -> String {
 }
 
 fn cmd_impact(
-    file: Option<&Path>,
+    files: &[PathBuf],
     node: Option<&str>,
     project: &Path,
     format: &str,
@@ -2429,8 +2426,6 @@ fn cmd_impact(
     use petgraph::Direction;
 
     let mut proj = project::Project::find(project)?;
-    // Note: `load_store()` returns single-layer `Result<&GraphStore>` (not nested).
-    // See project/mod.rs:420. Match without `?` to handle "not yet analyzed" gracefully.
     let store = match proj.load_store() {
         Ok(s) => s,
         Err(_) => {
@@ -2441,53 +2436,92 @@ fn cmd_impact(
 
     let graph = store.graph();
     let calls_filter = EdgeFilter::calls_only();
+    let file_nodes = store.file_nodes();
+    let key_index = store.node_key_index();
 
-    // ── 解析起点节点 ───────────────────────────────────────────────
-    // 返回 (start_nodes, ImpactTarget)
-    let (start_nodes, target) = match (file, node) {
-        (Some(path), None) => {
-            let file_nodes = store.file_nodes();
-            let key_index = store.node_key_index();
-            resolve_file_target(graph, file_nodes, key_index, path)?
+    let compute_file_impact = |file_path: &Path| -> Result<ImpactResult> {
+        let (start_nodes, target) = resolve_file_target(graph, file_nodes, key_index, file_path)?;
+
+        if start_nodes.is_empty() {
+            return Ok(build_impact_result(&target, vec![], vec![]));
         }
-        (None, Some(name)) => resolve_node_target(store, name)?,
-        // 不可达:clap 分发层已校验互斥
-        _ => unreachable!("clap layer guarantees exactly one of --file/--node is set"),
+
+        let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+        let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+
+        collect_impact_entries(
+            graph,
+            &start_nodes,
+            Direction::Incoming,
+            depth,
+            &calls_filter,
+            &mut upstream_map,
+        );
+        collect_impact_entries(
+            graph,
+            &start_nodes,
+            Direction::Outgoing,
+            depth,
+            &calls_filter,
+            &mut downstream_map,
+        );
+
+        let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
+        let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
+        upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+        downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+
+        Ok(build_impact_result(&target, upstream, downstream))
     };
 
-    if start_nodes.is_empty() {
-        emit_empty_result(&target, format)?;
-        return Ok(());
+    if !files.is_empty() {
+        let mut results: Vec<ImpactResult> = Vec::with_capacity(files.len());
+        for file in files {
+            match compute_file_impact(file) {
+                Ok(result) => results.push(result),
+                Err(_) => eprintln!("Warning: file '{}' not found in graph", file.display()),
+            }
+        }
+        if results.len() == 1 {
+            emit_result(&results[0], format)?;
+        } else {
+            emit_batch_result(&results, format)?;
+        }
+    } else if let Some(name) = node {
+        let (start_nodes, target) = resolve_node_target(store, name)?;
+        if start_nodes.is_empty() {
+            emit_empty_result(&target, format)?;
+            return Ok(());
+        }
+
+        let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+        let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
+
+        collect_impact_entries(
+            graph,
+            &start_nodes,
+            Direction::Incoming,
+            depth,
+            &calls_filter,
+            &mut upstream_map,
+        );
+        collect_impact_entries(
+            graph,
+            &start_nodes,
+            Direction::Outgoing,
+            depth,
+            &calls_filter,
+            &mut downstream_map,
+        );
+
+        let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
+        let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
+        upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+        downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
+
+        let result = build_impact_result(&target, upstream, downstream);
+        emit_result(&result, format)?;
     }
-
-    // ── 双向遍历 ──────────────────────────────────────────────────
-    let mut upstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
-    let mut downstream_map: HashMap<(Option<String>, String), ImpactEntry> = HashMap::new();
-
-    collect_impact_entries(
-        graph,
-        &start_nodes,
-        Direction::Incoming,
-        depth,
-        &calls_filter,
-        &mut upstream_map,
-    );
-    collect_impact_entries(
-        graph,
-        &start_nodes,
-        Direction::Outgoing,
-        depth,
-        &calls_filter,
-        &mut downstream_map,
-    );
-
-    let mut upstream: Vec<ImpactEntry> = upstream_map.into_values().collect();
-    let mut downstream: Vec<ImpactEntry> = downstream_map.into_values().collect();
-    upstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
-    downstream.sort_by(|a, b| (&a.file_path, &a.symbol).cmp(&(&b.file_path, &b.symbol)));
-
-    let result = build_impact_result(&target, upstream, downstream);
-    emit_result(&result, format)?;
     Ok(())
 }
 
@@ -2612,6 +2646,25 @@ fn emit_result(result: &ImpactResult, format: &str) -> Result<()> {
 fn emit_empty_result(target: &ImpactTarget, format: &str) -> Result<()> {
     let result = build_impact_result(target, vec![], vec![]);
     emit_result(&result, format)
+}
+
+fn emit_batch_result(results: &[ImpactResult], format: &str) -> Result<()> {
+    if format == "json" {
+        let json = serde_json::to_string_pretty(results).map_err(|e| {
+            error::CodeWebError::ExportError {
+                message: format!("JSON batch serialization: {}", e),
+            }
+        })?;
+        println_stdout!("{}", json);
+    } else {
+        for (i, result) in results.iter().enumerate() {
+            if i > 0 {
+                println_stdout!("\n---\n");
+            }
+            print_impact_text(result);
+        }
+    }
+    Ok(())
 }
 
 /// Match user-supplied path against `file_nodes` keys.
