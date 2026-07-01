@@ -433,6 +433,8 @@ pub enum Node {
         path: PathBuf,
         display_name: String,
         #[serde(default)]
+        line: usize,
+        #[serde(default)]
         url_pattern: Option<String>,
     },
     /// SQL extracted from a JSP page (scriptlet, declaration, or JSTL tag).
@@ -480,8 +482,29 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         #[cfg(feature = "jsp")]
         Node::JspPage { .. } => "jsp",
         #[cfg(feature = "jsp")]
-        Node::JspSql { .. } => "jsql",
+        Node::JspSql { .. } => "jspsql",
     }
+}
+
+/// Human-readable display name for a node, suitable for CLI output.
+///
+/// Unlike [`NodeKey`] (which is a stable internal identifier based on full
+/// paths), this returns a readable name — for JspPage/JspSql it uses a
+/// shortened relative path, for others it falls back to [`NodeKey::to_string`].
+pub fn node_display_name(node: &Node) -> String {
+    #[cfg(feature = "jsp")]
+    if let Node::JspPage {
+        ref display_name, ..
+    } = node
+    {
+        return format!("jsp:{}", display_name);
+    }
+    #[cfg(feature = "jsp")]
+    if let Node::JspSql { ref file, line, .. } = node {
+        let short = crate::parser::jsp_preprocessor::compute_display_name(file);
+        return format!("jspsql:{}:{}", short, line);
+    }
+    key::NodeKey::from_node(node).to_string()
 }
 
 /// Returns a detailed sub-type tag for nodes that have internal categories.

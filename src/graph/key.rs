@@ -173,7 +173,7 @@ impl fmt::Display for NodeKey {
                 file,
                 line,
                 sql_hash,
-            } => write!(f, "jsql:{}:{}:{}", file, line, sql_hash),
+            } => write!(f, "jspsql:{}:{}:{}", file, line, sql_hash),
         }
     }
 }

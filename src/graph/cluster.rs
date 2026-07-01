@@ -92,7 +92,7 @@ impl NodeKind {
             #[cfg(feature = "jsp")]
             NodeKind::JspPage => "jsp",
             #[cfg(feature = "jsp")]
-            NodeKind::JspSql => "jsql",
+            NodeKind::JspSql => "jspsql",
         }
     }
 }
