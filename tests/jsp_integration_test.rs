@@ -96,7 +96,7 @@ PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id = ?")
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("jsp") || stdout.contains("jsql"),
+        stdout.contains("jsp") || stdout.contains("jspsql"),
         "DOT output should contain JSP nodes: {}",
         stdout
     );

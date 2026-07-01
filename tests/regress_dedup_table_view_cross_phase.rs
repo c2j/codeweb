@@ -74,11 +74,7 @@ fn regress_dedup_cross_phase_no_panic() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|n| {
-            n["type"] == "view"
-                && n["schema"] == "bigfund"
-                && n["name"] == "orders"
-        })
+        .filter(|n| n["type"] == "view" && n["schema"] == "bigfund" && n["name"] == "orders")
         .collect();
     assert_eq!(
         view_nodes.len(),
