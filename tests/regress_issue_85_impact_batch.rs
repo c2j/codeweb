@@ -61,8 +61,7 @@ fn run_in_dir(dir: &TempDir, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-#[ignore = "issue #85: impact command should support multiple --file args (batch mode)"]
-fn regress_impact_multiple_file_args_rejected() {
+fn regress_impact_batch_two_files() {
     let dir = setup_multi_file_project();
 
     let output = run_in_dir(
@@ -78,21 +77,30 @@ fn regress_impact_multiple_file_args_rejected() {
         ],
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let is_broken = !output.status.success()
-        || (output.status.success()
-            && !stderr.is_empty()
-            && stderr.contains("provided more than once"));
-
     assert!(
-        is_broken,
-        "Issue #85: expected --file twice to fail or warn. \
-         Exit code: {:?}, stderr: '{}'. \
-         Current behavior: clap Option<PathBuf> rejects multiple --file args.",
-        output.status.code(),
-        stderr.trim()
+        output.status.success(),
+        "batch impact should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("batch impact must be valid JSON");
+
+    assert!(json.is_array(), "batch impact must return JSON array");
+    let results = json.as_array().unwrap();
+    assert_eq!(results.len(), 2, "2 files → 2 results");
+
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(result["schema_version"], 2, "result[{}] schema_version", i);
+        assert!(result["file"].is_string(), "result[{}] has file", i);
+        assert!(result["upstream"].is_array(), "result[{}] has upstream", i);
+        assert!(
+            result["downstream"].is_array(),
+            "result[{}] has downstream",
+            i
+        );
+    }
 }
 
 #[test]
@@ -161,7 +169,6 @@ fn regress_impact_single_file_workaround() {
 }
 
 #[test]
-#[ignore = "issue #85: after fix, batch impact should return array of results in single invocation"]
 fn regress_impact_batch_mode_expected_behavior() {
     let dir = setup_multi_file_project();
 
