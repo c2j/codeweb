@@ -633,6 +633,32 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
+        // ── Hint extraction from SelectStatement.hints ──
+        for hint_name in select.hints.iter() {
+            if hint_name.is_empty() {
+                continue;
+            }
+            if let Some(paren) = hint_name.find('(') {
+                self.push_builtin_call(
+                    &hint_name[..paren],
+                    ogsql_parser::ast::BuiltinFuncMeta {
+                        category: "Hint".into(),
+                        domain: "QueryPlan".into(),
+                    },
+                    0,
+                );
+            } else {
+                self.push_builtin_call(
+                    hint_name,
+                    ogsql_parser::ast::BuiltinFuncMeta {
+                        category: "Hint".into(),
+                        domain: "QueryPlan".into(),
+                    },
+                    0,
+                );
+            }
+        }
+
         for tr in &select.from {
             self.extract_func_from_table_ref(tr);
         }
@@ -640,6 +666,51 @@ impl Visitor for CallExtractor {
     }
 
     fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
+        // ── Operator detection (ANY / ALL / SOME / EXISTS / IN / NOT_IN) ──
+        match expr {
+            Expr::ScalarSublink { sublink_type, .. } => {
+                let name = match sublink_type {
+                    ogsql_parser::ast::ScalarSublinkType::Any => "ANY",
+                    ogsql_parser::ast::ScalarSublinkType::Some => "SOME",
+                    ogsql_parser::ast::ScalarSublinkType::All => "ALL",
+                };
+                self.push_builtin_call(
+                    name,
+                    ogsql_parser::ast::BuiltinFuncMeta {
+                        category: "Operator".into(),
+                        domain: "Comparison".into(),
+                    },
+                    0,
+                );
+                return VisitorResult::Continue;
+            }
+            Expr::Exists(_) => {
+                self.push_builtin_call(
+                    "EXISTS",
+                    ogsql_parser::ast::BuiltinFuncMeta {
+                        category: "Operator".into(),
+                        domain: "Predicate".into(),
+                    },
+                    0,
+                );
+                return VisitorResult::Continue;
+            }
+            Expr::InSubquery { negated, .. } => {
+                let name = if *negated { "NOT_IN" } else { "IN" };
+                self.push_builtin_call(
+                    name,
+                    ogsql_parser::ast::BuiltinFuncMeta {
+                        category: "Operator".into(),
+                        domain: "Predicate".into(),
+                    },
+                    0,
+                );
+                return VisitorResult::Continue;
+            }
+            _ => {}
+        }
+
+        // ── Existing FunctionCall handling ──
         if let Expr::FunctionCall { name, builtin, .. } = expr {
             if name.is_empty() {
                 return VisitorResult::Continue;
@@ -650,11 +721,9 @@ impl Visitor for CallExtractor {
             }
             match builtin {
                 None => {
-                    // User-defined function — existing behavior
                     self.push_call(&name.join("."), false, 0);
                 }
                 Some(meta) => {
-                    // Built-in function — new path
                     self.push_builtin_call(&name.join("."), meta.clone(), 0);
                 }
             }
@@ -3656,5 +3725,254 @@ mod procedure_sql_extraction {
             }
         }
         Vec::new()
+    }
+
+    #[test]
+    fn operator_any_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_any() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col > ANY(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let any_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "ANY")
+            .collect();
+        assert!(
+            !any_edges.is_empty(),
+            "expected ANY operator to be extracted"
+        );
+        assert_eq!(
+            any_edges[0].builtin_meta.as_ref().unwrap().category,
+            "Operator"
+        );
+        assert_eq!(
+            any_edges[0].builtin_meta.as_ref().unwrap().domain,
+            "Comparison"
+        );
+    }
+
+    #[test]
+    fn operator_exists_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_exists() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE EXISTS(SELECT 1 FROM t2 WHERE t2.id = t1.id)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let exists_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "EXISTS")
+            .collect();
+        assert!(
+            !exists_edges.is_empty(),
+            "expected EXISTS operator to be extracted"
+        );
+        assert_eq!(
+            exists_edges[0].builtin_meta.as_ref().unwrap().category,
+            "Operator"
+        );
+        assert_eq!(
+            exists_edges[0].builtin_meta.as_ref().unwrap().domain,
+            "Predicate"
+        );
+    }
+
+    #[test]
+    fn operator_in_subquery_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_in() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col IN (SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let in_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "IN")
+            .collect();
+        assert!(!in_edges.is_empty(), "expected IN operator to be extracted");
+    }
+
+    #[test]
+    fn operator_all_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_all() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col > ALL(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let all_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "ALL")
+            .collect();
+        assert!(
+            !all_edges.is_empty(),
+            "expected ALL operator to be extracted"
+        );
+    }
+
+    #[test]
+    fn operator_some_kept_separate_from_any() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_some() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col = SOME(SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let some_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "SOME")
+            .collect();
+        assert!(
+            !some_edges.is_empty(),
+            "expected SOME operator to be extracted as 'SOME'"
+        );
+
+        let any_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "ANY")
+            .collect();
+        assert!(any_edges.is_empty(), "SOME should NOT create an ANY node");
+    }
+
+    #[test]
+    fn operator_not_in_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_not_in() AS $$
+        BEGIN
+            FOR r IN (SELECT * FROM t1 WHERE col NOT IN (SELECT col FROM t2)) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "NOT_IN")
+            .collect();
+        assert!(
+            !edges.is_empty(),
+            "expected NOT_IN operator to be extracted"
+        );
+        assert_eq!(edges[0].builtin_meta.as_ref().unwrap().domain, "Predicate");
+    }
+
+    #[test]
+    fn hint_tablescan_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_hint() AS $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            SELECT /*+ tablescan(t1) */ * INTO r FROM t1;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let hint_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "tablescan")
+            .collect();
+        assert!(
+            !hint_edges.is_empty(),
+            "expected tablescan hint to be extracted"
+        );
+        assert_eq!(
+            hint_edges[0].builtin_meta.as_ref().unwrap().category,
+            "Hint"
+        );
+        assert_eq!(
+            hint_edges[0].builtin_meta.as_ref().unwrap().domain,
+            "QueryPlan"
+        );
+    }
+
+    #[test]
+    fn hint_nestloop_extracted_as_builtin() {
+        let sql = "CREATE OR REPLACE PROCEDURE test_nestloop() AS $$
+        BEGIN
+            FOR r IN (SELECT /*+ nestloop(t1 t2) */ * FROM t1 JOIN t2 ON t1.id = t2.id) LOOP
+                NULL;
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;";
+        let stmts = ogsql_parser::Parser::parse_sql(sql).0;
+        let mut extractor = CallExtractor::new(
+            std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            std::collections::HashSet::new(),
+        );
+        ogsql_parser::walk_statement(&mut extractor, &stmts[0].statement);
+
+        let nestloop_edges: Vec<_> = extractor
+            .edges
+            .iter()
+            .filter(|e| e.builtin_meta.is_some() && e.callee_name == "nestloop")
+            .collect();
+        assert!(
+            !nestloop_edges.is_empty(),
+            "expected nestloop hint to be extracted"
+        );
+        assert_eq!(
+            nestloop_edges[0].builtin_meta.as_ref().unwrap().category,
+            "Hint"
+        );
     }
 }

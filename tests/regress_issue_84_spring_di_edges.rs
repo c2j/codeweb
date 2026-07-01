@@ -131,12 +131,8 @@ fn regress_di_constructor_injection_creates_edge() {
     );
 
     let node_ids = collect_node_ids_by_fqn(&json);
-    let has_di_edge = has_edge_between_classes(
-        &json,
-        &node_ids,
-        "FilmControllerCdi",
-        "FilmService",
-    );
+    let has_di_edge =
+        has_edge_between_classes(&json, &node_ids, "FilmControllerCdi", "FilmService");
     assert!(
         has_di_edge,
         "Issue #84: expected edge from FilmControllerCdi to FilmService (constructor DI). \
@@ -162,12 +158,8 @@ fn regress_di_field_injection_creates_edge() {
     );
 
     let node_ids = collect_node_ids_by_fqn(&json);
-    let has_di_edge = has_edge_between_classes(
-        &json,
-        &node_ids,
-        "FilmControllerFdi",
-        "FilmService",
-    );
+    let has_di_edge =
+        has_edge_between_classes(&json, &node_ids, "FilmControllerFdi", "FilmService");
     assert!(
         has_di_edge,
         "Issue #84: expected edge from FilmControllerFdi to FilmService (field DI). \
@@ -194,12 +186,8 @@ public class PlainController {
     ]);
 
     let node_ids = collect_node_ids_by_fqn(&json);
-    let has_call_edge = has_edge_between_classes(
-        &json,
-        &node_ids,
-        "PlainController",
-        "PlainController",
-    );
+    let has_call_edge =
+        has_edge_between_classes(&json, &node_ids, "PlainController", "PlainController");
     assert!(
         has_call_edge,
         "Baseline: PlainController.work() directly calls helper() \
