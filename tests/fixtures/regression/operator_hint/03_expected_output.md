@@ -1,0 +1,231 @@
+-- ============================================================
+-- Operator + Hint Tracking - 预期输出参考
+-- 
+-- 本文件模拟实现完成后的回归测试预期行为。
+-- 输出格式完全复用 BuiltinFunction 节点的现有格式。
+-- ============================================================
+
+-- ============================================================
+-- 1. 图节点 (JSON 导出格式)
+-- ============================================================
+-- 
+-- 预期在 `codeweb export --format json` 中出现以下节点:
+
+-- 1.1 Operator 节点 (category="Operator")
+-- {
+--   "id": "node_01",
+--   "tag": "builtin",
+--   "name": "ANY",
+--   "category": "Operator",
+--   "domain": "Comparison",
+--   "file": "01_operators.sql",
+--   "line": 8
+-- }
+-- {
+--   "id": "node_02",
+--   "tag": "builtin",
+--   "name": "ALL",
+--   "category": "Operator",
+--   "domain": "Comparison",
+--   "file": "01_operators.sql",
+--   "line": 19
+-- }
+-- {
+--   "id": "node_03",
+--   "tag": "builtin",
+--   "name": "EXISTS",
+--   "category": "Operator",
+--   "domain": "Predicate",
+--   "file": "01_operators.sql",
+--   "line": 30
+-- }
+-- {
+--   "id": "node_04",
+--   "tag": "builtin",
+--   "name": "IN",
+--   "category": "Operator",
+--   "domain": "Predicate",
+--   "file": "01_operators.sql",
+--   "line": 43
+-- }
+-- {
+--   "id": "node_05",
+--   "tag": "builtin",
+--   "name": "NOT_IN",
+--   "category": "Operator",
+--   "domain": "Predicate",
+--   "file": "01_operators.sql",
+--   "line": 56
+-- }
+-- {
+--   "id": "node_06",
+--   "tag": "builtin",
+--   "name": "SOME",
+--   "category": "Operator",
+--   "domain": "Comparison",
+--   "file": "01_operators.sql",
+--   "line": 67
+-- }
+
+-- 1.2 Hint 节点 (category="Hint")
+-- {
+--   "id": "node_h1",
+--   "tag": "builtin",
+--   "name": "tablescan",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 8
+-- }
+-- {
+--   "id": "node_h2",
+--   "tag": "builtin",
+--   "name": "hashjoin",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 18
+-- }
+-- {
+--   "id": "node_h3",
+--   "tag": "builtin",
+--   "name": "leading",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 26
+-- }
+-- {
+--   "id": "node_h4",
+--   "tag": "builtin",
+--   "name": "expand_sublink",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 36
+-- }
+-- {
+--   "id": "node_h5",
+--   "tag": "builtin",
+--   "name": "blockname",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 46
+-- }
+-- {
+--   "id": "node_h6",
+--   "tag": "builtin",
+--   "name": "nestloop",
+--   "category": "Hint",
+--   "domain": "QueryPlan",
+--   "file": "02_hints.sql",
+--   "line": 46
+-- }
+
+-- ============================================================
+-- 2. 边 (UsesBuiltinFunction)
+-- ============================================================
+-- 
+-- 预期出现以下 UsesBuiltinFunction 边:
+--
+-- proc_use_any      → ANY       (UsesBuiltinFunction)
+-- proc_use_all      → ALL       (UsesBuiltinFunction)
+-- proc_use_exists   → EXISTS    (UsesBuiltinFunction)
+-- proc_use_in       → IN        (UsesBuiltinFunction)
+-- proc_use_not_in   → NOT_IN    (UsesBuiltinFunction)
+-- proc_use_some     → SOME      (UsesBuiltinFunction)
+-- proc_mixed_ops    → ANY       (UsesBuiltinFunction)
+-- proc_mixed_ops    → EXISTS    (UsesBuiltinFunction)
+-- proc_mixed_ops    → IN        (UsesBuiltinFunction)
+-- proc_hint_tablescan → tablescan  (UsesBuiltinFunction)
+-- proc_hint_hashjoin  → hashjoin   (UsesBuiltinFunction)
+-- proc_hint_multi     → tablescan  (UsesBuiltinFunction)
+-- proc_hint_multi     → hashjoin   (UsesBuiltinFunction)
+-- proc_hint_multi     → leading    (UsesBuiltinFunction)
+-- proc_hint_rewrite   → expand_sublink (UsesBuiltinFunction)
+-- proc_hint_with_args → blockname  (UsesBuiltinFunction)
+-- proc_hint_with_args → nestloop   (UsesBuiltinFunction)
+
+-- ============================================================
+-- 3. codeweb nodes -t builtin (预期输出)
+-- ============================================================
+-- 
+-- $ codeweb nodes -t builtin
+-- 
+-- TAG      NAME             CATEGORY   DOMAIN       CALLERS
+-- builtin  ANY              Operator   Comparison   2
+-- builtin  ALL              Operator   Comparison   1
+-- builtin  SOME             Operator   Comparison   1
+-- builtin  EXISTS           Operator   Predicate    2
+-- builtin  IN               Operator   Predicate    2
+-- builtin  NOT_IN           Operator   Predicate    1
+-- builtin  tablescan        Hint       QueryPlan    2        0
+-- builtin  hashjoin         Hint       QueryPlan    2        0
+-- builtin  leading          Hint       QueryPlan    1        0
+-- builtin  expand_sublink   Hint       QueryPlan    1        0
+-- builtin  blockname        Hint       QueryPlan    1        0
+-- builtin  nestloop         Hint       QueryPlan    1        0
+-- ... (其他已有 builtin 如 COUNT, SUBSTR 等)
+
+-- ============================================================
+-- 4. codeweb detail "any" (预期输出)
+-- ============================================================
+-- 
+-- $ codeweb detail "any"
+-- 
+-- Node: ANY
+-- Tag: builtin
+-- Category: Operator
+-- Domain: Comparison
+-- 
+-- Callers (3):
+--   proc_use_any    (01_operators.sql:8)     [builtin]
+--   proc_mixed_ops  (01_operators.sql:72)    [builtin]
+--   (cross-path callers from mapper/Java/JSP if any)
+
+-- ============================================================
+-- 5. codeweb detail "proc_mixed_ops" (预期输出，含 --builtfunc)
+-- ============================================================
+-- 
+-- $ codeweb detail proc_mixed_ops --builtfunc
+-- 
+-- Node: proc_mixed_ops
+-- Tag: proc
+-- 
+-- Callees:
+--   ANY     (builtin)   [builtin]
+--   EXISTS  (builtin)   [builtin]
+--   IN      (builtin)   [builtin]
+--   (其他存储过程调用...)
+
+-- $ codeweb detail proc_mixed_ops
+-- (默认隐藏 builtin，和现有 BuiltinFunction 行为一致)
+
+-- ============================================================
+-- 6. codeweb trace-sql "ANY" (预期行为)
+-- ============================================================
+-- 
+-- SQL fragment 搜索不适用于 operator/hint 查询，因为它们是 AST 节点而非 SQL 文本。
+-- 用户应使用 `codeweb detail <name>` 或 `codeweb nodes -t builtin` 查询。
+
+-- ============================================================
+-- 7. 去重验证
+-- ============================================================
+-- 
+-- 同一 operator/hint 名称在 SQL-proc、XML-mapper、Java、JSP 中多次引用时，
+-- 合并为单个 BuiltinFunction 节点（和现有 builtin_index 行为一致）。
+-- SOME 和 ANY 是独立节点，不去重。
+
+-- ============================================================
+-- 8. 和现有 BuiltinFunction 的区别
+-- ============================================================
+-- 
+-- 节点格式完全相同，仅通过 category 区分：
+--   category = "Scalar"  | "Aggregate" | ... → 现有内置函数
+--   category = "Operator"                       → SQL 操作符 (本次新增)
+--   category = "Hint"                           → 优化器 hint (本次新增)
+-- 
+-- 可通过 category 过滤：
+--   codeweb nodes -t builtin --filter "category=Operator"
+--   codeweb nodes -t builtin --filter "category=Hint"
