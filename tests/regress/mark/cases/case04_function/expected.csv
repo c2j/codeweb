@@ -1,6 +1,6 @@
 unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
 sql_020,"SELECT calc_tax(100) FROM dual",direct,func:calc_tax
-sql_021,"SELECT calc_total(1) FROM dual",indirect,func:calc_total
-sql_022,"CALL generate_invoice(1)",indirect,proc:generate_invoice
-sql_023,"CALL batch_invoice()",indirect,proc:batch_invoice
+sql_021,"SELECT calc_total(1) FROM dual",indirect,func:calc_total → func:calc_tax
+sql_022,"CALL generate_invoice(1)",indirect,proc:generate_invoice → func:calc_total → func:calc_tax
+sql_023,"CALL batch_invoice()",indirect,proc:batch_invoice → proc:generate_invoice → func:calc_total → func:calc_tax
 sql_024,"SELECT * FROM orders","",""

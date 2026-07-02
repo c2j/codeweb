@@ -1,6 +1,6 @@
 Unique SQL Id,SQL Text,codeweb_match,codeweb_matched_by
 sql_030,"SELECT * FROM ORDERS WHERE ID = 1",direct,table:orders
 sql_031,"select * from orders where id = 1",direct,table:orders
-sql_032,"CALL UPDATE_ORDERS()",indirect,proc:update_orders
-sql_033,"call update_orders()",indirect,proc:update_orders
+sql_032,"CALL UPDATE_ORDERS()",indirect,proc:update_orders → table:orders
+sql_033,"call update_orders()",indirect,proc:update_orders → table:orders
 sql_034,"SELECT * FROM Orders WHERE Id = 1",direct,table:orders

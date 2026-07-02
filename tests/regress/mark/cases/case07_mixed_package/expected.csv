@@ -1,6 +1,6 @@
 unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
 sql_050,"SELECT * FROM orders WHERE region = 'EAST'",direct,table:orders
-sql_051,"CALL pkg_order.process_order(100)",indirect,proc:pkg_order.process_order
-sql_052,"CALL pkg_order.cancel_order(200)",indirect,proc:pkg_order.cancel_order
-sql_053,"CALL pkg_report.generate_report('WEST')",indirect,proc:pkg_report.generate_report
-sql_054,"CALL finance.calc_revenue()",indirect,proc:finance.calc_revenue
+sql_051,"CALL pkg_order.process_order(100)",indirect,proc:pkg_order.process_order → table:orders
+sql_052,"CALL pkg_order.cancel_order(200)",indirect,proc:pkg_order.cancel_order → table:orders
+sql_053,"CALL pkg_report.generate_report('WEST')",indirect,proc:pkg_report.generate_report → table:orders | proc:pkg_report.generate_report → proc:pkg_order.process_order → table:orders
+sql_054,"CALL finance.calc_revenue()",indirect,proc:finance.calc_revenue → table:orders

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use petgraph::graph::NodeIndex;
@@ -9,22 +9,90 @@ use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
 use crate::graph::Node;
 
-/// Build the incoming transitive closure of `target` — all upstream nodes reachable
-/// via Incoming edges (callers, TableAccess sources, etc.), including `target` itself.
-pub fn build_callers_set(store: &GraphStore, target: NodeIndex) -> HashSet<NodeIndex> {
+/// Build the incoming transitive closure of `target` and record ALL parent relationships
+/// for path reconstruction. Returns (visited_set, parent_map).
+/// parent[node] = all nodes through which `node` was discovered (one step closer to target).
+pub fn build_callers_set(
+    store: &GraphStore,
+    target: NodeIndex,
+) -> (HashSet<NodeIndex>, HashMap<NodeIndex, Vec<NodeIndex>>) {
     let graph = store.graph();
     let mut visited = HashSet::new();
+    let mut parent: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
     let mut frontier = vec![target];
     visited.insert(target);
 
     while let Some(node) = frontier.pop() {
         for neighbor in graph.neighbors_directed(node, Direction::Incoming) {
+            parent.entry(neighbor).or_default().push(node);
             if visited.insert(neighbor) {
                 frontier.push(neighbor);
             }
         }
     }
-    visited
+    (visited, parent)
+}
+
+/// Reconstruct all caller paths from `caller_idx` back to `target_idx` using parent map.
+/// Returns paths joined by " | ", e.g. "proc:A → table:T | proc:A → proc:B → table:T".
+fn build_all_caller_paths(
+    caller_idx: NodeIndex,
+    target_idx: NodeIndex,
+    parent: &HashMap<NodeIndex, Vec<NodeIndex>>,
+    store: &GraphStore,
+) -> String {
+    let graph = store.graph();
+    let mut all_paths: Vec<String> = Vec::new();
+    let mut current_path: Vec<String> = vec![NodeKey::from_node(&graph[caller_idx]).to_string()];
+    let mut visited_in_path: HashSet<NodeIndex> = HashSet::new();
+    visited_in_path.insert(caller_idx);
+
+    backtrack_paths(
+        caller_idx,
+        target_idx,
+        parent,
+        graph,
+        &mut current_path,
+        &mut visited_in_path,
+        &mut all_paths,
+    );
+
+    if all_paths.is_empty() {
+        // No parent chain found — just the caller itself
+        return current_path[0].clone();
+    }
+    all_paths.join(" | ")
+}
+
+fn backtrack_paths(
+    current: NodeIndex,
+    target: NodeIndex,
+    parent: &HashMap<NodeIndex, Vec<NodeIndex>>,
+    graph: &crate::graph::CodeGraph,
+    current_path: &mut Vec<String>,
+    visited_in_path: &mut HashSet<NodeIndex>,
+    all_paths: &mut Vec<String>,
+) {
+    if current == target {
+        // Reached target — record a reversed copy of the path
+        let path_str = current_path.join(" → ");
+        all_paths.push(path_str);
+        return;
+    }
+
+    if let Some(parents) = parent.get(&current) {
+        for &p in parents {
+            if visited_in_path.contains(&p) {
+                continue; // cycle guard
+            }
+            let node_key = NodeKey::from_node(&graph[p]).to_string();
+            current_path.push(node_key);
+            visited_in_path.insert(p);
+            backtrack_paths(p, target, parent, graph, current_path, visited_in_path, all_paths);
+            visited_in_path.remove(&p);
+            current_path.pop();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,23 +129,28 @@ pub fn classify_row(
     target_idx: NodeIndex,
     target_node: &Node,
     callers: &HashSet<NodeIndex>,
+    parent: &HashMap<NodeIndex, Vec<NodeIndex>>,
     store: &GraphStore,
 ) -> MatchResult {
     // --- Direct match ---
     match target_node {
         Node::Table { name, .. } | Node::View { name, .. } => {
             if contains_table_name(sql_text, name) {
+                let path =
+                    build_all_caller_paths(target_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Direct,
-                    matched_by: Some(NodeKey::from_node(target_node).to_string()),
+                    matched_by: Some(path),
                 };
             }
         }
         Node::Procedure { id, .. } | Node::Function { id, .. } => {
             if contains_routine_call(sql_text, &id.name) {
+                let path =
+                    build_all_caller_paths(target_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Direct,
-                    matched_by: Some(NodeKey::from_node(target_node).to_string()),
+                    matched_by: Some(path),
                 };
             }
         }
@@ -92,22 +165,26 @@ pub fn classify_row(
         }
         let caller_node = &graph[caller_idx];
 
-        // 1) Name match: CSV SQL text contains a CALL/EXECUTE to this caller routine
+        // 1) Name match
         if let Some(routine_name) = try_extract_routine_name(caller_node) {
             if contains_routine_call(sql_text, routine_name) {
+                let path =
+                    build_all_caller_paths(caller_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Indirect,
-                    matched_by: Some(NodeKey::from_node(caller_node).to_string()),
+                    matched_by: Some(path),
                 };
             }
         }
 
-        // 2) Fingerprint match: CSV SQL text matches caller's body_sql
+        // 2) Fingerprint match
         if let Some(body_sql) = try_extract_body_sql(caller_node) {
             if sql_text_fingerprint_matches(sql_text, body_sql) {
+                let path =
+                    build_all_caller_paths(caller_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Indirect,
-                    matched_by: Some(NodeKey::from_node(caller_node).to_string()),
+                    matched_by: Some(path),
                 };
             }
         }
@@ -281,8 +358,8 @@ pub fn process_mark(
         Some((*idx, store.graph()[*idx].clone()))
     };
 
-    // 2) Build callers set (only if target resolved)
-    let callers = target_info
+    // 2) Build callers set and parent map (only if target resolved)
+    let (callers, parent) = target_info
         .as_ref()
         .map(|(idx, _)| build_callers_set(store, *idx))
         .unwrap_or_default();
@@ -339,7 +416,7 @@ pub fn process_mark(
             .unwrap_or("");
 
         let result = if let Some((target_idx, ref target_node)) = target_info {
-            classify_row(sql_text, target_idx, target_node, &callers, store)
+            classify_row(sql_text, target_idx, target_node, &callers, &parent, store)
         } else {
             MatchResult {
                 match_type: MatchType::None,
