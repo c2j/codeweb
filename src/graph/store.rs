@@ -200,6 +200,7 @@ impl GraphStore {
                     sql: Some(sql_text),
                     class_name,
                     method_name,
+                    line,
                     ..
                 } => {
                     let fp = sql_match::sql_fingerprint(sql_text);
@@ -209,7 +210,7 @@ impl GraphStore {
                         (None, Some(m)) => m.clone(),
                         (None, None) => "?".to_string(),
                     };
-                    let display_key = format!("javasql:{}", ctx);
+                    let display_key = format!("javasql:{}:{}", ctx, line);
                     sql_fingerprint_index
                         .entry(fp)
                         .or_default()
@@ -398,6 +399,7 @@ impl GraphStore {
                     sql: Some(sql_text),
                     class_name,
                     method_name,
+                    line,
                     ..
                 } => {
                     let fp = sql_match::sql_fingerprint(sql_text);
@@ -407,7 +409,7 @@ impl GraphStore {
                         (None, Some(m)) => m.clone(),
                         (None, None) => "?".to_string(),
                     };
-                    let display_key = format!("javasql:{}", ctx);
+                    let display_key = format!("javasql:{}:{}", ctx, line);
                     self.sql_fingerprint_index
                         .entry(fp)
                         .or_default()
@@ -574,6 +576,7 @@ impl GraphStore {
                     sql: Some(sql_text),
                     class_name,
                     method_name,
+                    line,
                     ..
                 } if prepared.matches(sql_text) => {
                     let ctx = match (class_name, method_name) {
@@ -583,7 +586,7 @@ impl GraphStore {
                         (None, None) => "?".to_string(),
                     };
                     let score = prepared.score(sql_text);
-                    results.push((idx, format!("javasql:{}", ctx), score));
+                    results.push((idx, format!("javasql:{}:{}", ctx, line), score));
                 }
                 Node::Procedure { id, body_sql, .. } => {
                     let mut best: Option<f64> = None;
@@ -645,11 +648,23 @@ impl GraphStore {
         // display key — the same format used by search_by_sql().
         //
         // This bridges the gap between search results (which show
-        // "javasql:ClassName.method") and CLI commands like detail/trace
+        // "javasql:ClassName.method:line") and CLI commands like detail/trace
         // (which use search_nodes() for lookup).
         if let Some(stripped) = lower.strip_prefix("javasql:") {
             let semantic_query = stripped.trim();
-            if !semantic_query.is_empty() {
+            // Strip trailing :line for semantic matching, but keep it for
+            // disambiguation when multiple nodes share the same class+method.
+            let line_filter: Option<usize> = semantic_query
+                .rsplit_once(':')
+                .and_then(|(_, line_str)| line_str.parse::<usize>().ok());
+            let class_method_query = match line_filter {
+                Some(_) => semantic_query
+                    .rsplit_once(':')
+                    .map(|(prefix, _)| prefix)
+                    .unwrap_or(semantic_query),
+                None => semantic_query,
+            };
+            if !class_method_query.is_empty() {
                 for idx in self.nodes_by_type("sql") {
                     if results.iter().any(|(i, _, _)| i == idx) {
                         continue;
@@ -673,7 +688,7 @@ impl GraphStore {
                         _ => None,
                     };
                     if let Some(candidate) = semantic_candidate {
-                        if let Some(rank) = MatchRank::classify(semantic_query, &candidate) {
+                        if let Some(rank) = MatchRank::classify(class_method_query, &candidate) {
                             let display = crate::graph::key::NodeKey::from_node(&self.graph[*idx])
                                 .to_string();
                             results.push((*idx, display, rank));
@@ -1031,6 +1046,7 @@ impl GraphStore {
                     sql: Some(sql_text),
                     class_name,
                     method_name,
+                    line,
                     ..
                 } => {
                     let fp = sql_match::sql_fingerprint(sql_text);
@@ -1040,7 +1056,7 @@ impl GraphStore {
                         (None, Some(m)) => m.clone(),
                         (None, None) => "?".to_string(),
                     };
-                    let display_key = format!("javasql:{}", ctx);
+                    let display_key = format!("javasql:{}:{}", ctx, line);
                     self.sql_fingerprint_index
                         .entry(fp)
                         .or_default()
