@@ -1,0 +1,7 @@
+unique_sql_id,sql_text
+sql_060,SELECT * FROM accounts
+sql_061,SELECT * FROM inventory
+sql_062,SELECT * FROM accounts JOIN inventory ON 1=1
+sql_063,CALL audit_accounts()
+sql_064,CALL check_inventory()
+sql_065,SELECT * FROM dual

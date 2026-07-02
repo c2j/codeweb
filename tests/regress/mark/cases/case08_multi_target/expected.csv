@@ -1,0 +1,7 @@
+unique_sql_id,sql_text,codeweb_match_accounts,codeweb_matched_by_accounts,codeweb_match_inventory,codeweb_matched_by_inventory
+sql_060,"SELECT * FROM accounts","direct to accounts",table:accounts,"",""
+sql_061,"SELECT * FROM inventory","","","direct to inventory",table:inventory
+sql_062,"SELECT * FROM accounts JOIN inventory ON 1=1","direct to accounts",table:accounts,"direct to inventory",table:inventory
+sql_063,"CALL audit_accounts()","indirect to accounts",proc:audit_accounts → table:accounts,"",""
+sql_064,"CALL check_inventory()","","","indirect to inventory",proc:check_inventory → table:inventory
+sql_065,"SELECT * FROM dual","","","",""

@@ -1,6 +1,6 @@
-unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
-sql_005,"CALL proc_c()",direct,proc:proc_c
-sql_006,"CALL proc_b()",indirect,proc:proc_b → proc:proc_c
-sql_007,"CALL proc_a()",indirect,proc:proc_a → proc:proc_b → proc:proc_c
-sql_008,"CALL unrelated_proc()","",""
-sql_009,"SELECT * FROM dual","",""
+unique_sql_id,sql_text,codeweb_match_proc_c,codeweb_matched_by_proc_c
+sql_005,"CALL proc_c()","direct to proc_c",proc:proc_c
+sql_006,"CALL proc_b()","indirect to proc_c",proc:proc_b → proc:proc_c
+sql_007,"CALL proc_a()","indirect to proc_c",proc:proc_a → proc:proc_b → proc:proc_c
+sql_008,"CALL unrelated_proc()",,
+sql_009,"SELECT * FROM dual",,

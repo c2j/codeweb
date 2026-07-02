@@ -386,9 +386,9 @@ enum Commands {
 
     /// Mark WDR SQL detail CSV rows by relation to a target graph node
     Mark {
-        /// Target node name (table, procedure, or function)
-        #[arg(short, long)]
-        node: String,
+        /// Target node name(s) — can specify multiple (table, procedure, or function)
+        #[arg(short, long, num_args = 1..)]
+        node: Vec<String>,
 
         /// Input CSV file from WDR SQL detail report
         #[arg(short, long)]

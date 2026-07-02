@@ -109,10 +109,10 @@ pub struct MatchResult {
 }
 
 impl MatchResult {
-    pub fn csv_values(&self) -> (String, String) {
+    pub fn csv_values(&self, target_name: &str) -> (String, String) {
         let match_str = match self.match_type {
-            MatchType::Direct => "direct".to_string(),
-            MatchType::Indirect => "indirect".to_string(),
+            MatchType::Direct => format!("direct to {}", target_name),
+            MatchType::Indirect => format!("indirect to {}", target_name),
             MatchType::None => String::new(),
         };
         let by_str = self.matched_by.clone().unwrap_or_default();
@@ -330,41 +330,65 @@ fn normalize_header(h: &str) -> String {
         .join(" ")
 }
 
-/// Entry point: read CSV, classify each row, write annotated CSV.
+/// Pre-resolved target with its callers set and parent map.
+struct TargetContext {
+    name: String,          // the --node argument as typed by user
+    node_idx: NodeIndex,
+    node: Node,
+    callers: HashSet<NodeIndex>,
+    parent: HashMap<NodeIndex, Vec<NodeIndex>>,
+}
+
+/// Entry point: read CSV, classify each row against all targets, write annotated CSV.
 pub fn process_mark(
     store: &GraphStore,
-    node_name: &str,
+    node_names: &[String],
     csv_path: &Path,
     output_path: Option<&Path>,
 ) -> Result<()> {
-    // 1) Resolve target node
-    let matches = store.search_nodes(node_name);
-    let target_info: Option<(NodeIndex, Node)> = if matches.is_empty() {
-        eprintln!("No nodes matching '{}'", node_name);
-        eprintln!(
-            "Try `codeweb nodes -s {}` to find available nodes.",
-            node_name
-        );
-        None
-    } else {
-        if matches.len() > 1 {
-            eprintln!("Multiple nodes match '{}':", node_name);
-            for (i, (_, name)) in matches.iter().enumerate() {
-                eprintln!("  {}: {}", i + 1, name);
+    // 1) Resolve all targets. Unresolved targets still get columns (with empty results).
+    let targets: Vec<TargetContext> = node_names
+        .iter()
+        .map(|name| {
+            let matches = store.search_nodes(name);
+            if matches.is_empty() {
+                eprintln!("No nodes matching '{}'", name);
+                eprintln!(
+                    "Try `codeweb nodes -s {}` to find available nodes.",
+                    name
+                );
+                TargetContext {
+                    name: name.clone(),
+                    node_idx: NodeIndex::end(), // dummy, never used
+                    node: Node::Unresolved {
+                        raw_expr: Box::new(String::new()),
+                        context: Box::new(String::new()),
+                    },
+                    callers: HashSet::new(),
+                    parent: HashMap::new(),
+                }
+            } else {
+                if matches.len() > 1 {
+                    eprintln!("Multiple nodes match '{}':", name);
+                    for (i, (_, n)) in matches.iter().enumerate() {
+                        eprintln!("  {}: {}", i + 1, n);
+                    }
+                    eprintln!("Using first match: {}", matches[0].1);
+                }
+                let (idx, _) = &matches[0];
+                let (callers, parent) = build_callers_set(store, *idx);
+                TargetContext {
+                    name: name.clone(),
+                    node_idx: *idx,
+                    node: store.graph()[*idx].clone(),
+                    callers,
+                    parent,
+                }
             }
-            eprintln!("Using first match: {}", matches[0].1);
-        }
-        let (idx, _) = &matches[0];
-        Some((*idx, store.graph()[*idx].clone()))
-    };
+        })
+        .collect();
 
-    // 2) Build callers set and parent map (only if target resolved)
-    let (callers, parent) = target_info
-        .as_ref()
-        .map(|(idx, _)| build_callers_set(store, *idx))
-        .unwrap_or_default();
-
-    // 3) Read CSV
+    // 2) Read CSV
     let csv_content =
         std::fs::read_to_string(csv_path).map_err(|e| crate::error::CodeWebError::FileRead {
             path: csv_path.to_path_buf(),
@@ -400,8 +424,9 @@ pub fn process_mark(
         });
     }
 
-    // 4) Classify each row
-    let mut output_rows: Vec<(Vec<String>, MatchResult)> = Vec::new();
+    // 3) Classify each row against all targets
+    // Each row produces ONE output row. Per-target results go into target-specific columns.
+    let mut output_rows: Vec<(Vec<String>, Vec<Option<MatchResult>>)> = Vec::new();
     for record in reader.records() {
         let record = record.map_err(|e| crate::error::CodeWebError::ExportError {
             message: format!("CSV parse error: {}", e),
@@ -415,18 +440,24 @@ pub fn process_mark(
             .map(|(v, _)| v.as_str())
             .unwrap_or("");
 
-        let result = if let Some((target_idx, ref target_node)) = target_info {
-            classify_row(sql_text, target_idx, target_node, &callers, &parent, store)
-        } else {
-            MatchResult {
-                match_type: MatchType::None,
-                matched_by: None,
-            }
-        };
-        output_rows.push((fields, result));
+        let results: Vec<Option<MatchResult>> = targets
+            .iter()
+            .map(|t| {
+                let mr = classify_row(
+                    sql_text, t.node_idx, &t.node, &t.callers, &t.parent, store,
+                );
+                if mr.match_type == MatchType::None {
+                    None
+                } else {
+                    Some(mr)
+                }
+            })
+            .collect();
+
+        output_rows.push((fields, results));
     }
 
-    // 5) Write output
+    // 4) Write output
     let writer: Box<dyn std::io::Write> = if let Some(out_path) = output_path {
         let file =
             std::fs::File::create(out_path).map_err(|e| crate::error::CodeWebError::FileRead {
@@ -439,23 +470,29 @@ pub fn process_mark(
     };
     let mut wtr = csv::WriterBuilder::new().from_writer(writer);
 
-    // Write header
+    // Header: original + per-target columns
     let mut out_headers = headers.clone();
-    out_headers.extend_from_slice(&[
-        "codeweb_match".to_string(),
-        "codeweb_matched_by".to_string(),
-    ]);
+    for t in &targets {
+        out_headers.push(format!("codeweb_match_{}", t.name));
+        out_headers.push(format!("codeweb_matched_by_{}", t.name));
+    }
     wtr.write_record(&out_headers)
         .map_err(|e| crate::error::CodeWebError::ExportError {
             message: format!("CSV write error: {}", e),
         })?;
 
-    // Write rows
-    for (fields, result) in &output_rows {
-        let (match_str, by_str) = result.csv_values();
+    // Rows
+    for (fields, results) in &output_rows {
         let mut row = fields.clone();
-        row.push(match_str);
-        row.push(by_str);
+        for (i, result) in results.iter().enumerate() {
+            let t = &targets[i];
+            let (match_str, by_str) = match result {
+                Some(mr) => mr.csv_values(&t.name),
+                None => (String::new(), String::new()),
+            };
+            row.push(match_str);
+            row.push(by_str);
+        }
         wtr.write_record(&row)
             .map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("CSV write error: {}", e),

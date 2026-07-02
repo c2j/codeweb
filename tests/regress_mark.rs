@@ -34,6 +34,10 @@ const CASE07_SQL: &str = include_str!("regress/mark/cases/case07_mixed_package/s
 const CASE07_INPUT: &str = include_str!("regress/mark/cases/case07_mixed_package/input.csv");
 const CASE07_EXPECTED: &str = include_str!("regress/mark/cases/case07_mixed_package/expected.csv");
 
+const CASE08_SQL: &str = include_str!("regress/mark/cases/case08_multi_target/schema.sql");
+const CASE08_INPUT: &str = include_str!("regress/mark/cases/case08_multi_target/input.csv");
+const CASE08_EXPECTED: &str = include_str!("regress/mark/cases/case08_multi_target/expected.csv");
+
 // ── helpers ──
 
 fn codeweb_bin() -> PathBuf {
@@ -75,13 +79,13 @@ fn init_project(dir: &TempDir, sql: &str, csv_input: Option<&str>) {
     );
 }
 
-fn run_mark(dir: &TempDir, node: &str, csv_file: &str) -> String {
-    let output = run_in_dir(
-        dir,
-        &[
-            "mark", "--node", node, "--csv", csv_file, "--output", "out.csv",
-        ],
-    );
+fn run_mark(dir: &TempDir, nodes: &[&str], csv_file: &str) -> String {
+    let mut args = vec!["mark", "--csv", csv_file, "--output", "out.csv"];
+    for node in nodes {
+        args.push("--node");
+        args.push(node);
+    }
+    let output = run_in_dir(dir, &args);
     assert!(
         output.status.success(),
         "mark failed: {}",
@@ -133,7 +137,7 @@ fn regress_mark_case01_simple_table() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE01_SQL, Some(CASE01_INPUT));
 
-    let actual = run_mark(&dir, "orders", "input.csv");
+    let actual = run_mark(&dir, &["orders"], "input.csv");
     assert_csv_eq(&actual, CASE01_EXPECTED, "case01");
 }
 
@@ -142,7 +146,7 @@ fn regress_mark_case02_proc_chain() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE02_SQL, Some(CASE02_INPUT));
 
-    let actual = run_mark(&dir, "proc_c", "input.csv");
+    let actual = run_mark(&dir, &["proc_c"], "input.csv");
     assert_csv_eq(&actual, CASE02_EXPECTED, "case02");
 }
 
@@ -151,7 +155,7 @@ fn regress_mark_case03_table_deep_chain() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE03_SQL, Some(CASE03_INPUT));
 
-    let actual = run_mark(&dir, "accounts", "input.csv");
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
     assert_csv_eq(&actual, CASE03_EXPECTED, "case03");
 }
 
@@ -160,7 +164,7 @@ fn regress_mark_case04_function() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE04_SQL, Some(CASE04_INPUT));
 
-    let actual = run_mark(&dir, "calc_tax", "input.csv");
+    let actual = run_mark(&dir, &["calc_tax"], "input.csv");
     assert_csv_eq(&actual, CASE04_EXPECTED, "case04");
 }
 
@@ -169,7 +173,7 @@ fn regress_mark_case05_case_insensitivity() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE05_SQL, Some(CASE05_INPUT));
 
-    let actual = run_mark(&dir, "orders", "input.csv");
+    let actual = run_mark(&dir, &["orders"], "input.csv");
     assert_csv_eq(&actual, CASE05_EXPECTED, "case05");
 }
 
@@ -179,7 +183,7 @@ fn regress_mark_case06_no_match() {
     init_project(&dir, CASE06_SQL, Some(CASE06_INPUT));
 
     // Target a node that is NOT in the graph
-    let actual = run_mark(&dir, "nonexistent_table", "input.csv");
+    let actual = run_mark(&dir, &["nonexistent_table"], "input.csv");
     assert_csv_eq(&actual, CASE06_EXPECTED, "case06");
 }
 
@@ -188,6 +192,15 @@ fn regress_mark_case07_mixed_package() {
     let dir = TempDir::new().unwrap();
     init_project(&dir, CASE07_SQL, Some(CASE07_INPUT));
 
-    let actual = run_mark(&dir, "orders", "input.csv");
+    let actual = run_mark(&dir, &["orders"], "input.csv");
     assert_csv_eq(&actual, CASE07_EXPECTED, "case07");
+}
+
+#[test]
+fn regress_mark_case08_multi_target() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE08_SQL, Some(CASE08_INPUT));
+
+    let actual = run_mark(&dir, &["accounts", "inventory"], "input.csv");
+    assert_csv_eq(&actual, CASE08_EXPECTED, "case08");
 }

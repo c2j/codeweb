@@ -1,7 +1,7 @@
-unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
-sql_001,"SELECT * FROM orders WHERE id = 1",direct,table:orders
-sql_002,"SELECT * FROM customers WHERE id = 2","",""
-sql_003,"CALL update_orders()",indirect,proc:update_orders → table:orders
-sql_004,"INSERT INTO orders (id, amount, status) VALUES (1, 100, 'new')",direct,table:orders
-sql_005,"CALL get_orders()",indirect,proc:get_orders → table:orders
-sql_006,"SELECT status FROM orders WHERE amount > 50",direct,table:orders
+unique_sql_id,sql_text,codeweb_match_orders,codeweb_matched_by_orders
+sql_001,"SELECT * FROM orders WHERE id = 1","direct to orders",table:orders
+sql_002,"SELECT * FROM customers WHERE id = 2",,
+sql_003,"CALL update_orders()","indirect to orders",proc:update_orders → table:orders
+sql_004,"INSERT INTO orders (id, amount, status) VALUES (1, 100, 'new')","direct to orders",table:orders
+sql_005,"CALL get_orders()","indirect to orders",proc:get_orders → table:orders
+sql_006,"SELECT status FROM orders WHERE amount > 50","direct to orders",table:orders

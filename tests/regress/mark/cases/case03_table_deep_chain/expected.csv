@@ -1,8 +1,8 @@
-unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
-sql_010,"SELECT balance FROM accounts WHERE id = 100",direct,table:accounts
-sql_011,"CALL audit_accounts()",indirect,proc:audit_accounts → table:accounts
-sql_012,"CALL monthly_close()",indirect,proc:monthly_close → proc:audit_accounts → table:accounts
-sql_013,"CALL year_end()",indirect,proc:year_end → proc:monthly_close → proc:audit_accounts → table:accounts
-sql_014,"UPDATE accounts SET balance = 0 WHERE owner = 'CLOSED'",direct,table:accounts
-sql_015,"SELECT * FROM inventory","",""
-sql_016,"SELECT SUM(balance) FROM accounts WHERE owner = 'ACTIVE'",direct,table:accounts
+unique_sql_id,sql_text,codeweb_match_accounts,codeweb_matched_by_accounts
+sql_010,"SELECT balance FROM accounts WHERE id = 100","direct to accounts",table:accounts
+sql_011,"CALL audit_accounts()","indirect to accounts",proc:audit_accounts → table:accounts
+sql_012,"CALL monthly_close()","indirect to accounts",proc:monthly_close → proc:audit_accounts → table:accounts
+sql_013,"CALL year_end()","indirect to accounts",proc:year_end → proc:monthly_close → proc:audit_accounts → table:accounts
+sql_014,"UPDATE accounts SET balance = 0 WHERE owner = 'CLOSED'","direct to accounts",table:accounts
+sql_015,"SELECT * FROM inventory",,
+sql_016,"SELECT SUM(balance) FROM accounts WHERE owner = 'ACTIVE'","direct to accounts",table:accounts
