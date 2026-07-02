@@ -290,6 +290,10 @@ enum Commands {
         /// Open browser automatically after server starts
         #[arg(long)]
         open: bool,
+
+        /// Access log level: info (default) or debug
+        #[arg(long, default_value = "info", value_parser = ["info", "debug"])]
+        log_level: String,
     },
 
     /// Start MCP server for LLM integration (stdio JSON-RPC)
@@ -683,7 +687,8 @@ fn run() -> Result<()> {
             project,
             addr,
             open,
-        }) => server::run(&project, &addr, open),
+            log_level,
+        }) => server::run(&project, &addr, open, &log_level),
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { project }) => mcp::server::run(&project),
         Some(Commands::Trace {
