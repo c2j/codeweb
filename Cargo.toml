@@ -1,6 +1,6 @@
 [package]
 name = "codeweb"
-version = "0.7.30"
+version = "0.7.31"
 edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
 
@@ -46,6 +46,7 @@ schemars = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
+csv = "1"
 indicatif = "0.18.4"
 pathdiff = "0.2.3"
 rust-i18n = "3"

@@ -1,0 +1,6 @@
+unique_sql_id,sql_text
+sql_050,SELECT * FROM orders WHERE region = 'EAST'
+sql_051,CALL pkg_order.process_order(100)
+sql_052,CALL pkg_order.cancel_order(200)
+sql_053,CALL pkg_report.generate_report('WEST')
+sql_054,CALL finance.calc_revenue()

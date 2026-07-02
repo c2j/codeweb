@@ -1,0 +1,4 @@
+unique_sql_id,sql_text,codeweb_match,codeweb_matched_by
+sql_040,"SELECT * FROM products","",""
+sql_041,"CALL list_products()","",""
+sql_042,"SELECT * FROM customers","",""

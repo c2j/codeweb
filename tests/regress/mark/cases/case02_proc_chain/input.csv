@@ -1,0 +1,6 @@
+unique_sql_id,sql_text
+sql_005,CALL proc_c()
+sql_006,CALL proc_b()
+sql_007,CALL proc_a()
+sql_008,CALL unrelated_proc()
+sql_009,SELECT * FROM dual

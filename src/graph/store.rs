@@ -1024,7 +1024,7 @@ fn collapse_operator_spaces(s: &str) -> String {
         .replace("< ", "<")
 }
 
-fn normalize_for_matching(s: &str) -> String {
+pub(crate) fn normalize_for_matching(s: &str) -> String {
     let s = strip_line_comments(s);
     let s = strip_block_comments(&s);
     let s = strip_where_one_equals_one(&s);

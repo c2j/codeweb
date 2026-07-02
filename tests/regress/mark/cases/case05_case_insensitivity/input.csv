@@ -1,0 +1,6 @@
+Unique SQL Id,SQL Text
+sql_030,SELECT * FROM ORDERS WHERE ID = 1
+sql_031,select * from orders where id = 1
+sql_032,CALL UPDATE_ORDERS()
+sql_033,call update_orders()
+sql_034,SELECT * FROM Orders WHERE Id = 1

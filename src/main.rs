@@ -8,6 +8,7 @@ mod export;
 mod graph;
 #[allow(dead_code)]
 mod import;
+mod mark;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod parse_log;
@@ -383,6 +384,25 @@ enum Commands {
         project: PathBuf,
     },
 
+    /// Mark WDR SQL detail CSV rows by relation to a target graph node
+    Mark {
+        /// Target node name (table, procedure, or function)
+        #[arg(short, long)]
+        node: String,
+
+        /// Input CSV file from WDR SQL detail report
+        #[arg(short, long)]
+        csv: PathBuf,
+
+        /// Output CSV file (stdout if omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
     /// Import a CGEF JSON graph file into a standalone GraphStore
     Import {
         /// Path to the CGEF JSON file to import
@@ -696,6 +716,16 @@ fn run() -> Result<()> {
             sort_by.as_deref(),
             &project,
         ),
+        Some(Commands::Mark {
+            node,
+            csv,
+            output,
+            project,
+        }) => {
+            let mut proj = project::Project::find(&project)?;
+            let store = proj.load_store()?;
+            mark::process_mark(store, &node, &csv, output.as_deref())
+        }
         Some(Commands::Detail {
             name,
             project,
