@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::project::Project;
 
-pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
+pub fn run(project_path: &Path, addr: &str, open_browser: bool, log_level: &str) -> Result<()> {
     let pb = indicatif::ProgressBar::new_spinner();
     pb.set_style(
         indicatif::ProgressStyle::default_spinner()
@@ -21,7 +21,11 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
     let mut proj = Project::find(project_path)?;
 
     let codeweb_dir = proj.root().join(".codeweb");
-    access_log::init(&codeweb_dir);
+    let level = match log_level {
+        "debug" => access_log::LogLevel::Debug,
+        _ => access_log::LogLevel::Info,
+    };
+    access_log::init(&codeweb_dir, level);
 
     pb.set_message("Loading graph store...");
     let _ = proj.load_store()?;
@@ -60,11 +64,14 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool) -> Result<()> {
             let _ = open_browser_url(&url);
         }
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| crate::error::CodeWebError::ExportError {
-                message: format!("server error: {}", e),
-            })
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| crate::error::CodeWebError::ExportError {
+            message: format!("server error: {}", e),
+        })
     })
 }
 
