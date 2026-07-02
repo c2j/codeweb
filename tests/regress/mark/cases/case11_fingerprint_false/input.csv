@@ -1,0 +1,5 @@
+unique_sql_id,sql_text
+sql_090,SELECT balance FROM accounts WHERE id = 100
+sql_091,CALL audit_accounts()
+sql_092,"INSERT INTO accounts (id, balance, owner) VALUES (1, 100, 'REPORT')"
+sql_093,"INSERT INTO accounts_backup (id, balance, owner) VALUES (-1, 0, 'AUDIT')"

@@ -1,0 +1,6 @@
+unique_sql_id,sql_text
+sql_080,SELECT calc_total(100) FROM dual
+sql_081,SELECT calc_subtotal(50) FROM dual
+sql_082,"SELECT id, calc_total_amount FROM invoices"
+sql_083,SELECT calc_total FROM daily_summary
+sql_084,SELECT * FROM calc_total_backup

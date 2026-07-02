@@ -3,6 +3,7 @@ use crate::graph::node_type_tag;
 use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
+use crate::sql_match;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
@@ -188,7 +189,7 @@ impl GraphStore {
                     statement_id,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let display_key = format!("mapper:{}.{}", namespace, statement_id);
                     sql_fingerprint_index
                         .entry(fp)
@@ -201,7 +202,7 @@ impl GraphStore {
                     method_name,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let ctx = match (class_name, method_name) {
                         (Some(c), Some(m)) => format!("{}.{}", c, m),
                         (Some(c), None) => c.clone(),
@@ -216,7 +217,7 @@ impl GraphStore {
                 }
                 Node::Procedure { id, body_sql, .. } => {
                     for sql in body_sql {
-                        let fp = sql_fingerprint(&sql.sql_text);
+                        let fp = sql_match::sql_fingerprint(&sql.sql_text);
                         let display_key = format!("proc:{}", id);
                         sql_fingerprint_index
                             .entry(fp)
@@ -226,7 +227,7 @@ impl GraphStore {
                 }
                 Node::Function { id, body_sql, .. } => {
                     for sql in body_sql {
-                        let fp = sql_fingerprint(&sql.sql_text);
+                        let fp = sql_match::sql_fingerprint(&sql.sql_text);
                         let display_key = format!("func:{}", id);
                         sql_fingerprint_index
                             .entry(fp)
@@ -386,7 +387,7 @@ impl GraphStore {
                     statement_id,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let display_key = format!("mapper:{}.{}", namespace, statement_id);
                     self.sql_fingerprint_index
                         .entry(fp)
@@ -399,7 +400,7 @@ impl GraphStore {
                     method_name,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let ctx = match (class_name, method_name) {
                         (Some(c), Some(m)) => format!("{}.{}", c, m),
                         (Some(c), None) => c.clone(),
@@ -523,7 +524,7 @@ impl GraphStore {
                 _ => continue,
             };
             for variant_sql in variant_sqls {
-                let fp = sql_fingerprint(variant_sql);
+                let fp = sql_match::sql_fingerprint(variant_sql);
                 self.sql_fingerprint_index
                     .entry(fp)
                     .or_default()
@@ -537,7 +538,7 @@ impl GraphStore {
     /// Returns Vec of (NodeIndex, display_key, relevance_score) sorted by score descending,
     /// then by node type prefix and display key as tiebreakers.
     pub fn search_by_sql(&self, query: &str) -> Vec<(NodeIndex, String, f64)> {
-        let normalized = normalize_for_matching(&query.to_lowercase());
+        let normalized = sql_match::normalize_for_matching(&query.to_lowercase());
         let fp = blake3::hash(normalized.as_bytes()).to_hex().to_string();
         if let Some(hits) = self.sql_fingerprint_index.get(&fp) {
             if !hits.is_empty() {
@@ -545,12 +546,12 @@ impl GraphStore {
                     .iter()
                     .map(|(idx, key)| (*idx, key.clone(), 1.0))
                     .collect();
-                sort_scored_results(&mut results);
+                sql_match::sort_scored_results(&mut results);
                 return results;
             }
         }
 
-        let prepared = PreparedQuery::new(query);
+        let prepared = sql_match::PreparedQuery::new(query);
         let mut results: Vec<(NodeIndex, String, f64)> = Vec::new();
         for idx in self.graph.node_indices() {
             match &self.graph[idx] {
@@ -611,633 +612,12 @@ impl GraphStore {
                 _ => {}
             }
         }
-        sort_scored_results(&mut results);
+        sql_match::sort_scored_results(&mut results);
         results
     }
 }
 
-/// Returns `Some("?")` for dynamic templates, `Some("table_name")` for concrete,
-/// or `None` if no table reference is found. The caller treats `"?"` as wildcard.
-fn extract_table_name(normalized: &str) -> Option<&str> {
-    if let Some(rest) = normalized.strip_prefix("update ") {
-        if let Some(end) = rest.find(" set ") {
-            let table_part = &rest[..end];
-            return Some(table_part.split_whitespace().next().unwrap_or(""));
-        }
-    }
-    if let Some(rest) = normalized.strip_prefix("delete from ") {
-        let table_part = if let Some(end) = rest.find(" where ") {
-            &rest[..end]
-        } else {
-            rest
-        };
-        return Some(table_part.split_whitespace().next().unwrap_or(""));
-    }
-    if let Some(rest) = normalized.strip_prefix("insert into ") {
-        let table_part = if let Some(end) = rest.find(" values") {
-            &rest[..end]
-        } else if let Some(end) = rest.find('(') {
-            &rest[..end]
-        } else if let Some(end) = rest.find(" select") {
-            &rest[..end]
-        } else {
-            rest
-        };
-        return Some(table_part.split_whitespace().next().unwrap_or(""));
-    }
-    if let Some(rest) = normalized.strip_prefix("merge into ") {
-        if let Some(end) = rest.find(" using ") {
-            let table_part = &rest[..end];
-            return Some(table_part.split_whitespace().next().unwrap_or(""));
-        }
-    }
-    if let Some(pos) = normalized.find(" from ") {
-        let after_from = &normalized[pos + 6..];
-        let table_part = if let Some(end) = after_from.find(" where ") {
-            &after_from[..end]
-        } else if let Some(end) = after_from.find(" group ") {
-            &after_from[..end]
-        } else if let Some(end) = after_from.find(" order ") {
-            &after_from[..end]
-        } else if let Some(end) = after_from.find(" having ") {
-            &after_from[..end]
-        } else if let Some(end) = after_from.find(" limit ") {
-            &after_from[..end]
-        } else if let Some(end) = after_from.find(" union ") {
-            &after_from[..end]
-        } else {
-            after_from
-        };
-        return Some(table_part.split_whitespace().next().unwrap_or(""));
-    }
-    None
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SqlKeyword {
-    Select,
-    Insert,
-    Update,
-    Delete,
-    Merge,
-    With,
-    Other,
-    Empty,
-}
-
-impl SqlKeyword {
-    fn extract(normalized: &str) -> Self {
-        let first_word = normalized
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .next()
-            .unwrap_or("");
-        match first_word {
-            "select" => Self::Select,
-            "insert" => Self::Insert,
-            "update" => Self::Update,
-            "delete" => Self::Delete,
-            "merge" => Self::Merge,
-            "with" => Self::With,
-            "" => Self::Empty,
-            _ => Self::Other,
-        }
-    }
-
-    fn is_compatible(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Select | Self::With, Self::Select | Self::With) => true,
-            (Self::Other | Self::Empty, _) | (_, Self::Other | Self::Empty) => true,
-            _ if self == other => true,
-            _ => false,
-        }
-    }
-}
-
-fn tables_compatible(query_table: &Option<String>, sql_normalized: &str) -> bool {
-    let query_table = match query_table {
-        Some(t) => t.as_str(),
-        None => return true,
-    };
-    if query_table == "?" {
-        return true;
-    }
-    match extract_table_name(sql_normalized) {
-        None | Some("?") => true,
-        Some(sql_table) => sql_table == query_table,
-    }
-}
-
-/// Query normalized and pre-computed once, then reused for every node comparison.
-struct PreparedQuery {
-    normalized: String,
-    has_wildcard: bool,
-    segments: Vec<String>,
-    keyword: SqlKeyword,
-    table: Option<String>,
-}
-
-impl PreparedQuery {
-    fn new(query: &str) -> Self {
-        let lower = query.to_lowercase();
-        let normalized = normalize_for_matching(&lower);
-        let has_wildcard = normalized.contains('?');
-        let segments: Vec<String> = if has_wildcard {
-            normalized
-                .split('?')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let keyword = SqlKeyword::extract(&normalized);
-        let pre_collapse = normalize_for_matching_pre_collapse(&lower);
-        let table = extract_table_name(&pre_collapse).map(String::from);
-        Self {
-            normalized,
-            has_wildcard,
-            segments,
-            keyword,
-            table,
-        }
-    }
-
-    fn matches(&self, sql_text: &str) -> bool {
-        let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
-
-        let sql_kw = SqlKeyword::extract(&sql_lower);
-        if !self.keyword.is_compatible(&sql_kw) {
-            return false;
-        }
-
-        if sql_lower.contains(&self.normalized) {
-            return true;
-        }
-
-        if !tables_compatible(&self.table, &sql_lower) {
-            return false;
-        }
-
-        let sql_has_wc = sql_lower.contains('?');
-
-        if !sql_has_wc && !self.has_wildcard {
-            return false;
-        }
-
-        if self.has_wildcard && find_query_segments_in_sql(&sql_lower, &self.segments) {
-            return true;
-        }
-
-        if sql_has_wc && find_sql_segments_in_query(&sql_lower, &self.normalized, self.has_wildcard)
-        {
-            return true;
-        }
-
-        {
-            let sql_pre_collapse = normalize_for_matching_pre_collapse(&sql_text.to_lowercase());
-            if tables_compatible(&self.table, &sql_pre_collapse)
-                && jaccard_similarity(&self.normalized, &sql_lower) >= 0.8
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Compute a relevance score in [0.0, 1.0] for SQL text against this query.
-    ///
-    /// This always returns a value ≥ 0 even when `matches()` returns false,
-    /// so it should only be called after `matches()` has been confirmed.
-    fn score(&self, sql_text: &str) -> f64 {
-        let sql_norm = normalize_for_matching(&sql_text.to_lowercase());
-        compute_relevance(&self.normalized, &sql_norm, self.keyword, &self.table)
-    }
-}
-
-/// Compute Jaccard similarity between two normalized SQL strings by splitting
-/// on non-word characters and comparing token sets. Returns a value in [0, 1].
-fn jaccard_similarity(a: &str, b: &str) -> f64 {
-    let tokens_a: std::collections::HashSet<&str> = a
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty())
-        .collect();
-    let tokens_b: std::collections::HashSet<&str> = b
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    if tokens_a.is_empty() && tokens_b.is_empty() {
-        return 1.0;
-    }
-
-    let intersection = tokens_a.intersection(&tokens_b).count();
-    let union = tokens_a.union(&tokens_b).count();
-
-    intersection as f64 / union as f64
-}
-
-/// Extract the type prefix from a display_key (e.g. "mapper", "javasql", "proc", "func").
-/// Used as the primary tiebreaker when scores are equal.
-fn extract_type_prefix(display_key: &str) -> &str {
-    display_key.split(':').next().unwrap_or(display_key)
-}
-
-/// Compute a relevance score in [0.0, 1.0] for a SQL match.
-///
-/// Scoring tiers:
-/// - 1.00  Exact match (normalized query == normalized SQL)
-/// - 0.95  Query is a substring of SQL
-/// - 0.85  Jaccard ≥ 0.8 with same DML keyword + same table
-/// - 0.70  Jaccard ≥ 0.8 with different DML keyword or table
-/// - 0.00  No match (caller should have already filtered)
-fn compute_relevance(
-    query_norm: &str,
-    sql_norm: &str,
-    query_kw: SqlKeyword,
-    query_table: &Option<String>,
-) -> f64 {
-    if sql_norm == query_norm {
-        return 1.0;
-    }
-    if sql_norm.contains(query_norm) {
-        return 0.95;
-    }
-
-    let jaccard = jaccard_similarity(query_norm, sql_norm);
-
-    let kw_bonus = if query_kw.is_compatible(&SqlKeyword::extract(sql_norm)) {
-        0.10
-    } else {
-        0.0
-    };
-
-    let table_bonus = if tables_compatible(query_table, sql_norm) {
-        0.05
-    } else {
-        0.0
-    };
-
-    (jaccard * 0.85 + kw_bonus + table_bonus).clamp(0.0, 1.0)
-}
-
-fn sort_scored_results(results: &mut [(NodeIndex, String, f64)]) {
-    results.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| extract_type_prefix(&a.1).cmp(extract_type_prefix(&b.1)))
-            .then_with(|| a.1.cmp(&b.1))
-    });
-}
-
-fn normalize_for_matching_pre_collapse(s: &str) -> String {
-    let s = strip_line_comments(s);
-    let s = strip_block_comments(&s);
-    let s = strip_where_one_equals_one(&s);
-    let s = replace_string_literals(&s);
-    let s = replace_number_literals(&s);
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Collapse consecutive whitespace into single spaces, replace ogsql-parser internal
-/// placeholder markers (`__XML_PARAM_*__`, `__XML_RAW_*__`) with `?`, then remove spaces
-/// around SQL operators, parentheses, and commas so that formatting differences don't
-/// prevent a match (e.g. `user_id = ?` vs `user_id=?`, `TO_CHAR( x , y )` vs `TO_CHAR(x,y)`).
-fn strip_line_comments(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for line in s.lines() {
-        if let Some(pos) = line.find("--") {
-            result.push_str(line[..pos].trim_end());
-        } else {
-            result.push_str(line);
-        }
-        result.push(' ');
-    }
-    result.trim_end().to_string()
-}
-
-fn strip_block_comments(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut pos = 0;
-    while pos < s.len() {
-        let remaining = &s[pos..];
-        if let Some(start) = remaining.find("/*") {
-            result.push_str(&remaining[..start]);
-            let after_start = &remaining[start + 2..];
-            if let Some(end) = after_start.find("*/") {
-                pos += start + 2 + end + 2;
-            } else {
-                pos = s.len();
-            }
-        } else {
-            result.push_str(remaining);
-            break;
-        }
-    }
-    result
-}
-
-fn replace_string_literals(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            result.push('?');
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\'' {
-                    i += 1;
-                    if i < chars.len() && chars[i] == '\'' {
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-fn replace_number_literals(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            if i > 0 && (chars[i - 1].is_ascii_alphabetic() || chars[i - 1] == '_') {
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-            result.push('?');
-            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                i += 1;
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-fn strip_where_one_equals_one(s: &str) -> String {
-    let lower = s.to_lowercase();
-    let patterns = ["where 1=1 and ", "where 1 = 1 and "];
-    for pat in &patterns {
-        if let Some(pos) = lower.find(pat) {
-            let prefix = &s[..pos];
-            let rest = &s[pos + pat.len()..];
-            return format!("{}where {}", prefix, rest.trim_start());
-        }
-    }
-    s.to_string()
-}
-
-fn collapse_operator_spaces(s: &str) -> String {
-    s.replace(" >= ", ">=")
-        .replace(" <= ", "<=")
-        .replace(" <> ", "<>")
-        .replace(" != ", "!=")
-        .replace(" = ", "=")
-        .replace(" > ", ">")
-        .replace(" < ", "<")
-        .replace(" - ", "-")
-        .replace(" + ", "+")
-        .replace(" * ", "*")
-        .replace("( ", "(")
-        .replace(" )", ")")
-        .replace(" ,", ",")
-        .replace(", ", ",")
-        .replace(" =", "=")
-        .replace("= ", "=")
-        .replace(" >", ">")
-        .replace("> ", ">")
-        .replace(" <", "<")
-        .replace("< ", "<")
-}
-
-pub(crate) fn normalize_for_matching(s: &str) -> String {
-    let s = strip_line_comments(s);
-    let s = strip_block_comments(&s);
-    let s = strip_where_one_equals_one(&s);
-    let s = replace_string_literals(&s);
-    let s = replace_number_literals(&s);
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = s.trim_end_matches(';').to_string();
-    let s = replace_xml_placeholders(&s);
-    collapse_operator_spaces(&s)
-}
-
-fn sql_fingerprint(sql: &str) -> String {
-    let normalized = normalize_for_matching(&sql.to_lowercase());
-    blake3::hash(normalized.as_bytes()).to_hex().to_string()
-}
-
-/// Replace ogsql-parser internal placeholder markers with `?` for search matching.
-/// Handles both `__XML_PARAM_*__` (parameter placeholders from `#{}`) and
-/// `__XML_RAW_*__` (text-substitution placeholders from `${}`), including
-/// variants with embedded type hints like `__XML_RAW_STRING_col__`.
-/// Input is expected to be already lowercased.
-fn replace_xml_placeholders(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut pos = 0;
-
-    while pos < s.len() {
-        let remaining = &s[pos..];
-
-        let (prefix, prefix_len) = if remaining.starts_with("__xml_param_") {
-            ("__xml_param_", 12)
-        } else if remaining.starts_with("__xml_raw_") {
-            ("__xml_raw_", 10)
-        } else {
-            let c = remaining.chars().next().unwrap();
-            result.push(c);
-            pos += c.len_utf8();
-            continue;
-        };
-
-        let after_prefix = &s[pos + prefix_len..];
-        if let Some(end) = after_prefix.find("__") {
-            result.push('?');
-            pos += prefix_len + end + 2;
-        } else {
-            result.push_str(prefix);
-            pos += prefix_len;
-        }
-    }
-
-    result
-}
-
-/// Check if `sql_text` (lowercased) matches `query_lower` where `?` in **either** side
-/// acts as a wildcard matching any non-empty sequence of characters.
-///
-/// Matching strategy (tried in order, first success wins):
-/// 1. Direct substring match after normalization.
-/// 2. Query has `?` → split query on `?`, verify each segment appears in order in SQL.
-/// 3. SQL has `?` → split SQL on `?`, verify at least 2 consecutive concrete segments
-///    appear in order in the query (the `?` gaps absorb any characters).
-///
-/// Both sides are normalized before comparison: whitespace collapsed, `__XML_PARAM_*__`
-/// and `__XML_RAW_*__` replaced with `?`, spaces around operators removed.
-#[cfg(test)]
-fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
-    let prepared = PreparedQuery::new(query_lower);
-    prepared.matches(sql_text)
-}
-
-/// Verify each pre-split query segment appears in order in `sql`.
-fn find_query_segments_in_sql(sql: &str, segments: &[String]) -> bool {
-    if segments.is_empty() {
-        return false;
-    }
-    let mut pos = 0;
-    for part in segments {
-        match sql[pos..].find(part.as_str()) {
-            Some(p) => pos += p + part.len(),
-            None => return false,
-        }
-    }
-    true
-}
-
-const MIN_PART_LEN: usize = 4;
-const SOLO_MIN_LEN: usize = 6;
-
-fn try_stripped_part(query: &str, pos: usize, part: &str) -> Option<(usize, usize)> {
-    let stripped = strip_sql_segment(part);
-    if stripped.len() >= MIN_PART_LEN && stripped.len() < part.len() {
-        if let Some(p) = query[pos..].find(stripped) {
-            return Some((p, stripped.len()));
-        }
-    }
-    None
-}
-
-/// Strip trailing non-semantic content from a SQL segment for fuzzy matching.
-/// Removes: trailing operators/punctuation, trailing quoted strings, then operators again.
-fn strip_sql_segment(part: &str) -> &str {
-    let s = strip_trailing_quoted(part);
-    let s = s.trim_end_matches(|c: char| !c.is_ascii_alphabetic() && c != '_' && c != '.');
-    if s.len() >= part.len() {
-        return part;
-    }
-    s
-}
-
-/// Strip a trailing single-quoted SQL string literal (e.g. `'created'`, `'CREATED'`).
-fn strip_trailing_quoted(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 {
-        match bytes[i - 1] {
-            b'\'' => {
-                if let Some(open) = s[..i - 1].rfind('\'') {
-                    i = open;
-                } else {
-                    break;
-                }
-            }
-            b' ' | b')' | b',' => {
-                i -= 1;
-            }
-            _ => break,
-        }
-    }
-    if i < s.len() {
-        &s[..i]
-    } else {
-        s
-    }
-}
-
-/// Split `sql` on `?`, check if enough consecutive concrete segments
-/// appear in order in `query` (the `?` gaps between SQL segments absorb
-/// any characters in the query).
-///
-/// When `query_has_wildcard` is true, the match is only accepted if the
-/// query tail after the last matched position (excluding leading `?`) is empty.
-/// This prevents queries with extra conditions not present in the SQL from matching.
-fn find_sql_segments_in_query(sql: &str, query: &str, query_has_wildcard: bool) -> bool {
-    let sql_parts: Vec<&str> = sql.split('?').filter(|s| !s.is_empty()).collect();
-    if sql_parts.is_empty() {
-        return false;
-    }
-    if sql_parts.len() == 1 {
-        return query.contains(sql_parts[0]);
-    }
-
-    let sig_parts: Vec<&str> = sql_parts
-        .into_iter()
-        .filter(|p| p.len() >= MIN_PART_LEN)
-        .collect();
-    if sig_parts.is_empty() {
-        return false;
-    }
-    if sig_parts.len() == 1 {
-        let p = sig_parts[0];
-        if p.len() >= SOLO_MIN_LEN && query.contains(p) {
-            return true;
-        }
-        let stripped = strip_sql_segment(p);
-        return stripped.len() >= SOLO_MIN_LEN
-            && stripped.len() < p.len()
-            && query.contains(stripped);
-    }
-
-    let mut pos = 0;
-    let mut count = 0;
-    let mut solo_len: usize = 0;
-
-    for part in &sig_parts {
-        let matched = match query[pos..].find(*part) {
-            Some(p) => Some((p, part.len())),
-            None => try_stripped_part(query, pos, part),
-        };
-        match matched {
-            Some((p, len)) => {
-                if count > 0 && p == 0 {
-                    break;
-                }
-                pos += p + len;
-                solo_len = len;
-                count += 1;
-            }
-            None => break,
-        }
-    }
-
-    let threshold = if count == 1 {
-        solo_len >= SOLO_MIN_LEN
-    } else {
-        count >= 2
-    };
-    if threshold {
-        if query_has_wildcard {
-            let tail = query[pos..].trim_start_matches('?').trim();
-            if tail.is_empty() {
-                return true;
-            }
-        } else if count == 1 {
-            let tail = query[pos..].trim();
-            if tail.is_empty() {
-                return true;
-            }
-        } else {
-            return true;
-        }
-    }
-
-    false
-}
+// SQL matching functions moved to crate::sql_match
 
 impl GraphStore {
     /// Search nodes by name using the sorted name_index.
@@ -1640,7 +1020,7 @@ impl GraphStore {
                     statement_id,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let display_key = format!("mapper:{}.{}", namespace, statement_id);
                     self.sql_fingerprint_index
                         .entry(fp)
@@ -1653,7 +1033,7 @@ impl GraphStore {
                     method_name,
                     ..
                 } => {
-                    let fp = sql_fingerprint(sql_text);
+                    let fp = sql_match::sql_fingerprint(sql_text);
                     let ctx = match (class_name, method_name) {
                         (Some(c), Some(m)) => format!("{}.{}", c, m),
                         (Some(c), None) => c.clone(),
@@ -2168,6 +1548,11 @@ impl GraphStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
+        let prepared = crate::sql_match::PreparedQuery::new(query_lower);
+        prepared.matches(sql_text)
+    }
 
     #[test]
     fn test_bincode_roundtrip_edge_only() {

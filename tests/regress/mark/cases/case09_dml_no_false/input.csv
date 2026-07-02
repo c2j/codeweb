@@ -1,0 +1,7 @@
+unique_sql_id,sql_text
+sql_070,SELECT * FROM orders WHERE id = 1
+sql_071,CALL sync_orders()
+sql_072,UPDATE sync_orders_log SET status = 'done'
+sql_073,SELECT * FROM sync_orders_data
+sql_074,DELETE FROM sync_orders_backup
+sql_075,"INSERT INTO sync_orders_archive SELECT * FROM orders"

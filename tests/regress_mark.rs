@@ -38,6 +38,23 @@ const CASE08_SQL: &str = include_str!("regress/mark/cases/case08_multi_target/sc
 const CASE08_INPUT: &str = include_str!("regress/mark/cases/case08_multi_target/input.csv");
 const CASE08_EXPECTED: &str = include_str!("regress/mark/cases/case08_multi_target/expected.csv");
 
+const CASE09_SQL: &str = include_str!("regress/mark/cases/case09_dml_no_false/schema.sql");
+const CASE09_INPUT: &str = include_str!("regress/mark/cases/case09_dml_no_false/input.csv");
+const CASE09_EXPECTED: &str = include_str!("regress/mark/cases/case09_dml_no_false/expected.csv");
+
+const CASE10_SQL: &str = include_str!("regress/mark/cases/case10_select_column/schema.sql");
+const CASE10_INPUT: &str = include_str!("regress/mark/cases/case10_select_column/input.csv");
+const CASE10_EXPECTED: &str = include_str!("regress/mark/cases/case10_select_column/expected.csv");
+
+const CASE11_SQL: &str = include_str!("regress/mark/cases/case11_fingerprint_false/schema.sql");
+const CASE11_INPUT: &str = include_str!("regress/mark/cases/case11_fingerprint_false/input.csv");
+const CASE11_EXPECTED: &str =
+    include_str!("regress/mark/cases/case11_fingerprint_false/expected.csv");
+
+const CASE12_SQL: &str = include_str!("regress/mark/cases/case12_select_into/schema.sql");
+const CASE12_INPUT: &str = include_str!("regress/mark/cases/case12_select_into/input.csv");
+const CASE12_EXPECTED: &str = include_str!("regress/mark/cases/case12_select_into/expected.csv");
+
 // ── helpers ──
 
 fn codeweb_bin() -> PathBuf {
@@ -203,4 +220,40 @@ fn regress_mark_case08_multi_target() {
 
     let actual = run_mark(&dir, &["accounts", "inventory"], "input.csv");
     assert_csv_eq(&actual, CASE08_EXPECTED, "case08");
+}
+
+#[test]
+fn regress_mark_case09_dml_no_false() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE09_SQL, Some(CASE09_INPUT));
+
+    let actual = run_mark(&dir, &["orders"], "input.csv");
+    assert_csv_eq(&actual, CASE09_EXPECTED, "case09");
+}
+
+#[test]
+fn regress_mark_case10_select_column() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE10_SQL, Some(CASE10_INPUT));
+
+    let actual = run_mark(&dir, &["calc_total"], "input.csv");
+    assert_csv_eq(&actual, CASE10_EXPECTED, "case10");
+}
+
+#[test]
+fn regress_mark_case11_fingerprint_false() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE11_SQL, Some(CASE11_INPUT));
+
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
+    assert_csv_eq(&actual, CASE11_EXPECTED, "case11");
+}
+
+#[test]
+fn regress_mark_case12_select_into() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE12_SQL, Some(CASE12_INPUT));
+
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
+    assert_csv_eq(&actual, CASE12_EXPECTED, "case12");
 }

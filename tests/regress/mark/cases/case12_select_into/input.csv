@@ -1,0 +1,4 @@
+unique_sql_id,sql_text
+sql_100,SELECT SUM(balance) FROM accounts WHERE owner = 'ACTIVE'
+sql_101,CALL verify_balance()
+sql_102,SELECT SUM(balance) FROM accounts WHERE owner = 'CLOSED'

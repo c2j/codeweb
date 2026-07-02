@@ -1,0 +1,6 @@
+unique_sql_id,sql_text,codeweb_match_calc_total,codeweb_matched_by_calc_total
+sql_080,"SELECT calc_total(100) FROM dual","direct to calc_total",func:calc_total
+sql_081,"SELECT calc_subtotal(50) FROM dual","indirect to calc_total",func:calc_subtotal → func:calc_total
+sql_082,"SELECT id, calc_total_amount FROM invoices",,
+sql_083,"SELECT calc_total FROM daily_summary",,
+sql_084,"SELECT * FROM calc_total_backup",,

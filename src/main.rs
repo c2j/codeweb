@@ -18,6 +18,7 @@ mod parser;
 mod project;
 #[cfg(feature = "serve")]
 mod server;
+mod sql_match;
 #[cfg(feature = "tui")]
 mod tui;
 

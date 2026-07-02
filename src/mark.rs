@@ -88,7 +88,15 @@ fn backtrack_paths(
             let node_key = NodeKey::from_node(&graph[p]).to_string();
             current_path.push(node_key);
             visited_in_path.insert(p);
-            backtrack_paths(p, target, parent, graph, current_path, visited_in_path, all_paths);
+            backtrack_paths(
+                p,
+                target,
+                parent,
+                graph,
+                current_path,
+                visited_in_path,
+                all_paths,
+            );
             visited_in_path.remove(&p);
             current_path.pop();
         }
@@ -136,8 +144,7 @@ pub fn classify_row(
     match target_node {
         Node::Table { name, .. } | Node::View { name, .. } => {
             if contains_table_name(sql_text, name) {
-                let path =
-                    build_all_caller_paths(target_idx, target_idx, parent, store);
+                let path = build_all_caller_paths(target_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Direct,
                     matched_by: Some(path),
@@ -146,8 +153,7 @@ pub fn classify_row(
         }
         Node::Procedure { id, .. } | Node::Function { id, .. } => {
             if contains_routine_call(sql_text, &id.name) {
-                let path =
-                    build_all_caller_paths(target_idx, target_idx, parent, store);
+                let path = build_all_caller_paths(target_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Direct,
                     matched_by: Some(path),
@@ -168,8 +174,7 @@ pub fn classify_row(
         // 1) Name match
         if let Some(routine_name) = try_extract_routine_name(caller_node) {
             if contains_routine_call(sql_text, routine_name) {
-                let path =
-                    build_all_caller_paths(caller_idx, target_idx, parent, store);
+                let path = build_all_caller_paths(caller_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Indirect,
                     matched_by: Some(path),
@@ -177,11 +182,10 @@ pub fn classify_row(
             }
         }
 
-        // 2) Fingerprint match
-        if let Some(body_sql) = try_extract_body_sql(caller_node) {
-            if sql_text_fingerprint_matches(sql_text, body_sql) {
-                let path =
-                    build_all_caller_paths(caller_idx, target_idx, parent, store);
+        // 2) Fingerprint match — check all body_sql entries
+        for bs in all_body_sql(caller_node) {
+            if sql_text_fingerprint_matches(sql_text, &bs.sql_text) {
+                let path = build_all_caller_paths(caller_idx, target_idx, parent, store);
                 return MatchResult {
                     match_type: MatchType::Indirect,
                     matched_by: Some(path),
@@ -288,33 +292,83 @@ fn try_extract_routine_name(node: &Node) -> Option<&str> {
     }
 }
 
-/// Try to extract body_sql from a Node for fingerprint matching.
-fn try_extract_body_sql(node: &Node) -> Option<&str> {
+fn all_body_sql(node: &Node) -> Vec<&crate::graph::ProcedureBodySql> {
     match node {
         Node::Procedure { body_sql, .. } | Node::Function { body_sql, .. } => {
-            body_sql.first().map(|bs| bs.sql_text.as_str())
+            body_sql.iter().collect()
         }
-        _ => None,
+        _ => vec![],
     }
 }
 
-/// Check if `sql_text` matches `body_sql` after normalization.
-/// Uses the same normalize_for_matching logic as the store's search_by_sql.
+/// Strip PL/pgSQL `INTO var` clause from a normalized SQL string.
+/// `SELECT a, b INTO v1, v2 FROM t` → `SELECT a, b FROM t`
+/// `SELECT a INTO v1` (no FROM) → `SELECT a`
+/// This bridges the gap between body_sql (has INTO) and WDR sql_text (doesn't).
+fn strip_select_into(normalized: &str) -> String {
+    let lower = normalized.to_lowercase();
+    // Match " into " or " into strict "
+    let into_keywords = [" into strict ", " into "];
+    let (into_pos, skip_len) = match into_keywords
+        .iter()
+        .find_map(|kw| lower.find(kw).map(|pos| (pos, kw.len())))
+    {
+        Some(v) => v,
+        None => return normalized.to_string(),
+    };
+    let after_into = &normalized[into_pos + skip_len..];
+
+    // The INTO target can be one or more identifiers separated by commas
+    // Stop at " from ", " where ", " group ", " order ", " having ", " limit ", " union ", or end
+    let end_markers = [
+        " from ",
+        " where ",
+        " group ",
+        " order ",
+        " having ",
+        " limit ",
+        " union ",
+        " join ",
+        " left ",
+        " right ",
+        " inner ",
+        " outer ",
+        " cross ",
+        " natural ",
+        " for ",
+        " returning ",
+        " with ",
+    ];
+    let mut cut = after_into.len();
+    for marker in &end_markers {
+        if let Some(pos) = lower[into_pos + skip_len..].find(marker) {
+            let end = pos + into_pos + skip_len;
+            if end < cut + into_pos + skip_len {
+                cut = pos;
+            }
+        }
+    }
+    let before = &normalized[..into_pos];
+    let after = if cut < after_into.len() {
+        // There's a marker after INTO vars — keep the marker
+        &after_into[cut..]
+    } else {
+        // No marker found — INTO was at end, strip it entirely
+        ""
+    };
+    // Trim trailing comma left by stripping multi-var INTO
+    let before = before.trim_end_matches(',').trim_end();
+    let after = after.trim_start();
+    format!("{} {}", before, after).trim().to_string()
+}
+
+/// Check if `sql_text` matches body_sql using the shared PreparedQuery engine.
 fn sql_text_fingerprint_matches(sql_text: &str, body_sql: &str) -> bool {
-    let norm_sql = crate::graph::store::normalize_for_matching(&sql_text.to_lowercase());
-    let norm_body = crate::graph::store::normalize_for_matching(&body_sql.to_lowercase());
-
-    // Body SQL is typically short (single DML statement). Check if the
-    // normalized body appears as a substring of the normalized CSV SQL.
-    if norm_body.len() >= 10 && norm_sql.contains(&norm_body) {
-        return true;
-    }
-    // Also check if the normalized SQL appears within the body (less likely but cheap)
-    if norm_sql.len() >= 10 && norm_body.contains(&norm_sql) {
-        return true;
-    }
-
-    false
+    let query = crate::sql_match::PreparedQuery::new(sql_text);
+    let normalized_body = crate::sql_match::normalize_for_matching(&body_sql.to_lowercase());
+    let norm_body = strip_select_into(&normalized_body);
+    // Check the body (already normalized + INTO-stripped) against the query
+    query.matches(&norm_body) || query.matches(body_sql)
 }
 
 /// Normalize a CSV header name to a canonical form for matching:
@@ -332,7 +386,7 @@ fn normalize_header(h: &str) -> String {
 
 /// Pre-resolved target with its callers set and parent map.
 struct TargetContext {
-    name: String,          // the --node argument as typed by user
+    name: String, // the --node argument as typed by user
     node_idx: NodeIndex,
     node: Node,
     callers: HashSet<NodeIndex>,
@@ -353,10 +407,7 @@ pub fn process_mark(
             let matches = store.search_nodes(name);
             if matches.is_empty() {
                 eprintln!("No nodes matching '{}'", name);
-                eprintln!(
-                    "Try `codeweb nodes -s {}` to find available nodes.",
-                    name
-                );
+                eprintln!("Try `codeweb nodes -s {}` to find available nodes.", name);
                 TargetContext {
                     name: name.clone(),
                     node_idx: NodeIndex::end(), // dummy, never used
@@ -412,9 +463,7 @@ pub fn process_mark(
     let has_sql_id = headers
         .iter()
         .any(|h| normalize_header(h) == "unique sql id");
-    let has_sql_text = headers
-        .iter()
-        .any(|h| normalize_header(h) == "sql text");
+    let has_sql_text = headers.iter().any(|h| normalize_header(h) == "sql text");
     if !has_sql_id || !has_sql_text {
         return Err(crate::error::CodeWebError::ExportError {
             message: format!(
@@ -443,9 +492,7 @@ pub fn process_mark(
         let results: Vec<Option<MatchResult>> = targets
             .iter()
             .map(|t| {
-                let mr = classify_row(
-                    sql_text, t.node_idx, &t.node, &t.callers, &t.parent, store,
-                );
+                let mr = classify_row(sql_text, t.node_idx, &t.node, &t.callers, &t.parent, store);
                 if mr.match_type == MatchType::None {
                     None
                 } else {
@@ -595,6 +642,66 @@ mod tests {
         assert!(contains_routine_call(
             "PERFORM update_orders()",
             "update_orders"
+        ));
+    }
+
+    #[test]
+    fn test_strip_select_into_basic() {
+        assert_eq!(
+            strip_select_into("select a into ? from t"),
+            "select a from t"
+        );
+    }
+
+    #[test]
+    fn test_strip_select_into_multi_var() {
+        assert_eq!(
+            strip_select_into("select a, b into ?, ? from t"),
+            "select a, b from t"
+        );
+    }
+
+    #[test]
+    fn test_strip_select_into_no_from() {
+        assert_eq!(strip_select_into("select a into ?"), "select a");
+    }
+
+    #[test]
+    fn test_strip_select_into_with_where() {
+        assert_eq!(
+            strip_select_into("select a into ? from t where b = ?"),
+            "select a from t where b = ?"
+        );
+    }
+
+    #[test]
+    fn test_strip_select_into_noop() {
+        assert_eq!(strip_select_into("select a from t"), "select a from t");
+    }
+
+    #[test]
+    fn test_strip_select_into_strict() {
+        assert_eq!(
+            strip_select_into("select a into strict ? from t"),
+            "select a from t"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_matches_select_into() {
+        // body has INTO, csv doesn't → should match
+        assert!(sql_text_fingerprint_matches(
+            "SELECT a FROM t WHERE b = 1",
+            "SELECT a INTO v FROM t WHERE b = 1"
+        ));
+    }
+
+    #[test]
+    fn test_fingerprint_no_match_different_table() {
+        // different tables → should not match
+        assert!(!sql_text_fingerprint_matches(
+            "SELECT a FROM backup WHERE b = 1",
+            "SELECT a INTO v FROM main WHERE b = 1"
         ));
     }
 }
