@@ -1389,11 +1389,49 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
     let store = proj.load_store()?;
     let graph = store.graph();
 
+    let prepared = sql_match::PreparedQuery::new(fragment);
     let matches = store.search_by_sql(fragment);
 
     if matches.is_empty() {
         eprintln!("No matching SQL found for fragment: '{}'", fragment);
         return Ok(());
+    }
+
+    fn print_sql_block(lines: &[&str], kind_tag: &str, max_lines: usize) {
+        let total = lines.len();
+        let display = if total > max_lines {
+            &lines[..max_lines]
+        } else {
+            lines
+        };
+        for (i, l) in display.iter().enumerate() {
+            if i == display.len() - 1 && total <= max_lines {
+                println_stdout!("    sql:   {} [{}]", l, kind_tag);
+            } else if i == display.len() - 1 {
+                println_stdout!("    sql:   {} [{}]", l, kind_tag);
+            } else {
+                println_stdout!("    sql:   {}", l);
+            }
+        }
+        if total > max_lines {
+            println_stdout!("    sql:   ... +{} more lines", total - max_lines);
+        }
+    }
+
+    fn kind_tag_from_sql(sql: &str) -> &str {
+        let first = sql
+            .trim_start()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        match first.to_uppercase().as_str() {
+            "SELECT" | "WITH" => "SELECT",
+            "INSERT" => "INSERT",
+            "UPDATE" => "UPDATE",
+            "DELETE" => "DELETE",
+            "MERGE" => "MERGE",
+            _ => "",
+        }
     }
 
     println_stdout!("SQL fragment: '{}'", fragment);
@@ -1419,15 +1457,10 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     statement_id,
                     score_pct
                 );
-                println_stdout!("    kind:  {}", kind);
                 println_stdout!("    file:  {}:{}", xml_file.to_string_lossy(), line);
-                for l in sql_text.lines().take(5) {
-                    println_stdout!("    sql:   {}", l);
-                }
-                let line_count = sql_text.lines().count();
-                if line_count > 5 {
-                    println_stdout!("    sql:   ... +{} more lines", line_count - 5);
-                }
+                let lines: Vec<&str> = sql_text.lines().collect();
+                let tag = kind.to_uppercase();
+                print_sql_block(&lines, &tag, 5);
 
                 let callers: Vec<petgraph::graph::NodeIndex> = graph
                     .neighbors_directed(*idx, petgraph::Direction::Incoming)
@@ -1480,13 +1513,9 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     score_pct
                 );
                 println_stdout!("    file:  {}:{}", java_file.to_string_lossy(), line);
-                for l in sql_text.lines().take(5) {
-                    println_stdout!("    sql:   {}", l);
-                }
-                let line_count = sql_text.lines().count();
-                if line_count > 5 {
-                    println_stdout!("    sql:   ... +{} more lines", line_count - 5);
-                }
+                let lines: Vec<&str> = sql_text.lines().collect();
+                let tag = kind_tag_from_sql(sql_text);
+                print_sql_block(&lines, tag, 5);
                 println_stdout!();
             }
             Node::Procedure {
@@ -1501,14 +1530,26 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     location.file.to_string_lossy(),
                     location.line
                 );
-                for sql in body_sql.iter().take(5) {
-                    for l in sql.sql_text.lines().take(3) {
-                        println_stdout!("    sql:   {} [{}]", l, sql.kind);
-                    }
+                let matching: Vec<_> = body_sql
+                    .iter()
+                    .filter(|s| prepared.matches(&s.sql_text))
+                    .collect();
+                for sql in matching.iter().take(5) {
+                    let lines: Vec<&str> = sql.sql_text.lines().collect();
+                    print_sql_block(&lines, &sql.kind, 3);
                 }
-                let total = body_sql.len();
-                if total > 5 {
-                    println_stdout!("    sql:   ... +{} more SQL statements", total - 5);
+                if matching.len() > 5 {
+                    println_stdout!(
+                        "    sql:   ... +{} more matching SQL statements",
+                        matching.len() - 5
+                    );
+                }
+                let unmatched = body_sql.len() - matching.len();
+                if unmatched > 0 {
+                    println_stdout!(
+                        "    ({} other SQL statement(s) in body not shown)",
+                        unmatched
+                    );
                 }
                 let callers: Vec<petgraph::graph::NodeIndex> = graph
                     .neighbors_directed(*idx, petgraph::Direction::Incoming)
@@ -1534,14 +1575,26 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                     location.file.to_string_lossy(),
                     location.line
                 );
-                for sql in body_sql.iter().take(5) {
-                    for l in sql.sql_text.lines().take(3) {
-                        println_stdout!("    sql:   {} [{}]", l, sql.kind);
-                    }
+                let matching: Vec<_> = body_sql
+                    .iter()
+                    .filter(|s| prepared.matches(&s.sql_text))
+                    .collect();
+                for sql in matching.iter().take(5) {
+                    let lines: Vec<&str> = sql.sql_text.lines().collect();
+                    print_sql_block(&lines, &sql.kind, 3);
                 }
-                let total = body_sql.len();
-                if total > 5 {
-                    println_stdout!("    sql:   ... +{} more SQL statements", total - 5);
+                if matching.len() > 5 {
+                    println_stdout!(
+                        "    sql:   ... +{} more matching SQL statements",
+                        matching.len() - 5
+                    );
+                }
+                let unmatched = body_sql.len() - matching.len();
+                if unmatched > 0 {
+                    println_stdout!(
+                        "    ({} other SQL statement(s) in body not shown)",
+                        unmatched
+                    );
                 }
                 let callers: Vec<petgraph::graph::NodeIndex> = graph
                     .neighbors_directed(*idx, petgraph::Direction::Incoming)

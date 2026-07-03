@@ -15,6 +15,7 @@ use crate::graph::node_sub_type_tag;
 use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::{CodeGraph, Node};
+use crate::sql_match::PreparedQuery;
 
 use super::access_log;
 use super::state::AppState;
@@ -144,6 +145,7 @@ async fn search_sql(
     Query(query): Query<SearchSqlQuery>,
 ) -> impl IntoResponse {
     let graph = state.graph();
+    let prepared = PreparedQuery::new(&query.q);
     let results = state.store().search_by_sql(&query.q);
     let nodes: Vec<Value> = results
         .into_iter()
@@ -168,6 +170,7 @@ async fn search_sql(
                                     serde_json::json!({
                                         "sql": s.sql_text,
                                         "kind": s.kind,
+                                        "matched": prepared.matches(&s.sql_text),
                                     })
                                 })
                                 .collect::<Vec<_>>(),

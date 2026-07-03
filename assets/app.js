@@ -126,11 +126,12 @@ function updateNodeCount() {
 
 function renderSqlSnippet(bodySql) {
   if (!bodySql || bodySql.length === 0) return '';
-  const s = bodySql[0];
-  const line = (s.sql || '').split('\n')[0].trim();
+  const matched = bodySql.find(s => s.matched) || bodySql[0];
+  const line = (matched.sql || '').split('\n')[0].trim();
   if (!line) return '';
   const display = line.substring(0, 120) + (line.length > 120 ? '...' : '');
-  return '<div class="sql-snippet"><span class="sql-kind">' + esc(s.kind) + '</span> <span class="sql-text">' + esc(display) + '</span></div>';
+  const matchClass = matched.matched ? ' sql-matched' : ' sql-unmatched';
+  return '<div class="sql-snippet' + matchClass + '"><span class="sql-kind">' + esc(matched.kind) + '</span> <span class="sql-text">' + esc(display) + '</span></div>';
 }
 
 function renderVirtualList() {
