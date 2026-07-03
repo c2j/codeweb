@@ -55,8 +55,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .dim{color:#555;font-style:italic}
 .truncated{padding:8px;color:#e94560;font-size:14px;text-align:center}
 .sql-snippet{flex:0 0 100%;padding:0 0 1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Cascadia Code',Consolas,monospace;font-size:12px}
-.sql-kind{color:#8bc34a;font-weight:700;margin-left:68px}
-.sql-text{color:#a0a0a0}
+.sql-matched .sql-kind{color:#4caf50;font-weight:700}
+.sql-matched .sql-text{color:#e0e0e0}
+.sql-unmatched .sql-kind{color:#555;font-weight:700}
+.sql-unmatched .sql-text{color:#555;text-decoration:line-through}
 .sql-more{flex:0 0 100%;color:#555;font-style:italic;margin-left:68px;font-size:12px}
 .node-item-with-snippet{padding-top:2px;padding-bottom:2px}
 .prop-label.dim{color:#8bc34a;font-size:12px;font-weight:400}
