@@ -51,6 +51,10 @@ pub struct GraphStore {
     /// Built from MappedStatement and JavaSql nodes for O(1) lookup.
     #[serde(default)]
     sql_fingerprint_index: HashMap<String, Vec<(NodeIndex, String)>>,
+    /// Index: lock clause kind key → list of (NodeIndex, display_key)
+    /// Built from ogsql-parser AST for O(1) lookup of FOR UPDATE / FOR SHARE etc.
+    #[serde(default)]
+    lock_clause_index: HashMap<String, Vec<(NodeIndex, String)>>,
 }
 
 #[allow(dead_code)]
@@ -74,6 +78,7 @@ impl GraphStore {
             schema_index: HashMap::new(),
             edge_category_index: HashMap::new(),
             sql_fingerprint_index: HashMap::new(),
+            lock_clause_index: HashMap::new(),
         }
     }
 
@@ -240,6 +245,53 @@ impl GraphStore {
             }
         }
 
+        let mut lock_clause_index: HashMap<String, Vec<(NodeIndex, String)>> = HashMap::new();
+        for idx in graph.node_indices() {
+            let (display_key, sql_texts) = match &graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => (
+                    format!("mapper:{}.{}", namespace, statement_id),
+                    vec![sql_text.as_str()],
+                ),
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    line,
+                    ..
+                } => {
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    (format!("javasql:{}:{}", ctx, line), vec![sql_text.as_str()])
+                }
+                Node::Procedure { id, body_sql, .. } => (
+                    format!("proc:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                Node::Function { id, body_sql, .. } => (
+                    format!("func:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                _ => continue,
+            };
+            for sql in sql_texts {
+                if let Some(kind) = sql_match::detect_lock_clause_in_sql(sql) {
+                    lock_clause_index
+                        .entry(kind.index_key().to_string())
+                        .or_default()
+                        .push((idx, display_key.clone()));
+                }
+            }
+        }
+
         Self {
             version: 6,
             project_name: project_name.to_string(),
@@ -257,6 +309,7 @@ impl GraphStore {
             schema_index,
             edge_category_index,
             sql_fingerprint_index,
+            lock_clause_index,
         }
     }
 
@@ -419,6 +472,54 @@ impl GraphStore {
             }
         }
 
+        pb.set_message("lock clause index...");
+        self.lock_clause_index.clear();
+        for idx in self.graph.node_indices() {
+            let (display_key, sql_texts) = match &self.graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => (
+                    format!("mapper:{}.{}", namespace, statement_id),
+                    vec![sql_text.as_str()],
+                ),
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    line,
+                    ..
+                } => {
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    (format!("javasql:{}:{}", ctx, line), vec![sql_text.as_str()])
+                }
+                Node::Procedure { id, body_sql, .. } => (
+                    format!("proc:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                Node::Function { id, body_sql, .. } => (
+                    format!("func:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                _ => continue,
+            };
+            for sql in sql_texts {
+                if let Some(kind) = sql_match::detect_lock_clause_in_sql(sql) {
+                    self.lock_clause_index
+                        .entry(kind.index_key().to_string())
+                        .or_default()
+                        .push((idx, display_key.clone()));
+                }
+            }
+        }
+
         pb.finish_with_message(format!(
             "Indexes rebuilt ({} nodes, {} edges)",
             expected,
@@ -507,6 +608,10 @@ impl GraphStore {
         &self.sql_fingerprint_index
     }
 
+    pub fn lock_clause_index(&self) -> &HashMap<String, Vec<(NodeIndex, String)>> {
+        &self.lock_clause_index
+    }
+
     /// Enrich the SQL fingerprint index with expanded dynamic SQL variants.
     /// For each mapper node that has dynamic elements, expands all possible SQL variants
     /// and adds their fingerprints to the index.
@@ -550,6 +655,20 @@ impl GraphStore {
                     .collect();
                 sql_match::sort_scored_results(&mut results);
                 return results;
+            }
+        }
+
+        if let Some(kind) = sql_match::classify_lock_clause_query(query) {
+            let key = kind.index_key().to_string();
+            if let Some(hits) = self.lock_clause_index.get(&key) {
+                if !hits.is_empty() {
+                    let mut results: Vec<(NodeIndex, String, f64)> = hits
+                        .iter()
+                        .map(|(idx, display_key)| (*idx, display_key.clone(), 0.9))
+                        .collect();
+                    sql_match::sort_scored_results(&mut results);
+                    return results;
+                }
             }
         }
 
@@ -971,6 +1090,7 @@ impl GraphStore {
         self.schema_index.clear();
         self.edge_category_index.clear();
         self.node_summaries.clear();
+        self.lock_clause_index.clear();
 
         for idx in self.graph.node_indices() {
             let tag = node_type_tag(&self.graph[idx]).to_string();
@@ -1063,6 +1183,53 @@ impl GraphStore {
                         .push((idx, display_key));
                 }
                 _ => {}
+            }
+        }
+
+        self.lock_clause_index.clear();
+        for idx in self.graph.node_indices() {
+            let (display_key, sql_texts) = match &self.graph[idx] {
+                Node::MappedStatement {
+                    sql: Some(sql_text),
+                    namespace,
+                    statement_id,
+                    ..
+                } => (
+                    format!("mapper:{}.{}", namespace, statement_id),
+                    vec![sql_text.as_str()],
+                ),
+                Node::JavaSql {
+                    sql: Some(sql_text),
+                    class_name,
+                    method_name,
+                    line,
+                    ..
+                } => {
+                    let ctx = match (class_name, method_name) {
+                        (Some(c), Some(m)) => format!("{}.{}", c, m),
+                        (Some(c), None) => c.clone(),
+                        (None, Some(m)) => m.clone(),
+                        (None, None) => "?".to_string(),
+                    };
+                    (format!("javasql:{}:{}", ctx, line), vec![sql_text.as_str()])
+                }
+                Node::Procedure { id, body_sql, .. } => (
+                    format!("proc:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                Node::Function { id, body_sql, .. } => (
+                    format!("func:{}", id),
+                    body_sql.iter().map(|s| s.sql_text.as_str()).collect(),
+                ),
+                _ => continue,
+            };
+            for sql in sql_texts {
+                if let Some(kind) = sql_match::detect_lock_clause_in_sql(sql) {
+                    self.lock_clause_index
+                        .entry(kind.index_key().to_string())
+                        .or_default()
+                        .push((idx, display_key.clone()));
+                }
             }
         }
     }
@@ -1563,6 +1730,7 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
@@ -3726,6 +3894,263 @@ mod tests {
         let store = GraphStore::from_graph("test", graph);
 
         assert_eq!(store.search_by_sql("select ? from users").len(), 1);
+    }
+
+    // --- search_by_sql: "for update" clause ---
+
+    #[test]
+    fn search_by_sql_for_update_matches_mapper() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "com.example.OrderDao",
+            "lockById",
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("lockById"));
+    }
+
+    #[test]
+    fn search_by_sql_for_update_matches_javasql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_javasql_node(
+            Some("OrderRepository"),
+            Some("lockById"),
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("lockById"));
+    }
+
+    #[test]
+    fn search_by_sql_for_update_matches_procedure_body_sql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "lock_order".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: crate::graph::SourceLocation {
+                file: Arc::new(PathBuf::from("test.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![crate::graph::ProcedureBodySql {
+                sql_text: "SELECT * FROM t_orders WHERE id = p_id FOR UPDATE".to_string(),
+                kind: "SELECT".to_string(),
+                line: Some(5),
+            }],
+        });
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("lock_order"));
+    }
+
+    #[test]
+    fn search_by_sql_for_update_case_insensitive() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lock",
+            Some("SELECT * FROM t FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.search_by_sql("for update").len(), 1);
+        assert_eq!(store.search_by_sql("FOR UPDATE").len(), 1);
+        assert_eq!(store.search_by_sql("For Update").len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_for_update_extra_whitespace_in_sql() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lock",
+            Some("SELECT * FROM t WHERE id = ? FOR   UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.search_by_sql("for update").len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_for_update_not_matched_without_clause() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "selectAll",
+            Some("SELECT id, name FROM orders WHERE status = 'ACTIVE'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert!(
+            store.search_by_sql("for update").is_empty(),
+            "SQL without FOR UPDATE clause must not match"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_for_update_in_string_literal_ignored() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "selectByStatus",
+            Some("SELECT * FROM orders WHERE status = 'for update'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert!(
+            store.search_by_sql("for update").is_empty(),
+            "'for update' inside a string literal must be normalized away"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_for_update_in_comment_ignored() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "selectAll",
+            Some("-- for update\nSELECT id, name FROM orders"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert!(
+            store.search_by_sql("for update").is_empty(),
+            "'for update' inside a line comment must be stripped before matching"
+        );
+    }
+
+    #[test]
+    fn search_by_sql_for_update_matches_nowait_variant() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lockNowait",
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE NOWAIT"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("lockNowait"));
+    }
+
+    #[test]
+    fn search_by_sql_for_update_nowait_full_phrase() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lockNowait",
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE NOWAIT"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.search_by_sql("for update nowait").len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_for_update_skip_then_wait_clause() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lockSkip",
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE SKIP LOCKED"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_by_sql_for_update_not_confused_by_update_dml() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "updateStatus",
+            Some("UPDATE orders SET status = ? WHERE id = ?"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert!(
+            store.search_by_sql("for update").is_empty(),
+            "UPDATE DML without FOR UPDATE clause must not match"
+        );
+    }
+
+    // --- lock clause index (build-time ogsql-parser AST) ---
+
+    #[test]
+    fn lock_clause_index_contains_mapper_with_for_update() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lockById",
+            Some("SELECT * FROM orders WHERE id = ? FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let index = store.lock_clause_index();
+        assert!(index.contains_key("for_update"));
+        assert_eq!(index["for_update"].len(), 1);
+        assert!(index["for_update"][0].1.contains("lockById"));
+    }
+
+    #[test]
+    fn lock_clause_index_for_share_separate_from_for_update() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lockShare",
+            Some("SELECT * FROM orders WHERE id = ? FOR SHARE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let index = store.lock_clause_index();
+        assert!(index.contains_key("for_share"));
+        assert!(!index.contains_key("for_update"));
+    }
+
+    #[test]
+    fn lock_clause_index_empty_for_regular_select() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "findAll",
+            Some("SELECT id, name FROM orders WHERE status = 'ACTIVE'"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert!(store.lock_clause_index().is_empty());
+    }
+
+    #[test]
+    fn search_by_sql_for_update_uses_lock_clause_fast_path() {
+        // Fast path returns score 0.9 (not 1.0 from fingerprint exact match).
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lock",
+            Some("SELECT * FROM t FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_by_sql("for update");
+        assert_eq!(results.len(), 1);
+        assert!((results[0].2 - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn lock_clause_index_roundtrip_through_bincode() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(make_mapper_node(
+            "dao",
+            "lock",
+            Some("SELECT * FROM t FOR UPDATE"),
+        ));
+        let store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.lock_clause_index()["for_update"].len(), 1);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        store.save_bincode(tmp.path()).unwrap();
+        let loaded = GraphStore::load_bincode(tmp.path()).unwrap();
+        assert_eq!(loaded.lock_clause_index()["for_update"].len(), 1);
     }
 
     // =======================================================================

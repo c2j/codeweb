@@ -1,11 +1,12 @@
 //! SQL matching utilities shared by trace-sql and mark commands.
 //!
 //! Provides SQL normalization, wildcard matching, Jaccard similarity,
-//! DML keyword classification, and fingerprint hashing.
+//! DML keyword classification, fingerprint hashing, and lock clause detection.
 
 use std::collections::HashSet;
 
 use petgraph::graph::NodeIndex;
+use serde::{Deserialize, Serialize};
 
 // ── SQL normalization pipeline ──
 
@@ -189,6 +190,81 @@ fn normalize_for_matching_pre_collapse(s: &str) -> String {
 pub(crate) fn sql_fingerprint(sql: &str) -> String {
     let normalized = normalize_for_matching(&sql.to_lowercase());
     blake3::hash(normalized.as_bytes()).to_hex().to_string()
+}
+
+// ── Lock clause detection (build-time + search-time) ──
+
+/// Lock clause variants ogsql-parser can identify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum LockKind {
+    Update,
+    Share,
+    NoKeyUpdate,
+    KeyShare,
+}
+
+impl LockKind {
+    /// Index key used as HashMap key in GraphStore.
+    pub(crate) fn index_key(self) -> &'static str {
+        match self {
+            LockKind::Update => "for_update",
+            LockKind::Share => "for_share",
+            LockKind::NoKeyUpdate => "for_no_key_update",
+            LockKind::KeyShare => "for_key_share",
+        }
+    }
+}
+
+/// Parse SQL text through ogsql-parser and detect any lock clause.
+/// Returns the first lock clause kind found, or None.
+/// Used at build time to populate the lock clause index.
+pub(crate) fn detect_lock_clause_in_sql(sql: &str) -> Option<LockKind> {
+    let (stmts, _errors) = ogsql_parser::Parser::parse_sql(sql);
+    for info in &stmts {
+        if let ogsql_parser::ast::Statement::Select(select) = &info.statement {
+            match &select.node.lock_clause {
+                Some(ogsql_parser::ast::LockClause::Update { .. }) => {
+                    return Some(LockKind::Update);
+                }
+                Some(ogsql_parser::ast::LockClause::Share { .. }) => {
+                    return Some(LockKind::Share);
+                }
+                Some(ogsql_parser::ast::LockClause::NoKeyUpdate { .. }) => {
+                    return Some(LockKind::NoKeyUpdate);
+                }
+                Some(ogsql_parser::ast::LockClause::KeyShare { .. }) => {
+                    return Some(LockKind::KeyShare);
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// Hybrid classification: wrap-then-parse, fall back to normalized pattern matching.
+/// Used at search time to detect if a user query targets a lock clause.
+pub(crate) fn classify_lock_clause_query(query: &str) -> Option<LockKind> {
+    let wrapped = format!("SELECT 1 {}", query);
+    if let Some(kind) = detect_lock_clause_in_sql(&wrapped) {
+        return Some(kind);
+    }
+
+    let normalized = normalize_for_matching(&query.to_lowercase());
+    let cleaned = normalized.trim();
+    if cleaned.contains("for update") {
+        return Some(LockKind::Update);
+    }
+    if cleaned.contains("for share") {
+        return Some(LockKind::Share);
+    }
+    if cleaned.contains("for no key update") {
+        return Some(LockKind::NoKeyUpdate);
+    }
+    if cleaned.contains("for key share") {
+        return Some(LockKind::KeyShare);
+    }
+    None
 }
 
 // ── Table extraction ──
