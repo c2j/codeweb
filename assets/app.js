@@ -75,6 +75,7 @@ async function loadNodes(search) {
   const q = search || document.getElementById('search-input').value;
   currentOffset = 0;
   isLoading = true;
+  renderVirtualList();
   let data;
   if (searchMode === 'sql' && q) {
     data = await api('/nodes/search-sql?q=' + encodeURIComponent(q));
@@ -134,6 +135,10 @@ function renderSqlSnippet(bodySql) {
 
 function renderVirtualList() {
   const list = document.getElementById('node-list');
+  if (isLoading) {
+    list.innerHTML = '<div class="loading-spinner">Searching...</div>';
+    return;
+  }
   const scrollTop = list.scrollTop;
   const viewHeight = list.clientHeight;
   const count = allNodes.length;
