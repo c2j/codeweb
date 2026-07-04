@@ -1,0 +1,6 @@
+unique_sql_id,sql_text,codeweb_match_orders,codeweb_matched_by_orders
+sql_250,SELECT * FROM orders WHERE id = 1,"direct to orders",table:orders
+sql_251,"SELECT * FROM order_items WHERE order_id = 1",,
+sql_252,"SELECT order_id, product_name FROM order_items WHERE order_id = 100",,
+sql_253,CALL process_order(1),"indirect to orders",proc:process_order → table:orders
+sql_254,"SELECT * FROM order_items oi JOIN orders o ON oi.order_id = o.id","direct to orders",table:orders

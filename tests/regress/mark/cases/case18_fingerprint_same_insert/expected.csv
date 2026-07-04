@@ -1,0 +1,7 @@
+unique_sql_id,sql_text,codeweb_match_payment,codeweb_matched_by_payment
+sql_240,SELECT * FROM payment WHERE id = 1,"direct to payment",table:payment
+sql_241,CALL archive_payment(1),"indirect to payment",proc:archive_payment → table:payment
+sql_242,"INSERT INTO payment_archive (id, amount, status) SELECT id, amount, status FROM payment WHERE id = 42","direct to payment",table:payment
+sql_243,"INSERT INTO payment_archive (id, amount, status) VALUES (0, 0, 'test')",,
+sql_244,"INSERT INTO backup (id, amount, status) SELECT id, amount, status FROM payment WHERE id = 99","direct to payment",table:payment
+sql_245,"INSERT INTO payment_archive (id, amount, status) SELECT id, amount, status FROM refund WHERE id = 55",,

@@ -1,0 +1,7 @@
+unique_sql_id,sql_text
+sql_230,SELECT * FROM accounts WHERE id = 1
+sql_231,CALL audit_accounts()
+sql_232,"INSERT INTO audit_log (table_name, action) VALUES ('accounts', 'audited')"
+sql_233,"INSERT INTO audit_log (table_name, action) VALUES ('inventory', 'checked')"
+sql_234,"INSERT INTO audit_log (table_name, action) VALUES ('customers', 'migrated')"
+sql_235,SELECT * FROM audit_log WHERE table_name = 'accounts'

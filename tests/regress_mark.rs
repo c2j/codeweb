@@ -55,6 +55,50 @@ const CASE12_SQL: &str = include_str!("regress/mark/cases/case12_select_into/sch
 const CASE12_INPUT: &str = include_str!("regress/mark/cases/case12_select_into/input.csv");
 const CASE12_EXPECTED: &str = include_str!("regress/mark/cases/case12_select_into/expected.csv");
 
+const CASE13_SQL: &str = include_str!("regress/mark/cases/case13_jaccard_false/schema.sql");
+const CASE13_INPUT: &str = include_str!("regress/mark/cases/case13_jaccard_false/input.csv");
+const CASE13_EXPECTED: &str =
+    include_str!("regress/mark/cases/case13_jaccard_false/expected.csv");
+
+const CASE14_SQL: &str = include_str!("regress/mark/cases/case14_fingerprint_real/schema.sql");
+const CASE14_INPUT: &str = include_str!("regress/mark/cases/case14_fingerprint_real/input.csv");
+const CASE14_EXPECTED: &str =
+    include_str!("regress/mark/cases/case14_fingerprint_real/expected.csv");
+
+const CASE15_SQL: &str = include_str!("regress/mark/cases/case15_string_literal_values/schema.sql");
+const CASE15_INPUT: &str =
+    include_str!("regress/mark/cases/case15_string_literal_values/input.csv");
+const CASE15_EXPECTED: &str =
+    include_str!("regress/mark/cases/case15_string_literal_values/expected.csv");
+
+const CASE16_SQL: &str = include_str!("regress/mark/cases/case16_string_literal_where/schema.sql");
+const CASE16_INPUT: &str =
+    include_str!("regress/mark/cases/case16_string_literal_where/input.csv");
+const CASE16_EXPECTED: &str =
+    include_str!("regress/mark/cases/case16_string_literal_where/expected.csv");
+
+const CASE17_SQL: &str = include_str!("regress/mark/cases/case17_fingerprint_audit/schema.sql");
+const CASE17_INPUT: &str = include_str!("regress/mark/cases/case17_fingerprint_audit/input.csv");
+const CASE17_EXPECTED: &str =
+    include_str!("regress/mark/cases/case17_fingerprint_audit/expected.csv");
+
+const CASE18_SQL: &str =
+    include_str!("regress/mark/cases/case18_fingerprint_same_insert/schema.sql");
+const CASE18_INPUT: &str =
+    include_str!("regress/mark/cases/case18_fingerprint_same_insert/input.csv");
+const CASE18_EXPECTED: &str =
+    include_str!("regress/mark/cases/case18_fingerprint_same_insert/expected.csv");
+
+const CASE19_SQL: &str = include_str!("regress/mark/cases/case19_column_name_guard/schema.sql");
+const CASE19_INPUT: &str = include_str!("regress/mark/cases/case19_column_name_guard/input.csv");
+const CASE19_EXPECTED: &str =
+    include_str!("regress/mark/cases/case19_column_name_guard/expected.csv");
+
+const CASE20_SQL: &str = include_str!("regress/mark/cases/case20_function_name_guard/schema.sql");
+const CASE20_INPUT: &str = include_str!("regress/mark/cases/case20_function_name_guard/input.csv");
+const CASE20_EXPECTED: &str =
+    include_str!("regress/mark/cases/case20_function_name_guard/expected.csv");
+
 // ── helpers ──
 
 fn codeweb_bin() -> PathBuf {
@@ -256,4 +300,76 @@ fn regress_mark_case12_select_into() {
 
     let actual = run_mark(&dir, &["accounts"], "input.csv");
     assert_csv_eq(&actual, CASE12_EXPECTED, "case12");
+}
+
+#[test]
+fn regress_mark_case13_jaccard_false() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE13_SQL, Some(CASE13_INPUT));
+
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
+    assert_csv_eq(&actual, CASE13_EXPECTED, "case13");
+}
+
+#[test]
+fn regress_mark_case14_fingerprint_real() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE14_SQL, Some(CASE14_INPUT));
+
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
+    assert_csv_eq(&actual, CASE14_EXPECTED, "case14");
+}
+
+#[test]
+fn regress_mark_case15_string_literal_values() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE15_SQL, Some(CASE15_INPUT));
+
+    let actual = run_mark(&dir, &["orders"], "input.csv");
+    assert_csv_eq(&actual, CASE15_EXPECTED, "case15");
+}
+
+#[test]
+fn regress_mark_case16_string_literal_where() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE16_SQL, Some(CASE16_INPUT));
+
+    let actual = run_mark(&dir, &["film"], "input.csv");
+    assert_csv_eq(&actual, CASE16_EXPECTED, "case16");
+}
+
+#[test]
+fn regress_mark_case17_fingerprint_audit() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE17_SQL, Some(CASE17_INPUT));
+
+    let actual = run_mark(&dir, &["accounts"], "input.csv");
+    assert_csv_eq(&actual, CASE17_EXPECTED, "case17");
+}
+
+#[test]
+fn regress_mark_case18_fingerprint_same_insert() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE18_SQL, Some(CASE18_INPUT));
+
+    let actual = run_mark(&dir, &["payment"], "input.csv");
+    assert_csv_eq(&actual, CASE18_EXPECTED, "case18");
+}
+
+#[test]
+fn regress_mark_case19_column_name_guard() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE19_SQL, Some(CASE19_INPUT));
+
+    let actual = run_mark(&dir, &["orders"], "input.csv");
+    assert_csv_eq(&actual, CASE19_EXPECTED, "case19");
+}
+
+#[test]
+fn regress_mark_case20_function_name_guard() {
+    let dir = TempDir::new().unwrap();
+    init_project(&dir, CASE20_SQL, Some(CASE20_INPUT));
+
+    let actual = run_mark(&dir, &["inventory"], "input.csv");
+    assert_csv_eq(&actual, CASE20_EXPECTED, "case20");
 }

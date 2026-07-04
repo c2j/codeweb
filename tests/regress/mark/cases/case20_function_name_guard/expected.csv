@@ -1,0 +1,7 @@
+unique_sql_id,sql_text,codeweb_match_inventory,codeweb_matched_by_inventory
+sql_260,SELECT * FROM inventory WHERE id = 1,"direct to inventory",table:inventory
+sql_261,CALL check_inventory_status(),"indirect to inventory",proc:check_inventory_status → table:inventory
+sql_262,"CALL update_inventory(1, 100)","indirect to inventory","proc:update_inventory → table:inventory"
+sql_263,EXEC check_inventory_status,"indirect to inventory",proc:check_inventory_status → table:inventory
+sql_264,"SELECT * FROM inventory_log WHERE id = 1",,
+sql_265,"SELECT check_inventory_status, update_inventory FROM settings",,

@@ -1,0 +1,6 @@
+unique_sql_id,sql_text
+sql_210,SELECT * FROM orders WHERE id = 1
+sql_211,"INSERT INTO audit_log (table_name, action) VALUES ('orders', 'processed')"
+sql_212,"INSERT INTO audit_log (table_name, action) VALUES ('products', 'cleanup')"
+sql_213,"INSERT INTO config (key, value) VALUES ('target_table', 'orders')"
+sql_214,CALL process_orders()
