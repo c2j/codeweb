@@ -1,0 +1,5 @@
+unique_sql_id,sql_text,codeweb_match_accounts,codeweb_matched_by_accounts
+sql_100,"SELECT id, balance FROM accounts WHERE owner = 'ACTIVE'","direct to accounts",table:accounts
+sql_101,"SELECT id, owner FROM accounts WHERE balance > 0","direct to accounts",table:accounts
+sql_102,"SELECT * FROM accounts WHERE id = 1","direct to accounts",table:accounts
+sql_103,"SELECT id, balance, owner FROM accounts WHERE id = 100","direct to accounts",table:accounts

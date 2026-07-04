@@ -1,0 +1,6 @@
+unique_sql_id,sql_text
+sql_220,SELECT * FROM film WHERE id = 1
+sql_221,SELECT * FROM film_log WHERE entity_type = 'film'
+sql_222,SELECT * FROM film_log WHERE entity_type = 'actor'
+sql_223,SELECT * FROM film_log WHERE entity_type = 'film' AND entity_id = 42
+sql_224,CALL log_film_access(1)

@@ -1,0 +1,6 @@
+unique_sql_id,sql_text,codeweb_match_orders,codeweb_matched_by_orders
+sql_210,"SELECT * FROM orders WHERE id = 1","direct to orders",table:orders
+sql_211,"INSERT INTO audit_log (table_name, action) VALUES ('orders', 'processed')","direct to orders",table:orders
+sql_212,"INSERT INTO audit_log (table_name, action) VALUES ('products', 'cleanup')","indirect to orders",proc:process_orders → table:orders
+sql_213,"INSERT INTO config (key, value) VALUES ('target_table', 'orders')","direct to orders",table:orders
+sql_214,CALL process_orders(),"indirect to orders",proc:process_orders → table:orders

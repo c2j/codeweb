@@ -1,0 +1,7 @@
+unique_sql_id,sql_text
+sql_240,SELECT * FROM payment WHERE id = 1
+sql_241,CALL archive_payment(1)
+sql_242,"INSERT INTO payment_archive (id, amount, status) SELECT id, amount, status FROM payment WHERE id = 42"
+sql_243,"INSERT INTO payment_archive (id, amount, status) VALUES (0, 0, 'test')"
+sql_244,"INSERT INTO backup (id, amount, status) SELECT id, amount, status FROM payment WHERE id = 99"
+sql_245,"INSERT INTO payment_archive (id, amount, status) SELECT id, amount, status FROM refund WHERE id = 55"

@@ -1,0 +1,5 @@
+unique_sql_id,sql_text,codeweb_match_accounts,codeweb_matched_by_accounts
+sql_110,"SELECT SUM(balance) FROM accounts WHERE owner = 'ACTIVE'","direct to accounts",table:accounts
+sql_111,CALL verify_balance(),"indirect to accounts",proc:verify_balance → table:accounts
+sql_112,"SELECT SUM(balance) FROM accounts WHERE owner = 'CLOSED'","direct to accounts",table:accounts
+sql_113,"SELECT SUM(t.amount) FROM transactions t",,
