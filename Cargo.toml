@@ -1,6 +1,6 @@
 [package]
 name = "codeweb"
-version = "0.7.36"
+version = "0.7.37"
 edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
 
