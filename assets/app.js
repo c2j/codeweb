@@ -6,6 +6,8 @@ let searchMode = 'name'; // 'name' or 'sql'
 let showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
 let currentOffset = 0;
 let isLoading = false;
+let navHistory = [];
+let isNavigatingBack = false;
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -64,11 +66,14 @@ async function init() {
   });
 
   document.getElementById('detail-panel').addEventListener('click', function(e) {
+    if (e.target.closest('.copy-btn')) return;
     const treeNode = e.target.closest('.tree-node');
     if (treeNode && treeNode.dataset.key) {
       navigateTo(treeNode.dataset.key);
     }
   });
+
+  document.getElementById('detail-back').addEventListener('click', goBack);
 }
 
 async function loadNodes(search) {
@@ -180,6 +185,7 @@ function renderVirtualList() {
       '<div class="node-item-row">' +
       '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>' +
       '<span class="node-key" title="' + esc(n.key) + '">' + esc(n.key) + '</span>' +
+      '<span class="copy-btn" onclick="event.stopPropagation(); copyToClipboard(this)" data-copy-key="' + esc(n.key) + '" title="Copy name">📋</span>' +
       (n.score != null ? '<span class="node-score">' + Math.round(n.score * 100) + '%</span>' : '') +
       '<span class="node-degree">' + n.in_degree + '/' + n.out_degree + '</span>' +
       '</div>' + snippet + '</div>';
@@ -190,6 +196,36 @@ function renderVirtualList() {
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
+async function copyToClipboard(btn) {
+  const text = btn.dataset.copyKey;
+  try {
+    await navigator.clipboard.writeText(text);
+    document.querySelectorAll('.copy-btn.copy-success').forEach(b => {
+      b.classList.remove('copy-success');
+      b.textContent = '\ud83d\udccb';
+    });
+    btn.textContent = '\u2713';
+    btn.classList.add('copy-success');
+    setTimeout(() => {
+      btn.textContent = '\ud83d\udccb';
+      btn.classList.remove('copy-success');
+    }, 1500);
+  } catch (_) {}
+}
+
+function updateBackButton() {
+  const btn = document.getElementById('detail-back');
+  if (!btn) return;
+  btn.style.display = navHistory.length > 0 ? '' : 'none';
+}
+
+async function goBack() {
+  if (navHistory.length === 0) return;
+  const prevKey = navHistory.pop();
+  isNavigatingBack = true;
+  await navigateTo(prevKey);
+}
+
 async function selectNode(id) {
   selectedNodeId = id;
   const node = allNodes.find(n => n.id === id);
@@ -198,6 +234,11 @@ async function selectNode(id) {
 }
 
 async function navigateTo(key) {
+  if (!isNavigatingBack && currentTraceKey && currentTraceKey !== key) {
+    navHistory.push(currentTraceKey);
+  }
+  isNavigatingBack = false;
+
   const node = allNodes.find(n => n.key === key);
   selectedNodeId = node ? node.id : null;
   renderVirtualList();
@@ -209,6 +250,7 @@ async function navigateTo(key) {
   ]);
   if (currentTraceKey !== key) return;
   showDetail(trace, detail, searchMode);
+  updateBackButton();
 }
 
 function toggleProperties() {
@@ -299,6 +341,7 @@ function renderTreeHtml(nodes, prefixes) {
     html += '<span class="tree-prefix">' + esc(prefix + connector) + '</span>';
     html += '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>';
     html += '<span class="tree-key">' + esc(n.key) + '</span>';
+    html += '<span class="copy-btn" onclick="event.stopPropagation(); copyToClipboard(this)" data-copy-key="' + esc(n.key) + '" title="Copy name">📋</span>';
     html += label;
     html += '</div>';
 
@@ -314,6 +357,7 @@ function hideDetail() {
   document.getElementById('detail-panel').classList.add('hidden');
   selectedNodeId = null;
   currentTraceKey = null;
+  navHistory = [];
   renderVirtualList();
 }
 
