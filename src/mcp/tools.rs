@@ -20,12 +20,16 @@ use crate::graph::{CodeGraph, Node};
 
 pub struct McpState {
     store: Arc<GraphStore>,
+    project_name: String,
+    empty_reason: Option<String>,
 }
 
 impl McpState {
-    pub fn new(store: GraphStore) -> Self {
+    pub fn new(store: GraphStore, project_name: String, empty_reason: Option<String>) -> Self {
         Self {
             store: Arc::new(store),
+            project_name,
+            empty_reason,
         }
     }
 
@@ -35,6 +39,23 @@ impl McpState {
 
     fn graph(&self) -> &CodeGraph {
         self.store.graph()
+    }
+
+    fn graph_empty(&self) -> bool {
+        self.store.graph().node_count() == 0
+    }
+
+    fn empty_graph_response(&self) -> String {
+        let message = self.empty_reason.clone().unwrap_or_else(|| {
+            "Code graph has 0 nodes — the project contains no analyzable source files.".to_string()
+        });
+        serde_json::to_string(&serde_json::json!({
+            "status": "empty",
+            "project": &self.project_name,
+            "message": message,
+            "hint": "Run `codeweb analyze` in the project directory, then restart the MCP server.",
+        }))
+        .unwrap_or_default()
     }
 }
 
@@ -101,10 +122,17 @@ fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<se
 #[tool_router]
 impl McpState {
     /// Get project statistics
-    #[tool(description = "Get project statistics including node counts by type and edge count")]
+    #[tool(
+        description = "Get project statistics including node counts by type and edge count. Always call this first to check graph status."
+    )]
     fn codeweb_stats(&self) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let stats = self.store().stats();
         let result = serde_json::json!({
+            "status": "ready",
+            "project": &self.project_name,
             "procedures": stats.procedures,
             "functions": stats.functions,
             "unresolved": stats.unresolved,
@@ -135,6 +163,9 @@ impl McpState {
         description = "List graph nodes, optionally filtered by search string and node type, with pagination"
     )]
     fn codeweb_nodes(&self, Parameters(params): Parameters<NodesParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let summaries = self.store().node_summaries();
         let search_lower = params.search.map(|s| s.to_lowercase());
         let type_filter = params.node_type.map(|t| t.to_lowercase());
@@ -201,6 +232,9 @@ impl McpState {
         description = "Get detailed information about a node by ID, including its properties, callers, and callees. Set depth to control traversal (default 1 = direct only, 0 = unlimited, N = N hops)"
     )]
     fn codeweb_node_detail(&self, Parameters(params): Parameters<NodeDetailParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let graph = self.graph();
         let idx = NodeIndex::new(params.id);
 
@@ -364,6 +398,9 @@ impl McpState {
         description = "Trace bidirectional call chain from a node by name, showing callers and callees as nested trees"
     )]
     fn codeweb_trace(&self, Parameters(params): Parameters<TraceParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let store = self.store();
         let graph = self.graph();
         let matches = store.search_nodes(&params.from);
@@ -399,6 +436,9 @@ impl McpState {
         description = "Search MappedStatement and JavaSql nodes by SQL text content, with relevance scoring and detailed results"
     )]
     fn codeweb_search_sql(&self, Parameters(params): Parameters<SearchSqlParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let graph = self.graph();
         let results = self.store().search_by_sql(&params.sql);
         let nodes: Vec<serde_json::Value> = results
@@ -451,6 +491,9 @@ impl McpState {
         description = "Execute a declarative JSON query spec against the graph for complex multi-step traversals"
     )]
     fn codeweb_query(&self, Parameters(params): Parameters<QueryParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
         let spec: Result<QuerySpec, _> = serde_json::from_value(params.spec);
         let spec = match spec {
             Ok(s) => s,
@@ -477,6 +520,12 @@ use rmcp::ServerHandler;
 
 #[tool_handler(
     name = "codeweb",
-    instructions = "Code graph analysis tools. Use codeweb_stats for overview, codeweb_nodes to find nodes, codeweb_trace to follow call chains, codeweb_search_sql to find SQL, codeweb_node_detail for deep inspection, codeweb_query for complex traversals."
+    instructions = "Code graph analysis tools. ALWAYS call codeweb_stats first. \
+        If it returns status='empty', the graph has not been built — tell the user to run `codeweb analyze` in the project directory then restart this MCP server, and stop. \
+        If status='ready': use codeweb_nodes to find nodes (search + type filter), \
+        codeweb_trace to follow call chains bidirectionally, \
+        codeweb_search_sql to find SQL by text content, \
+        codeweb_node_detail for properties + callers + callees, \
+        codeweb_query for complex multi-step traversals via JSON QuerySpec."
 )]
 impl ServerHandler for McpState {}

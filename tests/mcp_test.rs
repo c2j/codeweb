@@ -228,9 +228,15 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(text)
             .unwrap_or_else(|e| panic!("stats text should be valid JSON: {e}"));
 
+        // New project without `codeweb analyze` → graph is empty.
+        // The MCP server stays alive and returns status="empty" with guidance.
+        assert_eq!(
+            stats["status"], "empty",
+            "unanalyzed project should return status=empty, got: {stats}"
+        );
         assert!(
-            stats.get("edges").is_some(),
-            "stats response should contain an 'edges' field, got: {stats}"
+            stats.get("hint").is_some(),
+            "empty stats should include a hint, got: {stats}"
         );
     }
 }
