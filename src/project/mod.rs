@@ -459,7 +459,7 @@ impl Project {
         &self.config.project.name
     }
 
-    fn store_path(&self) -> PathBuf {
+    pub fn store_path(&self) -> PathBuf {
         self.root.join(&self.config.store.path)
     }
 
@@ -472,7 +472,7 @@ impl Project {
         Ok(())
     }
 
-    fn try_load_store(&mut self) -> Option<&GraphStore> {
+    pub fn try_load_store(&mut self) -> Option<&GraphStore> {
         if self.store.is_none() {
             let store_path = self.store_path();
             if store_path.exists() {

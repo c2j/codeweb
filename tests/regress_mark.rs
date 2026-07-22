@@ -57,8 +57,7 @@ const CASE12_EXPECTED: &str = include_str!("regress/mark/cases/case12_select_int
 
 const CASE13_SQL: &str = include_str!("regress/mark/cases/case13_jaccard_false/schema.sql");
 const CASE13_INPUT: &str = include_str!("regress/mark/cases/case13_jaccard_false/input.csv");
-const CASE13_EXPECTED: &str =
-    include_str!("regress/mark/cases/case13_jaccard_false/expected.csv");
+const CASE13_EXPECTED: &str = include_str!("regress/mark/cases/case13_jaccard_false/expected.csv");
 
 const CASE14_SQL: &str = include_str!("regress/mark/cases/case14_fingerprint_real/schema.sql");
 const CASE14_INPUT: &str = include_str!("regress/mark/cases/case14_fingerprint_real/input.csv");
@@ -72,8 +71,7 @@ const CASE15_EXPECTED: &str =
     include_str!("regress/mark/cases/case15_string_literal_values/expected.csv");
 
 const CASE16_SQL: &str = include_str!("regress/mark/cases/case16_string_literal_where/schema.sql");
-const CASE16_INPUT: &str =
-    include_str!("regress/mark/cases/case16_string_literal_where/input.csv");
+const CASE16_INPUT: &str = include_str!("regress/mark/cases/case16_string_literal_where/input.csv");
 const CASE16_EXPECTED: &str =
     include_str!("regress/mark/cases/case16_string_literal_where/expected.csv");
 
