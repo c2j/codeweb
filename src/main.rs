@@ -582,6 +582,32 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         depth: usize,
     },
+
+    /// Find call-relationship paths connecting multiple nodes
+    ///
+    /// Given two or more node names, discovers all directed call paths
+    /// between them in both directions. Uses only call edges (DirectCall,
+    /// CallsProcedure, InvokesMapper, CallsJava).
+    Inspect {
+        /// Node names to inspect (substring match, at least 2 required)
+        nodes: Vec<String>,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Max traversal depth between any two nodes
+        #[arg(short, long, default_value_t = 15)]
+        max_depth: usize,
+
+        /// Max paths to show per node pair
+        #[arg(long, default_value_t = 10)]
+        max_paths: usize,
+
+        /// Display style
+        #[arg(short, long, default_value = "both", value_parser = ["summary", "paths", "both"])]
+        style: String,
+    },
 }
 
 fn main() {
@@ -797,6 +823,19 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
             cmd_impact(&file, node.as_deref(), &project, &format, depth)
+        }
+        Some(Commands::Inspect {
+            nodes,
+            project,
+            max_depth,
+            max_paths,
+            style,
+        }) => {
+            if nodes.len() < 2 {
+                eprintln!("Error: inspect requires at least 2 node names.");
+                std::process::exit(2);
+            }
+            cmd_inspect(&nodes, &project, max_depth, max_paths, &style)
         }
     }
 }
@@ -2631,6 +2670,74 @@ fn cmd_impact(
         let result = build_impact_result(&target, upstream, downstream);
         emit_result(&result, format)?;
     }
+    Ok(())
+}
+
+fn cmd_inspect(
+    node_names: &[String],
+    project: &Path,
+    max_depth: usize,
+    max_paths: usize,
+    style: &str,
+) -> Result<()> {
+    use crate::graph::inspect::{
+        find_paths_between, format_inspect_result, InspectOptions, InspectStyle,
+    };
+
+    let mut proj = project::Project::find(project)?;
+    let store = match proj.load_store() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Project not analyzed. Run `codeweb analyze` first.");
+            return Ok(());
+        }
+    };
+    let graph = store.graph();
+
+    let mut targets: Vec<NodeIndex> = Vec::with_capacity(node_names.len());
+    let mut all_matched_names: Vec<String> = Vec::with_capacity(node_names.len());
+
+    eprintln!("── NAME RESOLUTION ──");
+    for name in node_names {
+        let matches = store.search_nodes(name);
+        if matches.is_empty() {
+            eprintln!("  \"{}\" → 0 matches", name);
+            eprintln!("Error: '{}' did not match any node.", name);
+            std::process::exit(2);
+        }
+        if matches.len() > 1 {
+            eprintln!("  \"{}\" → {} matches (using #1)", name, matches.len());
+            for (i, (_, display)) in matches.iter().enumerate() {
+                let marker = if i == 0 { "  ← using" } else { "" };
+                eprintln!("    {}. {}{}", i + 1, display, marker);
+            }
+        } else {
+            eprintln!("  \"{}\" → 1 match  (exact)", name);
+        }
+        targets.push(matches[0].0);
+        all_matched_names.push(matches[0].1.clone());
+    }
+    eprintln!();
+
+    let opts = InspectOptions {
+        max_depth,
+        max_paths_per_pair: max_paths,
+        max_total_paths: max_paths.saturating_mul(10),
+    };
+
+    let style_enum = match style {
+        "summary" => InspectStyle::Summary,
+        "paths" => InspectStyle::Paths,
+        _ => InspectStyle::Both,
+    };
+
+    let result = find_paths_between(graph, &targets, &opts);
+
+    println_stdout!(
+        "{}",
+        format_inspect_result(&result, graph, &all_matched_names, style_enum)
+    );
+
     Ok(())
 }
 

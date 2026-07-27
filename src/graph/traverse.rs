@@ -49,7 +49,7 @@ pub struct DegreeInfo {
     pub total_degree: usize,
 }
 
-fn edge_label_for(
+pub(crate) fn edge_label_for(
     graph: &crate::graph::CodeGraph,
     from: NodeIndex,
     to: NodeIndex,
