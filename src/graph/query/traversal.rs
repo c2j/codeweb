@@ -19,6 +19,7 @@ pub struct GraphTraversal<'a> {
     node_filter: Option<NodeFilter>,
     max_depth: Option<usize>,
     until: Option<UntilCondition<'a>>,
+    target: Option<NodeIndex>,
 }
 
 impl<'a> GraphTraversal<'a> {
@@ -31,6 +32,7 @@ impl<'a> GraphTraversal<'a> {
             node_filter: None,
             max_depth: None,
             until: None,
+            target: None,
         }
     }
 
@@ -61,6 +63,12 @@ impl<'a> GraphTraversal<'a> {
         self
     }
 
+    /// Set a target node: only paths ending at this node will be collected.
+    pub fn target(mut self, target: NodeIndex) -> Self {
+        self.target = Some(target);
+        self
+    }
+
     pub fn collect_nodes(self) -> Vec<NodeIndex> {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
@@ -74,6 +82,20 @@ impl<'a> GraphTraversal<'a> {
         let mut visited = HashSet::new();
         visited.insert(self.start);
         self.dfs_paths(self.start, 0, &mut visited, &mut current_path, &mut paths);
+        paths
+    }
+
+    /// Collect only paths that end at the target node.
+    /// Falls back to `collect_paths()` if no target is set.
+    pub fn collect_paths_to_target(self) -> Vec<Vec<NodeIndex>> {
+        if self.target.is_none() {
+            return self.collect_paths();
+        }
+        let mut paths = Vec::new();
+        let mut current_path = vec![self.start];
+        let mut visited = HashSet::new();
+        visited.insert(self.start);
+        self.dfs_paths_to_target(self.start, 0, &mut visited, &mut current_path, &mut paths);
         paths
     }
 }
@@ -203,6 +225,71 @@ impl<'a> GraphTraversal<'a> {
 
         if !has_unvisited && current_path.len() > 1 {
             paths.push(current_path.clone());
+        }
+    }
+
+    fn dfs_paths_to_target(
+        &self,
+        current: NodeIndex,
+        depth: usize,
+        visited: &mut HashSet<NodeIndex>,
+        current_path: &mut Vec<NodeIndex>,
+        paths: &mut Vec<Vec<NodeIndex>>,
+    ) {
+        if let Some(max) = self.max_depth {
+            if depth >= max {
+                return;
+            }
+        }
+
+        let neighbors: Vec<_> = self
+            .graph
+            .neighbors_directed(current, self.direction)
+            .collect();
+
+        for neighbor in neighbors {
+            if visited.contains(&neighbor) {
+                continue;
+            }
+
+            let (from, to) = match self.direction {
+                Direction::Outgoing => (current, neighbor),
+                Direction::Incoming => (neighbor, current),
+            };
+            let edge_matches = self
+                .graph
+                .edges_connecting(from, to)
+                .any(|e| self.edge_filter.matches(e.weight()));
+            if !edge_matches {
+                continue;
+            }
+
+            if !self
+                .node_filter
+                .as_ref()
+                .is_none_or(|f| f.matches(&self.graph[neighbor]))
+            {
+                continue;
+            }
+
+            visited.insert(neighbor);
+            current_path.push(neighbor);
+
+            let is_until = self
+                .until
+                .as_ref()
+                .is_some_and(|u| u(&self.graph[neighbor]));
+
+            if is_until {
+                paths.push(current_path.clone());
+            } else if Some(neighbor) == self.target {
+                paths.push(current_path.clone());
+            } else {
+                self.dfs_paths_to_target(neighbor, depth + 1, visited, current_path, paths);
+            }
+
+            current_path.pop();
+            visited.remove(&neighbor);
         }
     }
 }
