@@ -18,6 +18,7 @@ pub struct GraphTraversal<'a> {
     edge_filter: EdgeFilter,
     node_filter: Option<NodeFilter>,
     max_depth: Option<usize>,
+    max_paths: Option<usize>,
     until: Option<UntilCondition<'a>>,
     target: Option<NodeIndex>,
 }
@@ -31,6 +32,7 @@ impl<'a> GraphTraversal<'a> {
             edge_filter: EdgeFilter::new(),
             node_filter: None,
             max_depth: None,
+            max_paths: None,
             until: None,
             target: None,
         }
@@ -52,6 +54,10 @@ impl<'a> GraphTraversal<'a> {
     }
     pub fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = Some(depth);
+        self
+    }
+    pub fn max_paths(mut self, n: usize) -> Self {
+        self.max_paths = Some(n);
         self
     }
     pub fn node_filter(mut self, filter: NodeFilter) -> Self {
@@ -108,6 +114,11 @@ impl<'a> GraphTraversal<'a> {
         visited: &mut HashSet<NodeIndex>,
         result: &mut Vec<NodeIndex>,
     ) {
+        if let Some(max) = self.max_paths {
+            if result.len() >= max {
+                return;
+            }
+        }
         if let Some(max) = self.max_depth {
             if depth >= max {
                 return;
@@ -164,6 +175,11 @@ impl<'a> GraphTraversal<'a> {
         current_path: &mut Vec<NodeIndex>,
         paths: &mut Vec<Vec<NodeIndex>>,
     ) {
+        if let Some(max) = self.max_paths {
+            if paths.len() >= max {
+                return;
+            }
+        }
         if let Some(max) = self.max_depth {
             if depth >= max {
                 if current_path.len() > 1 {
@@ -241,13 +257,13 @@ impl<'a> GraphTraversal<'a> {
                 return;
             }
         }
+        if let Some(max) = self.max_paths {
+            if paths.len() >= max {
+                return;
+            }
+        }
 
-        let neighbors: Vec<_> = self
-            .graph
-            .neighbors_directed(current, self.direction)
-            .collect();
-
-        for neighbor in neighbors {
+        for neighbor in self.graph.neighbors_directed(current, self.direction) {
             if visited.contains(&neighbor) {
                 continue;
             }
@@ -564,5 +580,99 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0], table);
+    }
+
+    #[test]
+    fn max_paths_caps_collect_paths() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("a", None));
+        let b = graph.add_node(make_proc("b", None));
+        let c = graph.add_node(make_proc("c", None));
+        graph.add_edge(
+            a,
+            b,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: SourceLocation {
+                    file: make_file(),
+                    line: 1,
+                },
+            },
+        );
+        graph.add_edge(
+            a,
+            c,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: SourceLocation {
+                    file: make_file(),
+                    line: 1,
+                },
+            },
+        );
+
+        // a→b and a→c are two paths. max_paths(1) should return at most 1.
+        let paths = GraphTraversal::new(&graph, a)
+            .outgoing()
+            .edge_filter(EdgeFilter::calls_only())
+            .max_paths(1)
+            .collect_paths();
+
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn max_paths_caps_collect_paths_to_target() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("a", None));
+        let x = graph.add_node(make_proc("x", None));
+        let y = graph.add_node(make_proc("y", None));
+        let b = graph.add_node(make_proc("b", None));
+        let loc = SourceLocation {
+            file: make_file(),
+            line: 1,
+        };
+        graph.add_edge(
+            a,
+            x,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            x,
+            b,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            a,
+            y,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: loc.clone(),
+            },
+        );
+        graph.add_edge(
+            y,
+            b,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: loc,
+            },
+        );
+
+        // Two paths a→x→b and a→y→b. max_paths(1) should cap at 1.
+        let paths = GraphTraversal::new(&graph, a)
+            .outgoing()
+            .edge_filter(EdgeFilter::calls_only())
+            .max_paths(1)
+            .target(b)
+            .collect_paths_to_target();
+
+        assert_eq!(paths.len(), 1);
     }
 }
