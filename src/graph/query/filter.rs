@@ -67,6 +67,14 @@ impl EdgeFilter {
         self
     }
 
+    pub fn from_categories(cats: &[EdgeCategory]) -> Self {
+        let mut filter = Self::new();
+        for &cat in cats {
+            filter = filter.with_category(cat);
+        }
+        filter
+    }
+
     pub fn calls_only() -> Self {
         Self::new().with_category(EdgeCategory::Call)
     }

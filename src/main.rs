@@ -581,6 +581,12 @@ enum Commands {
         /// Traversal depth (1 = direct callers/callees only)
         #[arg(short, long, default_value = "1")]
         depth: usize,
+
+        /// Edge types to include in impact traversal (comma-separated).
+        /// Valid: all, call, dataflow, reference, composition, inheritance.
+        /// Default "all" includes every edge type.
+        #[arg(short = 'e', long, default_value = "all", value_delimiter = ',')]
+        edge_types: Vec<String>,
     },
 
     /// Find reachability paths connecting multiple nodes
@@ -817,6 +823,7 @@ fn run() -> Result<()> {
             project,
             format,
             depth,
+            edge_types,
         }) => {
             if !file.is_empty() && node.is_some() {
                 eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
@@ -826,7 +833,14 @@ fn run() -> Result<()> {
                 eprintln!("Error: must pass exactly one of --file <path> or --node <name>.");
                 std::process::exit(2);
             }
-            cmd_impact(&file, node.as_deref(), &project, &format, depth)
+            cmd_impact(
+                &file,
+                node.as_deref(),
+                &project,
+                &format,
+                depth,
+                &edge_types,
+            )
         }
         Some(Commands::Inspect {
             nodes,
@@ -2568,14 +2582,32 @@ fn jsp_count_fragment() -> String {
     String::new()
 }
 
+fn build_edge_filter(types: &[String]) -> Result<crate::graph::query::filter::EdgeFilter> {
+    use crate::graph::query::filter::EdgeFilter;
+
+    if types.is_empty() || types.iter().any(|t| t.eq_ignore_ascii_case("all")) {
+        return Ok(EdgeFilter::new());
+    }
+
+    let categories: Vec<crate::graph::EdgeCategory> = types
+        .iter()
+        .map(|t| {
+            t.parse::<crate::graph::EdgeCategory>()
+                .map_err(|e| crate::error::CodeWebError::ConfigError { message: e })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(EdgeFilter::from_categories(&categories))
+}
+
 fn cmd_impact(
     files: &[PathBuf],
     node: Option<&str>,
     project: &Path,
     format: &str,
     depth: usize,
+    edge_types: &[String],
 ) -> Result<()> {
-    use crate::graph::query::filter::EdgeFilter;
     use petgraph::Direction;
 
     let mut proj = project::Project::find(project)?;
@@ -2588,7 +2620,7 @@ fn cmd_impact(
     };
 
     let graph = store.graph();
-    let calls_filter = EdgeFilter::calls_only();
+    let edge_filter = build_edge_filter(edge_types)?;
     let file_nodes = store.file_nodes();
     let key_index = store.node_key_index();
 
@@ -2607,7 +2639,7 @@ fn cmd_impact(
             &start_nodes,
             Direction::Incoming,
             depth,
-            &calls_filter,
+            &edge_filter,
             &mut upstream_map,
         );
         collect_impact_entries(
@@ -2615,7 +2647,7 @@ fn cmd_impact(
             &start_nodes,
             Direction::Outgoing,
             depth,
-            &calls_filter,
+            &edge_filter,
             &mut downstream_map,
         );
 
@@ -2655,7 +2687,7 @@ fn cmd_impact(
             &start_nodes,
             Direction::Incoming,
             depth,
-            &calls_filter,
+            &edge_filter,
             &mut upstream_map,
         );
         collect_impact_entries(
@@ -2663,7 +2695,7 @@ fn cmd_impact(
             &start_nodes,
             Direction::Outgoing,
             depth,
-            &calls_filter,
+            &edge_filter,
             &mut downstream_map,
         );
 
@@ -2970,7 +3002,7 @@ fn collect_impact_entries(
                 let file_path = crate::graph::store::node_source_file(neighbor_node)
                     .map(|p| p.to_string_lossy().to_string());
                 let symbol = NodeKey::from_node(neighbor_node).to_string();
-                let line = edge_location_line(weight);
+                let line = impact_entry_line(neighbor_node, weight);
 
                 out.entry((file_path.clone(), symbol.clone()))
                     .or_insert(ImpactEntry {
@@ -2987,6 +3019,26 @@ fn collect_impact_entries(
         if frontier.is_empty() {
             break;
         }
+    }
+}
+
+/// Returns the source line for the ImpactEntry.
+///
+/// For nodes whose edge location comes from extracted SQL fragments
+/// (JavaSql, MappedStatement, JspSql), the edge's `location.line` is
+/// relative to the extracted SQL text, not the source file. Use the
+/// node's own `line` field instead.
+fn impact_entry_line(
+    neighbor_node: &crate::graph::Node,
+    edge: &crate::graph::Edge,
+) -> Option<usize> {
+    use crate::graph::Node;
+    match neighbor_node {
+        Node::JavaSql { line, .. } => Some(*line),
+        Node::MappedStatement { line, .. } => Some(*line),
+        #[cfg(feature = "jsp")]
+        Node::JspSql { line, .. } => Some(*line),
+        _ => edge_location_line(edge),
     }
 }
 
@@ -3027,21 +3079,32 @@ fn print_impact_text(result: &ImpactResult) {
     if result.upstream.is_empty() {
         println_stdout!("  (none)");
     } else {
-        for entry in &result.upstream {
-            let line_tag = entry.line.map(|l| format!(":{}", l)).unwrap_or_default();
-            let file = entry.file_path.as_deref().unwrap_or("<unknown>");
-            println_stdout!("  {}  {}{}", entry.symbol, file, line_tag);
-        }
+        print_grouped_entries(&result.upstream);
     }
     println_stdout!();
     println_stdout!("── DOWNSTREAM ({}) ──", result.downstream.len());
     if result.downstream.is_empty() {
         println_stdout!("  (none)");
     } else {
-        for entry in &result.downstream {
+        print_grouped_entries(&result.downstream);
+    }
+}
+
+/// Print entries grouped by file_path to reduce repetition.
+/// Entries are assumed sorted by (file_path, symbol).
+fn print_grouped_entries(entries: &[ImpactEntry]) {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<&str, Vec<&ImpactEntry>> = BTreeMap::new();
+    for entry in entries {
+        let key = entry.file_path.as_deref().unwrap_or("<unknown>");
+        groups.entry(key).or_default().push(entry);
+    }
+    for (file, group) in &groups {
+        println_stdout!("  {}", file);
+        for entry in group {
             let line_tag = entry.line.map(|l| format!(":{}", l)).unwrap_or_default();
-            let file = entry.file_path.as_deref().unwrap_or("<unknown>");
-            println_stdout!("  {}  {}{}", entry.symbol, file, line_tag);
+            println_stdout!("    {}{}", entry.symbol, line_tag);
         }
     }
 }

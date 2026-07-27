@@ -337,3 +337,225 @@ fn test_impact_neither_flag_error() {
         stderr
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// --edge-types 标志测试
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_impact_edge_types_default_all() {
+    let dir = setup_project();
+
+    // 默认 "all" 应包含所有边类型 — DirectCall 应被捕获
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "all",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream
+            .iter()
+            .any(|e| e["symbol"].as_str().unwrap().contains("proc_b")),
+        "downstream should contain proc_b with --edge-types all: {:?}",
+        downstream
+    );
+}
+
+#[test]
+fn test_impact_edge_types_call_only() {
+    let dir = setup_project();
+
+    // --edge-types call: 仅 Call 类别，DirectCall 仍应被捕获
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "call",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream
+            .iter()
+            .any(|e| e["symbol"].as_str().unwrap().contains("proc_b")),
+        "downstream should contain proc_b with --edge-types call: {:?}",
+        downstream
+    );
+}
+
+#[test]
+fn test_impact_edge_types_dataflow_excludes_call_edges() {
+    let dir = setup_project();
+
+    // --edge-types dataflow: DirectCall 不属于 DataFlow，应被过滤
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "dataflow",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream.is_empty(),
+        "downstream should be empty with --edge-types dataflow (no dataflow edges in proc graph): {:?}",
+        downstream
+    );
+}
+
+#[test]
+fn test_impact_edge_types_invalid_value() {
+    let dir = setup_project();
+
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "invalid_type",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "should fail when --edge-types has invalid value"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("unknown edge type"),
+        "stderr should mention unknown edge type: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_impact_edge_types_multiple_categories() {
+    let dir = setup_project();
+
+    // --edge-types call,dataflow: 应包含 DirectCall
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "call,dataflow",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream
+            .iter()
+            .any(|e| e["symbol"].as_str().unwrap().contains("proc_b")),
+        "downstream should contain proc_b with --edge-types call,dataflow: {:?}",
+        downstream
+    );
+}
+
+#[test]
+fn test_impact_edge_types_all_with_other_ignored() {
+    let dir = setup_project();
+
+    // --edge-types all,call: "all" anywhere short-circuits to all edges
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "all,call",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream
+            .iter()
+            .any(|e| e["symbol"].as_str().unwrap().contains("proc_b")),
+        "downstream should contain proc_b when all is in edge-types list: {:?}",
+        downstream
+    );
+}
+
+#[test]
+fn test_impact_edge_types_whitespace_trimmed() {
+    let dir = setup_project();
+
+    // --edge-types "call, dataflow": whitespace after comma should be trimmed
+    let output = run_in_dir(
+        &dir,
+        &[
+            "impact",
+            "--node",
+            "proc_a",
+            "--format",
+            "json",
+            "--edge-types",
+            "call, dataflow",
+        ],
+    );
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("must be valid JSON");
+
+    let downstream = json["downstream"].as_array().unwrap();
+    assert!(
+        downstream
+            .iter()
+            .any(|e| e["symbol"].as_str().unwrap().contains("proc_b")),
+        "downstream should contain proc_b even with whitespace in edge-types: {:?}",
+        downstream
+    );
+}

@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,24 @@ pub enum EdgeCategory {
     Reference,
     /// Inheritance: extends/implements.
     Inheritance,
+}
+
+impl FromStr for EdgeCategory {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "call" => Ok(EdgeCategory::Call),
+            "dataflow" => Ok(EdgeCategory::DataFlow),
+            "reference" => Ok(EdgeCategory::Reference),
+            "composition" => Ok(EdgeCategory::Composition),
+            "inheritance" => Ok(EdgeCategory::Inheritance),
+            other => Err(format!(
+                "unknown edge type: '{}'. Valid: call, dataflow, reference, composition, inheritance",
+                other
+            )),
+        }
+    }
 }
 
 /// What kind of write operation was performed.
