@@ -583,11 +583,11 @@ enum Commands {
         depth: usize,
     },
 
-    /// Find call-relationship paths connecting multiple nodes
+    /// Find reachability paths connecting multiple nodes
     ///
-    /// Given two or more node names, discovers all directed call paths
-    /// between them in both directions. Uses only call edges (DirectCall,
-    /// CallsProcedure, InvokesMapper, CallsJava).
+    /// Given two or more node names, discovers all directed paths
+    /// between them across all edge types. Unreachable pairs are hidden
+    /// by default; use --unreachable to show all pairs.
     Inspect {
         /// Node names to inspect (substring match, at least 2 required)
         nodes: Vec<String>,
@@ -607,6 +607,10 @@ enum Commands {
         /// Display style
         #[arg(short, long, default_value = "both", value_parser = ["summary", "paths", "both"])]
         style: String,
+
+        /// Show unreachable node pairs (0 paths) in output
+        #[arg(long, default_value = "false")]
+        unreachable: bool,
     },
 }
 
@@ -830,12 +834,13 @@ fn run() -> Result<()> {
             max_depth,
             max_paths,
             style,
+            unreachable,
         }) => {
             if nodes.len() < 2 {
                 eprintln!("Error: inspect requires at least 2 node names.");
                 std::process::exit(2);
             }
-            cmd_inspect(&nodes, &project, max_depth, max_paths, &style)
+            cmd_inspect(&nodes, &project, max_depth, max_paths, &style, unreachable)
         }
     }
 }
@@ -2679,6 +2684,7 @@ fn cmd_inspect(
     max_depth: usize,
     max_paths: usize,
     style: &str,
+    show_unreachable: bool,
 ) -> Result<()> {
     use crate::graph::inspect::{
         find_paths_between, format_inspect_result, InspectOptions, InspectStyle,
@@ -2735,7 +2741,13 @@ fn cmd_inspect(
 
     println_stdout!(
         "{}",
-        format_inspect_result(&result, graph, &all_matched_names, style_enum)
+        format_inspect_result(
+            &result,
+            graph,
+            &all_matched_names,
+            style_enum,
+            show_unreachable
+        )
     );
 
     Ok(())
