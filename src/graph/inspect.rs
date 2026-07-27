@@ -1,5 +1,5 @@
 use petgraph::graph::NodeIndex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::graph::query::filter::EdgeFilter;
 use crate::graph::query::traversal::GraphTraversal;
@@ -117,7 +117,7 @@ fn collect_paths_between(
 
     let raw_paths = GraphTraversal::new(graph, from)
         .outgoing()
-        .edge_filter(EdgeFilter::calls_only())
+        .edge_filter(EdgeFilter::new())
         .max_depth(max_depth)
         .max_paths(max_paths)
         .target(to)
@@ -132,8 +132,11 @@ fn collect_paths_between(
         }
         let edge_labels: Vec<String> = hops
             .windows(2)
-            .filter_map(|w| crate::graph::traverse::edge_label_for(graph, w[0], w[1]))
-            .map(|s| s.to_string())
+            .map(|w| {
+                crate::graph::traverse::edge_label_for(graph, w[0], w[1])
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            })
             .collect();
         paths.push(InspectPath {
             from,
@@ -146,11 +149,78 @@ fn collect_paths_between(
     paths
 }
 
+/// Format a single path as a tree chain using `detail`-compatible box-drawing characters.
+///
+/// The first node in `hops` is the source (shown without connector),
+/// each subsequent hop is shown with `└──` and its edge label.
+fn format_path_chain(graph: &CodeGraph, path: &InspectPath, lines: &mut Vec<String>) {
+    let hops = &path.hops;
+    let labels = &path.edge_labels;
+
+    for (hi, hop) in hops.iter().enumerate() {
+        let name = node_display_name(&graph[*hop]);
+        if hi == 0 {
+            // Source node
+            lines.push(format!("    {}", name));
+        } else {
+            let label = if hi - 1 < labels.len() {
+                format!(" {}", labels[hi - 1])
+            } else {
+                String::new()
+            };
+            let prefix = "    ";
+            lines.push(format!("{}└── {}{}", prefix, name, label));
+        }
+    }
+}
+
+/// Format PATHS section using detail-compatible tree style.
+/// Groups paths by (from, to) and renders each path as an indented chain.
+fn format_paths_tree(result: &InspectResult, graph: &CodeGraph) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Group paths by (from, to) pair
+    let mut path_groups: BTreeMap<(NodeIndex, NodeIndex), Vec<&InspectPath>> = BTreeMap::new();
+    for p in &result.paths {
+        path_groups.entry((p.from, p.to)).or_default().push(p);
+    }
+
+    for ((from, to), paths) in &path_groups {
+        let from_name = node_display_name(&graph[*from]);
+        let to_name = node_display_name(&graph[*to]);
+        lines.push(String::new());
+        lines.push(format!(
+            "── {} → {} ({} path{}) ──",
+            from_name,
+            to_name,
+            paths.len(),
+            if paths.len() == 1 { "" } else { "s" }
+        ));
+
+        for (pi, path) in paths.iter().enumerate() {
+            let hops_count = path.hops.len() - 1;
+            if paths.len() > 1 {
+                lines.push(format!(
+                    "  Path {}/{} ({} hop{}):",
+                    pi + 1,
+                    paths.len(),
+                    hops_count,
+                    if hops_count == 1 { "" } else { "s" }
+                ));
+            }
+            format_path_chain(graph, path, &mut lines);
+        }
+    }
+
+    lines
+}
+
 pub fn format_inspect_result(
     result: &InspectResult,
     graph: &CodeGraph,
     target_names: &[String],
     style: InspectStyle,
+    show_unreachable: bool,
 ) -> String {
     let mut lines = Vec::new();
 
@@ -184,11 +254,12 @@ pub fn format_inspect_result(
     lines.push(String::new());
 
     if style != InspectStyle::Paths {
-        // ── SUMMARY ──
-        lines.push("── SUMMARY ──".to_string());
-        if result.summary.is_empty() {
+        // ── CONNECTIONS ──
+        lines.push("── CONNECTIONS ──".to_string());
+        let has_any_path = result.summary.iter().any(|(_, _, c)| *c > 0);
+        if !has_any_path && !show_unreachable {
             lines.push("  (no paths found between any pair)".to_string());
-        } else {
+        } else if has_any_path {
             // Group by from
             let mut groups: std::collections::BTreeMap<
                 NodeIndex,
@@ -200,6 +271,9 @@ pub fn format_inspect_result(
             for (from, entries) in &groups {
                 let from_name = node_display_name(&graph[*from]);
                 for (_, to, count) in entries {
+                    if !show_unreachable && *count == 0 {
+                        continue;
+                    }
                     let to_name = node_display_name(&graph[*to]);
                     let shortest = result
                         .paths
@@ -228,75 +302,27 @@ pub fn format_inspect_result(
         }
         lines.push(String::new());
 
-        // Show unreachable pairs
-        let connected: HashSet<(NodeIndex, NodeIndex)> =
-            result.paths.iter().map(|p| (p.from, p.to)).collect();
-        let mut unreachable: Vec<String> = Vec::new();
-        for (from, to, count) in &result.summary {
-            if *count == 0 {
-                let from_name = node_display_name(&graph[*from]);
-                let to_name = node_display_name(&graph[*to]);
-                unreachable.push(format!("  {} → {}", from_name, to_name));
+        // Show unreachable pairs (only when explicitly requested)
+        if show_unreachable {
+            let mut unreachable: Vec<String> = Vec::new();
+            for (from, to, count) in &result.summary {
+                if *count == 0 {
+                    let from_name = node_display_name(&graph[*from]);
+                    let to_name = node_display_name(&graph[*to]);
+                    unreachable.push(format!("  {} → {}", from_name, to_name));
+                }
             }
-        }
-        let _ = connected;
-        if !unreachable.is_empty() {
-            lines.push("── UNREACHABLE ──".to_string());
-            lines.extend(unreachable);
-            lines.push(String::new());
+            if !unreachable.is_empty() {
+                lines.push("── UNREACHABLE ──".to_string());
+                lines.extend(unreachable);
+                lines.push(String::new());
+            }
         }
     }
 
-    if style != InspectStyle::Summary {
-        // ── PATHS ──
-        if !result.paths.is_empty() {
-            lines.push("── PATHS ──".to_string());
-            // Group by (from, to)
-            let mut path_groups: std::collections::BTreeMap<
-                (NodeIndex, NodeIndex),
-                Vec<&InspectPath>,
-            > = std::collections::BTreeMap::new();
-            for p in &result.paths {
-                path_groups.entry((p.from, p.to)).or_default().push(p);
-            }
-
-            for ((from, to), paths) in &path_groups {
-                let from_name = node_display_name(&graph[*from]);
-                let to_name = node_display_name(&graph[*to]);
-                lines.push(String::new());
-                lines.push(format!(
-                    "── {} → {} ({} path{}) ──",
-                    from_name,
-                    to_name,
-                    paths.len(),
-                    if paths.len() == 1 { "" } else { "s" }
-                ));
-
-                for (pi, path) in paths.iter().enumerate() {
-                    let hops_count = path.hops.len() - 1;
-                    if paths.len() > 1 {
-                        lines.push(format!(
-                            "  Path {}/{} ({} hop{})",
-                            pi + 1,
-                            paths.len(),
-                            hops_count,
-                            if hops_count == 1 { "" } else { "s" }
-                        ));
-                    }
-                    for (hi, hop) in path.hops.iter().enumerate() {
-                        let name = node_display_name(&graph[*hop]);
-                        let edge = if hi < path.edge_labels.len() {
-                            format!(" {}", path.edge_labels[hi])
-                        } else {
-                            String::new()
-                        };
-                        let indent = if paths.len() > 1 { "      " } else { "    " };
-                        let connector = if hi == 0 { "  " } else { "→ " };
-                        lines.push(format!("{}{}{}{}", indent, connector, name, edge));
-                    }
-                }
-            }
-        }
+    if style != InspectStyle::Summary && !result.paths.is_empty() {
+        lines.push("── PATHS ──".to_string());
+        lines.extend(format_paths_tree(result, graph));
     }
 
     lines.join("\n")
@@ -492,11 +518,102 @@ mod tests {
             &graph,
             &["proc_a".into(), "proc_b".into()],
             InspectStyle::Both,
+            false, // show_unreachable
         );
 
-        assert!(output.contains("── SUMMARY ──"));
+        assert!(output.contains("── CONNECTIONS ──"));
         assert!(output.contains("proc_a"));
         assert!(output.contains("proc_b"));
         assert!(output.contains("── PATHS ──"));
+    }
+
+    #[test]
+    fn format_inspect_result_hides_unreachable_by_default() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("proc_a", Some("public")));
+        let b = graph.add_node(make_proc("proc_b", Some("public")));
+        make_direct_call(&mut graph, a, b);
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+
+        // Default (show_unreachable=false): no UNREACHABLE section, no 0-path lines
+        let output_default = format_inspect_result(
+            &result,
+            &graph,
+            &["proc_a".into(), "proc_b".into()],
+            InspectStyle::Both,
+            false,
+        );
+        assert!(!output_default.contains("UNREACHABLE"));
+        assert!(!output_default.contains("0 paths (unreachable)"));
+
+        // show_unreachable=true: should have UNREACHABLE section with the B→A pair
+        let output_all = format_inspect_result(
+            &result,
+            &graph,
+            &["proc_a".into(), "proc_b".into()],
+            InspectStyle::Both,
+            true,
+        );
+        assert!(output_all.contains("── UNREACHABLE ──"));
+        assert!(output_all.contains("0 paths (unreachable)"));
+    }
+
+    #[test]
+    fn format_inspect_result_tree_paths_uses_box_drawing() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("proc_a", Some("public")));
+        let b = graph.add_node(make_proc("proc_b", Some("public")));
+        make_direct_call(&mut graph, a, b);
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["proc_a".into(), "proc_b".into()],
+            InspectStyle::Both,
+            false,
+        );
+
+        // PATHS section body should use └── connector (detail-compatible), not the old → prefix
+        let paths_section = &output[output.find("── PATHS ──").unwrap()..];
+        assert!(
+            paths_section.contains("└──"),
+            "PATHS body should use box-drawing characters"
+        );
+        // Old format had "    → proc:name", new format has "    └── proc:name"
+        assert!(
+            !paths_section.contains("    \u{2192} "),
+            "PATHS body should not use old arrow connectors: {}",
+            paths_section
+        );
+    }
+
+    #[test]
+    fn format_inspect_result_multi_target_tree() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("root", None));
+        let b = graph.add_node(make_proc("child1", None));
+        let c = graph.add_node(make_proc("child2", None));
+        make_direct_call(&mut graph, a, b);
+        make_direct_call(&mut graph, a, c);
+
+        let result = find_paths_between(&graph, &[a, b, c], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["root".into(), "child1".into(), "child2".into()],
+            InspectStyle::Both,
+            false,
+        );
+
+        // CONNECTIONS should show only the 2 reachable pairs, not the 4 0-path ones
+        assert!(output.contains("proc:root → proc:child1"));
+        assert!(output.contains("proc:root → proc:child2"));
+        assert!(!output.contains("0 paths"), "default: no 0-path lines");
+        assert!(
+            !output.contains("UNREACHABLE"),
+            "default: no UNREACHABLE section"
+        );
     }
 }
