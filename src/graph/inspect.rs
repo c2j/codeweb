@@ -52,8 +52,10 @@ pub fn find_paths_between(
             let from = targets[i];
             let to = targets[j];
 
-            let forward = collect_paths_between(graph, from, to, opts.max_depth);
-            let backward = collect_paths_between(graph, to, from, opts.max_depth);
+            let forward =
+                collect_paths_between(graph, from, to, opts.max_depth, opts.max_paths_per_pair);
+            let backward =
+                collect_paths_between(graph, to, from, opts.max_depth, opts.max_paths_per_pair);
 
             all_paths.extend(forward);
             all_paths.extend(backward);
@@ -105,11 +107,19 @@ fn collect_paths_between(
     from: NodeIndex,
     to: NodeIndex,
     max_depth: usize,
+    max_paths: usize,
 ) -> Vec<InspectPath> {
+    use petgraph::algo::has_path_connecting;
+
+    if !has_path_connecting(graph, from, to, None) {
+        return vec![];
+    }
+
     let raw_paths = GraphTraversal::new(graph, from)
         .outgoing()
         .edge_filter(EdgeFilter::calls_only())
         .max_depth(max_depth)
+        .max_paths(max_paths)
         .target(to)
         .collect_paths_to_target();
 

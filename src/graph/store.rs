@@ -869,7 +869,18 @@ impl GraphStore {
             }
         }
 
-        results.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        results.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| {
+                    // Same rank: prefer nodes with more connections.
+                    // When proc and func share the same FQN (e.g. "public.do_work"),
+                    // the more-connected node (typically the procedure) is placed first.
+                    let deg_a = self.graph.neighbors_undirected(a.0).count();
+                    let deg_b = self.graph.neighbors_undirected(b.0).count();
+                    deg_b.cmp(&deg_a)
+                })
+                .then_with(|| a.1.cmp(&b.1))
+        });
         results
             .into_iter()
             .map(|(idx, display, _)| (idx, display))
@@ -2241,6 +2252,70 @@ mod tests {
         let store = GraphStore::from_graph("test", graph);
         let results = store.search_nodes("nonexistent");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_nodes_prefers_higher_degree_on_same_rank() {
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+
+        let func_a = graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let proc_a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "do_work".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let proc_b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "other".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        // Give proc_a a call edge → more connections → should rank higher
+        graph.add_edge(
+            proc_a,
+            proc_b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::CrossPackage,
+                location: loc,
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("do_work");
+
+        assert_eq!(results.len(), 2, "both func and proc match");
+        // proc with more connections should come first
+        assert!(
+            results[0].1.starts_with("proc:"),
+            "higher-degree node (proc) should be first, got: {}",
+            results[0].1
+        );
     }
 
     #[test]
