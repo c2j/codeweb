@@ -53,6 +53,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .prop-col-name{color:#8bc34a}
 .prop-col-type{color:#a0a0a0;margin-left:6px}
 .prop-pk{color:#ff9800;font-size:12px;font-weight:700;margin-left:4px}
+.prop-comment{color:#888;font-size:12px;margin-left:4px}
 .prop-sql{background:#0f3460;padding:6px 8px;border-radius:4px;font-size:14px;font-family:'Cascadia Code',Consolas,monospace;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:4px 0;color:#e0e0e0}
 .dim{color:#555;font-style:italic}
 .truncated{padding:8px;color:#e94560;font-size:14px;text-align:center}
