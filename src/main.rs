@@ -611,7 +611,7 @@ enum Commands {
         max_paths: usize,
 
         /// Display style
-        #[arg(short, long, default_value = "both", value_parser = ["summary", "paths", "both"])]
+        #[arg(short, long, default_value = "both", value_parser = ["summary", "paths", "both", "tree"])]
         style: String,
 
         /// Show unreachable node pairs (0 paths) in output
@@ -2962,6 +2962,7 @@ fn cmd_inspect(
     let style_enum = match style {
         "summary" => InspectStyle::Summary,
         "paths" => InspectStyle::Paths,
+        "tree" => InspectStyle::Tree,
         _ => InspectStyle::Both,
     };
 

@@ -33,6 +33,9 @@ pub enum InspectStyle {
     Summary,
     Paths,
     Both,
+    /// Reverse convergence tree: roots are destination nodes,
+    /// children are callers. Edges marked with `←`.
+    Tree,
 }
 
 pub struct InspectResult {
@@ -215,6 +218,155 @@ fn format_paths_tree(result: &InspectResult, graph: &CodeGraph) -> Vec<String> {
     lines
 }
 
+/// Build a reverse adjacency map from paths.
+/// Key = callee, Value = list of (caller, edge_label) pairs.
+/// Deduplicates edges that appear in multiple paths.
+fn build_reverse_adjacency(
+    graph: &CodeGraph,
+    paths: &[&InspectPath],
+) -> BTreeMap<NodeIndex, Vec<(NodeIndex, String)>> {
+    let mut adj: BTreeMap<NodeIndex, Vec<(NodeIndex, String)>> = BTreeMap::new();
+
+    for path in paths {
+        let hops = &path.hops;
+        let labels = &path.edge_labels;
+        for i in 0..hops.len().saturating_sub(1) {
+            let caller = hops[i];
+            let callee = hops[i + 1];
+            let label = if i < labels.len() {
+                labels[i].clone()
+            } else {
+                String::new()
+            };
+            let entry = adj.entry(callee).or_default();
+            if !entry.iter().any(|(n, _)| *n == caller) {
+                entry.push((caller, label));
+            }
+        }
+    }
+
+    for children in adj.values_mut() {
+        children.sort_by(|(a, _), (b, _)| {
+            node_display_name(&graph[*a]).cmp(&node_display_name(&graph[*b]))
+        });
+    }
+
+    adj
+}
+
+/// Recursively render a child node and its subtree in the reverse convergence tree.
+/// `edge_label` describes the call from this child to its parent.
+/// `visited` prevents infinite recursion on cyclic reverse adjacencies.
+fn render_reverse_child(
+    graph: &CodeGraph,
+    adj: &BTreeMap<NodeIndex, Vec<(NodeIndex, String)>>,
+    node: NodeIndex,
+    edge_label: &str,
+    prefix: &str,
+    is_last: bool,
+    visited: &mut HashSet<NodeIndex>,
+    lines: &mut Vec<String>,
+) {
+    if !visited.insert(node) {
+        // Cycle detected: show the node name but don't recurse
+        let name = node_display_name(&graph[node]);
+        let connector = if is_last { "└── " } else { "├── " };
+        lines.push(format!("{}{}{}  (cycle)", prefix, connector, name));
+        return;
+    }
+
+    let name = node_display_name(&graph[node]);
+    let child_count = adj.get(&node).map(|c| c.len()).unwrap_or(0);
+
+    let connector = if is_last { "└── " } else { "├── " };
+    let label_str = if edge_label.is_empty() {
+        String::new()
+    } else {
+        format!("  ← {}", edge_label)
+    };
+    let caller_info = if child_count > 0 {
+        format!("  (called by {})", child_count)
+    } else {
+        String::new()
+    };
+
+    lines.push(format!(
+        "{}{}{}{}{}",
+        prefix, connector, name, label_str, caller_info
+    ));
+
+    let extension = if is_last { "    " } else { "│   " };
+    let new_prefix = format!("{}{}", prefix, extension);
+
+    if let Some(grandchildren) = adj.get(&node) {
+        let count = grandchildren.len();
+        for (gi, (gc, gc_label)) in grandchildren.iter().enumerate() {
+            render_reverse_child(
+                graph,
+                adj,
+                *gc,
+                gc_label,
+                &new_prefix,
+                gi == count - 1,
+                visited,
+                lines,
+            );
+        }
+    }
+}
+
+/// Format PATHS as reverse convergence trees.
+/// Groups paths by destination (to), then builds a tree with
+/// the destination as root and all callers as children.
+fn format_paths_reverse_tree(result: &InspectResult, graph: &CodeGraph) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Group paths by destination (to)
+    let mut by_dest: BTreeMap<NodeIndex, Vec<&InspectPath>> = BTreeMap::new();
+    for p in &result.paths {
+        by_dest.entry(p.to).or_default().push(p);
+    }
+
+    for (root, paths) in &by_dest {
+        let root_name = node_display_name(&graph[*root]);
+        let mut direct_callers: HashSet<NodeIndex> = HashSet::new();
+        for p in paths {
+            if p.hops.len() >= 2 {
+                direct_callers.insert(p.hops[p.hops.len() - 2]);
+            }
+        }
+        let caller_count = direct_callers.len();
+
+        lines.push(String::new());
+        lines.push(format!(
+            "── {} (root, called by {}) ──",
+            root_name, caller_count
+        ));
+
+        let adj = build_reverse_adjacency(graph, paths);
+
+        if let Some(children) = adj.get(root) {
+            let count = children.len();
+            let mut visited: HashSet<NodeIndex> = HashSet::new();
+            visited.insert(*root);
+            for (ci, (child, label)) in children.iter().enumerate() {
+                render_reverse_child(
+                    graph,
+                    &adj,
+                    *child,
+                    label,
+                    "    ",
+                    ci == count - 1,
+                    &mut visited,
+                    &mut lines,
+                );
+            }
+        }
+    }
+
+    lines
+}
+
 pub fn format_inspect_result(
     result: &InspectResult,
     graph: &CodeGraph,
@@ -322,7 +474,11 @@ pub fn format_inspect_result(
 
     if style != InspectStyle::Summary && !result.paths.is_empty() {
         lines.push("── PATHS ──".to_string());
-        lines.extend(format_paths_tree(result, graph));
+        if style == InspectStyle::Tree {
+            lines.extend(format_paths_reverse_tree(result, graph));
+        } else {
+            lines.extend(format_paths_tree(result, graph));
+        }
     }
 
     lines.join("\n")
@@ -614,6 +770,229 @@ mod tests {
         assert!(
             !output.contains("UNREACHABLE"),
             "default: no UNREACHABLE section"
+        );
+    }
+
+    // ────────────────────────────────────────────────
+    // Regression: forked DAG topology (two branches converging on c)
+    //   a1 → b1 → c
+    //   a2 → b2 → c
+    //
+    // inspect a1 a2       → 0 paths (a1 and a2 are not reachable from each other)
+    // inspect a1 a2 c     → 2 paths (a1→c via b1, a2→c via b2)
+    // ────────────────────────────────────────────────
+
+    /// Given `a1 → b1 → c ← b2 ← a2`, calling `find_paths_between(&[a1, a2])`
+    /// should return zero paths — a1 and a2 are not directly reachable.
+    #[test]
+    fn forked_dag_targets_only_leaves_zero_paths() {
+        let mut graph = CodeGraph::new();
+        let a1 = graph.add_node(make_proc("a1", None));
+        let b1 = graph.add_node(make_proc("b1", None));
+        let c = graph.add_node(make_proc("c", None));
+        let b2 = graph.add_node(make_proc("b2", None));
+        let a2 = graph.add_node(make_proc("a2", None));
+
+        // a1 → b1 → c
+        make_direct_call(&mut graph, a1, b1);
+        make_direct_call(&mut graph, b1, c);
+        // a2 → b2 → c
+        make_direct_call(&mut graph, a2, b2);
+        make_direct_call(&mut graph, b2, c);
+
+        let result = find_paths_between(&graph, &[a1, a2], &InspectOptions::default());
+
+        // No directed path exists between a1 and a2 in either direction.
+        assert!(
+            result.paths.is_empty(),
+            "a1 and a2 should have 0 paths between them"
+        );
+        // All summary entries should be zero.
+        for (_, _, count) in &result.summary {
+            assert_eq!(*count, 0, "every pair summary should be 0");
+        }
+    }
+
+    /// Same graph (`a1 → b1 → c ← b2 ← a2`), but with c included as a target.
+    /// Should find a1→c (via b1) and a2→c (via b2).
+    #[test]
+    fn forked_dag_targets_include_convergence_finds_paths() {
+        let mut graph = CodeGraph::new();
+        let a1 = graph.add_node(make_proc("a1", None));
+        let b1 = graph.add_node(make_proc("b1", None));
+        let c = graph.add_node(make_proc("c", None));
+        let b2 = graph.add_node(make_proc("b2", None));
+        let a2 = graph.add_node(make_proc("a2", None));
+
+        make_direct_call(&mut graph, a1, b1);
+        make_direct_call(&mut graph, b1, c);
+        make_direct_call(&mut graph, a2, b2);
+        make_direct_call(&mut graph, b2, c);
+
+        let result = find_paths_between(&graph, &[a1, a2, c], &InspectOptions::default());
+
+        // Should find exactly 2 paths: a1→c and a2→c
+        assert_eq!(result.paths.len(), 2, "should find a1→c and a2→c");
+
+        // Verify a1 → b1 → c
+        let a1_to_c = result
+            .paths
+            .iter()
+            .find(|p| p.from == a1 && p.to == c)
+            .expect("should have a1→c path");
+        assert_eq!(a1_to_c.hops, vec![a1, b1, c], "a1→c path should go via b1");
+
+        // Verify a2 → b2 → c
+        let a2_to_c = result
+            .paths
+            .iter()
+            .find(|p| p.from == a2 && p.to == c)
+            .expect("should have a2→c path");
+        assert_eq!(a2_to_c.hops, vec![a2, b2, c], "a2→c path should go via b2");
+
+        // Summary should show a1→c count=1, a2→c count=1
+        let a1c_summary = result
+            .summary
+            .iter()
+            .find(|(f, t, _)| *f == a1 && *t == c)
+            .unwrap();
+        assert_eq!(a1c_summary.2, 1);
+        let a2c_summary = result
+            .summary
+            .iter()
+            .find(|(f, t, _)| *f == a2 && *t == c)
+            .unwrap();
+        assert_eq!(a2c_summary.2, 1);
+    }
+
+    #[test]
+    fn format_reverse_tree_forked_dag() {
+        let mut graph = CodeGraph::new();
+        let a1 = graph.add_node(make_proc("a1", None));
+        let b1 = graph.add_node(make_proc("b1", None));
+        let c = graph.add_node(make_proc("c", None));
+        let b2 = graph.add_node(make_proc("b2", None));
+        let a2 = graph.add_node(make_proc("a2", None));
+
+        make_direct_call(&mut graph, a1, b1);
+        make_direct_call(&mut graph, b1, c);
+        make_direct_call(&mut graph, a2, b2);
+        make_direct_call(&mut graph, b2, c);
+
+        let result = find_paths_between(&graph, &[a1, a2, c], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["a1".into(), "a2".into(), "c".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        assert!(output.contains("── proc:c (root, called by 2) ──"));
+        assert!(output.contains("├── proc:b1"));
+        assert!(output.contains("← [cross]"));
+        assert!(output.contains("(called by 1)"));
+        assert!(output.contains("└── proc:b2"));
+        assert!(output.contains("── PATHS ──"));
+        assert!(output.contains("── CONNECTIONS ──"));
+        // a1 and a2 are leaf nodes — no (called by) annotation
+        let paths_section = &output[output.find("── PATHS ──").unwrap()..];
+        let a1_line = paths_section
+            .lines()
+            .find(|l| l.contains("proc:a1"))
+            .unwrap();
+        assert!(!a1_line.contains("(called by)"), "a1 is leaf: no called-by");
+        let a2_line = paths_section
+            .lines()
+            .find(|l| l.contains("proc:a2"))
+            .unwrap();
+        assert!(!a2_line.contains("(called by)"), "a2 is leaf: no called-by");
+    }
+
+    #[test]
+    fn format_reverse_tree_shared_intermediate_merged() {
+        let mut graph = CodeGraph::new();
+        let a1 = graph.add_node(make_proc("a1", None));
+        let a2 = graph.add_node(make_proc("a2", None));
+        let b = graph.add_node(make_proc("b", None));
+        let c = graph.add_node(make_proc("c", None));
+
+        make_direct_call(&mut graph, a1, b);
+        make_direct_call(&mut graph, a2, b);
+        make_direct_call(&mut graph, b, c);
+
+        let result = find_paths_between(&graph, &[a1, a2, c], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["a1".into(), "a2".into(), "c".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        assert!(output.contains("── proc:c (root, called by 1) ──"));
+        assert!(output.contains("proc:b  ← [cross]  (called by 2)"));
+        // b should appear exactly once (merged)
+        assert_eq!(
+            output.matches("proc:b").count(),
+            1,
+            "b should appear exactly once in output"
+        );
+        assert!(output.contains("├── proc:a1"));
+        assert!(output.contains("└── proc:a2"));
+    }
+
+    #[test]
+    fn format_reverse_tree_no_paths_empty() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("a", None));
+        let b = graph.add_node(make_proc("b", None));
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["a".into(), "b".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        assert!(!output.contains("── PATHS ──"));
+        assert!(output.contains("(no paths found between any pair)"));
+    }
+
+    #[test]
+    fn format_reverse_tree_cyclic_graph_does_not_overflow() {
+        // A↔B mutual recursion, both call C
+        // Paths: A→C, A→B→C, B→C, B→A→C
+        // Reverse adjacency merges to: C←{A,B}, A←{B}, B←{A} → cycle A↔B
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("a", None));
+        let b = graph.add_node(make_proc("b", None));
+        let c = graph.add_node(make_proc("c", None));
+
+        make_direct_call(&mut graph, a, b);
+        make_direct_call(&mut graph, b, a);
+        make_direct_call(&mut graph, a, c);
+        make_direct_call(&mut graph, b, c);
+
+        let result = find_paths_between(&graph, &[a, b, c], &InspectOptions::default());
+        // Must not stack overflow
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["a".into(), "b".into(), "c".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        // Both a and b should appear as direct callers of c
+        assert!(output.contains("── proc:c (root, called by 2) ──"));
+        // a appears under c as direct child, and a again via b→a → marked (cycle)
+        let pats_section = &output[output.find("── PATHS ──").unwrap()..];
+        assert!(
+            pats_section.contains("(cycle)"),
+            "should contain cycle marker for revisited node in reverse tree"
         );
     }
 }
