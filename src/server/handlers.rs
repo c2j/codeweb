@@ -7,6 +7,7 @@ use axum::{
     Json, Router,
 };
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
@@ -14,7 +15,7 @@ use crate::graph::key::NodeKey;
 use crate::graph::node_sub_type_tag;
 use crate::graph::query::spec::QuerySpec;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
-use crate::graph::{CodeGraph, Node};
+use crate::graph::{CodeGraph, Edge, Node};
 use crate::sql_match::PreparedQuery;
 
 use super::access_log;
@@ -311,9 +312,42 @@ async fn node_detail(
             }
             if !columns.is_empty() {
                 let col_summary: Vec<Value> = columns.iter().map(|c| {
-                    serde_json::json!({"name": c.name, "type": c.data_type, "nullable": c.nullable, "pk": c.is_primary_key})
+                    serde_json::json!({"name": c.name, "type": c.data_type, "nullable": c.nullable, "pk": c.is_primary_key, "description": c.comment})
                 }).collect();
                 properties.push(serde_json::json!({"label": "columns", "value": col_summary}));
+            }
+            {
+                let index_list: Vec<Value> = graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .filter(|e| matches!(e.weight(), Edge::IndexesTable { .. }))
+                    .filter_map(|e| {
+                        if let Node::Index {
+                            name,
+                            unique,
+                            index_method,
+                            columns,
+                            constraint,
+                            ..
+                        } = &graph[e.source()]
+                        {
+                            Some(serde_json::json!({
+                                "name": name,
+                                "unique": unique,
+                                "method": index_method,
+                                "columns": columns,
+                                "constraint": constraint.as_ref().map(|c| match c {
+                                    crate::graph::IndexConstraint::PrimaryKey => "PRIMARY KEY",
+                                    crate::graph::IndexConstraint::Unique => "UNIQUE",
+                                }),
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !index_list.is_empty() {
+                    properties.push(serde_json::json!({"label": "indexes", "value": index_list}));
+                }
             }
             if *temporary {
                 properties.push(serde_json::json!({"label": "temporary", "value": "true"}));

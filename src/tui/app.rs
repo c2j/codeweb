@@ -1,9 +1,10 @@
 use crate::graph::key::NodeKey;
 use crate::graph::traverse;
-use crate::graph::Node;
+use crate::graph::{Edge, IndexConstraint, Node};
 use crate::project::Project;
 use crate::tui::theme::TuiTheme;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -197,6 +198,58 @@ impl App {
                     attr_line,
                     Style::default().fg(self.theme.fg_secondary()),
                 )));
+            }
+            if let Node::Table { .. } = node {
+                let mut index_lines: Vec<String> = Vec::new();
+                for edge_ref in graph.edges_directed(idx, petgraph::Direction::Incoming) {
+                    if matches!(edge_ref.weight(), Edge::IndexesTable { .. }) {
+                        let source_idx = edge_ref.source();
+                        let source_node = &graph[source_idx];
+                        if let Node::Index {
+                            name,
+                            unique,
+                            index_method,
+                            columns,
+                            constraint,
+                            ..
+                        } = source_node
+                        {
+                            let idx_name = name.as_deref().unwrap_or("(unnamed)");
+                            let uniq = if *unique { " UNIQUE" } else { "" };
+                            let method = index_method
+                                .as_ref()
+                                .map(|m| format!(" [{}]", m))
+                                .unwrap_or_default();
+                            let constraint_label = constraint
+                                .as_ref()
+                                .map(|c| match c {
+                                    IndexConstraint::PrimaryKey => " (PRIMARY KEY)",
+                                    IndexConstraint::Unique => " (UNIQUE)",
+                                })
+                                .unwrap_or("");
+                            index_lines.push(format!(
+                                "  {}{}{}{} ({})",
+                                idx_name,
+                                uniq,
+                                method,
+                                constraint_label,
+                                columns.join(", ")
+                            ));
+                        }
+                    }
+                }
+                if !index_lines.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("indexes ({}):", index_lines.len()),
+                        Style::default().fg(self.theme.fg_secondary()),
+                    )));
+                    for line_text in index_lines {
+                        lines.push(Line::from(Span::styled(
+                            line_text,
+                            Style::default().fg(self.theme.fg_secondary()),
+                        )));
+                    }
+                }
             }
             lines.push(Line::from(""));
         }
@@ -999,9 +1052,14 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
                         .as_deref()
                         .map(|d| format!(" DEFAULT {}", d))
                         .unwrap_or_default();
+                    let comment = col
+                        .comment
+                        .as_deref()
+                        .map(|c| format!(" -- {}", c))
+                        .unwrap_or_default();
                     attrs.push(format!(
-                        "  {} {} {}{}{}",
-                        col.name, col.data_type, null, pk, def
+                        "  {} {} {}{}{}{}",
+                        col.name, col.data_type, null, pk, def, comment
                     ));
                 }
                 if columns.len() > 5 && compact {

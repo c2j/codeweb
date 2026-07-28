@@ -431,10 +431,10 @@ enum Commands {
         force: bool,
     },
 
-    /// Show callers/callees detail for a node
+    /// Show callers/callees detail for one or more nodes
     Detail {
-        /// Node name to search for (substring match)
-        name: String,
+        /// Node name(s) to search for (substring match)
+        names: Vec<String>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -769,13 +769,13 @@ fn run() -> Result<()> {
             mark::process_mark(store, &node, &csv, output.as_deref())
         }
         Some(Commands::Detail {
-            name,
+            names,
             project,
             style,
             depth,
             files,
             builtfunc,
-        }) => cmd_detail(&name, &project, &style, depth, files, builtfunc),
+        }) => cmd_detail(&names, &project, &style, depth, files, builtfunc),
         Some(Commands::Import {
             file,
             output,
@@ -1326,7 +1326,7 @@ fn filter_indexes_from_tree(
 }
 
 fn cmd_detail(
-    name: &str,
+    names: &[String],
     project: &Path,
     style: &str,
     depth: i64,
@@ -1337,11 +1337,27 @@ fn cmd_detail(
     let store = proj.load_store()?;
     let graph = store.graph();
 
+    for name in names {
+        detail_one(name, graph, store, style, depth, show_files, show_builtins);
+    }
+
+    Ok(())
+}
+
+fn detail_one(
+    name: &str,
+    graph: &crate::graph::CodeGraph,
+    store: &crate::graph::store::GraphStore,
+    style: &str,
+    depth: i64,
+    show_files: bool,
+    show_builtins: bool,
+) {
     let matches = store.search_nodes(name);
 
     if matches.is_empty() {
         eprintln!("No nodes matching '{}'", name);
-        return Ok(());
+        return;
     }
 
     if matches.len() > 1 {
@@ -1453,8 +1469,6 @@ fn cmd_detail(
             }
         }
     }
-
-    Ok(())
 }
 
 fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Result<()> {

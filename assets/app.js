@@ -275,10 +275,20 @@ function renderPropertiesHtml(detail, showBodySql) {
           h += '<pre class="prop-sql">' + esc(s.sql) + '</pre>';
         }
       }
-    } else if (Array.isArray(p.value)) {
+    } else if (Array.isArray(p.value) && p.label === 'columns') {
       h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> (' + p.value.length + ')</div>';
       for (const col of p.value.slice(0, 10)) {
-        h += '<div class="prop-col"><span class="prop-col-name">' + esc(col.name) + '</span> <span class="prop-col-type">' + esc(col.type) + '</span>' + (col.pk ? ' <span class="prop-pk">PK</span>' : '') + '</div>';
+        h += '<div class="prop-col"><span class="prop-col-name">' + esc(col.name) + '</span> <span class="prop-col-type">' + esc(col.type) + '</span>' + (col.pk ? ' <span class="prop-pk">PK</span>' : '') + (col.description ? ' <span class="prop-comment">' + esc(col.description) + '</span>' : '') + '</div>';
+      }
+      if (p.value.length > 10) {
+        h += '<div class="prop-col dim">... +' + (p.value.length - 10) + ' more</div>';
+      }
+    } else if (Array.isArray(p.value) && p.label === 'indexes') {
+      h += '<div class="prop-entry"><span class="prop-label">' + esc(p.label) + ':</span> (' + p.value.length + ')</div>';
+      for (const idx of p.value.slice(0, 10)) {
+        var idxLabel = (idx.name || '(unnamed)') + (idx.unique ? ' UNIQUE' : '') + (idx.method ? ' [' + idx.method + ']' : '') + (idx.constraint ? ' (' + idx.constraint + ')' : '');
+        var idxCols = (idx.columns || []).join(', ');
+        h += '<div class="prop-col"><span class="prop-col-name">' + esc(idxLabel) + '</span> <span class="prop-col-type dim">' + esc(idxCols) + '</span></div>';
       }
       if (p.value.length > 10) {
         h += '<div class="prop-col dim">... +' + (p.value.length - 10) + ' more</div>';
