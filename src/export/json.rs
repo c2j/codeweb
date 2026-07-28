@@ -145,6 +145,16 @@ enum NodeKindJson {
         unique: bool,
         #[serde(skip_serializing_if = "is_false")]
         global: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index_method: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tablespace: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        where_clause: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        constraint: Option<String>,
         file: String,
         line: usize,
     },
@@ -497,6 +507,11 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 table_name,
                 unique,
                 global,
+                index_method,
+                columns,
+                tablespace,
+                where_clause,
+                constraint,
                 location,
             } => NodeJson {
                 id: idx.index(),
@@ -505,6 +520,14 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     table_name: table_name.clone(),
                     unique: *unique,
                     global: *global,
+                    index_method: index_method.clone(),
+                    columns: columns.clone(),
+                    tablespace: tablespace.clone(),
+                    where_clause: where_clause.clone(),
+                    constraint: constraint.as_ref().map(|c| match c {
+                        crate::graph::IndexConstraint::PrimaryKey => "primary_key".to_string(),
+                        crate::graph::IndexConstraint::Unique => "unique".to_string(),
+                    }),
                     file: location.file.to_string_lossy().to_string(),
                     line: location.line,
                 },

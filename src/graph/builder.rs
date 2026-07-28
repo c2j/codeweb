@@ -5,11 +5,13 @@ use crate::graph::{
     determine_call_scope, extract_routine_id, CallScope, CodeGraph, DataFlowKind, Edge, Node,
     RoutineId, RoutineKind, SourceLocation,
 };
-use crate::graph::{ColumnSummary, DistributeInfo, PartitionInfo};
+use crate::graph::{ColumnSummary, DistributeInfo, IndexConstraint, PartitionInfo};
 use crate::parser::{
     AllParsedFiles, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
 };
-use ogsql_parser::ast::{ColumnConstraint, PackageItem, Statement};
+use ogsql_parser::ast::{
+    AlterTableAction, ColumnConstraint, PackageItem, Statement, TableConstraint,
+};
 use ogsql_parser::{walk_pl_block, walk_statement};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -558,12 +560,30 @@ impl GraphBuilder {
                             .as_ref()
                             .map(|n| n.last().cloned().unwrap_or_default().to_string());
                         let (table_schema, table_name) = split_object_name(&i.table);
+                        let index_columns: Vec<String> = i
+                            .columns
+                            .iter()
+                            .filter_map(|c| {
+                                c.name.clone().or_else(|| {
+                                    c.expr.as_ref().map(crate::graph::format::format_expr)
+                                })
+                            })
+                            .collect();
+                        let where_clause = i
+                            .where_clause
+                            .as_ref()
+                            .map(crate::graph::format::format_expr);
                         let index_node = Node::Index {
                             name: idx_name,
                             table_schema: table_schema.clone(),
                             table_name: table_name.clone(),
                             unique: i.unique,
                             global: false,
+                            index_method: i.using_method.clone(),
+                            columns: index_columns,
+                            tablespace: i.tablespace.clone(),
+                            where_clause,
+                            constraint: None,
                             location: SourceLocation {
                                 file: file_arc.clone(),
                                 line: info.start_line,
@@ -600,6 +620,186 @@ impl GraphBuilder {
                             },
                         );
                     }
+                    Statement::CreateGlobalIndex(gi) => {
+                        let idx_name = gi
+                            .name
+                            .as_ref()
+                            .map(|n| n.last().cloned().unwrap_or_default().to_string());
+                        let (table_schema, table_name) = split_object_name(&gi.table);
+                        let index_columns: Vec<String> =
+                            gi.columns.iter().map(|c| c.name.clone()).collect();
+                        let where_clause = gi
+                            .where_clause
+                            .as_ref()
+                            .map(crate::graph::format::format_expr);
+                        let index_node = Node::Index {
+                            name: idx_name,
+                            table_schema: table_schema.clone(),
+                            table_name: table_name.clone(),
+                            unique: gi.unique,
+                            global: true,
+                            index_method: gi.using_method.clone(),
+                            columns: index_columns,
+                            tablespace: gi.tablespace.clone(),
+                            where_clause,
+                            constraint: None,
+                            location: SourceLocation {
+                                file: file_arc.clone(),
+                                line: info.start_line,
+                            },
+                        };
+                        let idx = graph.add_node(index_node);
+                        let table_key = normalize_table_key(table_schema.as_deref(), &table_name);
+                        let table_idx =
+                            *table_index.entry(table_key.clone()).or_insert_with(|| {
+                                let node = Node::Table {
+                                    schema: table_schema.clone(),
+                                    name: table_name.clone(),
+                                    explicit: false,
+                                    system: is_system(table_schema.as_deref(), &table_name),
+                                    location: None,
+                                    columns: Box::new(vec![]),
+                                    partition_by: None,
+                                    distribute_by: None,
+                                    tablespace: None,
+                                    temporary: false,
+                                    unlogged: false,
+                                    ddl_source: None,
+                                };
+                                graph.add_node(node)
+                            });
+                        graph.add_edge(
+                            idx,
+                            table_idx,
+                            Edge::IndexesTable {
+                                location: SourceLocation {
+                                    file: file_arc.clone(),
+                                    line: info.start_line,
+                                },
+                            },
+                        );
+                    }
+                    Statement::AlterTable(alt) => {
+                        let (table_schema, table_name) = split_object_name(&alt.name);
+                        let table_key = normalize_table_key(table_schema.as_deref(), &table_name);
+                        let table_idx =
+                            *table_index.entry(table_key.clone()).or_insert_with(|| {
+                                let node = Node::Table {
+                                    schema: table_schema.clone(),
+                                    name: table_name.clone(),
+                                    explicit: false,
+                                    system: is_system(table_schema.as_deref(), &table_name),
+                                    location: None,
+                                    columns: Box::new(vec![]),
+                                    partition_by: None,
+                                    distribute_by: None,
+                                    tablespace: None,
+                                    temporary: false,
+                                    unlogged: false,
+                                    ddl_source: None,
+                                };
+                                graph.add_node(node)
+                            });
+
+                        for action in &alt.actions {
+                            if let AlterTableAction::AddConstraint { name, constraint } = action {
+                                match constraint {
+                                    TableConstraint::PrimaryKey {
+                                        columns,
+                                        using_index,
+                                    } => {
+                                        let index_name = name
+                                            .clone()
+                                            .or_else(|| using_index.clone())
+                                            .unwrap_or_else(|| format!("{}_pkey", table_name));
+                                        let index_node = Node::Index {
+                                            name: Some(index_name),
+                                            table_schema: table_schema.clone(),
+                                            table_name: table_name.clone(),
+                                            unique: true,
+                                            global: false,
+                                            index_method: Some("btree".to_string()),
+                                            columns: columns.clone(),
+                                            tablespace: None,
+                                            where_clause: None,
+                                            constraint: Some(IndexConstraint::PrimaryKey),
+                                            location: SourceLocation {
+                                                file: file_arc.clone(),
+                                                line: info.start_line,
+                                            },
+                                        };
+                                        let idx = graph.add_node(index_node);
+                                        graph.add_edge(
+                                            idx,
+                                            table_idx,
+                                            Edge::IndexesTable {
+                                                location: SourceLocation {
+                                                    file: file_arc.clone(),
+                                                    line: info.start_line,
+                                                },
+                                            },
+                                        );
+
+                                        if let Node::Table {
+                                            columns: ref mut tbl_cols,
+                                            ..
+                                        } = &mut graph[table_idx]
+                                        {
+                                            for col in tbl_cols.iter_mut() {
+                                                if columns.contains(&col.name) {
+                                                    col.is_primary_key = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    TableConstraint::Unique {
+                                        columns,
+                                        using_index,
+                                        ..
+                                    } => {
+                                        let index_name = name
+                                            .clone()
+                                            .or_else(|| using_index.clone())
+                                            .unwrap_or_else(|| {
+                                                format!(
+                                                    "{}_unique_{}",
+                                                    table_name,
+                                                    columns.join("_")
+                                                )
+                                            });
+                                        let index_node = Node::Index {
+                                            name: Some(index_name),
+                                            table_schema: table_schema.clone(),
+                                            table_name: table_name.clone(),
+                                            unique: true,
+                                            global: false,
+                                            index_method: Some("btree".to_string()),
+                                            columns: columns.clone(),
+                                            tablespace: None,
+                                            where_clause: None,
+                                            constraint: Some(IndexConstraint::Unique),
+                                            location: SourceLocation {
+                                                file: file_arc.clone(),
+                                                line: info.start_line,
+                                            },
+                                        };
+                                        let idx = graph.add_node(index_node);
+                                        graph.add_edge(
+                                            idx,
+                                            table_idx,
+                                            Edge::IndexesTable {
+                                                location: SourceLocation {
+                                                    file: file_arc.clone(),
+                                                    line: info.start_line,
+                                                },
+                                            },
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     Statement::CreateTable(t) => {
                         let (schema, name) = split_object_name(&t.name);
 
@@ -617,14 +817,14 @@ impl GraphBuilder {
                                     .any(|cc| matches!(cc, ColumnConstraint::NotNull));
                                 let default_value = c.constraints.iter().find_map(|cc| {
                                     if let ColumnConstraint::Default(expr) = cc {
-                                        Some(format!("{:?}", expr))
+                                        Some(crate::graph::format::format_expr(expr))
                                     } else {
                                         None
                                     }
                                 });
                                 ColumnSummary {
                                     name: c.name.clone(),
-                                    data_type: format!("{:?}", c.data_type),
+                                    data_type: crate::graph::format::format_data_type(&c.data_type),
                                     nullable,
                                     is_primary_key: is_pk,
                                     default_value,
@@ -736,14 +936,17 @@ impl GraphBuilder {
                                             ColumnConstraint::NotNull => nullable = false,
                                             ColumnConstraint::PrimaryKey => is_pk = true,
                                             ColumnConstraint::Default(expr) => {
-                                                default_value = Some(format!("{:?}", expr))
+                                                default_value =
+                                                    Some(crate::graph::format::format_expr(expr))
                                             }
                                             _ => {}
                                         }
                                     }
                                     ColumnSummary {
                                         name: c.name.clone(),
-                                        data_type: format!("{:?}", c.data_type),
+                                        data_type: crate::graph::format::format_data_type(
+                                            &c.data_type,
+                                        ),
                                         nullable,
                                         is_primary_key: is_pk,
                                         default_value,
@@ -819,6 +1022,94 @@ impl GraphBuilder {
                             }
                             *temporary = t.temporary;
                             *unlogged = t.unlogged;
+                        }
+
+                        for constraint in &t.constraints {
+                            match constraint {
+                                TableConstraint::PrimaryKey {
+                                    columns,
+                                    using_index,
+                                } => {
+                                    let index_name = using_index.clone().unwrap_or_else(|| {
+                                        format!("{}_{}_pkey", name, columns.join("_"))
+                                    });
+                                    let idx_node = Node::Index {
+                                        name: Some(index_name),
+                                        table_schema: schema.clone(),
+                                        table_name: name.clone(),
+                                        unique: true,
+                                        global: false,
+                                        index_method: Some("btree".to_string()),
+                                        columns: columns.clone(),
+                                        tablespace: None,
+                                        where_clause: None,
+                                        constraint: Some(IndexConstraint::PrimaryKey),
+                                        location: SourceLocation {
+                                            file: file_arc.clone(),
+                                            line: info.start_line,
+                                        },
+                                    };
+                                    let new_idx = graph.add_node(idx_node);
+                                    graph.add_edge(
+                                        new_idx,
+                                        idx,
+                                        Edge::IndexesTable {
+                                            location: SourceLocation {
+                                                file: file_arc.clone(),
+                                                line: info.start_line,
+                                            },
+                                        },
+                                    );
+                                    if let Node::Table {
+                                        columns: ref mut tbl_cols,
+                                        ..
+                                    } = &mut graph[idx]
+                                    {
+                                        for col in tbl_cols.iter_mut() {
+                                            if columns.contains(&col.name) {
+                                                col.is_primary_key = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                TableConstraint::Unique {
+                                    columns,
+                                    using_index,
+                                    ..
+                                } => {
+                                    let index_name = using_index.clone().unwrap_or_else(|| {
+                                        format!("{}_{}_unique", name, columns.join("_"))
+                                    });
+                                    let idx_node = Node::Index {
+                                        name: Some(index_name),
+                                        table_schema: schema.clone(),
+                                        table_name: name.clone(),
+                                        unique: true,
+                                        global: false,
+                                        index_method: Some("btree".to_string()),
+                                        columns: columns.clone(),
+                                        tablespace: None,
+                                        where_clause: None,
+                                        constraint: Some(IndexConstraint::Unique),
+                                        location: SourceLocation {
+                                            file: file_arc.clone(),
+                                            line: info.start_line,
+                                        },
+                                    };
+                                    let new_idx = graph.add_node(idx_node);
+                                    graph.add_edge(
+                                        new_idx,
+                                        idx,
+                                        Edge::IndexesTable {
+                                            location: SourceLocation {
+                                                file: file_arc.clone(),
+                                                line: info.start_line,
+                                            },
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
                         }
 
                         if schema.is_some() {

@@ -1315,6 +1315,16 @@ fn is_system_node(node: &Node) -> bool {
     )
 }
 
+fn filter_indexes_from_tree(
+    nodes: &mut Vec<graph::traverse::TreeNode>,
+    graph: &crate::graph::CodeGraph,
+) {
+    nodes.retain(|n| !matches!(&graph[n.idx], Node::Index { .. }));
+    for node in nodes.iter_mut() {
+        filter_indexes_from_tree(&mut node.children, graph);
+    }
+}
+
 fn cmd_detail(
     name: &str,
     project: &Path,
@@ -1353,7 +1363,8 @@ fn cmd_detail(
         .count();
 
     let display_name = graph::node_display_name(&graph[*start_idx]);
-    println_stdout!("  {} {}", tag, display_name);
+    println_stdout!("══ SUMMARY ══");
+    println_stdout!("  {}  {}", tag, display_name);
     if is_partial(&graph[*start_idx]) {
         println_stdout!("  ⚠ partial node — body implementation could not be parsed");
     }
@@ -1363,8 +1374,35 @@ fn cmd_detail(
     if is_system_node(&graph[*start_idx]) {
         println_stdout!("  ⚙ system object — belongs to a known system schema");
     }
-    println_stdout!("  in:{} out:{} total:{}", in_deg, out_deg, in_deg + out_deg);
-    print_node_details(&graph[*start_idx]);
+    println_stdout!(
+        "  in:{}  out:{}  total:{}",
+        in_deg,
+        out_deg,
+        in_deg + out_deg
+    );
+    if let Node::Table {
+        location,
+        temporary,
+        unlogged,
+        tablespace,
+        ..
+    } = &graph[*start_idx]
+    {
+        if let Some(loc) = location {
+            println_stdout!("  file   {}:{}", loc.file.to_string_lossy(), loc.line);
+        } else {
+            println_stdout!("  file   (implicit)");
+        }
+        if *temporary {
+            println_stdout!("  temporary: true");
+        }
+        if *unlogged {
+            println_stdout!("  unlogged: true");
+        }
+        if let Some(ts) = tablespace {
+            println_stdout!("  tablespace: {}", ts);
+        }
+    }
     println_stdout!();
 
     let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
@@ -1375,18 +1413,27 @@ fn cmd_detail(
         n if n >= 0 => n as usize,
         _ => 1,
     };
-    let (chain, _) = graph::traverse::trace_chain(
+    let (mut chain, _) = graph::traverse::trace_chain(
         graph,
         *start_idx,
         chain_max_depth,
         usize::MAX,
         skip_builtins,
     );
+    filter_indexes_from_tree(&mut chain.callers, graph);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
         "{}",
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
+
+    let indexes_output = format_indexes(graph, *start_idx);
+    if !indexes_output.is_empty() {
+        println_stdout!();
+        println_stdout!("{}", indexes_output);
+    }
+
+    print_node_details(&graph[*start_idx]);
 
     if show_files {
         let chain_files = graph::traverse::collect_chain_files(&chain, graph);
@@ -1719,46 +1766,97 @@ fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Res
     Ok(())
 }
 
+fn format_columns(columns: &[graph::ColumnSummary]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+
+    let max_name_width = columns
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let max_type_width = columns
+        .iter()
+        .map(|c| c.data_type.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let has_default = columns.iter().any(|c| c.default_value.is_some());
+
+    let mut lines = Vec::new();
+    lines.push(format!("── COLUMNS ({}) ──", columns.len()));
+
+    if has_default {
+        lines.push(format!(
+            "{:>2}  {:<name$}  {:<type$}  {:5}  DEFAULT",
+            "#", "NAME", "TYPE", "NULL?",
+            name = max_name_width, type = max_type_width,
+        ));
+    } else {
+        lines.push(format!(
+            "{:>2}  {:<name$}  {:<type$}  {:5}",
+            "#", "NAME", "TYPE", "NULL?",
+            name = max_name_width, type = max_type_width,
+        ));
+    }
+
+    let sep_width =
+        2 + 2 + max_name_width + 2 + max_type_width + 2 + 5 + if has_default { 2 + 7 } else { 0 };
+    lines.push(format!("  {}", "-".repeat(sep_width.saturating_sub(2))));
+
+    for (i, col) in columns.iter().enumerate() {
+        let null_str = if col.nullable { "NULL " } else { "NOT  " };
+        if has_default {
+            let default_str = col.default_value.as_deref().unwrap_or("—");
+            lines.push(format!(
+                "{:>2}  {:<name$}  {:<type$}  {:5}  {}",
+                i + 1, col.name, col.data_type, null_str, default_str,
+                name = max_name_width, type = max_type_width,
+            ));
+        } else {
+            lines.push(format!(
+                "{:>2}  {:<name$}  {:<type$}  {:5}",
+                i + 1, col.name, col.data_type, null_str,
+                name = max_name_width, type = max_type_width,
+            ));
+        }
+    }
+
+    let pk_cols: Vec<&str> = columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .map(|c| c.name.as_str())
+        .collect();
+    if !pk_cols.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("  ◆  PK ({})", pk_cols.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
 fn print_node_details(node: &Node) {
     use graph::{DistributeInfo, PartitionInfo};
     match node {
         Node::Table {
-            location,
             columns,
             partition_by,
             distribute_by,
-            tablespace,
-            temporary,
-            unlogged,
             ddl_source,
             ..
         } => {
-            if let Some(loc) = location {
-                println_stdout!("  file: {}:{}", loc.file.to_string_lossy(), loc.line);
-            } else {
-                println_stdout!("  file: (implicit)");
-            }
-            if *temporary {
-                println_stdout!("  temporary: true");
-            }
-            if *unlogged {
-                println_stdout!("  unlogged: true");
-            }
-            if let Some(ts) = tablespace {
-                println_stdout!("  tablespace: {}", ts);
-            }
             if !columns.is_empty() {
-                println_stdout!("  columns ({}):", columns.len());
-                for col in columns.iter() {
-                    let pk = if col.is_primary_key { " [PK]" } else { "" };
-                    let null = if col.nullable { "NULL" } else { "NOT NULL" };
-                    let def = col
-                        .default_value
-                        .as_deref()
-                        .map(|d| format!(" DEFAULT {}", d))
-                        .unwrap_or_default();
-                    println_stdout!("    {} {} {}{}{}", col.name, col.data_type, null, pk, def);
+                let cols_output = format_columns(columns);
+                if !cols_output.is_empty() {
+                    println_stdout!("{}", cols_output);
                 }
+            }
+            let has_partition_info = partition_by.is_some() || distribute_by.is_some();
+            if has_partition_info {
+                println_stdout!();
+                println_stdout!("── PARTITIONS ──");
             }
             if let Some(part) = partition_by {
                 match part.as_ref() {
@@ -1857,6 +1955,104 @@ fn print_node_details(node: &Node) {
         }
         _ => {}
     }
+}
+
+fn index_sort_key(graph: &crate::graph::CodeGraph, idx: NodeIndex) -> impl Ord {
+    match &graph[idx] {
+        Node::Index {
+            constraint,
+            unique,
+            name,
+            ..
+        } => {
+            let constraint_order = match constraint {
+                Some(graph::IndexConstraint::PrimaryKey) => 0,
+                Some(graph::IndexConstraint::Unique) => 1,
+                None if *unique => 2,
+                None => 3,
+            };
+            (constraint_order, name.clone().unwrap_or_default())
+        }
+        _ => (4, String::new()),
+    }
+}
+
+fn format_indexes(graph: &crate::graph::CodeGraph, table_idx: NodeIndex) -> String {
+    let mut indexes: Vec<NodeIndex> = graph
+        .neighbors_directed(table_idx, petgraph::Direction::Incoming)
+        .filter(|n| matches!(&graph[*n], Node::Index { .. }))
+        .collect();
+
+    if indexes.is_empty() {
+        return String::new();
+    }
+
+    indexes.sort_by_key(|a| index_sort_key(graph, *a));
+
+    let max_name_width = indexes
+        .iter()
+        .map(|idx| {
+            if let Node::Index { name: Some(n), .. } = &graph[*idx] {
+                n.len()
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
+        .max(30);
+
+    let mut lines = Vec::new();
+    lines.push(format!("── INDEXES ({}) ──", indexes.len()));
+    lines.push(format!(
+        "  {:<name$}  {:7}  {:7}  {:8}  COLUMNS",
+        "NAME",
+        "METHOD",
+        "UNIQUE",
+        "CONSTR",
+        name = max_name_width,
+    ));
+
+    for idx in &indexes {
+        if let Node::Index {
+            name,
+            unique,
+            index_method,
+            columns,
+            constraint,
+            ..
+        } = &graph[*idx]
+        {
+            let name_str = name.as_deref().unwrap_or("(unnamed)");
+            let method = index_method.as_deref().unwrap_or("btree");
+            let (unique_str, constr_str) = match constraint {
+                Some(graph::IndexConstraint::PrimaryKey) => {
+                    ("★ PK".to_string(), "PRI KEY".to_string())
+                }
+                Some(graph::IndexConstraint::Unique) => {
+                    ("★ UNIQ".to_string(), "UNIQUE".to_string())
+                }
+                None if *unique => ("★".to_string(), "—".to_string()),
+                None => ("—".to_string(), "—".to_string()),
+            };
+            let cols_str = if columns.is_empty() {
+                "—".to_string()
+            } else {
+                columns.join(", ")
+            };
+            lines.push(format!(
+                "  {:<name$}  {:7}  {:7}  {:8}  {}",
+                name_str,
+                method,
+                unique_str,
+                constr_str,
+                cols_str,
+                name = max_name_width,
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn cmd_import(
