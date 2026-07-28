@@ -1443,13 +1443,13 @@ fn detail_one(
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
 
+    print_node_details(&graph[*start_idx]);
+
     let indexes_output = format_indexes(graph, *start_idx);
     if !indexes_output.is_empty() {
         println_stdout!();
         println_stdout!("{}", indexes_output);
     }
-
-    print_node_details(&graph[*start_idx]);
 
     if show_files {
         let chain_files = graph::traverse::collect_chain_files(&chain, graph);
