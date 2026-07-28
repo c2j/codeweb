@@ -2,6 +2,7 @@ use crate::parser::ColumnAnalysis;
 
 pub mod builder;
 pub mod cluster;
+pub mod format;
 pub mod inspect;
 pub mod key;
 pub mod query;
@@ -261,6 +262,15 @@ pub enum DistributeInfo {
     Modulo { columns: Vec<String> },
 }
 
+/// Describes why an index exists — standalone CREATE INDEX or via a constraint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexConstraint {
+    /// Index backs a PRIMARY KEY constraint.
+    PrimaryKey,
+    /// Index backs a UNIQUE constraint.
+    Unique,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcedureBodySql {
     pub sql_text: String,
@@ -408,6 +418,16 @@ pub enum Node {
         unique: bool,
         #[serde(default)]
         global: bool,
+        #[serde(default)]
+        index_method: Option<String>,
+        #[serde(default)]
+        columns: Vec<String>,
+        #[serde(default)]
+        tablespace: Option<String>,
+        #[serde(default)]
+        where_clause: Option<String>,
+        #[serde(default)]
+        constraint: Option<IndexConstraint>,
         location: SourceLocation,
     },
     /// A MATERIALIZED VIEW.
@@ -870,6 +890,11 @@ mod tests {
             table_name: "my_table".to_string(),
             unique: true,
             global: false,
+            index_method: Some("btree".to_string()),
+            columns: vec!["col_a".to_string(), "col_b".to_string()],
+            tablespace: None,
+            where_clause: None,
+            constraint: Some(IndexConstraint::Unique),
             location: loc.clone(),
         };
         assert_eq!(idx_node.file(), Path::new("test.sql"));

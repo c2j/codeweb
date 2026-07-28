@@ -438,6 +438,23 @@ impl CgefParser {
                     table_name: table_name.to_string(),
                     unique: key_get_bool(key, "unique").unwrap_or(false),
                     global: key_get_bool(key, "global").unwrap_or(false),
+                    index_method: key_get_str(key, "index_method").map(String::from),
+                    columns: key
+                        .get("columns")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    tablespace: key_get_str(key, "tablespace").map(String::from),
+                    where_clause: key_get_str(key, "where_clause").map(String::from),
+                    constraint: key_get_str(key, "constraint").and_then(|s| match s {
+                        "primary_key" => Some(crate::graph::IndexConstraint::PrimaryKey),
+                        "unique" => Some(crate::graph::IndexConstraint::Unique),
+                        _ => None,
+                    }),
                     location: loc,
                 })
             }
