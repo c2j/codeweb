@@ -47,6 +47,14 @@ fn is_system(schema: Option<&str>, name: &str) -> bool {
 
 pub struct GraphBuilder;
 
+/// A column comment from a standalone `COMMENT ON COLUMN` statement,
+/// deferred until all table columns are populated in `finalize_graph`.
+pub struct DeferredColumnComment {
+    pub table_key: String,
+    pub col_name: String,
+    pub comment: String,
+}
+
 /// Accumulated indexing state for incremental graph building across chunks.
 pub struct GraphBuildContext {
     pub graph: CodeGraph,
@@ -60,6 +68,10 @@ pub struct GraphBuildContext {
     /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
     /// builtin called from multiple paths is a single graph node.
     pub builtin_index: HashMap<String, petgraph::graph::NodeIndex>,
+    /// Deferred column comments from `COMMENT ON COLUMN` statements.
+    /// Collected during `create_sql_nodes` and applied in `finalize_graph`
+    /// after all table columns are populated.
+    pub deferred_column_comments: Vec<DeferredColumnComment>,
 }
 
 impl GraphBuildContext {
@@ -73,6 +85,7 @@ impl GraphBuildContext {
             type_index: HashMap::new(),
             sequence_index: HashMap::new(),
             builtin_index: HashMap::new(),
+            deferred_column_comments: Vec::new(),
         }
     }
 }
@@ -149,9 +162,7 @@ impl GraphBuilder {
             &mut ctx.proc_index,
             &ctx.mapper_index,
         );
-        Self::dedup_table_view_nodes(&mut ctx.graph);
-        Self::merge_table_access_edges(&mut ctx.graph);
-        Self::resolve_unresolved_nodes(&mut ctx.graph);
+        Self::finalize_graph(&mut ctx);
 
         ctx.graph
     }
@@ -189,9 +200,7 @@ impl GraphBuilder {
         );
         Self::add_jsp_nodes_from_parsed(jsp_files, &mut ctx);
         Self::bridge_jsp_to_java_methods(&mut ctx.graph, jsp_files, &all.java_method_results);
-        Self::dedup_table_view_nodes(&mut ctx.graph);
-        Self::merge_table_access_edges(&mut ctx.graph);
-        Self::resolve_unresolved_nodes(&mut ctx.graph);
+        Self::finalize_graph(&mut ctx);
         ctx.graph
     }
 
@@ -207,6 +216,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.type_index,
             &mut ctx.sequence_index,
+            &mut ctx.deferred_column_comments,
         );
         Self::create_sql_edges(
             sql_files,
@@ -229,6 +239,7 @@ impl GraphBuilder {
     /// Must be called exactly once after all chunks and non-SQL files are added.
     pub fn finalize_graph(ctx: &mut GraphBuildContext) {
         Self::dedup_table_view_nodes(&mut ctx.graph);
+        apply_deferred_column_comments(ctx);
         Self::merge_table_access_edges(&mut ctx.graph);
         Self::resolve_unresolved_nodes(&mut ctx.graph);
     }
@@ -237,6 +248,7 @@ impl GraphBuilder {
     // Merged from: create_procedure_nodes + detect_and_create_partial_nodes
     // + add_view_nodes (5 loops → 1 loop)
 
+    #[allow(clippy::too_many_arguments)]
     fn create_sql_nodes(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
@@ -245,6 +257,7 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         type_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        deferred_column_comments: &mut Vec<DeferredColumnComment>,
     ) {
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -1271,6 +1284,17 @@ impl GraphBuilder {
                             },
                         };
                         graph.add_node(event_node);
+                    }
+                    Statement::Comment(comment_stmt)
+                        if comment_stmt.object_type.eq_ignore_ascii_case("COLUMN") =>
+                    {
+                        let (schema, table, col_name) = split_comment_col_name(&comment_stmt.name);
+                        let table_key = normalize_table_key(schema.as_deref(), &table);
+                        deferred_column_comments.push(DeferredColumnComment {
+                            table_key,
+                            col_name,
+                            comment: comment_stmt.comment.clone(),
+                        });
                     }
                     _ => {}
                 }
@@ -3941,6 +3965,45 @@ fn normalize_object_key(schema: Option<&str>, name: &str) -> String {
     match schema {
         Some(s) => format!("{}.{}", s.to_lowercase(), name.to_lowercase()),
         None => name.to_lowercase(),
+    }
+}
+
+/// Split a `COMMENT ON COLUMN` object name into (schema, table, column).
+/// Handles 2-part `["tbl", "col"]` and 3-part `["schema", "tbl", "col"]`.
+fn split_comment_col_name(name: &[ogsql_parser::Ident]) -> (Option<String>, String, String) {
+    if name.len() <= 2 {
+        (
+            None,
+            name.first().map(|i| i.to_string()).unwrap_or_default(),
+            name.get(1).map(|i| i.to_string()).unwrap_or_default(),
+        )
+    } else {
+        let schema = name[..name.len() - 2]
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        (
+            Some(schema),
+            name[name.len() - 2].to_string(),
+            name[name.len() - 1].to_string(),
+        )
+    }
+}
+
+fn apply_deferred_column_comments(ctx: &mut GraphBuildContext) {
+    for dc in &ctx.deferred_column_comments {
+        let Some(&table_idx) = ctx.table_index.get(&dc.table_key) else {
+            continue;
+        };
+        if let Node::Table { columns, .. } = &mut ctx.graph[table_idx] {
+            for col in columns.iter_mut() {
+                if col.name.eq_ignore_ascii_case(&dc.col_name) {
+                    col.comment = Some(dc.comment.clone());
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -6788,5 +6851,80 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         let result = super::nearest_routine_candidates("xyzzy", &lower_qualified, &graph, 3, 3);
 
         assert!(result.is_empty(), "distant name should return empty");
+    }
+
+    #[test]
+    fn comment_on_column_populates_column_comment() {
+        let sql = r#"
+            CREATE TABLE orders (
+                id INTEGER,
+                amount NUMERIC
+            );
+            COMMENT ON COLUMN orders.id IS 'primary key';
+            COMMENT ON COLUMN orders.amount IS 'order amount';
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_idx = graph
+            .node_indices()
+            .find(|&i| matches!(&graph[i], Node::Table { name, .. } if name == "orders"))
+            .expect("orders table should exist");
+
+        if let Node::Table { columns, .. } = &graph[table_idx] {
+            assert_eq!(columns.len(), 2);
+            let id_col = columns.iter().find(|c| c.name == "id").unwrap();
+            let amount_col = columns.iter().find(|c| c.name == "amount").unwrap();
+            assert_eq!(id_col.comment.as_deref(), Some("primary key"));
+            assert_eq!(amount_col.comment.as_deref(), Some("order amount"));
+        } else {
+            panic!("expected table node");
+        }
+    }
+
+    #[test]
+    fn comment_on_column_with_schema_qualifier() {
+        let sql = r#"
+            CREATE TABLE public.items (
+                name TEXT
+            );
+            COMMENT ON COLUMN public.items.name IS 'item name';
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_idx = graph
+            .node_indices()
+            .find(|&i| matches!(&graph[i], Node::Table { name, .. } if name == "items"))
+            .expect("items table should exist");
+
+        if let Node::Table { columns, .. } = &graph[table_idx] {
+            let name_col = columns.iter().find(|c| c.name == "name").unwrap();
+            assert_eq!(name_col.comment.as_deref(), Some("item name"));
+        } else {
+            panic!("expected table node");
+        }
+    }
+
+    #[test]
+    fn comment_on_column_before_create_table_is_applied() {
+        let sql = r#"
+            COMMENT ON COLUMN users.email IS 'user email';
+            CREATE TABLE users (
+                id INTEGER,
+                email TEXT
+            );
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_idx = graph
+            .node_indices()
+            .find(|&i| matches!(&graph[i], Node::Table { name, .. } if name == "users"))
+            .expect("users table should exist");
+
+        if let Node::Table { columns, .. } = &graph[table_idx] {
+            let email_col = columns.iter().find(|c| c.name == "email").unwrap();
+            assert_eq!(email_col.comment.as_deref(), Some("user email"));
+        } else {
+            panic!("expected table node");
+        }
     }
 }
