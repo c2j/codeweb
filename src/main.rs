@@ -1798,44 +1798,95 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
         .unwrap_or(0)
         .max(4);
     let has_default = columns.iter().any(|c| c.default_value.is_some());
+    let max_default_width = columns
+        .iter()
+        .map(|c| c.default_value.as_deref().map(|d| d.len()).unwrap_or(0))
+        .max()
+        .unwrap_or(0)
+        .max(if has_default { 7 } else { 0 });
+    let has_comment = columns.iter().any(|c| c.comment.is_some());
+    let max_comment_width = columns
+        .iter()
+        .map(|c| c.comment.as_deref().map(|d| d.len()).unwrap_or(0))
+        .max()
+        .unwrap_or(0)
+        .max(if has_comment { 7 } else { 0 });
 
     let mut lines = Vec::new();
     lines.push(format!("── COLUMNS ({}) ──", columns.len()));
 
-    if has_default {
+    {
+        let num_hdr = format!("{:>2}", "#");
+        let name_hdr = format!("{:<name$}", "NAME", name = max_name_width);
+        let type_hdr = format!("{:<type$}", "TYPE", type = max_type_width);
+        let null_hdr = format!("{:5}", "NULL?");
+        let default_hdr = if has_default {
+            format!("  {:<dw$}", "DEFAULT", dw = max_default_width)
+        } else {
+            String::new()
+        };
+        let comment_hdr = if has_comment {
+            format!("  {:<cw$}", "COMMENT", cw = max_comment_width)
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "{:>2}  {:<name$}  {:<type$}  {:5}  DEFAULT",
-            "#", "NAME", "TYPE", "NULL?",
-            name = max_name_width, type = max_type_width,
-        ));
-    } else {
-        lines.push(format!(
-            "{:>2}  {:<name$}  {:<type$}  {:5}",
-            "#", "NAME", "TYPE", "NULL?",
-            name = max_name_width, type = max_type_width,
+            "{}  {}  {}  {}{}{}",
+            num_hdr, name_hdr, type_hdr, null_hdr, default_hdr, comment_hdr
         ));
     }
 
-    let sep_width =
-        2 + 2 + max_name_width + 2 + max_type_width + 2 + 5 + if has_default { 2 + 7 } else { 0 };
-    lines.push(format!("  {}", "-".repeat(sep_width.saturating_sub(2))));
+    {
+        let sep_inner = 2 + max_name_width + 2 + max_type_width + 2 + 5;
+        let sep_default = if has_default {
+            2 + max_default_width
+        } else {
+            0
+        };
+        let sep_comment = if has_comment {
+            2 + max_comment_width
+        } else {
+            0
+        };
+        let sep_width = 2 + sep_inner + sep_default + sep_comment;
+        lines.push(format!("  {}", "-".repeat(sep_width.saturating_sub(2))));
+    }
 
     for (i, col) in columns.iter().enumerate() {
         let null_str = if col.nullable { "NULL " } else { "NOT  " };
-        if has_default {
-            let default_str = col.default_value.as_deref().unwrap_or("—");
-            lines.push(format!(
-                "{:>2}  {:<name$}  {:<type$}  {:5}  {}",
-                i + 1, col.name, col.data_type, null_str, default_str,
-                name = max_name_width, type = max_type_width,
-            ));
-        } else {
-            lines.push(format!(
-                "{:>2}  {:<name$}  {:<type$}  {:5}",
-                i + 1, col.name, col.data_type, null_str,
-                name = max_name_width, type = max_type_width,
-            ));
-        }
+        let default_str = col
+            .default_value
+            .as_deref()
+            .map(|d| format!("  {:<dw$}", d, dw = max_default_width))
+            .unwrap_or_else(|| {
+                if has_default {
+                    format!("  {:<dw$}", "—", dw = max_default_width)
+                } else {
+                    String::new()
+                }
+            });
+        let comment_str = col
+            .comment
+            .as_deref()
+            .map(|c| format!("  {:<cw$}", c, cw = max_comment_width))
+            .unwrap_or_else(|| {
+                if has_comment {
+                    format!("  {:<cw$}", "", cw = max_comment_width)
+                } else {
+                    String::new()
+                }
+            });
+        lines.push(format!(
+            "{:>2}  {:<name$}  {:<type$}  {}{}{}",
+            i + 1,
+            col.name,
+            col.data_type,
+            null_str,
+            default_str,
+            comment_str,
+            name = max_name_width,
+            type = max_type_width,
+        ));
     }
 
     let pk_cols: Vec<&str> = columns
