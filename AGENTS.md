@@ -99,6 +99,22 @@ cargo fmt -- --check
 
 If `--features full` has **pre-existing** failures unrelated to the change, document them explicitly in the PR/commit message and verify the change doesn't make them worse.
 
+## Git Workflow
+
+**NEVER push directly to `main`.** All changes must go through a pull request.
+
+1. Create a feature branch from `main`:
+   ```sh
+   git checkout -b <branch-name>
+   ```
+2. Commit changes to the feature branch.
+3. Push the feature branch and create a PR:
+   ```sh
+   git push -u origin <branch-name>
+   gh pr create --title "..." --body-file /tmp/pr-body.md
+   ```
+4. Merge via PR (squash or rebase preferred). Delete the feature branch after merge.
+
 ## Commands
 
 ```sh

@@ -321,6 +321,11 @@ fn render_reverse_child(
 fn format_paths_reverse_tree(result: &InspectResult, graph: &CodeGraph) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
 
+    lines.push(
+        "(direction: children are callers of parent; ← = called by; [intra]/[cross]/[external] = call scope; [calls]/[invokes]/[dynamic]/[builtin]/... = edge type)"
+            .to_string(),
+    );
+
     // Group paths by destination (to)
     let mut by_dest: BTreeMap<NodeIndex, Vec<&InspectPath>> = BTreeMap::new();
     for p in &result.paths {
@@ -478,6 +483,34 @@ pub fn format_inspect_result(
             lines.extend(format_paths_reverse_tree(result, graph));
         } else {
             lines.extend(format_paths_tree(result, graph));
+        }
+    }
+
+    // ── SUMMARY ──
+    if !result.paths.is_empty() || show_unreachable {
+        lines.push(String::new());
+        lines.push("── SUMMARY ──".to_string());
+        for &(from, to, count) in &result.summary {
+            let from_name = node_display_name(&graph[from]);
+            let to_name = node_display_name(&graph[to]);
+            if count > 0 {
+                let shortest = result
+                    .paths
+                    .iter()
+                    .filter(|p| p.from == from && p.to == to)
+                    .map(|p| p.hops.len() - 1)
+                    .min()
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "  ✅ {} → {} : reachable ({} hop{})",
+                    from_name,
+                    to_name,
+                    shortest,
+                    if shortest == 1 { "" } else { "s" }
+                ));
+            } else if show_unreachable || result.paths.is_empty() {
+                lines.push(format!("  ❌ {} → {} : unreachable", from_name, to_name));
+            }
         }
     }
 
@@ -993,6 +1026,231 @@ mod tests {
         assert!(
             pats_section.contains("(cycle)"),
             "should contain cycle marker for revisited node in reverse tree"
+        );
+    }
+
+    // ── Regression: direction clarity in Tree mode output ──
+    // Issue #1, #4, #7: reverse tree display is confusing because
+    // destination is root and callers are children, but without clear
+    // directional markers users read top-down and misinterpret direction.
+
+    #[test]
+    fn reverse_tree_root_is_destination_not_caller() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("proc_caller", None));
+        let b = graph.add_node(make_proc("proc_callee", None));
+        make_direct_call(&mut graph, a, b); // a → b
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["proc_caller".into(), "proc_callee".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        let paths_section = &output[output.find("── PATHS ──").unwrap()..];
+        // Root must be the destination (callee), not the source (caller)
+        assert!(
+            paths_section.contains("proc:proc_callee (root, called by 1)"),
+            "Tree mode root must be the destination node (proc_callee), not the caller.\nGot:\n{}",
+            paths_section
+        );
+        // The child must be the caller
+        assert!(
+            paths_section.contains("proc:proc_caller"),
+            "Tree mode child must be the caller (proc_caller).\nGot:\n{}",
+            paths_section
+        );
+    }
+
+    #[test]
+    fn reverse_tree_edge_labels_present_for_cross_package() {
+        let mut graph = CodeGraph::new();
+        let loc = SourceLocation {
+            file: make_file(),
+            line: 1,
+        };
+        let a = graph.add_node(make_proc("pkg_a_call", Some("pkg_a")));
+        let b = graph.add_node(make_proc("pkg_b_proc", Some("pkg_b")));
+        graph.add_edge(
+            a,
+            b,
+            Edge::DirectCall {
+                scope: CallScope::CrossPackage,
+                location: loc,
+            },
+        );
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["pkg_a_call".into(), "pkg_b_proc".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        let paths_section = &output[output.find("── PATHS ──").unwrap()..];
+        assert!(
+            paths_section.contains("← [cross]"),
+            "Cross-package DirectCall must show ← [cross] marker.\nGot:\n{}",
+            paths_section
+        );
+    }
+
+    #[test]
+    fn reverse_tree_child_is_always_caller_of_parent() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("upstream", None));
+        let x = graph.add_node(make_proc("middle", None));
+        let b = graph.add_node(make_proc("downstream", None));
+        make_direct_call(&mut graph, a, x); // a → x
+        make_direct_call(&mut graph, x, b); // x → b
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["upstream".into(), "downstream".into()],
+            InspectStyle::Tree,
+            false,
+        );
+
+        let paths_section = &output[output.find("── PATHS ──").unwrap()..];
+
+        // Root = downstream (b), called by middle (x)
+        assert!(
+            paths_section.contains("proc:downstream (root, called by 1)"),
+            "Root should be downstream (destination).\nGot:\n{}",
+            paths_section
+        );
+
+        // middle's only caller is upstream
+        assert!(
+            paths_section.contains("(called by 1)"),
+            "Intermediate node should show '(called by 1)'.\nGot:\n{}",
+            paths_section
+        );
+
+        // upstream (leaf) has no callers — verify in tree output only
+        let tree_only = if let Some(summary_idx) = paths_section.find("── SUMMARY ──") {
+            &paths_section[..summary_idx]
+        } else {
+            paths_section
+        };
+        let upstream_lines: Vec<&str> = tree_only
+            .lines()
+            .filter(|l| l.contains("proc:upstream"))
+            .collect();
+        assert_eq!(
+            upstream_lines.len(),
+            1,
+            "upstream should appear exactly once in tree output"
+        );
+        assert!(
+            !upstream_lines[0].contains("(called by"),
+            "Leaf node upstream should not show '(called by)'. Got: {}",
+            upstream_lines[0]
+        );
+    }
+
+    #[test]
+    fn tree_mode_vs_paths_mode_direction_consistency() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("caller", None));
+        let b = graph.add_node(make_proc("callee", None));
+        make_direct_call(&mut graph, a, b);
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+
+        // Paths mode: shows forward direction explicitly
+        let paths_output = format_inspect_result(
+            &result,
+            &graph,
+            &["caller".into(), "callee".into()],
+            InspectStyle::Paths,
+            false,
+        );
+        assert!(
+            paths_output.contains("proc:caller → proc:callee"),
+            "Paths mode must show A → B direction. Got:\n{}",
+            paths_output
+        );
+
+        // Tree mode: shows reverse direction (callee as root, caller as child)
+        let tree_output = format_inspect_result(
+            &result,
+            &graph,
+            &["caller".into(), "callee".into()],
+            InspectStyle::Tree,
+            false,
+        );
+        let tree_paths = &tree_output[tree_output.find("── PATHS ──").unwrap()..];
+        assert!(
+            tree_paths.contains("proc:callee (root, called by 1)"),
+            "Tree mode root is callee (destination). Got:\n{}",
+            tree_paths
+        );
+        assert!(
+            tree_paths.contains("proc:caller"),
+            "Tree mode child is caller. Got:\n{}",
+            tree_paths
+        );
+    }
+
+    #[test]
+    fn disconnected_nodes_produce_zero_paths_no_fabrication() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("isolated_a", None));
+        let b = graph.add_node(make_proc("isolated_b", None));
+        // no edges
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        assert!(
+            result.paths.is_empty(),
+            "disconnected nodes must produce 0 paths"
+        );
+        assert!(
+            result.summary.iter().all(|(_, _, c)| *c == 0),
+            "all summary entries must be 0 for disconnected nodes"
+        );
+    }
+
+    #[test]
+    fn inspect_summary_shows_direction_explicitly() {
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(make_proc("alpha", None));
+        let b = graph.add_node(make_proc("beta", None));
+        make_direct_call(&mut graph, a, b); // alpha → beta
+
+        let result = find_paths_between(&graph, &[a, b], &InspectOptions::default());
+        let output = format_inspect_result(
+            &result,
+            &graph,
+            &["alpha".into(), "beta".into()],
+            InspectStyle::Both,
+            true,
+        );
+
+        // Connections must show:
+        //   alpha → beta : 1 path(s)  (shortest 1 hop)
+        //   beta → alpha : 0 paths (unreachable)
+        assert!(
+            output.contains("proc:alpha → proc:beta"),
+            "CONNECTIONS must show reachable direction. Got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("proc:beta → proc:alpha"),
+            "CONNECTIONS must show unreachable direction. Got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("0 paths (unreachable)"),
+            "beta→alpha must be marked unreachable. Got:\n{}",
+            output
         );
     }
 }

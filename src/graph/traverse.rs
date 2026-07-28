@@ -60,7 +60,7 @@ pub(crate) fn edge_label_for(
         Edge::DirectCall { scope, .. } => Some(match scope {
             CallScope::IntraPackage => "[intra]".into(),
             CallScope::CrossPackage => "[cross]".into(),
-            CallScope::External => None?,
+            CallScope::External => "[external]".into(),
         }),
         Edge::TableAccess {
             flow_kind,
@@ -111,6 +111,17 @@ pub(crate) fn edge_label_for(
         Edge::DependsOn { .. } => Some("[depends_on]".into()),
         Edge::DynamicCall { .. } => Some("[dynamic]".into()),
         Edge::UsesBuiltinFunction { .. } => Some("[builtin]".into()),
+        Edge::CallsProcedure { .. } => Some("[calls]".into()),
+        Edge::InvokesMapper { .. } => Some("[invokes]".into()),
+        Edge::CallsJava { .. } => Some("[calls_java]".into()),
+        Edge::Extends { .. } => Some("[extends]".into()),
+        Edge::Implements { .. } => Some("[implements]".into()),
+        Edge::TriggersRoutine { .. } => Some("[triggers]".into()),
+        Edge::ReferencesType { .. } => Some("[ref_type]".into()),
+        Edge::UsesSequence { .. } => Some("[uses_seq]".into()),
+        Edge::IndexesTable { .. } => Some("[indexes]".into()),
+        Edge::AliasesObject { .. } => Some("[aliases]".into()),
+        Edge::ContainsRoutine | Edge::ContainsMethod => None,
         _ => None,
     }
 }
@@ -797,5 +808,196 @@ mod tests {
             "Expected proc_a to be in callers when tracing from builtin, got: {:?}",
             caller_keys
         );
+    }
+
+    // ── edge_label_for completeness tests ──
+    // Regression: edge_label_for returns None for many edge types, causing
+    // inspect --style tree to show edges without directional markers.
+    // See Issue #4, #6, #7 in the inspect direction bug report.
+
+    fn make_loc() -> crate::graph::SourceLocation {
+        crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("test.sql")),
+            line: 1,
+        }
+    }
+
+    fn add_proc_node(
+        graph: &mut crate::graph::CodeGraph,
+        name: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("sch".into()),
+                package: None,
+                name: name.to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: make_loc(),
+            partial: false,
+            body_sql: vec![],
+        })
+    }
+
+    #[test]
+    fn edge_label_direct_call_intra_package() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[intra]"),
+            "DirectCall[IntraPackage] must produce [intra] label"
+        );
+    }
+
+    #[test]
+    fn edge_label_direct_call_cross_package() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::CrossPackage,
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[cross]"),
+            "DirectCall[CrossPackage] must produce [cross] label"
+        );
+    }
+
+    #[test]
+    fn edge_label_direct_call_external_has_label() {
+        // REGRESSION: CallScope::External currently returns None via `None?`
+        // in edge_label_for, leaving the edge unmarked.
+        // This test documents the current (suboptimal) behavior.
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::External,
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[external]"),
+            "DirectCall[External] must produce [external] label"
+        );
+    }
+
+    #[test]
+    fn edge_label_dynamic_call() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DynamicCall {
+                raw_expr: "some_var".into(),
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[dynamic]"),
+            "DynamicCall must produce [dynamic] label"
+        );
+    }
+
+    #[test]
+    fn edge_label_calls_procedure_has_label() {
+        // REGRESSION: CallsProcedure edges (used by MyBatis/JavaSql→Procedure)
+        // currently fall through to `_ => None` in edge_label_for.
+        // In inspect --style tree, these edges appear without ← markers.
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a"); // stand-in for a non-proc caller
+        let b = add_proc_node(&mut graph, "b");
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::CallsProcedure {
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[calls]"),
+            "CallsProcedure must produce [calls] label for direction clarity"
+        );
+    }
+
+    #[test]
+    fn edge_label_uses_builtin_function() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = graph.add_node(crate::graph::Node::BuiltinFunction {
+            name: "count".into(),
+            category: "aggregate".into(),
+            domain: "sql".into(),
+            location: make_loc(),
+        });
+        graph.add_edge(
+            a,
+            b,
+            crate::graph::Edge::UsesBuiltinFunction {
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, a, b);
+        assert_eq!(
+            label.as_deref(),
+            Some("[builtin]"),
+            "UsesBuiltinFunction must produce [builtin] label"
+        );
+    }
+
+    #[test]
+    fn edge_label_none_for_unlabeled_edge_types() {
+        let unlabeled_edges: Vec<crate::graph::Edge> = vec![
+            crate::graph::Edge::ContainsRoutine,
+            crate::graph::Edge::ContainsMethod,
+        ];
+
+        for edge in &unlabeled_edges {
+            let mut g = crate::graph::CodeGraph::new();
+            let x = add_proc_node(&mut g, "x");
+            let y = add_proc_node(&mut g, "y");
+            g.add_edge(x, y, edge.clone());
+            let label = edge_label_for(&g, x, y);
+            assert!(
+                label.is_none(),
+                "{:?} currently returns None — consider adding a label",
+                edge
+            );
+        }
     }
 }
