@@ -81,12 +81,31 @@ pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
         .collect()
 }
 
+fn decode_sql_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let bytes = e.into_bytes();
+            if let Ok(s) = decode_gbk(&bytes) {
+                return s;
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
+
+fn decode_gbk(bytes: &[u8]) -> std::result::Result<String, ()> {
+    match encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes) {
+        Some(cow) => Ok(cow.into_owned()),
+        None => Err(()),
+    }
+}
+
 fn parse_file(path: &Path) -> std::result::Result<(Vec<StatementInfo>, String), String> {
     let parse_sw = std::time::Instant::now();
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
     let content_hash = blake3::hash(&bytes).to_hex().to_string();
-    let sql = String::from_utf8(bytes)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let sql = decode_sql_bytes(bytes);
 
     let tokens = Tokenizer::new(&sql)
         .tokenize()
@@ -229,5 +248,42 @@ END;
             PathBuf::from("/nonexistent/file.sql"),
         ]);
         assert_eq!(results.len(), 1, "unparseable file should be filtered out");
+    }
+
+    #[test]
+    fn decode_utf8_sql() {
+        let s = decode_sql_bytes("CREATE TABLE t (id INTEGER)".as_bytes().to_vec());
+        assert_eq!(s, "CREATE TABLE t (id INTEGER)");
+    }
+
+    #[test]
+    fn decode_utf8_chinese() {
+        let s = decode_sql_bytes("COMMENT ON COLUMN t.id IS '客户ID'".as_bytes().to_vec());
+        assert_eq!(s, "COMMENT ON COLUMN t.id IS '客户ID'");
+    }
+
+    #[test]
+    fn decode_gbk_chinese() {
+        // "客户ID" in GBK: BF CD BB A7 49 44
+        let gbk_bytes: Vec<u8> = b"COMMENT ON COLUMN t.id IS '"
+            .iter()
+            .copied()
+            .chain([0xBF, 0xCD, 0xBB, 0xA7, 0x49, 0x44])
+            .chain(b"'".iter().copied())
+            .collect();
+        let s = decode_sql_bytes(gbk_bytes);
+        assert_eq!(s, "COMMENT ON COLUMN t.id IS '客户ID'");
+    }
+
+    #[test]
+    fn decode_lossy_fallback() {
+        // Invalid bytes that are neither UTF-8 nor GBK
+        let bad: Vec<u8> = b"SELECT ".iter().copied().chain([0xFF, 0xFE]).collect();
+        let s = decode_sql_bytes(bad);
+        assert!(s.contains("SELECT"), "ASCII prefix preserved");
+        assert!(
+            s.contains('\u{FFFD}'),
+            "invalid bytes replaced with replacement char"
+        );
     }
 }
