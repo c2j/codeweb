@@ -6927,4 +6927,28 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             panic!("expected table node");
         }
     }
+
+    #[test]
+    fn comment_on_column_with_chinese_characters() {
+        let sql = r#"
+            CREATE TABLE products (
+                name TEXT
+            );
+            COMMENT ON COLUMN products.name IS '产品名称';
+        "#;
+        let graph = build_from_sql(sql);
+
+        let table_idx = graph
+            .node_indices()
+            .find(|&i| matches!(&graph[i], Node::Table { name, .. } if name == "products"))
+            .expect("products table should exist");
+
+        if let Node::Table { columns, .. } = &graph[table_idx] {
+            let name_col = columns.iter().find(|c| c.name == "name").unwrap();
+            assert_eq!(name_col.comment.as_deref(), Some("产品名称"));
+            assert_eq!(name_col.comment.as_deref().unwrap().len(), 12);
+        } else {
+            panic!("expected table node");
+        }
+    }
 }

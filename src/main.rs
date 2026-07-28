@@ -1780,6 +1780,39 @@ fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Res
     Ok(())
 }
 
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                1
+            } else if ('\u{1100}'..='\u{115F}').contains(&c)
+                || ('\u{2E80}'..='\u{A4CF}').contains(&c)
+                || ('\u{AC00}'..='\u{D7A3}').contains(&c)
+                || ('\u{F900}'..='\u{FAFF}').contains(&c)
+                || ('\u{FE10}'..='\u{FE19}').contains(&c)
+                || ('\u{FE30}'..='\u{FE6F}').contains(&c)
+                || ('\u{FF00}'..='\u{FF60}').contains(&c)
+                || ('\u{FFE0}'..='\u{FFE6}').contains(&c)
+                || ('\u{20000}'..='\u{2FFFD}').contains(&c)
+                || ('\u{30000}'..='\u{3FFFD}').contains(&c)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn pad_display(s: &str, width: usize) -> String {
+    let dw = display_width(s);
+    if dw >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - dw))
+    }
+}
+
 fn format_columns(columns: &[graph::ColumnSummary]) -> String {
     if columns.is_empty() {
         return String::new();
@@ -1787,27 +1820,27 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
 
     let max_name_width = columns
         .iter()
-        .map(|c| c.name.len())
+        .map(|c| display_width(&c.name))
         .max()
         .unwrap_or(0)
         .max(4);
     let max_type_width = columns
         .iter()
-        .map(|c| c.data_type.len())
+        .map(|c| display_width(&c.data_type))
         .max()
         .unwrap_or(0)
         .max(4);
     let has_default = columns.iter().any(|c| c.default_value.is_some());
     let max_default_width = columns
         .iter()
-        .map(|c| c.default_value.as_deref().map(|d| d.len()).unwrap_or(0))
+        .map(|c| c.default_value.as_deref().map(display_width).unwrap_or(0))
         .max()
         .unwrap_or(0)
         .max(if has_default { 7 } else { 0 });
     let has_comment = columns.iter().any(|c| c.comment.is_some());
     let max_comment_width = columns
         .iter()
-        .map(|c| c.comment.as_deref().map(|d| d.len()).unwrap_or(0))
+        .map(|c| c.comment.as_deref().map(display_width).unwrap_or(0))
         .max()
         .unwrap_or(0)
         .max(if has_comment { 7 } else { 0 });
@@ -1816,23 +1849,24 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
     lines.push(format!("── COLUMNS ({}) ──", columns.len()));
 
     {
-        let num_hdr = format!("{:>2}", "#");
-        let name_hdr = format!("{:<name$}", "NAME", name = max_name_width);
-        let type_hdr = format!("{:<type$}", "TYPE", type = max_type_width);
-        let null_hdr = format!("{:5}", "NULL?");
         let default_hdr = if has_default {
-            format!("  {:<dw$}", "DEFAULT", dw = max_default_width)
+            format!("  {}", pad_display("DEFAULT", max_default_width))
         } else {
             String::new()
         };
         let comment_hdr = if has_comment {
-            format!("  {:<cw$}", "COMMENT", cw = max_comment_width)
+            format!("  {}", pad_display("COMMENT", max_comment_width))
         } else {
             String::new()
         };
         lines.push(format!(
-            "{}  {}  {}  {}{}{}",
-            num_hdr, name_hdr, type_hdr, null_hdr, default_hdr, comment_hdr
+            "{:>2}  {}  {}  {:5}{}{}",
+            "#",
+            pad_display("NAME", max_name_width),
+            pad_display("TYPE", max_type_width),
+            "NULL?",
+            default_hdr,
+            comment_hdr
         ));
     }
 
@@ -1854,38 +1888,26 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
 
     for (i, col) in columns.iter().enumerate() {
         let null_str = if col.nullable { "NULL " } else { "NOT  " };
-        let default_str = col
-            .default_value
-            .as_deref()
-            .map(|d| format!("  {:<dw$}", d, dw = max_default_width))
-            .unwrap_or_else(|| {
-                if has_default {
-                    format!("  {:<dw$}", "—", dw = max_default_width)
-                } else {
-                    String::new()
-                }
-            });
-        let comment_str = col
-            .comment
-            .as_deref()
-            .map(|c| format!("  {:<cw$}", c, cw = max_comment_width))
-            .unwrap_or_else(|| {
-                if has_comment {
-                    format!("  {:<cw$}", "", cw = max_comment_width)
-                } else {
-                    String::new()
-                }
-            });
+        let default_str = if has_default {
+            let d = col.default_value.as_deref().unwrap_or("—");
+            format!("  {}", pad_display(d, max_default_width))
+        } else {
+            String::new()
+        };
+        let comment_str = if has_comment {
+            let c = col.comment.as_deref().unwrap_or("");
+            format!("  {}", pad_display(c, max_comment_width))
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "{:>2}  {:<name$}  {:<type$}  {}{}{}",
+            "{:>2}  {}  {}  {}{}{}",
             i + 1,
-            col.name,
-            col.data_type,
+            pad_display(&col.name, max_name_width),
+            pad_display(&col.data_type, max_type_width),
             null_str,
             default_str,
             comment_str,
-            name = max_name_width,
-            type = max_type_width,
         ));
     }
 
