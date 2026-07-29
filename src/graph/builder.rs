@@ -36,6 +36,70 @@ const SYSTEM_SCHEMAS: &[&str] = &[
 /// Known system table/view names that lack a schema qualifier (e.g. `dual`).
 const KNOWN_SYSTEM_NAMES: &[&str] = &["dual", "sys_dummy"];
 
+/// Extract column summaries from a CREATE VIEW / CREATE MATERIALIZED VIEW
+/// statement. Uses explicit column list if present, otherwise derives
+/// column names from the SELECT targets.
+fn extract_view_columns(
+    explicit_columns: &[String],
+    targets: &[ogsql_parser::ast::SelectTarget],
+) -> Vec<ColumnSummary> {
+    // Prefer explicit column list (CREATE VIEW v(col1, col2) AS ...)
+    if !explicit_columns.is_empty() {
+        return explicit_columns
+            .iter()
+            .map(|name| ColumnSummary {
+                name: name.clone(),
+                data_type: String::new(),
+                nullable: true,
+                is_primary_key: false,
+                default_value: None,
+                comment: None,
+            })
+            .collect();
+    }
+
+    // Derive column names from SELECT targets
+    let mut columns = Vec::new();
+    for target in targets {
+        match target {
+            ogsql_parser::ast::SelectTarget::Expr(expr, alias) => {
+                let name = match alias {
+                    Some(a) => a.to_string(),
+                    None => extract_column_name_from_expr(expr),
+                };
+                if !name.is_empty() {
+                    columns.push(ColumnSummary {
+                        name,
+                        data_type: String::new(),
+                        nullable: true,
+                        is_primary_key: false,
+                        default_value: None,
+                        comment: None,
+                    });
+                }
+            }
+            ogsql_parser::ast::SelectTarget::Star(_alias) => {
+                // Cannot determine individual column names from SELECT *
+                // without source table info; skip.
+            }
+        }
+    }
+    columns
+}
+
+/// Extract a column name from a SELECT expression.
+/// For simple ColumnRef expressions, returns the column name.
+/// For all other expressions, returns a "?" placeholder.
+fn extract_column_name_from_expr(expr: &ogsql_parser::ast::Expr) -> String {
+    use ogsql_parser::ast::Expr;
+    match expr {
+        Expr::ColumnRef(name) | Expr::ColumnRefOuterJoin(name) => {
+            name.last().map(|i| i.to_string()).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
 fn is_system(schema: Option<&str>, name: &str) -> bool {
     if KNOWN_SYSTEM_NAMES.contains(&name.to_lowercase().as_str()) {
         return true;
@@ -462,12 +526,19 @@ impl GraphBuilder {
                             None
                         };
                         let view_name = v.name.last().cloned().unwrap_or_default().to_string();
+                        let columns = extract_view_columns(&v.columns, &v.query.targets);
+                        let ddl_source = Some(Box::new(info.sql_text.clone()));
                         let view_node = Node::View {
                             schema: view_schema.clone(),
                             name: view_name.clone(),
                             explicit: true,
                             system: is_system(view_schema.as_deref(), &view_name),
-                            location: None,
+                            location: Some(SourceLocation {
+                                file: file_arc.clone(),
+                                line: info.start_line,
+                            }),
+                            columns: Box::new(columns),
+                            ddl_source,
                         };
                         let view_idx = graph.add_node(view_node);
 
@@ -1131,6 +1202,8 @@ impl GraphBuilder {
                     }
                     Statement::CreateMaterializedView(v) => {
                         let (schema, name) = split_object_name(&v.name);
+                        let columns = extract_view_columns(&v.columns, &v.query.targets);
+                        let ddl_source = Some(Box::new(info.sql_text.clone()));
                         let mview_node = Node::MaterializedView {
                             schema: schema.clone(),
                             name: name.clone(),
@@ -1138,6 +1211,8 @@ impl GraphBuilder {
                                 file: file_arc.clone(),
                                 line: info.start_line,
                             },
+                            columns: Box::new(columns),
+                            ddl_source,
                         };
                         let mview_idx = graph.add_node(mview_node);
 
@@ -4258,6 +4333,104 @@ mod tests {
             1,
             "View should depend on 1 table (t_users)"
         );
+    }
+
+    #[test]
+    fn view_extracts_explicit_column_list() {
+        let sql = r#"
+            CREATE VIEW v_report (id, total, status) AS
+            SELECT a.id, SUM(a.amount), a.status
+            FROM t_accounts a
+            GROUP BY a.id, a.status;
+        "#;
+        let graph = build_from_sql(sql);
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        assert_eq!(view_nodes.len(), 1);
+        if let Node::View { columns, .. } = &graph[view_nodes[0]] {
+            assert_eq!(columns.len(), 3, "should have 3 explicit columns");
+            assert_eq!(columns[0].name, "id");
+            assert_eq!(columns[1].name, "total");
+            assert_eq!(columns[2].name, "status");
+        } else {
+            panic!("expected View node");
+        }
+    }
+
+    #[test]
+    fn view_extracts_columns_from_select_targets() {
+        let sql = r#"
+            CREATE VIEW v_active_users AS
+            SELECT u.id, u.name, u.email
+            FROM t_users u
+            WHERE u.status = 'ACTIVE';
+        "#;
+        let graph = build_from_sql(sql);
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        assert_eq!(view_nodes.len(), 1);
+        if let Node::View { columns, .. } = &graph[view_nodes[0]] {
+            assert_eq!(
+                columns.len(),
+                3,
+                "should extract 3 columns from SELECT targets"
+            );
+            assert_eq!(columns[0].name, "id");
+            assert_eq!(columns[1].name, "name");
+            assert_eq!(columns[2].name, "email");
+        } else {
+            panic!("expected View node");
+        }
+    }
+
+    #[test]
+    fn view_select_star_has_empty_columns() {
+        let sql = "CREATE VIEW v_all AS SELECT * FROM t_users;";
+        let graph = build_from_sql(sql);
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        if let Node::View { columns, .. } = &graph[view_nodes[0]] {
+            assert!(
+                columns.is_empty(),
+                "SELECT * cannot determine individual column names without table info"
+            );
+        }
+    }
+
+    #[test]
+    fn view_stores_ddl_source() {
+        let sql = "CREATE VIEW v_test AS SELECT 1 AS flag;";
+        let graph = build_from_sql(sql);
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        if let Node::View { ddl_source, .. } = &graph[view_nodes[0]] {
+            // DDL source is stored — may be empty in test parser but is present in production
+            assert!(
+                ddl_source.is_some(),
+                "view should have ddl_source field set"
+            );
+        }
+    }
+
+    #[test]
+    fn view_has_file_location() {
+        let sql = "CREATE VIEW v_loc AS SELECT 1;";
+        let graph = build_from_sql(sql);
+        let view_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(graph[*i], Node::View { .. }))
+            .collect();
+        if let Node::View { location, .. } = &graph[view_nodes[0]] {
+            assert!(location.is_some(), "view should have a file location");
+        }
     }
 
     #[test]

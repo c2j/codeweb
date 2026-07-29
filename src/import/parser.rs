@@ -232,6 +232,8 @@ impl CgefParser {
                     explicit: false,
                     system: false,
                     location: None,
+                    columns: Box::new(vec![]),
+                    ddl_source: None,
                 })
             }
             "mapped_statement" => {
@@ -472,6 +474,8 @@ impl CgefParser {
                     schema: key_get_str(key, "schema").map(String::from),
                     name: name.to_string(),
                     location: loc,
+                    columns: Box::new(vec![]),
+                    ddl_source: None,
                 })
             }
             "synonym" => {

@@ -2144,6 +2144,8 @@ mod tests {
             explicit: false,
             system: false,
             location: None,
+            columns: Box::new(vec![]),
+            ddl_source: None,
         });
         graph.add_node(crate::graph::Node::Trigger {
             name: "trig1".to_string(),
@@ -3519,6 +3521,8 @@ mod tests {
             explicit: false,
             system: false,
             location: None,
+            columns: Box::new(vec![]),
+            ddl_source: None,
         }
     }
 

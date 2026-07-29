@@ -455,6 +455,10 @@ enum Commands {
         /// Show built-in function calls in the chain (default: hidden)
         #[arg(long = "builtfunc")]
         builtfunc: bool,
+
+        /// Show DDL source text for views and other objects
+        #[arg(short = 'v', long, default_value = "false")]
+        verbose: bool,
     },
 
     /// Search MappedStatement and JavaSql nodes by SQL fragment, then
@@ -775,7 +779,8 @@ fn run() -> Result<()> {
             depth,
             files,
             builtfunc,
-        }) => cmd_detail(&names, &project, &style, depth, files, builtfunc),
+            verbose,
+        }) => cmd_detail(&names, &project, &style, depth, files, builtfunc, verbose),
         Some(Commands::Import {
             file,
             output,
@@ -1332,13 +1337,23 @@ fn cmd_detail(
     depth: i64,
     show_files: bool,
     show_builtins: bool,
+    verbose: bool,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
     let graph = store.graph();
 
     for name in names {
-        detail_one(name, graph, store, style, depth, show_files, show_builtins);
+        detail_one(
+            name,
+            graph,
+            store,
+            style,
+            depth,
+            show_files,
+            show_builtins,
+            verbose,
+        );
     }
 
     Ok(())
@@ -1352,6 +1367,7 @@ fn detail_one(
     depth: i64,
     show_files: bool,
     show_builtins: bool,
+    verbose: bool,
 ) {
     let matches = store.search_nodes(name);
 
@@ -1419,6 +1435,20 @@ fn detail_one(
             println_stdout!("  tablespace: {}", ts);
         }
     }
+    if let Node::View { location, .. } = &graph[*start_idx] {
+        if let Some(loc) = location {
+            println_stdout!("  file   {}:{}", loc.file.to_string_lossy(), loc.line);
+        } else {
+            println_stdout!("  file   (implicit)");
+        }
+    }
+    if let Node::MaterializedView { location, .. } = &graph[*start_idx] {
+        println_stdout!(
+            "  file   {}:{}",
+            location.file.to_string_lossy(),
+            location.line
+        );
+    }
     println_stdout!();
 
     let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
@@ -1443,7 +1473,19 @@ fn detail_one(
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
 
-    print_node_details(&graph[*start_idx]);
+    print_node_details(&graph[*start_idx], verbose);
+
+    // For View / MaterializedView nodes, show referenced tables
+    if matches!(
+        &graph[*start_idx],
+        Node::View { .. } | Node::MaterializedView { .. }
+    ) {
+        let ref_output = format_referenced_tables(graph, *start_idx);
+        if !ref_output.is_empty() {
+            println_stdout!();
+            println_stdout!("{}", ref_output);
+        }
+    }
 
     let indexes_output = format_indexes(graph, *start_idx);
     if !indexes_output.is_empty() {
@@ -1924,7 +1966,88 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
     lines.join("\n")
 }
 
-fn print_node_details(node: &Node) {
+fn format_referenced_tables(graph: &crate::graph::CodeGraph, view_idx: NodeIndex) -> String {
+    let mut ref_nodes: Vec<(NodeIndex, &Node)> = graph
+        .neighbors_directed(view_idx, petgraph::Direction::Outgoing)
+        .filter_map(|n| {
+            if matches!(
+                &graph[n],
+                Node::Table { .. } | Node::View { .. } | Node::MaterializedView { .. }
+            ) {
+                Some((n, &graph[n]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if ref_nodes.is_empty() {
+        return String::new();
+    }
+
+    ref_nodes.sort_by(|a, b| {
+        let name_a = graph::node_display_name(a.1);
+        let name_b = graph::node_display_name(b.1);
+        name_a.cmp(&name_b)
+    });
+
+    let mut lines = Vec::new();
+    lines.push(format!("── REFERENCED OBJECTS ({}) ──", ref_nodes.len()));
+
+    for (_node_idx, node) in &ref_nodes {
+        let display = graph::node_display_name(node);
+        let tag = graph::node_type_tag(node);
+        match node {
+            Node::Table {
+                location, columns, ..
+            } => {
+                if let Some(loc) = location {
+                    lines.push(format!(
+                        "  {}  {}  [file: {}:{}]",
+                        tag,
+                        display,
+                        loc.file.to_string_lossy(),
+                        loc.line
+                    ));
+                } else {
+                    lines.push(format!("  {}  {}", tag, display));
+                }
+                for col in columns.iter() {
+                    lines.push(format!("    {}", col.name));
+                }
+            }
+            Node::View { location, .. } => {
+                if let Some(loc) = location {
+                    lines.push(format!(
+                        "  {}  {}  [file: {}:{}]",
+                        tag,
+                        display,
+                        loc.file.to_string_lossy(),
+                        loc.line
+                    ));
+                } else {
+                    lines.push(format!("  {}  {}", tag, display));
+                }
+            }
+            Node::MaterializedView { location, .. } => {
+                lines.push(format!(
+                    "  {}  {}  [file: {}:{}]",
+                    tag,
+                    display,
+                    location.file.to_string_lossy(),
+                    location.line
+                ));
+            }
+            _ => {
+                lines.push(format!("  {}  {}", tag, display));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn print_node_details(node: &Node, verbose: bool) {
     use graph::{DistributeInfo, PartitionInfo};
     match node {
         Node::Table {
@@ -1999,6 +2122,30 @@ fn print_node_details(node: &Node) {
             }
             if let Some(ddl) = ddl_source {
                 println_stdout!("  ddl: {}", ddl.as_ref());
+            }
+        }
+        Node::View {
+            columns,
+            ddl_source,
+            ..
+        }
+        | Node::MaterializedView {
+            columns,
+            ddl_source,
+            ..
+        } => {
+            if !columns.is_empty() {
+                let cols_output = format_columns(columns);
+                if !cols_output.is_empty() {
+                    println_stdout!("{}", cols_output);
+                }
+            }
+            if verbose {
+                if let Some(ddl) = ddl_source {
+                    println_stdout!();
+                    println_stdout!("── DEFINITION ──");
+                    println_stdout!("{}", ddl);
+                }
             }
         }
         Node::JavaSql {

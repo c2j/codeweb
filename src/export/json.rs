@@ -536,6 +536,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 schema,
                 name,
                 location,
+                ..
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::MaterializedView {
