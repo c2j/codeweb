@@ -233,6 +233,18 @@ pub struct ColumnSummary {
     pub comment: Option<String>,
 }
 
+/// Records the source table column that a view column is derived from.
+// TODO: wire this into builder + format_referenced_tables for reliable column lineage
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ViewColumnSource {
+    pub view_column: String,
+    pub table_schema: Option<String>,
+    pub table_name: String,
+    pub table_column: String,
+    pub data_type: Option<String>,
+}
+
 /// Partition strategy for a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartitionInfo {
@@ -375,6 +387,7 @@ pub enum Node {
         ddl_source: Option<Box<String>>,
     },
     #[allow(dead_code)]
+    #[allow(clippy::box_collection)]
     View {
         schema: Option<String>,
         name: String,
@@ -386,6 +399,10 @@ pub enum Node {
         system: bool,
         #[serde(default)]
         location: Option<SourceLocation>,
+        #[serde(default)]
+        columns: Box<Vec<ColumnSummary>>,
+        #[serde(default)]
+        ddl_source: Option<Box<String>>,
     },
     Package {
         schema: Option<String>,
@@ -431,10 +448,15 @@ pub enum Node {
         location: SourceLocation,
     },
     /// A MATERIALIZED VIEW.
+    #[allow(clippy::box_collection)]
     MaterializedView {
         schema: Option<String>,
         name: String,
         location: SourceLocation,
+        #[serde(default)]
+        columns: Box<Vec<ColumnSummary>>,
+        #[serde(default)]
+        ddl_source: Option<Box<String>>,
     },
     /// A database SYNONYM (alias for another object).
     Synonym {
@@ -903,6 +925,8 @@ mod tests {
             schema: Some("public".to_string()),
             name: "my_mview".to_string(),
             location: loc.clone(),
+            columns: Box::new(vec![]),
+            ddl_source: None,
         };
         assert_eq!(mview_node.file(), Path::new("test.sql"));
 
