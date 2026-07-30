@@ -393,6 +393,7 @@ impl GraphBuilder {
                         Self::create_package_nodes(
                             &pkg.name,
                             &pkg.items,
+                            true,
                             info.start_line,
                             &file_arc,
                             graph,
@@ -431,6 +432,7 @@ impl GraphBuilder {
                         Self::create_package_nodes(
                             &pkg.name,
                             &pkg.items,
+                            false,
                             info.start_line,
                             &file_arc,
                             graph,
@@ -1433,9 +1435,11 @@ impl GraphBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_package_nodes(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
+        is_spec: bool,
         start_line: usize,
         file_path: &Arc<PathBuf>,
         graph: &mut CodeGraph,
@@ -1459,17 +1463,42 @@ impl GraphBuilder {
             None => pkg_name_part.clone(),
         };
 
-        let pkg_idx = *package_index.entry(qualified).or_insert_with(|| {
-            let node = Node::Package {
-                schema: schema_part.clone(),
-                name: pkg_name_part.clone(),
-                location: SourceLocation {
-                    file: file_path.clone(),
-                    line: start_line,
-                },
-            };
-            graph.add_node(node)
-        });
+        let pkg_idx = if is_spec {
+            match package_index.get(&qualified) {
+                Some(&idx) => {
+                    if let Node::Package { location, .. } = &mut graph[idx] {
+                        *location = SourceLocation {
+                            file: file_path.clone(),
+                            line: start_line,
+                        };
+                    }
+                    idx
+                }
+                None => {
+                    let idx = graph.add_node(Node::Package {
+                        schema: schema_part.clone(),
+                        name: pkg_name_part.clone(),
+                        location: SourceLocation {
+                            file: file_path.clone(),
+                            line: start_line,
+                        },
+                    });
+                    package_index.insert(qualified, idx);
+                    idx
+                }
+            }
+        } else {
+            *package_index.entry(qualified).or_insert_with(|| {
+                graph.add_node(Node::Package {
+                    schema: schema_part.clone(),
+                    name: pkg_name_part.clone(),
+                    location: SourceLocation {
+                        file: file_path.clone(),
+                        line: start_line,
+                    },
+                })
+            })
+        };
 
         for item in pkg_items {
             let (proc_name, block, kind) = match item {
@@ -1553,9 +1582,7 @@ impl GraphBuilder {
         for file in files {
             for info in &file.statements {
                 if let Statement::CreatePackage(pkg) = &info.statement {
-                    spec_items_by_pkg
-                        .entry(pkg_qualified_key(&pkg.name))
-                        .or_insert(&pkg.items);
+                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
                 }
             }
         }
