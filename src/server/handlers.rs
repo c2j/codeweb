@@ -601,6 +601,16 @@ async fn export(
             Ok(json) => ("application/json", json),
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         },
+        "ndjson" => {
+            let mut buf = Vec::new();
+            if let Err(_) = crate::export::ndjson::to_ndjson(graph, &mut buf) {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            (
+                "application/x-ndjson",
+                String::from_utf8_lossy(&buf).to_string(),
+            )
+        }
         "mermaid" => ("text/plain", crate::export::mermaid::to_mermaid(graph)),
         _ => return Err(StatusCode::BAD_REQUEST),
     };

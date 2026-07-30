@@ -1141,6 +1141,36 @@ codeweb --lang zh-CN stats   # 中文（默认）
 | 未解析引用 | `unres` | Unresolved Reference |
 | 自定义节点 | *自定义* | 通过 CGEF 导入的自定义节点类型 |
 
+### CLI 标签 ↔ JSON type 对照
+
+`export -f json` 输出的 `_meta.type_mapping` 字段列出了 CLI 短标签与 JSON `"type"` 全称的对应关系。脚本调用 / AI Agent 集成时请参考此表，避免类型字符串匹配失败：
+
+| CLI 标签 | JSON `"type"` | 说明 |
+|----------|---------------|------|
+| `proc` | `procedure` | 存储过程（含 partial：`proc*`） |
+| `func` | `function` | 函数（含 partial：`func*`） |
+| `pkg` | `package` | 数据库包 |
+| `table` | `table` | 表（含推测型：`table*`） |
+| `view` | `view` | 视图（含推测型：`view*`） |
+| `mview` | `materialized_view` | 物化视图 |
+| `trigger` | `trigger` | 触发器 |
+| `type` | `type` | 自定义类型 |
+| `seq` | `sequence` | 序列 |
+| `index` | `index` | 索引 |
+| `synonym` | `synonym` | 同义词 |
+| `event` | `event` | 事件 |
+| `builtin` | `builtin_function` | 内建函数 |
+| `unres` | `unresolved` | 未解析引用 |
+| `mapper` | `mapped_statement` | MyBatis 映射语句 |
+| `sql` | `java_sql` | Java 内嵌 SQL |
+| `method` | `java_method` | Java 方法 |
+| `class` | `java_class` | Java 类 |
+| `jsp` | `jsp` | JSP 页面（需 `jsp` feature） |
+| `jspsql` | `jspsql` | JSP 内嵌 SQL（需 `jsp` feature） |
+| `custom` | `custom` | 自定义节点（CGEF 导入） |
+
+> **注意**：`proc*`、`func*`、`table*`、`view*` 等带星号标签在 JSON 中统一使用对应的无星号 `type` 值，通过 `partial` / `explicit` 布尔字段区分。
+
 ### 边类型
 
 | 边类型 | 说明 |

@@ -27,6 +27,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
 /// Like `println_stdout!` but handles `BrokenPipe` gracefully (exit 0 instead of panic).
 macro_rules! println_stdout {
@@ -187,7 +188,7 @@ struct Cli {
     input: Option<PathBuf>,
 
     /// Output format
-    #[arg(long, default_value = "dot", value_parser = ["dot", "json", "mermaid"])]
+    #[arg(long, default_value = "dot", value_parser = ["dot", "json", "mermaid", "ndjson"])]
     format: String,
 
     /// Output file (stdout if omitted)
@@ -242,7 +243,7 @@ enum Commands {
     /// Export graph to various formats
     Export {
         /// Output format
-        #[arg(short, long, default_value = "dot", value_parser = ["dot", "json", "mermaid"])]
+        #[arg(short, long, default_value = "dot", value_parser = ["dot", "json", "mermaid", "ndjson"])]
         format: String,
 
         /// Output file (stdout if omitted)
@@ -252,6 +253,11 @@ enum Commands {
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+
+        /// Filter nodes by name (substring match), export only the matching
+        /// subgraph (seed nodes + direct neighbors + edges between them).
+        #[arg(long)]
+        filter: Option<String>,
     },
 
     /// Merge multiple project stores
@@ -331,6 +337,22 @@ enum Commands {
         /// Show built-in function calls in the chain (default: hidden)
         #[arg(long = "builtfunc")]
         builtfunc: bool,
+
+        /// Exact case-insensitive key match
+        #[arg(long, conflicts_with = "regex")]
+        exact: bool,
+
+        /// Regex match against node keys
+        #[arg(long, conflicts_with = "exact")]
+        regex: bool,
+
+        /// Process all matching nodes
+        #[arg(long)]
+        all_matches: bool,
+
+        /// Exit with error on ambiguous match
+        #[arg(long)]
+        fail_on_multiple: bool,
     },
 
     /// Show project statistics
@@ -352,6 +374,10 @@ enum Commands {
         /// Search nodes by name (substring match)
         #[arg(short, long)]
         search: Option<String>,
+
+        /// Limit the number of search results returned
+        #[arg(long)]
+        limit: Option<usize>,
 
         /// Show only orphan nodes (no connections)
         #[arg(long)]
@@ -465,6 +491,27 @@ enum Commands {
         /// Show DDL source text for views and other objects
         #[arg(short = 'v', long, default_value = "false")]
         verbose: bool,
+
+        /// Exact case-insensitive key match
+        #[arg(long, conflicts_with = "regex")]
+        exact: bool,
+
+        /// Regex match against node keys
+        #[arg(long, conflicts_with = "exact")]
+        regex: bool,
+
+        /// Process all matching nodes
+        #[arg(long)]
+        all_matches: bool,
+
+        /// Exit with error on ambiguous match
+        #[arg(long)]
+        fail_on_multiple: bool,
+
+        /// Summarize R/W table access for a package by aggregating
+        /// its child procedures' TableAccess edges.
+        #[arg(long = "summarize-tables")]
+        summarize_tables: bool,
     },
 
     /// Search MappedStatement and JavaSql nodes by SQL fragment, then
@@ -597,6 +644,14 @@ enum Commands {
         /// Default "all" includes every edge type.
         #[arg(short = 'e', long, default_value = "all", value_delimiter = ',')]
         edge_types: Vec<String>,
+
+        /// Exact case-insensitive key match
+        #[arg(long, conflicts_with = "regex")]
+        exact: bool,
+
+        /// Regex match against node keys
+        #[arg(long, conflicts_with = "exact")]
+        regex: bool,
     },
 
     /// Find reachability paths connecting multiple nodes
@@ -627,7 +682,33 @@ enum Commands {
         /// Show unreachable node pairs (0 paths) in output
         #[arg(long, default_value = "false")]
         unreachable: bool,
+
+        /// Exact case-insensitive key match
+        #[arg(long, conflicts_with = "regex")]
+        exact: bool,
+
+        /// Regex match against node keys
+        #[arg(long, conflicts_with = "exact")]
+        regex: bool,
+
+        /// Process all matching nodes (show paths for all combinations)
+        #[arg(long)]
+        all_matches: bool,
+
+        /// Exit with error on ambiguous match
+        #[arg(long)]
+        fail_on_multiple: bool,
     },
+}
+
+fn match_mode_from_flags(exact: bool, regex: bool) -> crate::graph::search::MatchMode {
+    if exact {
+        crate::graph::search::MatchMode::Exact
+    } else if regex {
+        crate::graph::search::MatchMode::Regex
+    } else {
+        crate::graph::search::MatchMode::Substring
+    }
 }
 
 fn main() {
@@ -738,7 +819,8 @@ fn run() -> Result<()> {
             format,
             output,
             project,
-        }) => cmd_export(&format, output.as_deref(), &project),
+            filter,
+        }) => cmd_export(&format, output.as_deref(), &project, filter.as_deref()),
         Some(Commands::Merge {
             stores,
             output,
@@ -760,7 +842,19 @@ fn run() -> Result<()> {
             project,
             style,
             builtfunc,
-        }) => cmd_trace(&from, &project, &style, builtfunc),
+            exact,
+            regex,
+            all_matches,
+            fail_on_multiple,
+        }) => cmd_trace(
+            &from,
+            &project,
+            &style,
+            builtfunc,
+            match_mode_from_flags(exact, regex),
+            all_matches,
+            fail_on_multiple,
+        ),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -774,6 +868,7 @@ fn run() -> Result<()> {
             system,
             sort_by,
             project,
+            limit,
         }) => cmd_nodes(
             search.as_deref(),
             orphan,
@@ -785,6 +880,7 @@ fn run() -> Result<()> {
             system,
             sort_by.as_deref(),
             &project,
+            limit,
         ),
         Some(Commands::Mark {
             node,
@@ -804,7 +900,24 @@ fn run() -> Result<()> {
             files,
             builtfunc,
             verbose,
-        }) => cmd_detail(&names, &project, &style, depth, files, builtfunc, verbose),
+            exact,
+            regex,
+            all_matches,
+            fail_on_multiple,
+            summarize_tables,
+        }) => cmd_detail(
+            &names,
+            &project,
+            &style,
+            depth,
+            files,
+            builtfunc,
+            verbose,
+            match_mode_from_flags(exact, regex),
+            all_matches,
+            fail_on_multiple,
+            summarize_tables,
+        ),
         Some(Commands::Import {
             file,
             output,
@@ -853,6 +966,8 @@ fn run() -> Result<()> {
             format,
             depth,
             edge_types,
+            exact,
+            regex,
         }) => {
             if !file.is_empty() && node.is_some() {
                 eprintln!("Error: --file and --node are mutually exclusive. Pass exactly one.");
@@ -869,6 +984,7 @@ fn run() -> Result<()> {
                 &format,
                 depth,
                 &edge_types,
+                match_mode_from_flags(exact, regex),
             )
         }
         Some(Commands::Inspect {
@@ -878,12 +994,26 @@ fn run() -> Result<()> {
             max_paths,
             style,
             unreachable,
+            exact,
+            regex,
+            all_matches,
+            fail_on_multiple,
         }) => {
             if nodes.len() < 2 {
                 eprintln!("Error: inspect requires at least 2 node names.");
                 std::process::exit(2);
             }
-            cmd_inspect(&nodes, &project, max_depth, max_paths, &style, unreachable)
+            cmd_inspect(
+                &nodes,
+                &project,
+                max_depth,
+                max_paths,
+                &style,
+                unreachable,
+                match_mode_from_flags(exact, regex),
+                all_matches,
+                fail_on_multiple,
+            )
         }
     }
 }
@@ -933,19 +1063,108 @@ fn cmd_diff(project: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_export(format: &str, output: Option<&Path>, project: &Path) -> Result<()> {
+fn cmd_export(
+    format: &str,
+    output: Option<&Path>,
+    project: &Path,
+    filter: Option<&str>,
+) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
 
-    let graph = store.graph();
-    let result = match format {
-        "dot" => export::dot::to_dot(graph),
-        "json" => export::json::to_json(graph)?,
-        "mermaid" => export::mermaid::to_mermaid(graph),
-        _ => unreachable!(),
+    let full_graph = store.graph();
+    let filtered_graph;
+    let graph_to_export = if let Some(filter_query) = filter {
+        filtered_graph = build_filtered_subgraph(full_graph, store, filter_query);
+        &filtered_graph
+    } else {
+        full_graph
     };
 
-    write_output(&result, output)
+    match format {
+        "ndjson" => {
+            let mut writer: Box<dyn std::io::Write> = match output {
+                Some(path) => Box::new(std::fs::File::create(path).map_err(|source| {
+                    error::CodeWebError::FileRead {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                })?),
+                None => Box::new(std::io::stdout()),
+            };
+            export::ndjson::to_ndjson(graph_to_export, &mut writer)
+        }
+        "dot" => write_output(&export::dot::to_dot(graph_to_export), output),
+        "json" => write_output(&export::json::to_json(graph_to_export)?, output),
+        "mermaid" => write_output(&export::mermaid::to_mermaid(graph_to_export), output),
+        _ => unreachable!(),
+    }
+}
+
+fn build_filtered_subgraph(
+    full_graph: &crate::graph::CodeGraph,
+    store: &crate::graph::store::GraphStore,
+    filter_query: &str,
+) -> crate::graph::CodeGraph {
+    use petgraph::graph::NodeIndex;
+    use std::collections::HashSet;
+
+    let matches = store.search_nodes(filter_query);
+
+    if matches.is_empty() {
+        eprintln!(
+            "Filter '{}' matched 0 nodes; exporting empty graph.",
+            filter_query
+        );
+        return crate::graph::CodeGraph::new();
+    }
+
+    eprintln!("Filter '{}': {} seed nodes", filter_query, matches.len());
+
+    // Collect seed node indices + their direct neighbors (1-hop)
+    let mut selected: HashSet<NodeIndex> = HashSet::new();
+    for (idx, _) in &matches {
+        selected.insert(*idx);
+        // Add outgoing neighbors
+        for neighbor in full_graph.neighbors_directed(*idx, petgraph::Direction::Outgoing) {
+            selected.insert(neighbor);
+        }
+        // Add incoming neighbors
+        for neighbor in full_graph.neighbors_directed(*idx, petgraph::Direction::Incoming) {
+            selected.insert(neighbor);
+        }
+    }
+
+    // Build filtered graph: copy selected nodes, keep edges between them
+    let mut filtered = crate::graph::CodeGraph::new();
+    let mut old_to_new: std::collections::HashMap<NodeIndex, NodeIndex> =
+        std::collections::HashMap::new();
+
+    // Copy nodes
+    for old_idx in &selected {
+        let new_idx = filtered.add_node(full_graph[*old_idx].clone());
+        old_to_new.insert(*old_idx, new_idx);
+    }
+
+    // Copy edges where both endpoints are in selected set
+    for edge_idx in full_graph.edge_indices() {
+        if let Some((src, dst)) = full_graph.edge_endpoints(edge_idx) {
+            if selected.contains(&src) && selected.contains(&dst) {
+                if let (Some(&new_src), Some(&new_dst)) =
+                    (old_to_new.get(&src), old_to_new.get(&dst))
+                {
+                    filtered.add_edge(new_src, new_dst, full_graph[edge_idx].clone());
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "Subgraph: {} nodes, {} edges",
+        filtered.node_count(),
+        filtered.edge_count()
+    );
+    filtered
 }
 
 fn cmd_merge(stores: &[PathBuf], output: &Path, name: &str) -> Result<()> {
@@ -1017,33 +1236,56 @@ fn cmd_tui(project: &Path) -> Result<()> {
     tui::run(project)
 }
 
-fn cmd_trace(from: &str, project: &Path, style: &str, show_builtins: bool) -> Result<()> {
+fn cmd_trace(
+    from: &str,
+    project: &Path,
+    style: &str,
+    show_builtins: bool,
+    match_mode: crate::graph::search::MatchMode,
+    all_matches: bool,
+    fail_on_multiple: bool,
+) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
 
-    let matches = store.search_nodes(from);
     let graph = store.graph();
+    let result = store.resolve_single_node(from, match_mode, all_matches, fail_on_multiple);
 
-    if matches.is_empty() {
-        eprintln!("No nodes matching '{}'", from);
-        return Ok(());
-    }
-
-    if matches.len() > 1 {
-        eprintln!("Multiple matches found:");
-        for (i, (_, name)) in matches.iter().enumerate() {
-            eprintln!("  {}: {}", i + 1, name);
+    let start_idx = match result {
+        crate::graph::search::ResolveResult::Single(idx, _) => idx,
+        crate::graph::search::ResolveResult::Multiple(matches) => {
+            eprintln!("Processing all {} matches...", matches.len());
+            for (idx, name) in &matches {
+                eprintln!("  {}", name);
+                let (chain, _) = graph::traverse::trace_chain(
+                    graph,
+                    *idx,
+                    51,
+                    usize::MAX,
+                    !show_builtins && !matches!(graph[*idx], graph::Node::BuiltinFunction { .. }),
+                );
+                let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
+                println_stdout!(
+                    "{}",
+                    graph::traverse::format_chain(&chain, graph, chain_style)
+                );
+            }
+            return Ok(());
         }
-        eprintln!("Using first match: {}", matches[0].1);
-    }
+        crate::graph::search::ResolveResult::Empty => {
+            eprintln!("No nodes matching '{}'", from);
+            return Ok(());
+        }
+        crate::graph::search::ResolveResult::Ambiguous => {
+            eprintln!("Error: ambiguous match for '{}'", from);
+            std::process::exit(2);
+        }
+    };
 
-    let (start_idx, start_name) = &matches[0];
-    eprintln!("Tracing from: {}", start_name);
-
-    let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
+    let target_is_builtin = matches!(graph[start_idx], graph::Node::BuiltinFunction { .. });
     let skip_builtins = !show_builtins && !target_is_builtin;
 
-    let (chain, _) = graph::traverse::trace_chain(graph, *start_idx, 51, usize::MAX, skip_builtins);
+    let (chain, _) = graph::traverse::trace_chain(graph, start_idx, 51, usize::MAX, skip_builtins);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
         "{}",
@@ -1190,6 +1432,7 @@ fn cmd_nodes(
     system: bool,
     sort_by: Option<&[SortSpec]>,
     project: &Path,
+    limit: Option<usize>,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
@@ -1200,7 +1443,7 @@ fn cmd_nodes(
     let type_filter = node_type.map(|t| t.to_lowercase());
 
     let indices: Vec<petgraph::graph::NodeIndex> = if let Some(query) = search {
-        let matches = store.search_nodes(query);
+        let matches = store.search_nodes_limit(query, limit);
         if matches.is_empty() {
             eprintln!("No nodes matching '{}'", query);
             return Ok(());
@@ -1354,6 +1597,7 @@ fn filter_indexes_from_tree(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_detail(
     names: &[String],
     project: &Path,
@@ -1362,6 +1606,10 @@ fn cmd_detail(
     show_files: bool,
     show_builtins: bool,
     verbose: bool,
+    match_mode: crate::graph::search::MatchMode,
+    all_matches: bool,
+    fail_on_multiple: bool,
+    summarize_tables: bool,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = proj.load_store()?;
@@ -1377,12 +1625,17 @@ fn cmd_detail(
             show_files,
             show_builtins,
             verbose,
+            match_mode,
+            all_matches,
+            fail_on_multiple,
+            summarize_tables,
         );
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn detail_one(
     name: &str,
     graph: &crate::graph::CodeGraph,
@@ -1392,42 +1645,194 @@ fn detail_one(
     show_files: bool,
     show_builtins: bool,
     verbose: bool,
+    match_mode: crate::graph::search::MatchMode,
+    all_matches: bool,
+    fail_on_multiple: bool,
+    summarize_tables: bool,
 ) {
-    let matches = store.search_nodes(name);
+    let result = store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple);
 
-    if matches.is_empty() {
-        eprintln!("No nodes matching '{}'", name);
+    let start_idx = match result {
+        crate::graph::search::ResolveResult::Single(idx, _) => idx,
+        crate::graph::search::ResolveResult::Multiple(matches) => {
+            for (idx, _name) in &matches {
+                print_node_detail(
+                    *idx,
+                    graph,
+                    style,
+                    depth,
+                    show_files,
+                    show_builtins,
+                    verbose,
+                );
+            }
+            return;
+        }
+        crate::graph::search::ResolveResult::Empty => {
+            eprintln!("No nodes matching '{}'", name);
+            return;
+        }
+        crate::graph::search::ResolveResult::Ambiguous => {
+            eprintln!("Error: ambiguous match for '{}'", name);
+            std::process::exit(2);
+        }
+    };
+
+    if summarize_tables && matches!(graph[start_idx], crate::graph::Node::Package { .. }) {
+        print_table_summary(graph, start_idx);
         return;
     }
 
-    if matches.len() > 1 {
-        eprintln!("Multiple matches found:");
-        for (i, (_, n)) in matches.iter().enumerate() {
-            eprintln!("  {}: {}", i + 1, n);
+    print_node_detail(
+        start_idx,
+        graph,
+        style,
+        depth,
+        show_files,
+        show_builtins,
+        verbose,
+    );
+}
+
+fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph::NodeIndex) {
+    use crate::graph::{AccessMode, DataFlowKind, Edge, WriteKind};
+    use std::collections::{BTreeMap, HashSet};
+
+    let display_name = crate::graph::node_display_name(&graph[pkg_idx]);
+
+    // Collect child procedures via ContainsRoutine edges
+    let mut table_access: BTreeMap<String, (AccessMode, HashSet<WriteKind>)> = BTreeMap::new();
+
+    for edge_ref in graph.edges_directed(pkg_idx, petgraph::Direction::Outgoing) {
+        if !matches!(edge_ref.weight(), Edge::ContainsRoutine) {
+            continue;
         }
-        eprintln!("Using first match: {}", matches[0].1);
+        let child_idx = edge_ref.target();
+
+        // For each child, collect its outgoing TableAccess edges
+        for ta_ref in graph.edges_directed(child_idx, petgraph::Direction::Outgoing) {
+            if let Edge::TableAccess {
+                flow_kind,
+                modes,
+                write_kinds,
+                ..
+            } = ta_ref.weight()
+            {
+                if *flow_kind != DataFlowKind::DmlAccess {
+                    continue;
+                }
+                let dst = ta_ref.target();
+                if let crate::graph::Node::Table { name, .. } = &graph[dst] {
+                    let entry = table_access
+                        .entry(name.clone())
+                        .or_insert_with(|| (AccessMode::empty(), HashSet::new()));
+                    entry.0 |= *modes;
+                    for wk in write_kinds {
+                        entry.1.insert(*wk);
+                    }
+                }
+            }
+        }
     }
 
-    let (start_idx, _start_name) = &matches[0];
+    if table_access.is_empty() {
+        println_stdout!("Table Access Summary for {}:  (none)", display_name);
+        return;
+    }
 
-    let tag = node_type_tag(&graph[*start_idx]);
+    println_stdout!("══ TABLE ACCESS ──");
+    println_stdout!("  {}", display_name);
+
+    let mut reads: Vec<&String> = Vec::new();
+    let mut writes: Vec<(&String, Vec<&str>)> = Vec::new();
+    let mut rw: Vec<&String> = Vec::new();
+
+    for (tbl, (modes, wk)) in &table_access {
+        let is_read = modes.contains(AccessMode::Read);
+        let is_write = modes.contains(AccessMode::Write) || !wk.is_empty();
+
+        if is_read && is_write {
+            rw.push(tbl);
+        } else if is_read {
+            reads.push(tbl);
+        } else if is_write {
+            let wk_labels: Vec<&str> = wk
+                .iter()
+                .map(|w| match w {
+                    WriteKind::Insert => "insert",
+                    WriteKind::InsertSelect => "insert_select",
+                    WriteKind::Update => "update",
+                    WriteKind::Delete => "delete",
+                    WriteKind::MergeInsert => "merge_insert",
+                    WriteKind::MergeUpdate => "merge_update",
+                    WriteKind::MergeDelete => "merge_delete",
+                    WriteKind::SelectInto => "select_into",
+                    WriteKind::Truncate => "truncate",
+                })
+                .collect();
+            writes.push((tbl, wk_labels));
+        }
+    }
+
+    if !reads.is_empty() {
+        println_stdout!(
+            "  READ ({}):  {}",
+            reads.len(),
+            reads
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !writes.is_empty() {
+        println_stdout!("  WRITE ({}):", writes.len());
+        for (tbl, labels) in &writes {
+            if labels.is_empty() {
+                println_stdout!("    W:             {}", tbl);
+            } else {
+                println_stdout!("    {}:  {}", labels.join(","), tbl);
+            }
+        }
+    }
+    if !rw.is_empty() {
+        println_stdout!(
+            "  READ+WRITE ({}):  {}",
+            rw.len(),
+            rw.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    println_stdout!();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_node_detail(
+    start_idx: petgraph::graph::NodeIndex,
+    graph: &crate::graph::CodeGraph,
+    style: &str,
+    depth: i64,
+    show_files: bool,
+    show_builtins: bool,
+    verbose: bool,
+) {
+    let tag = node_type_tag(&graph[start_idx]);
     let in_deg = graph
-        .neighbors_directed(*start_idx, petgraph::Direction::Incoming)
+        .neighbors_directed(start_idx, petgraph::Direction::Incoming)
         .count();
     let out_deg = graph
-        .neighbors_directed(*start_idx, petgraph::Direction::Outgoing)
+        .neighbors_directed(start_idx, petgraph::Direction::Outgoing)
         .count();
 
-    let display_name = graph::node_display_name(&graph[*start_idx]);
+    let display_name = graph::node_display_name(&graph[start_idx]);
     println_stdout!("══ SUMMARY ══");
     println_stdout!("  {}  {}", tag, display_name);
-    if is_partial(&graph[*start_idx]) {
+    if is_partial(&graph[start_idx]) {
         println_stdout!("  ⚠ partial node — body implementation could not be parsed");
     }
-    if is_inferred(&graph[*start_idx]) {
+    if is_inferred(&graph[start_idx]) {
         println_stdout!("  ⚠ inferred node — no DDL definition found");
     }
-    if is_system_node(&graph[*start_idx]) {
+    if is_system_node(&graph[start_idx]) {
         println_stdout!("  ⚙ system object — belongs to a known system schema");
     }
     println_stdout!(
@@ -1442,7 +1847,7 @@ fn detail_one(
         unlogged,
         tablespace,
         ..
-    } = &graph[*start_idx]
+    } = &graph[start_idx]
     {
         if let Some(loc) = location {
             println_stdout!("  file   {}:{}", loc.file.to_string_lossy(), loc.line);
@@ -1459,14 +1864,14 @@ fn detail_one(
             println_stdout!("  tablespace: {}", ts);
         }
     }
-    if let Node::View { location, .. } = &graph[*start_idx] {
+    if let Node::View { location, .. } = &graph[start_idx] {
         if let Some(loc) = location {
             println_stdout!("  file   {}:{}", loc.file.to_string_lossy(), loc.line);
         } else {
             println_stdout!("  file   (implicit)");
         }
     }
-    if let Node::MaterializedView { location, .. } = &graph[*start_idx] {
+    if let Node::MaterializedView { location, .. } = &graph[start_idx] {
         println_stdout!(
             "  file   {}:{}",
             location.file.to_string_lossy(),
@@ -1475,7 +1880,7 @@ fn detail_one(
     }
     println_stdout!();
 
-    let target_is_builtin = matches!(graph[*start_idx], graph::Node::BuiltinFunction { .. });
+    let target_is_builtin = matches!(graph[start_idx], graph::Node::BuiltinFunction { .. });
     let skip_builtins = !show_builtins && !target_is_builtin;
 
     let chain_max_depth = match depth {
@@ -1483,13 +1888,8 @@ fn detail_one(
         n if n >= 0 => n as usize,
         _ => 1,
     };
-    let (mut chain, _) = graph::traverse::trace_chain(
-        graph,
-        *start_idx,
-        chain_max_depth,
-        usize::MAX,
-        skip_builtins,
-    );
+    let (mut chain, _) =
+        graph::traverse::trace_chain(graph, start_idx, chain_max_depth, usize::MAX, skip_builtins);
     filter_indexes_from_tree(&mut chain.callers, graph);
     let chain_style: graph::traverse::ChainStyle = style.parse().unwrap_or_default();
     println_stdout!(
@@ -1497,21 +1897,21 @@ fn detail_one(
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
 
-    print_node_details(&graph[*start_idx], verbose);
+    print_node_details(&graph[start_idx], verbose);
 
     // For View / MaterializedView nodes, show referenced tables
     if matches!(
-        &graph[*start_idx],
+        &graph[start_idx],
         Node::View { .. } | Node::MaterializedView { .. }
     ) {
-        let ref_output = format_referenced_tables(graph, *start_idx);
+        let ref_output = format_referenced_tables(graph, start_idx);
         if !ref_output.is_empty() {
             println_stdout!();
             println_stdout!("{}", ref_output);
         }
     }
 
-    let indexes_output = format_indexes(graph, *start_idx);
+    let indexes_output = format_indexes(graph, start_idx);
     if !indexes_output.is_empty() {
         println_stdout!();
         println_stdout!("{}", indexes_output);
@@ -2464,6 +2864,11 @@ fn cmd_legacy(cli: Cli) -> Result<()> {
     print_stats(&graph, cli.include_unresolved);
 
     let output = match cli.format.as_str() {
+        "ndjson" => {
+            let mut buf = Vec::new();
+            export::ndjson::to_ndjson(&graph, &mut buf)?;
+            String::from_utf8_lossy(&buf).to_string()
+        }
         "dot" => export::dot::to_dot(&graph),
         "json" => export::json::to_json(&graph)?,
         "mermaid" => export::mermaid::to_mermaid(&graph),
@@ -3061,6 +3466,7 @@ fn cmd_impact(
     format: &str,
     depth: usize,
     edge_types: &[String],
+    match_mode: crate::graph::search::MatchMode,
 ) -> Result<()> {
     use petgraph::Direction;
 
@@ -3127,7 +3533,7 @@ fn cmd_impact(
             emit_batch_result(&results, format)?;
         }
     } else if let Some(name) = node {
-        let (start_nodes, target) = resolve_node_target(store, name)?;
+        let (start_nodes, target) = resolve_node_target(store, name, match_mode)?;
         if start_nodes.is_empty() {
             emit_empty_result(&target, format)?;
             return Ok(());
@@ -3164,6 +3570,7 @@ fn cmd_impact(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_inspect(
     node_names: &[String],
     project: &Path,
@@ -3171,6 +3578,9 @@ fn cmd_inspect(
     max_paths: usize,
     style: &str,
     show_unreachable: bool,
+    match_mode: crate::graph::search::MatchMode,
+    all_matches: bool,
+    fail_on_multiple: bool,
 ) -> Result<()> {
     use crate::graph::inspect::{
         find_paths_between, format_inspect_result, InspectOptions, InspectStyle,
@@ -3191,23 +3601,32 @@ fn cmd_inspect(
 
     eprintln!("── NAME RESOLUTION ──");
     for name in node_names {
-        let matches = store.search_nodes(name);
-        if matches.is_empty() {
-            eprintln!("  \"{}\" → 0 matches", name);
-            eprintln!("Error: '{}' did not match any node.", name);
-            std::process::exit(2);
-        }
-        if matches.len() > 1 {
-            eprintln!("  \"{}\" → {} matches (using #1)", name, matches.len());
-            for (i, (_, display)) in matches.iter().enumerate() {
-                let marker = if i == 0 { "  ← using" } else { "" };
-                eprintln!("    {}. {}{}", i + 1, display, marker);
+        let result = store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple);
+        match result {
+            crate::graph::search::ResolveResult::Single(idx, display) => {
+                eprintln!("  \"{}\" → 1 match  (exact)", name);
+                targets.push(idx);
+                all_matched_names.push(display);
             }
-        } else {
-            eprintln!("  \"{}\" → 1 match  (exact)", name);
+            crate::graph::search::ResolveResult::Multiple(matches) => {
+                eprintln!("  \"{}\" → {} matches (using all)", name, matches.len());
+                for (i, (idx, display)) in matches.iter().enumerate() {
+                    eprintln!("    {}. {}", i + 1, display);
+                    targets.push(*idx);
+                    all_matched_names.push(display.clone());
+                }
+            }
+            crate::graph::search::ResolveResult::Empty => {
+                eprintln!("  \"{}\" → 0 matches", name);
+                eprintln!("Error: '{}' did not match any node.", name);
+                std::process::exit(2);
+            }
+            crate::graph::search::ResolveResult::Ambiguous => {
+                eprintln!("  \"{}\" → ambiguous match", name);
+                eprintln!("Error: ambiguous match for '{}'", name);
+                std::process::exit(2);
+            }
         }
-        targets.push(matches[0].0);
-        all_matched_names.push(matches[0].1.clone());
     }
     eprintln!();
 
@@ -3295,8 +3714,9 @@ fn resolve_file_target(
 fn resolve_node_target(
     store: &crate::graph::store::GraphStore,
     name: &str,
+    match_mode: crate::graph::search::MatchMode,
 ) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
-    let matches = store.search_nodes(name);
+    let matches = store.search_nodes_with_mode(name, match_mode);
 
     if matches.is_empty() {
         eprintln!("No nodes matching '{}'", name);

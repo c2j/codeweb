@@ -6,6 +6,7 @@ pub mod format;
 pub mod inspect;
 pub mod key;
 pub mod query;
+pub mod search;
 pub mod store;
 pub mod traverse;
 
@@ -1175,5 +1176,328 @@ mod tests {
         let store = crate::graph::store::GraphStore::from_graph("bench", graph);
         let stats = store.stats();
         eprintln!("GraphStore stats: {:?}", stats);
+    }
+
+    #[test]
+    fn node_type_tag_all_variants_non_empty() {
+        use std::sync::Arc;
+
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+
+        let nodes: Vec<Node> = vec![
+            Node::Procedure {
+                id: RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: "p".to_string(),
+                    kind: RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            },
+            Node::Procedure {
+                id: RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: "p_partial".to_string(),
+                    kind: RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: true,
+                body_sql: Vec::new(),
+            },
+            Node::Function {
+                id: RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: "f".to_string(),
+                    kind: RoutineKind::Function,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            },
+            Node::Function {
+                id: RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: "f_partial".to_string(),
+                    kind: RoutineKind::Function,
+                },
+                location: loc.clone(),
+                partial: true,
+                body_sql: Vec::new(),
+            },
+            Node::Package {
+                schema: Some("public".to_string()),
+                name: "my_pkg".to_string(),
+                location: loc.clone(),
+            },
+            Node::Table {
+                schema: Some("public".to_string()),
+                name: "t".to_string(),
+                explicit: true,
+                system: false,
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            },
+            Node::Table {
+                schema: Some("public".to_string()),
+                name: "t_implicit".to_string(),
+                explicit: false,
+                system: false,
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            },
+            Node::View {
+                schema: Some("public".to_string()),
+                name: "v".to_string(),
+                explicit: true,
+                system: false,
+                location: None,
+                columns: Box::new(vec![]),
+                ddl_source: None,
+            },
+            Node::View {
+                schema: Some("public".to_string()),
+                name: "v_implicit".to_string(),
+                explicit: false,
+                system: false,
+                location: None,
+                columns: Box::new(vec![]),
+                ddl_source: None,
+            },
+            Node::MaterializedView {
+                schema: Some("public".to_string()),
+                name: "mv".to_string(),
+                location: loc.clone(),
+                columns: Box::new(vec![]),
+                ddl_source: None,
+            },
+            Node::Trigger {
+                name: "trig".to_string(),
+                table: vec!["t".to_string()],
+                location: loc.clone(),
+            },
+            Node::Type {
+                name: "my_type".to_string(),
+                schema: Some("public".to_string()),
+                type_kind: "object".to_string(),
+                location: loc.clone(),
+            },
+            Node::Sequence {
+                name: "seq".to_string(),
+                schema: Some("public".to_string()),
+                location: loc.clone(),
+            },
+            Node::Index {
+                name: Some("idx".to_string()),
+                table_schema: Some("public".to_string()),
+                table_name: "t".to_string(),
+                unique: false,
+                global: false,
+                index_method: None,
+                columns: vec![],
+                tablespace: None,
+                where_clause: None,
+                constraint: None,
+                location: loc.clone(),
+            },
+            Node::Synonym {
+                name: "syn".to_string(),
+                schema: Some("public".to_string()),
+                target_schema: Some("public".to_string()),
+                target_name: "t".to_string(),
+                location: loc.clone(),
+            },
+            Node::Event {
+                name: "ev".to_string(),
+                location: loc.clone(),
+            },
+            Node::BuiltinFunction {
+                name: "count".to_string(),
+                category: "Aggregate".to_string(),
+                domain: "sql".to_string(),
+                location: loc.clone(),
+            },
+            Node::Unresolved {
+                raw_expr: Box::new("unknown_func".to_string()),
+                context: Box::new("procedure body".to_string()),
+            },
+            Node::MappedStatement {
+                namespace: "com.example.Mapper".to_string(),
+                statement_id: "selectOrders".to_string(),
+                kind: "select".to_string(),
+                xml_file: PathBuf::from("Mapper.xml"),
+                line: 10,
+                sql: None,
+            },
+            Node::JavaSql {
+                class_name: Some("OrderDao".to_string()),
+                method_name: Some("findAll".to_string()),
+                extraction_method: "annotation".to_string(),
+                java_file: PathBuf::from("OrderDao.java"),
+                line: 42,
+                sql: Some("SELECT * FROM orders".to_string()),
+            },
+            Node::JavaMethod {
+                fqn: "com.example.OrderService.process".to_string(),
+                class_fqn: "com.example.OrderService".to_string(),
+                name: "process".to_string(),
+                signature: "(Order)void".to_string(),
+                file: PathBuf::from("OrderService.java"),
+                line: 15,
+            },
+            Node::JavaClass {
+                fqn: "com.example.OrderService".to_string(),
+                name: "OrderService".to_string(),
+                package: Some("com.example".to_string()),
+                file: PathBuf::from("OrderService.java"),
+                line: 1,
+            },
+        ];
+
+        let mut tags_found = std::collections::HashSet::new();
+        for node in &nodes {
+            let tag = node_type_tag(node);
+            assert!(
+                !tag.is_empty(),
+                "node_type_tag returned empty string for node"
+            );
+            tags_found.insert(tag.to_string());
+        }
+
+        // All expected short tags must appear
+        let expected_tags = [
+            "proc", "proc*", "func", "func*", "pkg", "table", "table*", "view", "view*", "mview",
+            "trigger", "type", "seq", "index", "synonym", "event", "builtin", "unres", "mapper",
+            "sql", "method", "class",
+        ];
+        for expected in &expected_tags {
+            assert!(
+                tags_found.contains(*expected),
+                "expected tag '{}' not found in node_type_tag output; found: {:?}",
+                expected,
+                tags_found
+            );
+        }
+    }
+
+    #[test]
+    fn node_type_tag_short_names() {
+        use std::sync::Arc;
+
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+
+        // Verify specific short-tag → variant mappings that
+        // must NEVER change (CLI and JSON consumers depend on them).
+        let proc = Node::Procedure {
+            id: RoutineId {
+                schema: Some("s".to_string()),
+                package: None,
+                name: "p".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        };
+        assert_eq!(node_type_tag(&proc), "proc");
+
+        let partial_proc = Node::Procedure {
+            id: RoutineId {
+                schema: Some("s".to_string()),
+                package: None,
+                name: "pp".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: true,
+            body_sql: Vec::new(),
+        };
+        assert_eq!(node_type_tag(&partial_proc), "proc*");
+
+        let pkg = Node::Package {
+            schema: Some("s".to_string()),
+            name: "pkg".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(node_type_tag(&pkg), "pkg");
+
+        let tbl = Node::Table {
+            schema: None,
+            name: "t".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        assert_eq!(node_type_tag(&tbl), "table");
+
+        let tbl_implicit = Node::Table {
+            schema: None,
+            name: "ti".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        assert_eq!(node_type_tag(&tbl_implicit), "table*");
+
+        let mview = Node::MaterializedView {
+            schema: None,
+            name: "mv".to_string(),
+            location: loc.clone(),
+            columns: Box::new(vec![]),
+            ddl_source: None,
+        };
+        assert_eq!(node_type_tag(&mview), "mview");
+
+        let builtin = Node::BuiltinFunction {
+            name: "count".to_string(),
+            category: "Aggregate".to_string(),
+            domain: "sql".to_string(),
+            location: loc.clone(),
+        };
+        assert_eq!(node_type_tag(&builtin), "builtin");
+
+        let unres = Node::Unresolved {
+            raw_expr: Box::new("x".to_string()),
+            context: Box::new("body".to_string()),
+        };
+        assert_eq!(node_type_tag(&unres), "unres");
     }
 }

@@ -361,6 +361,7 @@ dependencies = [
  "petgraph",
  "ratatui",
  "rayon",
+ "regex",
  "rmcp",
  "rust-embed",
  "rust-i18n",

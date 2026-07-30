@@ -11,8 +11,44 @@ fn is_false(v: &bool) -> bool {
 
 #[derive(Serialize)]
 struct GraphJson {
+    #[serde(rename = "_meta")]
+    meta: GraphMeta,
     nodes: Vec<NodeJson>,
     edges: Vec<EdgeJson>,
+}
+
+#[derive(Serialize)]
+struct GraphMeta {
+    type_mapping: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+fn build_type_mapping() -> std::collections::BTreeMap<&'static str, &'static str> {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("proc", "procedure");
+    m.insert("func", "function");
+    m.insert("unres", "unresolved");
+    m.insert("mapper", "mapped_statement");
+    m.insert("sql", "java_sql");
+    m.insert("method", "java_method");
+    m.insert("class", "java_class");
+    m.insert("table", "table");
+    m.insert("view", "view");
+    m.insert("pkg", "package");
+    m.insert("trigger", "trigger");
+    m.insert("type", "type");
+    m.insert("seq", "sequence");
+    m.insert("index", "index");
+    m.insert("mview", "materialized_view");
+    m.insert("synonym", "synonym");
+    m.insert("event", "event");
+    m.insert("builtin", "builtin_function");
+    m.insert("custom", "custom");
+    #[cfg(feature = "jsp")]
+    {
+        m.insert("jsp", "jsp");
+        m.insert("jspsql", "jspsql");
+    }
+    m
 }
 
 #[derive(Serialize)]
@@ -855,7 +891,13 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
         edges.push(edge_json);
     }
 
-    let output = GraphJson { nodes, edges };
+    let output = GraphJson {
+        meta: GraphMeta {
+            type_mapping: build_type_mapping(),
+        },
+        nodes,
+        edges,
+    };
     serde_json::to_string_pretty(&output).map_err(|e| crate::error::CodeWebError::ExportError {
         message: e.to_string(),
     })
