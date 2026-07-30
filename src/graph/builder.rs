@@ -1627,6 +1627,7 @@ impl GraphBuilder {
                                 std::slice::from_ref(info),
                                 &file_arc,
                                 proc_idx,
+                                proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
                             );
@@ -1639,6 +1640,7 @@ impl GraphBuilder {
                                 std::slice::from_ref(info),
                                 &file_arc,
                                 proc_idx,
+                                proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
                             );
@@ -2402,6 +2404,7 @@ impl GraphBuilder {
                         statements,
                         &xml_path,
                         node_idx,
+                        None,
                         graph,
                         table_index,
                     );
@@ -2609,6 +2612,7 @@ impl GraphBuilder {
                         &parse_result.statements,
                         &java_path,
                         node_idx,
+                        None,
                         graph,
                         table_index,
                     );
@@ -2704,6 +2708,7 @@ impl GraphBuilder {
                         std::slice::from_ref(&block_stmt),
                         file_path,
                         proc_idx,
+                        schema_part.as_deref(),
                         graph,
                         table_index,
                     );
@@ -2716,6 +2721,7 @@ impl GraphBuilder {
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
         source_idx: petgraph::graph::NodeIndex,
+        owner_schema: Option<&str>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -2735,7 +2741,16 @@ impl GraphBuilder {
                 || !column_analysis.select_into.is_empty();
 
             for access in &extractor.accesses {
-                let key = normalize_table_key(access.schema.as_deref(), &access.name);
+                let key = if access.schema.is_none() && owner_schema.is_some() {
+                    let qualified = normalize_table_key(owner_schema, &access.name);
+                    if table_index.contains_key(&qualified) {
+                        qualified
+                    } else {
+                        normalize_table_key(None, &access.name)
+                    }
+                } else {
+                    normalize_table_key(access.schema.as_deref(), &access.name)
+                };
                 let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                     let node = Node::Table {
                         schema: access.schema.clone(),
@@ -2903,6 +2918,7 @@ impl GraphBuilder {
                         &parse_result.statements,
                         &jsp_path,
                         sql_idx,
+                        None,
                         &mut ctx.graph,
                         &mut ctx.table_index,
                     );
