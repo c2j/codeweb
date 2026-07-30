@@ -205,6 +205,12 @@ struct Cli {
     /// Output language (zh-CN or en, default: zh-CN)
     #[arg(long, global = true)]
     lang: Option<String>,
+
+    /// Number of worker threads for parallel file parsing.
+    /// Default: max(4, logical_cpus - 2). Set lower to reduce peak memory.
+    /// Also respects RAYON_NUM_THREADS env var (CLI flag takes precedence).
+    #[arg(long, global = true)]
+    threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -625,37 +631,6 @@ enum Commands {
 }
 
 fn main() {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let rayon_threads = std::cmp::max(4, cores - 2);
-
-    let builder = rayon::ThreadPoolBuilder::new()
-        .num_threads(rayon_threads)
-        .thread_name(|idx| format!("codeweb-worker-{idx}"))
-        .spawn_handler(|thread| {
-            std::thread::Builder::new()
-                .name(thread.name().unwrap_or_default().to_string())
-                .stack_size(4 * 1024 * 1024)
-                .spawn(move || {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let qos: libc::qos_class_t = unsafe { std::mem::transmute(0x11u32) };
-                        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = unsafe { libc::nice(10) };
-                    }
-                    thread.run()
-                })
-                .map(|_| ())
-        });
-
-    if let Err(e) = builder.build_global() {
-        eprintln!("warning: failed to configure thread pool: {e}");
-    }
-
     // Run main work in a thread with an enlarged stack.
     //
     // Windows main thread default stack = 1 MB (Linux/macOS = 8 MB).
@@ -680,6 +655,53 @@ fn main() {
     std::process::exit(exit_code);
 }
 
+fn init_thread_pool(cli_threads: Option<usize>) {
+    let threads = resolve_thread_count(cli_threads);
+
+    let builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("codeweb-worker-{idx}"))
+        .spawn_handler(|thread| {
+            std::thread::Builder::new()
+                .name(thread.name().unwrap_or_default().to_string())
+                .stack_size(4 * 1024 * 1024)
+                .spawn(move || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let qos: libc::qos_class_t = unsafe { std::mem::transmute(0x11u32) };
+                        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = unsafe { libc::nice(10) };
+                    }
+                    thread.run()
+                })
+                .map(|_| ())
+        });
+
+    if let Err(e) = builder.build_global() {
+        eprintln!("warning: failed to configure thread pool: {e}");
+    }
+}
+
+fn resolve_thread_count(cli_threads: Option<usize>) -> usize {
+    if let Some(n) = cli_threads.filter(|&n| n > 0) {
+        return n;
+    }
+    if let Ok(val) = std::env::var("RAYON_NUM_THREADS") {
+        if let Ok(n) = val.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    std::cmp::max(4, cores - 2)
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let show_banner =
@@ -690,6 +712,8 @@ fn run() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    init_thread_pool(cli.threads);
 
     if let Some(ref lang) = cli.lang {
         rust_i18n::set_locale(lang);

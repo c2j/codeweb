@@ -140,11 +140,8 @@ impl Project {
         let files_scanned = current_files.len();
         pb.finish_with_message(format!("Scanned {} files", files_scanned));
 
-        // Phase 2: Load existing store and diff against manifest
-        let existing_manifest: HashMap<PathBuf, FileRecord> = self
-            .try_load_store()
-            .map(|s| s.manifest().clone())
-            .unwrap_or_default();
+        // Phase 2: Diff against manifest (sidecar file, no full store load)
+        let existing_manifest: HashMap<PathBuf, FileRecord> = self.load_manifest_only();
 
         let changes = compute_changes(&current_files, &existing_manifest);
 
@@ -208,16 +205,22 @@ impl Project {
             .progress_chars("━━╾─"),
         );
 
-        const SQL_CHUNK_SIZE: usize = 500;
+        const DEFAULT_SQL_CHUNK_SIZE: usize = 100;
+        let sql_chunk_size = self
+            .config
+            .analysis
+            .sql_chunk_size
+            .max(1)
+            .min(DEFAULT_SQL_CHUNK_SIZE.max(1));
         all_sql_paths.sort();
         let total_sql = all_sql_paths.len();
-        let sql_chunks = total_sql.div_ceil(SQL_CHUNK_SIZE);
+        let sql_chunks = total_sql.div_ceil(sql_chunk_size);
 
         let mut ctx = GraphBuildContext::new();
         let mut all_hashes: Vec<(PathBuf, String, parser::fingerprint::FileType)> = Vec::new();
 
         pb.set_message(format!("Parsing SQL (1/{})...", sql_chunks));
-        for (chunk_idx, chunk) in all_sql_paths.chunks(SQL_CHUNK_SIZE).enumerate() {
+        for (chunk_idx, chunk) in all_sql_paths.chunks(sql_chunk_size).enumerate() {
             pb.set_message(format!("Parsing SQL ({}/{})...", chunk_idx + 1, sql_chunks));
             let parsed = parser::parse_sql_files(chunk);
             pb.inc(chunk.len() as u64);
@@ -231,46 +234,6 @@ impl Project {
             // parsed dropped here — AST memory freed
         }
 
-        // Java (typically fewer files, parse all at once)
-        pb.set_message("Parsing Java...");
-        let java_config = ogsql_parser::java::JavaExtractConfig {
-            extra_sql_methods: self.config.analysis.java.extra_sql_methods.clone(),
-            extra_sql_var_patterns: self.config.analysis.java.extra_sql_var_patterns.clone(),
-        };
-        let java_combined = parser::java_loader::load_java_files_combined_with_config(
-            &all_java_paths,
-            &java_config,
-        );
-        pb.inc(all_java_paths.len() as u64);
-
-        let (java_files, java_method_results): (Vec<_>, Vec<_>) = java_combined
-            .into_iter()
-            .map(|(path, combined)| {
-                (
-                    parser::JavaParsedFile {
-                        path: path.clone(),
-                        result: combined.sql_result,
-                        content_hash: combined.content_hash,
-                    },
-                    combined.method_result,
-                )
-            })
-            .unzip();
-
-        // Collect Java hashes
-        for pf in &java_files {
-            all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Java));
-        }
-
-        // XML (typically fewer files)
-        pb.set_message("Parsing XML mappers...");
-        let ibatis_files = parser::ibatis_loader::load_ibatis_files_from_paths(&all_xml_paths);
-        let structured_ibatis_files =
-            parser::ibatis_loader::load_ibatis_structured_files_from_paths(&all_xml_paths);
-        pb.inc(all_xml_paths.len() as u64);
-
-        // Phase 5: Add non-SQL nodes to graph
-        pb.set_message("Building graph...");
         let source_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
             vec![self.root.clone()]
         } else {
@@ -281,90 +244,176 @@ impl Project {
                 .map(|p| self.root.join(p))
                 .collect()
         };
-        GraphBuilder::add_ibatis_nodes_from_parsed_with_source_paths(
-            &ibatis_files,
-            &mut ctx.graph,
-            &mut ctx.proc_index,
-            &mut ctx.mapper_index,
-            &mut ctx.table_index,
-            &mut ctx.builtin_index,
-            &source_paths,
-        );
-        GraphBuilder::add_java_nodes_from_parsed_with_source_paths(
-            &java_files,
-            &mut ctx.graph,
-            &mut ctx.proc_index,
-            &ctx.mapper_index,
-            &mut ctx.table_index,
-            &mut ctx.builtin_index,
-            &source_paths,
-        );
-        GraphBuilder::add_java_method_nodes_from_parsed(
-            &java_method_results,
-            &mut ctx.graph,
-            &mut ctx.proc_index,
-            &ctx.mapper_index,
-        );
 
-        #[cfg(feature = "jsp")]
-        {
-            if !all_jsp_paths.is_empty() {
-                pb.set_message("Parsing JSP...");
-                let jsp_results = crate::parser::jsp_loader::load_jsp_files_from_paths(
-                    &all_jsp_paths,
-                    &java_config,
-                );
-                pb.inc(all_jsp_paths.len() as u64);
+        // Java files are typically heavier per-file than SQL, use smaller chunks.
+        const JAVA_CHUNK_SIZE: usize = 50;
+        let java_config = ogsql_parser::java::JavaExtractConfig {
+            extra_sql_methods: self.config.analysis.java.extra_sql_methods.clone(),
+            extra_sql_var_patterns: self.config.analysis.java.extra_sql_var_patterns.clone(),
+        };
+        let mut java_files_count = 0usize;
+        let mut simple_to_fqn: HashMap<String, String> = HashMap::new();
 
-                for result in &jsp_results {
-                    let hash = blake3::hash(result.synthesized.source.as_bytes())
-                        .to_hex()
-                        .to_string();
-                    all_hashes.push((result.file.clone(), hash, FileType::Jsp));
+        if !all_java_paths.is_empty() {
+            let java_chunks = all_java_paths.len().div_ceil(JAVA_CHUNK_SIZE);
+            for (chunk_idx, chunk) in all_java_paths.chunks(JAVA_CHUNK_SIZE).enumerate() {
+                pb.set_message(format!(
+                    "Parsing Java ({}/{})...",
+                    chunk_idx + 1,
+                    java_chunks
+                ));
+                let combined =
+                    parser::java_loader::load_java_files_combined_with_config(chunk, &java_config);
+                pb.inc(chunk.len() as u64);
+
+                for (path, c) in &combined {
+                    all_hashes.push((path.clone(), c.content_hash.clone(), FileType::Java));
+                    for class in &c.method_result.classes {
+                        simple_to_fqn.insert(class.name.clone(), class.fqn.clone());
+                    }
                 }
 
-                GraphBuilder::add_jsp_nodes_from_parsed(&jsp_results, &mut ctx);
-                GraphBuilder::bridge_jsp_to_java_methods(
+                let (jf_chunk, jmr_chunk): (Vec<_>, Vec<_>) = combined
+                    .into_iter()
+                    .map(|(path, c)| {
+                        (
+                            parser::JavaParsedFile {
+                                path,
+                                result: c.sql_result,
+                                content_hash: c.content_hash,
+                            },
+                            c.method_result,
+                        )
+                    })
+                    .unzip();
+                java_files_count += jf_chunk.len();
+
+                GraphBuilder::add_java_nodes_from_parsed_with_source_paths(
+                    &jf_chunk,
                     &mut ctx.graph,
-                    &jsp_results,
-                    &java_method_results,
+                    &mut ctx.proc_index,
+                    &ctx.mapper_index,
+                    &mut ctx.table_index,
+                    &mut ctx.builtin_index,
+                    &source_paths,
+                );
+                GraphBuilder::add_java_method_nodes_from_parsed(
+                    &jmr_chunk,
+                    &mut ctx.graph,
+                    &mut ctx.proc_index,
+                    &ctx.mapper_index,
+                );
+                // jf_chunk + jmr_chunk dropped here
+            }
+        }
+
+        // XML: chunked combined parse (flat + structured in one read) → build → drop
+        const XML_CHUNK_SIZE: usize = 50;
+        let mut ibatis_files_count = 0usize;
+        let mut all_structured: Vec<parser::ibatis_loader::IbatisStructuredFile> = Vec::new();
+
+        if !all_xml_paths.is_empty() {
+            let xml_chunks = all_xml_paths.len().div_ceil(XML_CHUNK_SIZE);
+            for (chunk_idx, chunk) in all_xml_paths.chunks(XML_CHUNK_SIZE).enumerate() {
+                pb.set_message(format!(
+                    "Parsing XML mappers ({}/{})...",
+                    chunk_idx + 1,
+                    xml_chunks
+                ));
+                let combined = parser::ibatis_loader::load_ibatis_files_combined(chunk);
+                pb.inc(chunk.len() as u64);
+
+                let mut flat_chunk: Vec<parser::ibatis_loader::IbatisParsedFile> =
+                    Vec::with_capacity(combined.len());
+
+                for cf in combined {
+                    all_hashes.push((cf.path.clone(), cf.content_hash.clone(), FileType::Xml));
+                    flat_chunk.push(parser::ibatis_loader::IbatisParsedFile {
+                        path: cf.path,
+                        result: cf.flat,
+                        content_hash: cf.content_hash,
+                    });
+                    all_structured.push(parser::ibatis_loader::IbatisStructuredFile {
+                        path: PathBuf::new(),
+                        result: cf.structured,
+                        content_hash: String::new(),
+                    });
+                }
+                ibatis_files_count += flat_chunk.len();
+
+                GraphBuilder::add_ibatis_nodes_from_parsed_with_source_paths(
+                    &flat_chunk,
+                    &mut ctx.graph,
+                    &mut ctx.proc_index,
+                    &mut ctx.mapper_index,
+                    &mut ctx.table_index,
+                    &mut ctx.builtin_index,
+                    &source_paths,
                 );
             }
         }
 
-        // Finish AFTER all parsing phases — JSP calls pb.inc() below; finishing
-        // earlier leaves a dead bar being updated.
+        // JSP: chunked parse → build → drop
+        #[cfg(feature = "jsp")]
+        {
+            const JSP_CHUNK_SIZE: usize = 50;
+            let mut jsp_files_count = 0usize;
+            let mut all_jsp_results: Vec<crate::parser::jsp_loader::JspFileResult> = Vec::new();
+
+            if !all_jsp_paths.is_empty() {
+                let jsp_chunks = all_jsp_paths.len().div_ceil(JSP_CHUNK_SIZE);
+                for (chunk_idx, chunk) in all_jsp_paths.chunks(JSP_CHUNK_SIZE).enumerate() {
+                    pb.set_message(format!("Parsing JSP ({}/{})...", chunk_idx + 1, jsp_chunks));
+                    let results =
+                        crate::parser::jsp_loader::load_jsp_files_from_paths(chunk, &java_config);
+                    pb.inc(chunk.len() as u64);
+                    jsp_files_count += results.len();
+
+                    for result in &results {
+                        let hash = blake3::hash(result.synthesized.source.as_bytes())
+                            .to_hex()
+                            .to_string();
+                        all_hashes.push((result.file.clone(), hash, FileType::Jsp));
+                    }
+
+                    GraphBuilder::add_jsp_nodes_from_parsed(&results, &mut ctx);
+                    all_jsp_results.extend(results);
+                }
+            }
+
+            GraphBuilder::bridge_jsp_to_java_methods(
+                &mut ctx.graph,
+                &all_jsp_results,
+                &simple_to_fqn,
+            );
+
+            pb.finish_with_message(format!(
+                "Parsed {} files ({} SQL, {} Java, {} XML, {} JSP)",
+                total_sql + java_files_count + ibatis_files_count + jsp_files_count,
+                total_sql,
+                java_files_count,
+                ibatis_files_count,
+                jsp_files_count,
+            ));
+        }
         #[cfg(not(feature = "jsp"))]
         pb.finish_with_message(format!(
             "Parsed {} files ({} SQL, {} Java, {} XML)",
-            total_sql + java_files.len() + ibatis_files.len(),
+            total_sql + java_files_count + ibatis_files_count,
             total_sql,
-            java_files.len(),
-            ibatis_files.len(),
-        ));
-        #[cfg(feature = "jsp")]
-        pb.finish_with_message(format!(
-            "Parsed {} files ({} SQL, {} Java, {} XML, {} JSP)",
-            total_sql + java_files.len() + ibatis_files.len() + all_jsp_paths.len(),
-            total_sql,
-            java_files.len(),
-            ibatis_files.len(),
-            all_jsp_paths.len(),
+            java_files_count,
+            ibatis_files_count,
         ));
 
         GraphBuilder::finalize_graph(&mut ctx);
 
-        // Expand dynamic SQL variants for fingerprint index
+        // Expand dynamic SQL variants for fingerprint index.
+        // Must run AFTER finalize_graph because dedup/merge may change node indices.
         let variant_map = GraphBuilder::add_ibatis_structured_variants(
-            &structured_ibatis_files,
+            &all_structured,
             &ctx.mapper_index,
             &source_paths,
         );
-
-        // Collect XML hashes (no AST to drop — ibatis_files is lightweight)
-        for pf in &ibatis_files {
-            all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Xml));
-        }
 
         // Phase 6: Build store
         let mut new_store = GraphStore::from_graph(&self.config.project.name, ctx.graph);
@@ -415,10 +464,7 @@ impl Project {
         };
 
         let current_files = scan_with_fingerprints(&input_paths, &self.config.analysis.exclude);
-        let existing_manifest: HashMap<PathBuf, FileRecord> = self
-            .try_load_store()
-            .map(|s| s.manifest().clone())
-            .unwrap_or_default();
+        let existing_manifest = self.load_manifest_only();
 
         Ok(compute_changes(&current_files, &existing_manifest))
     }
@@ -471,6 +517,13 @@ impl Project {
             config::StoreFormat::Json => store.save_json(&path)?,
         }
         Ok(())
+    }
+
+    /// Load only the manifest (file list + hashes) from the sidecar file,
+    /// without deserializing the full graph. Fast path for diff/up-to-date checks.
+    pub fn load_manifest_only(&self) -> HashMap<PathBuf, FileRecord> {
+        let store_path = self.store_path();
+        GraphStore::load_manifest_sidecar(&store_path).unwrap_or_default()
     }
 
     pub fn try_load_store(&mut self) -> Option<&GraphStore> {

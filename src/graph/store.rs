@@ -628,25 +628,29 @@ impl GraphStore {
     /// and adds their fingerprints to the index.
     pub fn enrich_fingerprint_index_with_variants(
         &mut self,
-        variant_map: &HashMap<NodeIndex, Vec<String>>,
+        variant_map: &HashMap<String, Vec<String>>,
     ) {
-        for (node_idx, variant_sqls) in variant_map {
-            let display_key = match &self.graph[*node_idx] {
-                Node::MappedStatement {
-                    namespace,
-                    statement_id,
-                    ..
-                } => {
-                    format!("mapper:{}.{}", namespace, statement_id)
-                }
-                _ => continue,
+        for (mapper_key, variant_sqls) in variant_map {
+            let node_idx = match self.node_key_index.get(&NodeKey::Mapper {
+                namespace: mapper_key
+                    .rsplit_once('.')
+                    .map(|(ns, _)| ns.to_string())
+                    .unwrap_or_default(),
+                statement_id: mapper_key
+                    .rsplit_once('.')
+                    .map(|(_, id)| id.to_string())
+                    .unwrap_or_default(),
+            }) {
+                Some(idx) => *idx,
+                None => continue,
             };
+            let display_key = format!("mapper:{}", mapper_key);
             for variant_sql in variant_sqls {
                 let fp = sql_match::sql_fingerprint(variant_sql);
                 self.sql_fingerprint_index
                     .entry(fp)
                     .or_default()
-                    .push((*node_idx, display_key.clone()));
+                    .push((node_idx, display_key.clone()));
             }
         }
     }
@@ -934,7 +938,51 @@ impl GraphStore {
             path: path.to_path_buf(),
             source: e,
         })?;
+        Self::save_manifest_sidecar(path, &self.manifest)?;
         Ok(())
+    }
+
+    fn save_manifest_sidecar(
+        store_path: &Path,
+        manifest: &HashMap<PathBuf, FileRecord>,
+    ) -> crate::error::Result<()> {
+        let manifest_path = Self::manifest_sidecar_path(store_path);
+        let bytes =
+            bincode::serialize(manifest).map_err(|e| crate::error::CodeWebError::ExportError {
+                message: format!("manifest bincode serialize: {}", e),
+            })?;
+        std::fs::write(&manifest_path, bytes).map_err(|e| {
+            crate::error::CodeWebError::FileRead {
+                path: manifest_path,
+                source: e,
+            }
+        })?;
+        Ok(())
+    }
+
+    pub fn load_manifest_sidecar(
+        store_path: &Path,
+    ) -> crate::error::Result<HashMap<PathBuf, FileRecord>> {
+        let manifest_path = Self::manifest_sidecar_path(store_path);
+        if !manifest_path.exists() {
+            return Ok(HashMap::new());
+        }
+        let bytes =
+            std::fs::read(&manifest_path).map_err(|e| crate::error::CodeWebError::FileRead {
+                path: manifest_path.clone(),
+                source: e,
+            })?;
+        bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
+            message: format!("manifest bincode deserialize: {}", e),
+        })
+    }
+
+    fn manifest_sidecar_path(store_path: &Path) -> PathBuf {
+        let stem = store_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "store".to_string());
+        store_path.with_file_name(format!("{stem}.manifest"))
     }
 
     pub fn load_bincode(path: &Path) -> crate::error::Result<Self> {
@@ -1015,6 +1063,7 @@ impl GraphStore {
             path: path.to_path_buf(),
             source: e,
         })?;
+        Self::save_manifest_sidecar(path, &self.manifest)?;
         Ok(())
     }
 
@@ -5279,7 +5328,7 @@ mod tests {
             // Enrich with a variant SQL
             let mut variant_map = std::collections::HashMap::new();
             variant_map.insert(
-                idx,
+                "dao.dynamicQuery".to_string(),
                 vec![
                     "SELECT * FROM users WHERE 1=1 AND status = ?".to_string(),
                     "SELECT * FROM users WHERE 1=1 AND name = ?".to_string(),
@@ -5310,7 +5359,7 @@ mod tests {
             // Enrich with variant SQL
             let mut variant_map = std::collections::HashMap::new();
             variant_map.insert(
-                idx,
+                "dao.search".to_string(),
                 vec!["SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string()],
             );
             store.enrich_fingerprint_index_with_variants(&variant_map);
@@ -5482,7 +5531,7 @@ mod tests {
             graph.add_node(make_mapper_node("dao", "find", Some("SELECT 1")));
             let mut store = GraphStore::from_graph("test", graph);
 
-            let empty_map: HashMap<NodeIndex, Vec<String>> = HashMap::new();
+            let empty_map: HashMap<String, Vec<String>> = HashMap::new();
             store.enrich_fingerprint_index_with_variants(&empty_map);
 
             // No crash, fingerprint count unchanged
@@ -5500,7 +5549,7 @@ mod tests {
 
             // Try to enrich with a non-mapper NodeIndex
             let mut variant_map = HashMap::new();
-            variant_map.insert(proc_idx, vec!["SELECT 1".to_string()]);
+            variant_map.insert("nonexistent.key".to_string(), vec!["SELECT 1".to_string()]);
             store.enrich_fingerprint_index_with_variants(&variant_map);
 
             // Should be skipped — no new entries
@@ -5523,7 +5572,10 @@ mod tests {
 
             // Enrich with the SAME SQL as a variant
             let mut variant_map = HashMap::new();
-            variant_map.insert(idx, vec!["SELECT * FROM users".to_string()]);
+            variant_map.insert(
+                "dao.search".to_string(),
+                vec!["SELECT * FROM users".to_string()],
+            );
             store.enrich_fingerprint_index_with_variants(&variant_map);
 
             // Same fingerprint, but now 2 entries in the bucket
@@ -5543,7 +5595,7 @@ mod tests {
 
             let mut variant_map = HashMap::new();
             variant_map.insert(
-                idx,
+                "dao.dynamicSearch".to_string(),
                 vec![
                     "SELECT * FROM users WHERE 1=1 AND status = ?".to_string(),
                     "SELECT * FROM users WHERE 1=1 AND role = ?".to_string(),
@@ -5797,7 +5849,7 @@ mod tests {
             // Simulate variant expansion result from builder
             let mut variant_map = HashMap::new();
             variant_map.insert(
-                dynamic_idx,
+                "dao.search".to_string(),
                 vec![
                     "SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string(),
                     "SELECT * FROM users WHERE 1=1 AND role = __XML_PARAM_role__".to_string(),
@@ -5855,7 +5907,7 @@ mod tests {
 
             let mut variant_map = HashMap::new();
             variant_map.insert(
-                idx,
+                "dao.search".to_string(),
                 vec!["SELECT * FROM users WHERE 1=1 AND status = __XML_PARAM_status__".to_string()],
             );
             store.enrich_fingerprint_index_with_variants(&variant_map);

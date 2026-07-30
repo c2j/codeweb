@@ -263,7 +263,13 @@ impl GraphBuilder {
             &ctx.mapper_index,
         );
         Self::add_jsp_nodes_from_parsed(jsp_files, &mut ctx);
-        Self::bridge_jsp_to_java_methods(&mut ctx.graph, jsp_files, &all.java_method_results);
+        let mut simple_to_fqn: HashMap<String, String> = HashMap::new();
+        for result in &all.java_method_results {
+            for class in &result.classes {
+                simple_to_fqn.insert(class.name.clone(), class.fqn.clone());
+            }
+        }
+        Self::bridge_jsp_to_java_methods(&mut ctx.graph, jsp_files, &simple_to_fqn);
         Self::finalize_graph(&mut ctx);
         ctx.graph
     }
@@ -2417,10 +2423,10 @@ impl GraphBuilder {
         structured_files: &[crate::parser::ibatis_loader::IbatisStructuredFile],
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
         _source_paths: &[PathBuf],
-    ) -> HashMap<petgraph::graph::NodeIndex, Vec<String>> {
+    ) -> HashMap<String, Vec<String>> {
         use ogsql_parser::ibatis::{ExpandConfig, IfExpandStrategy, PlaceholderStrategy};
 
-        let mut variant_map: HashMap<petgraph::graph::NodeIndex, Vec<String>> = HashMap::new();
+        let mut variant_map: HashMap<String, Vec<String>> = HashMap::new();
 
         let config = ExpandConfig {
             max_depth: 8,
@@ -2440,9 +2446,9 @@ impl GraphBuilder {
                 }
 
                 let mapper_key = format!("{}.{}", namespace, stmt.id);
-                let Some(&node_idx) = mapper_index.get(&mapper_key) else {
+                if !mapper_index.contains_key(&mapper_key) {
                     continue;
-                };
+                }
 
                 let variants = stmt.expand_variants(&config);
                 let variant_sqls: Vec<String> = variants
@@ -2452,7 +2458,7 @@ impl GraphBuilder {
                     .collect();
 
                 if !variant_sqls.is_empty() {
-                    variant_map.insert(node_idx, variant_sqls);
+                    variant_map.insert(mapper_key, variant_sqls);
                 }
             }
         }
@@ -3633,15 +3639,8 @@ impl GraphBuilder {
     pub(crate) fn bridge_jsp_to_java_methods(
         graph: &mut CodeGraph,
         jsp_files: &[crate::parser::jsp_loader::JspFileResult],
-        java_method_results: &[crate::parser::java_method::JavaParseResult],
+        simple_to_fqn: &HashMap<String, String>,
     ) {
-        let mut simple_to_fqn: HashMap<String, String> = HashMap::new();
-        for result in java_method_results {
-            for class in &result.classes {
-                simple_to_fqn.insert(class.name.clone(), class.fqn.clone());
-            }
-        }
-
         let mut method_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut class_index: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         for idx in graph.node_indices() {
