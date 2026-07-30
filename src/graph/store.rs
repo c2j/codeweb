@@ -10,6 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Magic bytes prefixing every `store.bincode` file. Lets `load_bincode`
+/// validate the file and check the format version *before* attempting bincode
+/// deserialization (which fails opaquely on cross-version layout drift).
+/// See issue #110.
+#[allow(dead_code)] // consumed in Task 2 (load_bincode/save_bincode header probe)
+const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
+
+/// GraphStore on-disk format version. Bump when the serialized struct layout
+/// changes. Validated in the file header (post-header era files) and again in
+/// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
+const STORE_VERSION: u32 = 6;
+
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
@@ -62,7 +74,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 6,
+            version: STORE_VERSION,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -293,7 +305,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 6,
+            version: STORE_VERSION,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -928,11 +940,11 @@ impl GraphStore {
             bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
             })?;
-        if store.version != 6 {
+        if store.version != STORE_VERSION {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
-                    store.version
+                    "unsupported cache version {}, expected {} — run `codeweb analyze` to regenerate",
+                    store.version, STORE_VERSION
                 ),
             });
         }
@@ -968,11 +980,11 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 6 {
+        if store.version != STORE_VERSION {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
-                    store.version
+                    "unsupported cache version {}, expected {} — run `codeweb analyze` to regenerate",
+                    store.version, STORE_VERSION
                 ),
             });
         }
