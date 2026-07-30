@@ -1,14 +1,11 @@
 -- Issue #58: Multi-caller shared unresolved node produces incorrect cross-schema edges.
 -- Two schemas each define compute(); two procedures in different schemas both call
--- bare compute(42). The shared unresolved node is resolved to ONE target based on
--- the first caller's schema (s1), so s2.proc_b gets an incorrect edge to s1.compute.
+-- bare compute(42). The fix uses per-edge resolution when Strategy 5 (CallerSchema)
+-- is the deciding factor with multiple distinct caller schemas.
 --
--- Expected after fix:
+-- Expected:
 --   s1.proc_a → s1.compute  (caller schema match)
 --   s2.proc_b → s2.compute  (caller schema match)
--- Currently (bug):
---   s1.proc_a → s1.compute  ✓ (first caller wins by accident)
---   s2.proc_b → s1.compute  ✗ (should be s2.compute)
 
 CREATE SCHEMA s1;
 CREATE SCHEMA s2;
