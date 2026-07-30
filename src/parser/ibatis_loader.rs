@@ -118,6 +118,71 @@ fn load_ibatis_structured_file(path: &Path) -> Result<(StructuredMapper, String)
     Ok((result, content_hash))
 }
 
+/// Combined flat + structured parse from a single file read.
+/// Returns both `ParsedMapper` and `StructuredMapper` to avoid reading the file twice.
+pub struct IbatisCombinedFile {
+    pub path: PathBuf,
+    pub flat: ParsedMapper,
+    pub structured: StructuredMapper,
+    pub content_hash: String,
+}
+
+pub fn load_ibatis_files_combined(paths: &[PathBuf]) -> Vec<IbatisCombinedFile> {
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .filter_map(|path| {
+            load_ibatis_file_combined(path)
+                .ok()
+                .map(|(flat, structured, hash)| IbatisCombinedFile {
+                    path: path.clone(),
+                    flat,
+                    structured,
+                    content_hash: hash,
+                })
+        })
+        .collect()
+}
+
+fn load_ibatis_file_combined(
+    path: &Path,
+) -> Result<(ParsedMapper, StructuredMapper, String), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let content_hash = blake3::hash(&bytes).to_hex().to_string();
+    let file_path = path.to_string_lossy().to_string();
+
+    let flat = parse_mapper_bytes_with_path(&bytes, Some(&file_path));
+    let structured = parse_mapper_bytes_structured_with_path(&bytes, Some(&file_path));
+
+    if flat.namespace.is_empty() && flat.statements.is_empty() && flat.errors.is_empty() {
+        crate::parse_log::info(&file_path, "skipped: not a mapper file");
+        return Err("not a mapper file".to_string());
+    }
+
+    if !flat.errors.is_empty() {
+        for err in &flat.errors {
+            crate::parse_log::warn(&file_path, &err.to_string());
+        }
+    }
+    if !structured.errors.is_empty() {
+        for err in &structured.errors {
+            crate::parse_log::warn(&file_path, &format!("[structured] {}", err));
+        }
+    }
+
+    crate::parse_log::info(
+        &file_path,
+        &format!(
+            "namespace={}, {} statements (flat+structured)",
+            flat.namespace,
+            flat.statements.len()
+        ),
+    );
+
+    Ok((flat, structured, content_hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
