@@ -27,6 +27,14 @@ pub struct AnalysisConfig {
     pub encoding: HashMap<String, String>,
     #[serde(default)]
     pub java: JavaConfig,
+    /// Number of SQL files parsed per memory chunk. Smaller = lower peak memory.
+    /// Default: 100. Upper bound: 100 (set lower only).
+    #[serde(default = "default_sql_chunk_size")]
+    pub sql_chunk_size: usize,
+}
+
+fn default_sql_chunk_size() -> usize {
+    100
 }
 
 /// Java SQL extraction tuning.
@@ -106,6 +114,7 @@ name = "{}"
 [analysis]
 paths = [{}]
 # exclude = ["**/test/**", "**/generated/**"]
+# sql_chunk_size = 100
 
 # [analysis.java]
 # extra_sql_methods = []
