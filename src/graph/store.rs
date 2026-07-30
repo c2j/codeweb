@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Magic bytes prefixing every `store.bincode` file. Lets `load_bincode`
+/// validate the file and check the format version *before* attempting bincode
+/// deserialization (which fails opaquely on cross-version layout drift).
+/// See issue #110.
+const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
+
+/// GraphStore on-disk format version. Bump when the serialized struct layout
+/// changes. Validated in the file header (post-header era files) and again in
+/// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
+const STORE_VERSION: u32 = 6;
+
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
@@ -62,7 +73,7 @@ impl GraphStore {
     pub fn new(project_name: &str) -> Self {
         let now = timestamp_ms();
         Self {
-            version: 6,
+            version: STORE_VERSION,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -293,7 +304,7 @@ impl GraphStore {
         }
 
         Self {
-            version: 6,
+            version: STORE_VERSION,
             project_name: project_name.to_string(),
             created_at: now,
             updated_at: now,
@@ -912,10 +923,17 @@ impl GraphStore {
                 source: e,
             })?;
         }
-        let bytes =
-            bincode::serialize(self).map_err(|e| crate::error::CodeWebError::ExportError {
+        // Prepend the magic + version header so load_bincode can validate the file
+        // and diagnose version mismatches BEFORE bincode deserialization (which
+        // fails opaquely on cross-version layout drift). See issue #110.
+        let mut bytes: Vec<u8> = Vec::with_capacity(13 + 1024);
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        bincode::serialize_into(&mut bytes, self).map_err(|e| {
+            crate::error::CodeWebError::ExportError {
                 message: format!("bincode serialize: {}", e),
-            })?;
+            }
+        })?;
         std::fs::write(path, bytes).map_err(|e| crate::error::CodeWebError::FileRead {
             path: path.to_path_buf(),
             source: e,
@@ -972,15 +990,57 @@ impl GraphStore {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let store: Self =
-            bincode::deserialize(&bytes).map_err(|e| crate::error::CodeWebError::ExportError {
-                message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
-            })?;
-        if store.version != 6 {
+
+        // Probe for the magic + version header (post-issue-#110 files).
+        // If present, validate version up front so a cross-version file yields an
+        // actionable message instead of a cryptic bincode deserialize failure.
+        // If absent, fall back to legacy whole-buffer deserialization (pre-header
+        // stores from v0.8.x and earlier). See issue #110.
+        let payload: &[u8] = if bytes.len() >= 13 && bytes[..9] == STORE_MAGIC {
+            let stored_ver = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+            if stored_ver != STORE_VERSION {
+                return Err(crate::error::CodeWebError::ExportError {
+                    message: format!(
+                        "unsupported cache version {}, expected {} — run `codeweb analyze` to regenerate",
+                        stored_ver, STORE_VERSION
+                    ),
+                });
+            }
+            &bytes[13..]
+        } else {
+            // Legacy headerless file — best-effort whole-buffer deserialize.
+            // The post-deserialize version check below still applies.
+            &bytes[..]
+        };
+
+        let store_result: Result<Self, _> = bincode::deserialize(payload);
+        let store: Self = match store_result {
+            Ok(s) => s,
+            Err(e) => {
+                // If deserialization failed and the file looks like it has a header
+                // (13+ bytes) but the magic didn't match, give a friendly error.
+                if bytes.len() >= 13 && bytes[..9] != STORE_MAGIC {
+                    return Err(crate::error::CodeWebError::ExportError {
+                        message: format!(
+                            "not a codeweb store (bad magic: expected CWEBSTORE, got {:?})",
+                            &bytes[..9]
+                        ),
+                    });
+                }
+                return Err(crate::error::CodeWebError::ExportError {
+                    message: format!("bincode deserialize: {} ({} bytes)", e, bytes.len()),
+                });
+            }
+        };
+
+        // Belt-and-suspenders: catches legacy files whose struct.version field was
+        // set to a mismatched value, and corrupted/garbage files that happened to
+        // deserialize to *something*.
+        if store.version != STORE_VERSION {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
-                    store.version
+                    "unsupported cache version {}, expected {} — run `codeweb analyze` to regenerate",
+                    store.version, STORE_VERSION
                 ),
             });
         }
@@ -1017,11 +1077,11 @@ impl GraphStore {
             serde_json::from_str(&json).map_err(|e| crate::error::CodeWebError::ExportError {
                 message: format!("json deserialize: {}", e),
             })?;
-        if store.version != 6 {
+        if store.version != STORE_VERSION {
             return Err(crate::error::CodeWebError::ExportError {
                 message: format!(
-                    "unsupported cache version {}, expected 6 — run `codeweb analyze` to regenerate",
-                    store.version
+                    "unsupported cache version {}, expected {} — run `codeweb analyze` to regenerate",
+                    store.version, STORE_VERSION
                 ),
             });
         }
@@ -2033,6 +2093,105 @@ mod tests {
         assert!(
             err_msg.contains("unsupported cache version"),
             "Error should mention version: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn save_bincode_writes_magic_version_header() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("with_header.bincode");
+        let store = GraphStore::new("probe-test");
+        store.save_bincode(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() >= 13,
+            "file must have at least a 13-byte header"
+        );
+        assert_eq!(&bytes[..9], b"CWEBSTORE", "magic header must be CWEBSTORE");
+        let stored_ver = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
+        assert_eq!(
+            stored_ver, STORE_VERSION,
+            "header version must match constant"
+        );
+    }
+
+    #[test]
+    fn load_bincode_round_trips_with_header() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("roundtrip.bincode");
+        let store = GraphStore::from_graph("roundtrip", CodeGraph::new());
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path);
+        assert!(
+            loaded.is_ok(),
+            "round-trip should succeed: {:?}",
+            loaded.err()
+        );
+        assert_eq!(loaded.unwrap().version, STORE_VERSION);
+    }
+
+    #[test]
+    fn load_bincode_falls_back_for_legacy_headerless_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bincode");
+        // Simulate a pre-header (legacy) file: raw bincode payload, no magic prefix.
+        let store = GraphStore::from_graph("legacy", CodeGraph::new());
+        let raw = bincode::serialize(&store).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+
+        let loaded = GraphStore::load_bincode(&path);
+        assert!(
+            loaded.is_ok(),
+            "legacy headerless file must still load: {:?}",
+            loaded.err()
+        );
+        assert_eq!(loaded.unwrap().project_name, "legacy");
+    }
+
+    #[test]
+    fn load_bincode_rejects_wrong_magic_with_friendly_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("not_a_store.bincode");
+        // 13+ bytes starting with something other than the magic.
+        let mut bytes = b"NOPESTORE".to_vec();
+        bytes.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"garbage payload that is not bincode");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "wrong magic must error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a codeweb store") || err_msg.contains("bad magic"),
+            "wrong-magic error should name the problem: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn load_bincode_rejects_header_version_mismatch_with_friendly_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wrong_ver.bincode");
+        // Header with correct magic but a future version number, followed by junk payload.
+        let mut bytes = b"CWEBSTORE".to_vec();
+        let future_ver: u32 = 99;
+        bytes.extend_from_slice(&future_ver.to_le_bytes());
+        bytes.extend_from_slice(b"payload does not matter, version check fires first");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "version mismatch must error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "version-mismatch error should mention version: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("99"),
+            "error should report the found version (99): {}",
             err_msg
         );
     }

@@ -212,6 +212,7 @@ impl Project {
             .sql_chunk_size
             .max(1)
             .min(DEFAULT_SQL_CHUNK_SIZE.max(1));
+        all_sql_paths.sort();
         let total_sql = all_sql_paths.len();
         let sql_chunks = total_sql.div_ceil(sql_chunk_size);
 

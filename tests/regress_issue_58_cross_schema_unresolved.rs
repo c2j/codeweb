@@ -73,7 +73,6 @@ fn has_edge(
 }
 
 #[test]
-#[ignore = "issue #58: shared unresolved node rewired to wrong schema — per-edge resolution needed"]
 fn regress_cross_schema_shared_unresolved_correct_edges() {
     let json = analyze_json(CROSS_SCHEMA_SHARED_UNRESOLVED);
 
@@ -87,31 +86,21 @@ fn regress_cross_schema_shared_unresolved_correct_edges() {
         "Issue #58: compute function in schema s2 not found in graph"
     );
 
-    // s1.proc_a → s1.compute: caller-schema match — WILL FAIL (bug: shared unresolved
-    // node is rewired to ONE target for all callers, so proc_a currently points to
-    // s2.compute instead of s1.compute)
+    // s1.proc_a → s1.compute: per-edge resolution resolves based on proc_a's schema
     assert!(
         has_edge(&json, "proc_a", "s1", "compute", "s1"),
-        "Issue #58: expected edge from s1.proc_a → s1.compute (caller schema match), \
-         but it is missing. Bug: the shared unresolved 'compute' call resolves to the \
-         same schema (s2) for ALL callers instead of per caller schema."
+        "Issue #58: expected edge from s1.proc_a → s1.compute (caller schema match)"
     );
 
-    // s2.proc_b → s2.compute: caller-schema match — may pass or fail depending on
-    // internal ordering, but must pass after per-edge resolution
+    // s2.proc_b → s2.compute: per-edge resolution resolves based on proc_b's schema
     assert!(
         has_edge(&json, "proc_b", "s2", "compute", "s2"),
-        "Issue #58: expected edge from s2.proc_b → s2.compute (caller schema match), \
-         but it is missing. Bug: shared unresolved node resolves to a single target \
-         for all callers regardless of their schema."
+        "Issue #58: expected edge from s2.proc_b → s2.compute (caller schema match)"
     );
 
-    // s1.proc_a must NOT have an edge to s2.compute — WILL FAIL (bug creates incorrect
-    // cross-schema edge because all callers are rewired to the same target)
+    // s1.proc_a must NOT have an edge to s2.compute (cross-schema)
     assert!(
         !has_edge(&json, "proc_a", "s1", "compute", "s2"),
-        "Issue #58: incorrect cross-schema edge from s1.proc_a → s2.compute. \
-         The shared unresolved 'compute' call was resolved to s2.compute for ALL callers. \
-         s1.proc_a should only reach s1.compute, not s2.compute."
+        "Issue #58: incorrect cross-schema edge from s1.proc_a → s2.compute"
     );
 }

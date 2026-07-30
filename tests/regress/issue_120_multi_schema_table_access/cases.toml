@@ -1,0 +1,10 @@
+[multi_schema_same_table]
+description = "Two schemas with same-named table, proc_a uses qualified reference, proc_b uses bare reference"
+expected_edges = [
+    { source = "proc_a", source_schema = "schema_a", target = "tab1", target_schema = "schema_a", edge_type = "table_access" },
+    { source = "proc_b", source_schema = "schema_b", target = "tab1", target_schema = "schema_b", edge_type = "table_access" },
+]
+forbidden_edges = [
+    { source = "proc_b", source_schema = "schema_b", target = "tab1", target_schema = "schema_a", edge_type = "table_access" },
+]
+expected_node_count = { table = { tab1 = 2 } }

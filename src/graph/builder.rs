@@ -399,6 +399,7 @@ impl GraphBuilder {
                         Self::create_package_nodes(
                             &pkg.name,
                             &pkg.items,
+                            true,
                             info.start_line,
                             &file_arc,
                             graph,
@@ -437,6 +438,7 @@ impl GraphBuilder {
                         Self::create_package_nodes(
                             &pkg.name,
                             &pkg.items,
+                            false,
                             info.start_line,
                             &file_arc,
                             graph,
@@ -1439,9 +1441,11 @@ impl GraphBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_package_nodes(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
+        is_spec: bool,
         start_line: usize,
         file_path: &Arc<PathBuf>,
         graph: &mut CodeGraph,
@@ -1465,17 +1469,42 @@ impl GraphBuilder {
             None => pkg_name_part.clone(),
         };
 
-        let pkg_idx = *package_index.entry(qualified).or_insert_with(|| {
-            let node = Node::Package {
-                schema: schema_part.clone(),
-                name: pkg_name_part.clone(),
-                location: SourceLocation {
-                    file: file_path.clone(),
-                    line: start_line,
-                },
-            };
-            graph.add_node(node)
-        });
+        let pkg_idx = if is_spec {
+            match package_index.get(&qualified) {
+                Some(&idx) => {
+                    if let Node::Package { location, .. } = &mut graph[idx] {
+                        *location = SourceLocation {
+                            file: file_path.clone(),
+                            line: start_line,
+                        };
+                    }
+                    idx
+                }
+                None => {
+                    let idx = graph.add_node(Node::Package {
+                        schema: schema_part.clone(),
+                        name: pkg_name_part.clone(),
+                        location: SourceLocation {
+                            file: file_path.clone(),
+                            line: start_line,
+                        },
+                    });
+                    package_index.insert(qualified, idx);
+                    idx
+                }
+            }
+        } else {
+            *package_index.entry(qualified).or_insert_with(|| {
+                graph.add_node(Node::Package {
+                    schema: schema_part.clone(),
+                    name: pkg_name_part.clone(),
+                    location: SourceLocation {
+                        file: file_path.clone(),
+                        line: start_line,
+                    },
+                })
+            })
+        };
 
         for item in pkg_items {
             let (proc_name, block, kind) = match item {
@@ -1559,9 +1588,7 @@ impl GraphBuilder {
         for file in files {
             for info in &file.statements {
                 if let Statement::CreatePackage(pkg) = &info.statement {
-                    spec_items_by_pkg
-                        .entry(pkg_qualified_key(&pkg.name))
-                        .or_insert(&pkg.items);
+                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
                 }
             }
         }
@@ -1606,6 +1633,7 @@ impl GraphBuilder {
                                 std::slice::from_ref(info),
                                 &file_arc,
                                 proc_idx,
+                                proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
                             );
@@ -1618,6 +1646,7 @@ impl GraphBuilder {
                                 std::slice::from_ref(info),
                                 &file_arc,
                                 proc_idx,
+                                proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
                             );
@@ -2381,6 +2410,7 @@ impl GraphBuilder {
                         statements,
                         &xml_path,
                         node_idx,
+                        None,
                         graph,
                         table_index,
                     );
@@ -2588,6 +2618,7 @@ impl GraphBuilder {
                         &parse_result.statements,
                         &java_path,
                         node_idx,
+                        None,
                         graph,
                         table_index,
                     );
@@ -2683,6 +2714,7 @@ impl GraphBuilder {
                         std::slice::from_ref(&block_stmt),
                         file_path,
                         proc_idx,
+                        schema_part.as_deref(),
                         graph,
                         table_index,
                     );
@@ -2695,6 +2727,7 @@ impl GraphBuilder {
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
         source_idx: petgraph::graph::NodeIndex,
+        owner_schema: Option<&str>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
@@ -2714,7 +2747,16 @@ impl GraphBuilder {
                 || !column_analysis.select_into.is_empty();
 
             for access in &extractor.accesses {
-                let key = normalize_table_key(access.schema.as_deref(), &access.name);
+                let key = if access.schema.is_none() && owner_schema.is_some() {
+                    let qualified = normalize_table_key(owner_schema, &access.name);
+                    if table_index.contains_key(&qualified) {
+                        qualified
+                    } else {
+                        normalize_table_key(None, &access.name)
+                    }
+                } else {
+                    normalize_table_key(access.schema.as_deref(), &access.name)
+                };
                 let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
                     let node = Node::Table {
                         schema: access.schema.clone(),
@@ -2882,6 +2924,7 @@ impl GraphBuilder {
                         &parse_result.statements,
                         &jsp_path,
                         sql_idx,
+                        None,
                         &mut ctx.graph,
                         &mut ctx.table_index,
                     );
@@ -3198,28 +3241,60 @@ impl GraphBuilder {
                 &pkg_member_lower,
                 &caller_schemas,
             ) {
-                ResolveOutcome::Resolved(target_idx) => {
+                ResolveOutcome::Resolved(target_idx, strategy) => {
                     if target_idx == *unres_idx {
                         continue; // shouldn't happen, but guard
                     }
-                    // Rewire all incoming edges to the resolved target.
-                    //
-                    // Limitation: when multiple callers in different schemas share
-                    // this unresolved node (via proc_index dedup), all edges are
-                    // rewired to the SAME target. Strategy 5 picks the target based
-                    // on the first caller's schema, so callers in other schemas get
-                    // a potentially incorrect edge. Per-edge resolution would fix
-                    // this but requires restructuring the rewiring logic.
-                    let sources: Vec<_> = graph
+
+                    // Collect source nodes with their schemas for per-edge logic.
+                    let sources: Vec<(petgraph::graph::NodeIndex, Option<String>)> = graph
                         .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
+                        .filter_map(|src| {
+                            let schema = match &graph[src] {
+                                Node::Procedure { id, .. } | Node::Function { id, .. } => {
+                                    id.schema.as_ref().map(|s| s.to_lowercase())
+                                }
+                                _ => None,
+                            };
+                            Some((src, schema))
+                        })
                         .collect();
-                    for src in sources {
+
+                    // When Strategy 5 is the deciding factor AND multiple distinct
+                    // caller schemas exist, resolve each edge independently based on
+                    // that edge's source-node schema. Otherwise, all edges go to the
+                    // same target (caller-independent strategies are correct for all).
+                    // Only count non-None schemas (Proc/Function callers); non-Proc
+                    // callers such as Trigger/Package bodies don't carry schema context.
+                    let distinct_schemas: std::collections::HashSet<&str> =
+                        sources.iter().filter_map(|(_, s)| s.as_deref()).collect();
+                    let needs_per_edge =
+                        strategy == ResolutionStrategy::CallerSchema && distinct_schemas.len() > 1;
+
+                    for (src, src_schema) in &sources {
+                        let edge_target = if needs_per_edge {
+                            let single_schema: Vec<Option<String>> = vec![src_schema.clone()];
+                            match try_resolve_routine(
+                                raw_expr,
+                                &lower_qualified,
+                                &bare_name_lower,
+                                &bare_name_schemas,
+                                &pkg_member_lower,
+                                &single_schema,
+                            ) {
+                                ResolveOutcome::Resolved(idx, _) => idx,
+                                ResolveOutcome::Miss(_) => target_idx,
+                            }
+                        } else {
+                            target_idx
+                        };
+
                         let weights: Vec<_> = graph
-                            .edges_connecting(src, *unres_idx)
+                            .edges_connecting(*src, *unres_idx)
                             .map(|e| e.weight().clone())
                             .collect();
                         for weight in weights {
-                            graph.add_edge(src, target_idx, weight);
+                            graph.add_edge(*src, edge_target, weight);
                         }
                     }
                     to_remove.push(*unres_idx);
@@ -3709,13 +3784,37 @@ fn noise_rule(raw_expr: &str) -> Option<&'static str> {
     None
 }
 
+/// Which resolution strategy succeeded.
+///
+/// Used in `resolve_unresolved_nodes` to decide whether per-edge rewiring is
+/// needed: Strategy 5 (CallerSchema) is caller-dependent — when multiple
+/// distinct caller schemas share the same unresolved node, each edge must be
+/// rewired to the target matching that edge's source-node schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolutionStrategy {
+    /// Strategy 1: Case-insensitive exact qualified-name match
+    ExactQualified,
+    /// Strategy 2: Bare name extracted from qualified (single unambiguous match)
+    BareNameQualified,
+    /// Strategy 3: Qualified prefix treated as package name
+    SchemaAsPackage,
+    /// Strategy 4: Unqualified bare name (single unambiguous match)
+    SingleBareName,
+    /// Strategy 5: Caller-schema disambiguation — **caller-dependent**
+    CallerSchema,
+    /// Strategy 6: Prefer schema=None (default schema)
+    DefaultSchema,
+    /// Strategy 7: Ambiguous — pick first candidate (best-effort)
+    Ambiguous,
+}
+
 /// Outcome of multi-strategy routine resolution.
 ///
-/// Either `Resolved(idx)` on success, or `Miss(trace)` with a diagnostic trace
-/// explaining why all 7 strategies failed.
+/// Either `Resolved(idx, strategy)` on success, or `Miss(trace)` with a
+/// diagnostic trace explaining why all 7 strategies failed.
 #[derive(Debug, Clone)]
 pub(crate) enum ResolveOutcome {
-    Resolved(petgraph::graph::NodeIndex),
+    Resolved(petgraph::graph::NodeIndex, ResolutionStrategy),
     Miss(StrategyTrace),
 }
 
@@ -3785,7 +3884,7 @@ fn try_resolve_routine(
     // because lower_qualified is keyed by display string which doesn't include kind)
     if let Some(&idx) = lower_qualified.get(&name_lower) {
         trace.s1_hit = true;
-        return ResolveOutcome::Resolved(idx);
+        return ResolveOutcome::Resolved(idx, ResolutionStrategy::ExactQualified);
     }
 
     // Strategy 2: If raw_name is "schema.name", try bare name in bare_name_lower
@@ -3797,7 +3896,7 @@ fn try_resolve_routine(
         // Try case-insensitive bare name (single unambiguous match)
         if let Some(matches) = bare_name_lower.get(&bare_lower) {
             if matches.len() == 1 {
-                return ResolveOutcome::Resolved(matches[0]);
+                return ResolveOutcome::Resolved(matches[0], ResolutionStrategy::BareNameQualified);
             }
         }
     }
@@ -3811,7 +3910,7 @@ fn try_resolve_routine(
         trace.s3_lookup = Some((pkg_part_lower.clone(), name_part_lower.clone()));
         if let Some(&idx) = pkg_member_lower.get(&(pkg_part_lower, name_part_lower)) {
             trace.s3_hit = true;
-            return ResolveOutcome::Resolved(idx);
+            return ResolveOutcome::Resolved(idx, ResolutionStrategy::SchemaAsPackage);
         }
     }
 
@@ -3819,7 +3918,7 @@ fn try_resolve_routine(
     if !raw_name.contains('.') {
         if let Some(matches) = bare_name_lower.get(&name_lower) {
             if matches.len() == 1 {
-                return ResolveOutcome::Resolved(matches[0]);
+                return ResolveOutcome::Resolved(matches[0], ResolutionStrategy::SingleBareName);
             }
         }
     }
@@ -3839,19 +3938,19 @@ fn try_resolve_routine(
                     .iter()
                     .find(|(s, _)| s.as_deref() == Some(caller_schema.as_str()))
                 {
-                    return ResolveOutcome::Resolved(idx);
+                    return ResolveOutcome::Resolved(idx, ResolutionStrategy::CallerSchema);
                 }
             }
 
             // Strategy 6: No caller-schema match — prefer schema=None (default schema).
             if let Some(&(_, idx)) = candidates.iter().find(|(s, _)| s.is_none()) {
-                return ResolveOutcome::Resolved(idx);
+                return ResolveOutcome::Resolved(idx, ResolutionStrategy::DefaultSchema);
             }
 
             // Strategy 7: Truly ambiguous — best-effort: pick first candidate.
             // For a static code graph this is better than leaving an Unresolved node,
             // because the user gets a starting point for investigation.
-            return ResolveOutcome::Resolved(candidates[0].1);
+            return ResolveOutcome::Resolved(candidates[0].1, ResolutionStrategy::Ambiguous);
         }
     }
 
@@ -6706,7 +6805,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         );
 
         match result {
-            super::ResolveOutcome::Resolved(idx) => assert_eq!(
+            super::ResolveOutcome::Resolved(idx, _) => assert_eq!(
                 idx, proc_idx,
                 "Resolved index must match the known procedure node"
             ),
@@ -6736,7 +6835,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         );
 
         match result {
-            super::ResolveOutcome::Resolved(_) => {
+            super::ResolveOutcome::Resolved(_, _) => {
                 panic!("Expected Miss for a name with no matching nodes")
             }
             super::ResolveOutcome::Miss(trace) => {
@@ -6825,7 +6924,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         );
 
         match result {
-            super::ResolveOutcome::Resolved(idx) => {
+            super::ResolveOutcome::Resolved(idx, _) => {
                 // S7 picks the first candidate registered (schema_a's entry).
                 assert_eq!(
                     idx, _idx_a,

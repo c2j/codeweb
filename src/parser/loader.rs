@@ -69,7 +69,7 @@ pub fn load_sql_files(input: &Path) -> Result<Vec<ParsedFile>> {
 pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
     use rayon::prelude::*;
 
-    paths
+    let mut files: Vec<ParsedFile> = paths
         .par_iter()
         .filter_map(|path| {
             parse_file(path).ok().map(|(statements, hash)| ParsedFile {
@@ -78,7 +78,9 @@ pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
                 content_hash: hash,
             })
         })
-        .collect()
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 fn decode_sql_bytes(bytes: Vec<u8>) -> String {
