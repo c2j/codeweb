@@ -209,6 +209,7 @@ impl Project {
         );
 
         const SQL_CHUNK_SIZE: usize = 500;
+        all_sql_paths.sort();
         let total_sql = all_sql_paths.len();
         let sql_chunks = total_sql.div_ceil(SQL_CHUNK_SIZE);
 
