@@ -741,15 +741,84 @@ impl GraphStore {
 
 // SQL matching functions moved to crate::sql_match
 
+/// Returns true if the query looks like a plain text search (no wildcards
+/// or regex metacharacters), making it safe for binary search optimization.
+fn is_simple_query(lower: &str) -> bool {
+    !lower.contains('*') && !lower.contains('?') && !lower.contains('\\')
+}
+
 impl GraphStore {
     /// Search nodes by name using the sorted name_index.
     /// Returns Vec of (NodeIndex, display_key) ranked by MatchRank (Exact > WordBoundary > Substring).
+    /// If `limit` is Some(n), returns at most n results after ranking.
     pub fn search_nodes(&self, query: &str) -> Vec<(NodeIndex, String)> {
+        self.search_nodes_limit(query, None)
+    }
+
+    /// Search nodes with optional result limit.
+    pub fn search_nodes_limit(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Vec<(NodeIndex, String)> {
         use crate::graph::traverse::MatchRank;
         let lower = query.to_lowercase();
         let mut results: Vec<(NodeIndex, String, MatchRank)> = Vec::new();
+        let mut seen: HashSet<NodeIndex> = HashSet::new();
 
+        // Fast path: binary search for exact and prefix matches.
+        // The name_index is sorted by lowercase key, so we can use
+        // binary search for O(log n) lookup on exact/prefix queries.
+        // Always followed by the full linear scan — fast path can miss
+        // substring matches that don't start with the query prefix.
+        if is_simple_query(&lower) {
+            // Try exact match first
+            let exact_pos = self
+                .name_index
+                .binary_search_by(|(k, _)| k.as_str().cmp(&lower));
+            if let Ok(pos) = exact_pos {
+                // Found exact match — collect all adjacent entries with
+                // the same key (multiple nodes can share the same
+                // lowercase key, e.g. same name in different schemas).
+                let mut i = pos;
+                while i > 0 && self.name_index[i - 1].0 == lower {
+                    i -= 1;
+                }
+                while i < self.name_index.len() && self.name_index[i].0 == lower {
+                    let idx = self.name_index[i].1;
+                    seen.insert(idx);
+                    let display =
+                        crate::graph::key::NodeKey::from_node(&self.graph[idx]).to_string();
+                    results.push((idx, display, MatchRank::Exact));
+                    i += 1;
+                }
+            } else {
+                // No exact match — try prefix match via partition_point.
+                let start = self
+                    .name_index
+                    .partition_point(|(k, _)| k.as_str() < lower.as_str());
+                let mut i = start;
+                while i < self.name_index.len() && self.name_index[i].0.starts_with(lower.as_str())
+                {
+                    let idx = self.name_index[i].1;
+                    if seen.insert(idx) {
+                        let display =
+                            crate::graph::key::NodeKey::from_node(&self.graph[idx]).to_string();
+                        if let Some(rank) = MatchRank::classify(&lower, &self.name_index[i].0) {
+                            results.push((idx, display, rank));
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // Full linear scan: catches substring matches the fast path
+        // missed (keys that contain the query but don't start with it).
         for (key_lower, idx) in &self.name_index {
+            if seen.contains(idx) {
+                continue;
+            }
             if !key_lower.contains(&lower) {
                 continue;
             }
@@ -872,19 +941,121 @@ impl GraphStore {
         results.sort_by(|a, b| {
             a.2.cmp(&b.2)
                 .then_with(|| {
-                    // Same rank: prefer nodes with more connections.
-                    // When proc and func share the same FQN (e.g. "public.do_work"),
-                    // the more-connected node (typically the procedure) is placed first.
                     let deg_a = self.graph.neighbors_undirected(a.0).count();
                     let deg_b = self.graph.neighbors_undirected(b.0).count();
                     deg_b.cmp(&deg_a)
                 })
                 .then_with(|| a.1.cmp(&b.1))
         });
-        results
-            .into_iter()
-            .map(|(idx, display, _)| (idx, display))
-            .collect()
+        let iter = results.into_iter().map(|(idx, display, _)| (idx, display));
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
+        }
+    }
+
+    /// Search nodes with explicit match mode.
+    ///
+    /// - `Exact`: binary search in name_index for exact lowercase key.
+    /// - `Regex`: compile query as regex, linear scan matching keys.
+    /// - `Substring`: delegates to `search_nodes()`.
+    pub fn search_nodes_with_mode(
+        &self,
+        query: &str,
+        mode: crate::graph::search::MatchMode,
+    ) -> Vec<(NodeIndex, String)> {
+        self.search_nodes_with_mode_limit(query, mode, None)
+    }
+
+    /// Search nodes with explicit match mode and optional result limit.
+    pub fn search_nodes_with_mode_limit(
+        &self,
+        query: &str,
+        mode: crate::graph::search::MatchMode,
+        limit: Option<usize>,
+    ) -> Vec<(NodeIndex, String)> {
+        match mode {
+            crate::graph::search::MatchMode::Substring => self.search_nodes_limit(query, limit),
+            crate::graph::search::MatchMode::Exact => {
+                let lower = query.to_lowercase();
+                let exact_pos = self
+                    .name_index
+                    .binary_search_by(|(k, _)| k.as_str().cmp(&lower));
+                match exact_pos {
+                    Ok(pos) => {
+                        let mut results = Vec::new();
+                        let mut i = pos;
+                        while i > 0 && self.name_index[i - 1].0 == lower {
+                            i -= 1;
+                        }
+                        while i < self.name_index.len() && self.name_index[i].0 == lower {
+                            let idx = self.name_index[i].1;
+                            let display =
+                                crate::graph::key::NodeKey::from_node(&self.graph[idx]).to_string();
+                            results.push((idx, display));
+                            i += 1;
+                        }
+                        results
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            crate::graph::search::MatchMode::Regex => {
+                let re = match regex::Regex::new(query) {
+                    Ok(r) => r,
+                    Err(_) => return Vec::new(),
+                };
+                let mut results: Vec<(NodeIndex, String)> = Vec::new();
+                for (key_lower, idx) in &self.name_index {
+                    if re.is_match(key_lower) {
+                        let display =
+                            crate::graph::key::NodeKey::from_node(&self.graph[*idx]).to_string();
+                        results.push((*idx, display));
+                    }
+                }
+                results
+            }
+        }
+    }
+
+    /// Resolve a single node name, handling ambiguity.
+    ///
+    /// Returns `Single` on unique match, `Multiple` when `all_matches` is true
+    /// and multiple hits exist, or `Empty` when `fail_on_multiple` is true for
+    /// ambiguous queries. Prints diagnostics to stderr when multiple matches
+    /// are found.
+    pub fn resolve_single_node(
+        &self,
+        name: &str,
+        mode: crate::graph::search::MatchMode,
+        all_matches: bool,
+        fail_on_multiple: bool,
+    ) -> crate::graph::search::ResolveResult {
+        use crate::graph::search::ResolveResult;
+        let matches = self.search_nodes_with_mode(name, mode);
+
+        if matches.is_empty() {
+            return ResolveResult::Empty;
+        }
+
+        if matches.len() == 1 {
+            return ResolveResult::Single(matches[0].0, matches[0].1.clone());
+        }
+
+        eprintln!("Multiple matches found:");
+        for (i, (_, display)) in matches.iter().enumerate() {
+            eprintln!("  {}: {}", i + 1, display);
+        }
+
+        if all_matches {
+            ResolveResult::Multiple(matches)
+        } else if fail_on_multiple {
+            eprintln!("Ambiguous match. Use --exact or refine the query.");
+            ResolveResult::Ambiguous
+        } else {
+            eprintln!("Using first match: {}", matches[0].1);
+            ResolveResult::Single(matches[0].0, matches[0].1.clone())
+        }
     }
 
     pub fn update_manifest(&mut self, records: Vec<FileRecord>) {
@@ -4694,6 +4865,723 @@ mod tests {
             p2_has_edge,
             "p2 should have edge to surviving Unresolved node"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Regression: search_nodes correctness (issue #116)
+    // These must pass identically before AND after binary search opt.
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn search_nodes_exact_match_returns_correct_node() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+
+        let pkg_idx = graph.add_node(crate::graph::Node::Package {
+            schema: Some("public".to_string()),
+            name: "pkg_a".to_string(),
+            location: loc.clone(),
+        });
+        let proc1_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_a".to_string()),
+                name: "proc_alpha".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let _proc2_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_a".to_string()),
+                name: "proc_alpha_beta".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        graph.add_edge(pkg_idx, proc1_idx, crate::graph::Edge::ContainsRoutine);
+        graph.add_edge(pkg_idx, _proc2_idx, crate::graph::Edge::ContainsRoutine);
+
+        let store = GraphStore::from_graph("test", graph);
+
+        // Exact match on "proc_alpha" should return BOTH proc_alpha and
+        // proc_alpha_beta (substring), with exact match ranked first.
+        let results = store.search_nodes("proc_alpha");
+        assert_eq!(
+            results.len(),
+            2,
+            "should match both proc_alpha and proc_alpha_beta"
+        );
+        // Exact match (proc_alpha) comes before substring match (proc_alpha_beta)
+        assert!(
+            results[0].1.contains("proc_alpha"),
+            "exact match should be first, got: {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn search_nodes_case_insensitive() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Function {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "func_gamma".to_string(),
+                kind: crate::graph::RoutineKind::Function,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+
+        // Case-insensitive search should still find the node
+        let results = store.search_nodes("FUNC_GAMMA");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("func_gamma"));
+
+        let results = store.search_nodes("Gamma");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("func_gamma"));
+    }
+
+    #[test]
+    fn search_nodes_package_substring_matches_package_procedures() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Package {
+            schema: Some("public".to_string()),
+            name: "pkg_b".to_string(),
+            location: loc.clone(),
+        });
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_b".to_string()),
+                name: "proc_one".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+
+        // Searching for "pkg_b" should match package and its procedure
+        let results = store.search_nodes("pkg_b");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_nodes_returns_empty_for_no_match_regress() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("nonexistent_table");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_nodes_multi_word_match_returns_all() {
+        // Regression: ensure that when multiple unrelated nodes match
+        // the same substring, ALL are returned (not just first).
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        for name in &["handler_init", "handler_process", "handler_cleanup"] {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: name.to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            });
+        }
+
+        let store = GraphStore::from_graph("test", graph);
+        let results = store.search_nodes("handler");
+        assert_eq!(results.len(), 3, "all 3 handler_* nodes should match");
+    }
+
+    #[test]
+    fn search_nodes_returns_prefix_and_substring_matches_together() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_a".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "proc_log".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_nodes("proc");
+        assert_eq!(
+            results.len(),
+            2,
+            "both proc:public.proc_a (prefix match) and table:public.proc_log (substring \
+             match) must be returned; fast path must not suppress substring hits"
+        );
+    }
+
+    #[test]
+    fn search_nodes_with_mode_exact_only_returns_exact_key_match() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "create_order".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "create_order_v2".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+
+        let results = store.search_nodes_with_mode(
+            "proc:public.create_order",
+            crate::graph::search::MatchMode::Exact,
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "exact mode should only return exact key match"
+        );
+        assert!(results[0].1.ends_with("create_order"));
+    }
+
+    #[test]
+    fn resolve_single_node_returns_single_on_unique_match() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "unique_proc".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+
+        let store = GraphStore::from_graph("test", graph);
+        let result = store.resolve_single_node(
+            "unique_proc",
+            crate::graph::search::MatchMode::Substring,
+            false,
+            false,
+        );
+
+        match result {
+            crate::graph::search::ResolveResult::Single(_idx, name) => {
+                assert!(name.contains("unique_proc"));
+            }
+            other => panic!("expected Single, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_single_node_returns_empty_on_no_match() {
+        let store = GraphStore::from_graph("test", CodeGraph::new());
+        let result = store.resolve_single_node(
+            "nonexistent",
+            crate::graph::search::MatchMode::Substring,
+            false,
+            false,
+        );
+        assert!(
+            matches!(result, crate::graph::search::ResolveResult::Empty),
+            "expected Empty, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_single_node_fail_on_multiple_returns_ambiguous() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        for name in &["do_work", "do_work_v2"] {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: name.to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            });
+        }
+
+        let store = GraphStore::from_graph("test", graph);
+        let result = store.resolve_single_node(
+            "do_work",
+            crate::graph::search::MatchMode::Substring,
+            false,
+            true,
+        );
+        assert!(
+            matches!(result, crate::graph::search::ResolveResult::Ambiguous),
+            "fail_on_multiple should return Ambiguous when ambiguous, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_single_node_all_matches_returns_multiple() {
+        let mut graph = CodeGraph::new();
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        for name in &["handler_a", "handler_b", "handler_c"] {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: name.to_string(),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            });
+        }
+
+        let store = GraphStore::from_graph("test", graph);
+        let result = store.resolve_single_node(
+            "handler",
+            crate::graph::search::MatchMode::Substring,
+            true,
+            false,
+        );
+
+        match result {
+            crate::graph::search::ResolveResult::Multiple(results) => {
+                assert_eq!(results.len(), 3);
+            }
+            other => panic!("expected Multiple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn summarize_tables_aggregates_child_proc_table_access() {
+        use std::collections::{BTreeMap, HashSet};
+
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = crate::graph::SourceLocation {
+            file: file.clone(),
+            line: 1,
+        };
+
+        let mut graph = CodeGraph::new();
+        let pkg = graph.add_node(crate::graph::Node::Package {
+            schema: Some("public".to_string()),
+            name: "pkg_test".to_string(),
+            location: loc.clone(),
+        });
+
+        let proc1 = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_test".to_string()),
+                name: "create_order".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let proc2 = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_test".to_string()),
+                name: "update_order".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let proc3 = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: Some("pkg_test".to_string()),
+                name: "read_customer".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+
+        graph.add_edge(pkg, proc1, crate::graph::Edge::ContainsRoutine);
+        graph.add_edge(pkg, proc2, crate::graph::Edge::ContainsRoutine);
+        graph.add_edge(pkg, proc3, crate::graph::Edge::ContainsRoutine);
+
+        let orders = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        let customers = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "customers".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        let audit_log = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "audit_log".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        let mut wk = HashSet::new();
+        wk.insert(crate::graph::WriteKind::Insert);
+        graph.add_edge(
+            proc1,
+            orders,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: wk.clone(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        graph.add_edge(
+            proc1,
+            audit_log,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: wk,
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+
+        let mut wk2 = HashSet::new();
+        wk2.insert(crate::graph::WriteKind::Update);
+        graph.add_edge(
+            proc2,
+            orders,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: wk2.clone(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        graph.add_edge(
+            proc2,
+            audit_log,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: wk2,
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+
+        graph.add_edge(
+            proc3,
+            customers,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+        let graph = store.graph();
+
+        let mut summary: BTreeMap<
+            String,
+            (crate::graph::AccessMode, HashSet<crate::graph::WriteKind>),
+        > = BTreeMap::new();
+        for edge_ref in graph.edges_directed(pkg, petgraph::Direction::Outgoing) {
+            if !matches!(edge_ref.weight(), crate::graph::Edge::ContainsRoutine) {
+                continue;
+            }
+            let child = edge_ref.target();
+            for ta_ref in graph.edges_directed(child, petgraph::Direction::Outgoing) {
+                if let crate::graph::Edge::TableAccess {
+                    flow_kind,
+                    modes,
+                    write_kinds,
+                    ..
+                } = ta_ref.weight()
+                {
+                    if *flow_kind != crate::graph::DataFlowKind::DmlAccess {
+                        continue;
+                    }
+                    let dst = ta_ref.target();
+                    if let crate::graph::Node::Table { name, .. } = &graph[dst] {
+                        let entry = summary
+                            .entry(name.clone())
+                            .or_insert_with(|| (crate::graph::AccessMode::empty(), HashSet::new()));
+                        entry.0 |= *modes;
+                        for wk in write_kinds {
+                            entry.1.insert(*wk);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(summary.len(), 3);
+        // orders: Insert from proc1 + Update from proc2
+        let o = summary.get("orders").unwrap();
+        assert!(o.0.contains(crate::graph::AccessMode::Write));
+        assert!(
+            o.1.contains(&crate::graph::WriteKind::Insert)
+                && o.1.contains(&crate::graph::WriteKind::Update)
+        );
+        // customers: Read only
+        let c = summary.get("customers").unwrap();
+        assert!(c.0.contains(crate::graph::AccessMode::Read));
+        assert!(!c.0.contains(crate::graph::AccessMode::Write));
+        // audit_log: Insert from two procs
+        let a = summary.get("audit_log").unwrap();
+        assert!(a.0.contains(crate::graph::AccessMode::Write));
+    }
+
+    #[test]
+    fn subgraph_filter_by_name_reduces_node_count() {
+        let file = Arc::new(PathBuf::from("test.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+
+        let mut graph = CodeGraph::new();
+        let proc_a = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "target_proc".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let proc_b = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "other_proc".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table = graph.add_node(crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "orders".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        graph.add_edge(
+            proc_a,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        graph.add_edge(
+            proc_b,
+            proc_a,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::CrossPackage,
+                location: loc,
+            },
+        );
+
+        let store = GraphStore::from_graph("test", graph);
+
+        // Filter by "target_proc" → should include target_proc, orders
+        // (direct neighbor), and proc_b (calls target_proc).
+        let matches = store.search_nodes("target_proc");
+        assert_eq!(matches.len(), 1);
+
+        let mut selected: HashSet<NodeIndex> = HashSet::new();
+        let graph = store.graph();
+        for (idx, _) in &matches {
+            selected.insert(*idx);
+            for n in graph.neighbors_directed(*idx, petgraph::Direction::Outgoing) {
+                selected.insert(n);
+            }
+            for n in graph.neighbors_directed(*idx, petgraph::Direction::Incoming) {
+                selected.insert(n);
+            }
+        }
+        // target_proc + orders (outgoing) + proc_b (incoming via DirectCall)
+        assert_eq!(selected.len(), 3);
+
+        // Edges between selected nodes: TableAccess + DirectCall
+        let edge_count: usize = graph
+            .edge_indices()
+            .filter(|e| {
+                let (s, d) = graph.edge_endpoints(*e).unwrap();
+                selected.contains(&s) && selected.contains(&d)
+            })
+            .count();
+        assert_eq!(edge_count, 2);
+    }
+
+    #[test]
+    fn search_nodes_limit_respects_limit() {
+        let file = Arc::new(PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation { file, line: 1 };
+        let mut graph = CodeGraph::new();
+        for i in 0..10 {
+            graph.add_node(crate::graph::Node::Procedure {
+                id: crate::graph::RoutineId {
+                    schema: Some("public".to_string()),
+                    package: None,
+                    name: format!("proc_{}", i),
+                    kind: crate::graph::RoutineKind::Procedure,
+                },
+                location: loc.clone(),
+                partial: false,
+                body_sql: Vec::new(),
+            });
+        }
+        let store = GraphStore::from_graph("test", graph);
+
+        let all = store.search_nodes("proc_");
+        assert_eq!(all.len(), 10, "should find all 10");
+
+        let limited = store.search_nodes_limit("proc_", Some(3));
+        assert_eq!(limited.len(), 3, "limit 3 should return 3 results");
     }
 
     #[cfg(feature = "search-sql-v2")]
