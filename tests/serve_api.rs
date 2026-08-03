@@ -201,4 +201,24 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["total"], 0);
     }
+
+    #[test]
+    fn test_serve_trace_empty_match_returns_200() {
+        let port = 19883;
+        let mut child = start_server(port);
+
+        let (status, body) = get(
+            port,
+            "/api/v1/trace?from=nonexistent_symbol_xyz_123",
+        );
+        stop_server(&mut child);
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["target"].is_null());
+        assert_eq!(json["callers"], serde_json::json!([]));
+        assert_eq!(json["callees"], serde_json::json!([]));
+        assert_eq!(json["caller_count"], 0);
+        assert_eq!(json["callee_count"], 0);
+    }
 }
