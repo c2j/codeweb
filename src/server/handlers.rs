@@ -34,9 +34,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/query", post(execute_query))
         .route("/api/v1/export", get(export))
         .route("/api/v1/graph", get(graph_data))
+        .fallback(super::assets::serve_asset)
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn(access_log::access_log_middleware))
-        .fallback(super::assets::serve_asset)
         .with_state(state)
 }
 
