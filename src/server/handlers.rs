@@ -447,13 +447,20 @@ struct DetailQuery {
 async fn trace(
     State(state): State<AppState>,
     Query(query): Query<TraceQuery>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Json<Value> {
     let store = state.store();
     let matches = store.search_nodes(&query.from);
     let graph = state.graph();
 
     if matches.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return Json(serde_json::json!({
+            "target": null,
+            "callers": [],
+            "callees": [],
+            "caller_count": 0,
+            "callee_count": 0,
+            "truncated": false,
+        }));
     }
 
     let (start_idx, _) = &matches[0];
@@ -475,7 +482,7 @@ async fn trace(
         "truncated": visited >= max_nodes,
     });
 
-    Ok(Json(result))
+    Json(result)
 }
 
 async fn execute_query(
