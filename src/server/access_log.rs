@@ -6,9 +6,10 @@ use std::sync::Mutex;
 
 use axum::extract::ConnectInfo;
 use axum::extract::Request;
-use axum::http::header;
+use axum::http::{header, Version};
 use axum::middleware::Next;
 use axum::response::Response;
+use chrono::Local;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -40,11 +41,15 @@ pub fn init(log_dir: &Path, log_level: LogLevel) {
 pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
+    let version = version_str(request.version()).to_string();
 
     let client_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().to_string());
+
+    let referer = header_str(request.headers(), header::REFERER);
+    let user_agent = header_str(request.headers(), header::USER_AGENT);
 
     let is_debug = LOG_LEVEL
         .lock()
@@ -61,6 +66,7 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let latency_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
+    let bytes = header_str(response.headers(), header::CONTENT_LENGTH);
 
     let resp_headers = if is_debug {
         extract_debug_headers(response.headers(), true)
@@ -68,19 +74,42 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
         None
     };
 
-    log_request(
-        method.as_str(),
-        &uri.to_string(),
+    log_request(&AccessEntry {
+        remote_addr: client_ip.as_deref(),
+        method: method.as_str(),
+        uri: &uri.to_string(),
+        version: &version,
         status,
+        bytes: &bytes,
+        referer: &referer,
+        user_agent: &user_agent,
         latency_ms,
-        client_ip.as_deref(),
-    );
+    });
 
     if let (Some(req_h), Some(resp_h)) = (req_headers, resp_headers) {
         log_debug_details(&req_h, &resp_h);
     }
 
     response
+}
+
+fn version_str(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/1.1",
+    }
+}
+
+fn header_str(headers: &axum::http::HeaderMap, name: axum::http::HeaderName) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
 }
 
 /// Extract key headers for debug logging.
@@ -137,85 +166,67 @@ fn is_static_asset(uri: &str) -> bool {
         || path.starts_with("favicon")
 }
 
-fn log_request(method: &str, uri: &str, status: u16, latency_ms: u64, remote_addr: Option<&str>) {
-    if is_static_asset(uri) {
+struct AccessEntry<'a> {
+    remote_addr: Option<&'a str>,
+    method: &'a str,
+    uri: &'a str,
+    version: &'a str,
+    status: u16,
+    bytes: &'a str,
+    referer: &'a str,
+    user_agent: &'a str,
+    latency_ms: u64,
+}
+
+fn log_request(entry: &AccessEntry) {
+    if is_static_asset(entry.uri) {
         return;
     }
 
-    let timestamp = chrono_now();
-    let ip_part = remote_addr.unwrap_or("-");
+    let ip_part = entry.remote_addr.unwrap_or("-");
+    let timestamp = clf_timestamp();
     let line = format!(
-        "{} INFO  \"{} {} HTTP/1.1\" {} {}ms {}",
-        timestamp, method, uri, status, latency_ms, ip_part
+        "{} - - [{}] \"{} {} {}\" {} {} \"{}\" \"{}\" {}ms",
+        ip_part,
+        timestamp,
+        entry.method,
+        entry.uri,
+        entry.version,
+        entry.status,
+        entry.bytes,
+        entry.referer,
+        entry.user_agent,
+        entry.latency_ms
     );
-    eprintln!("{}", &line);
+    eprintln!("{}", line);
 
     if let Ok(mut guard) = HTTP_LOG.lock() {
         if let Some(ref mut f) = *guard {
-            let _ = writeln!(f, "{}", &line);
+            let _ = writeln!(f, "{}", line);
         }
     }
 }
 
 fn log_debug_details(req_headers: &str, resp_headers: &str) {
-    let timestamp = chrono_now();
+    let timestamp = debug_timestamp();
     let req_line = format!("{} DEBUG req: {}", timestamp, req_headers);
     let resp_line = format!("{} DEBUG res: {}", timestamp, resp_headers);
-    eprintln!("{}", &req_line);
-    eprintln!("{}", &resp_line);
+    eprintln!("{}", req_line);
+    eprintln!("{}", resp_line);
 
     if let Ok(mut guard) = HTTP_LOG.lock() {
         if let Some(ref mut f) = *guard {
-            let _ = writeln!(f, "{}", &req_line);
-            let _ = writeln!(f, "{}", &resp_line);
+            let _ = writeln!(f, "{}", req_line);
+            let _ = writeln!(f, "{}", resp_line);
         }
     }
 }
 
-fn chrono_now() -> String {
-    let now = std::time::SystemTime::now();
-    let secs = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let h = time_of_day / 3600;
-    let m = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    let mut year = 1970_u32;
-    let mut remaining = days;
-    loop {
-        let dy = if is_leap(year) { 366 } else { 365 };
-        if remaining < dy {
-            break;
-        }
-        remaining -= dy;
-        year += 1;
-    }
-
-    let mut month = 1_u32;
-    let mut day = remaining + 1;
-    for &mo in &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] {
-        let md = if month == 2 && is_leap(year) {
-            mo + 1
-        } else {
-            mo
-        };
-        if day <= md {
-            break;
-        }
-        day -= md;
-        month += 1;
-    }
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, h, m, s
-    )
+/// Apache CLF timestamp: [dd/Mon/yyyy:HH:MM:SS +ZZZZ]
+fn clf_timestamp() -> String {
+    Local::now().format("%d/%b/%Y:%H:%M:%S %z").to_string()
 }
 
-fn is_leap(y: u32) -> bool {
-    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+fn debug_timestamp() -> String {
+    Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }

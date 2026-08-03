@@ -201,4 +201,47 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["total"], 0);
     }
+
+    #[test]
+    fn test_serve_trace_empty_returns_200() {
+        let port = 19883;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/trace?from=nonexistent_node_xyz");
+        stop_server(&mut child);
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["target"].is_null());
+        assert_eq!(json["caller_count"], 0);
+        assert_eq!(json["callee_count"], 0);
+        assert!(json["callers"].is_array());
+        assert!(json["callers"].as_array().unwrap().is_empty());
+        assert!(json["callees"].is_array());
+        assert!(json["callees"].as_array().unwrap().is_empty());
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[test]
+    fn test_serve_access_log_combined_format() {
+        let port = 19884;
+        let mut child = start_server(port);
+
+        let (status, _body) = get(port, "/api/v1/nodes/search-sql?q=zzz_unique_marker");
+        stop_server(&mut child);
+
+        assert_eq!(status, 200);
+        let log_path = project_root().join(".codeweb/http.log");
+        let content = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|_| panic!("http.log missing at {}", log_path.display()));
+        let re = regex::Regex::new(
+            r#"^\S+ - - \[\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}\] "GET /api/v1/nodes/search-sql\?q=zzz_unique_marker HTTP/1\.1" 200 (\d+|-)(\s+"[^"]*"){2} \d+ms$"#,
+        )
+        .unwrap();
+        assert!(
+            content.lines().any(|l| re.is_match(l)),
+            "no CLF access log line for request. log content:\n{}",
+            content
+        );
+    }
 }

@@ -14,7 +14,7 @@ default = ["cli", "tui", "jsp"]
 full = ["cli", "tui", "serve", "mcp", "jsp", "search-sql-v2"]
 cli = ["clap"]
 tui = ["ratatui", "crossterm"]
-serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
+serve = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess", "dep:chrono"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
 jsp = []
 search-sql-v2 = []
@@ -48,6 +48,7 @@ schemars = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
+chrono = { version = "0.4", optional = true }
 csv = "1"
 indicatif = "0.18.4"
 pathdiff = "0.2.3"

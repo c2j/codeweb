@@ -453,7 +453,14 @@ async fn trace(
     let graph = state.graph();
 
     if matches.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return Ok(Json(serde_json::json!({
+            "target": Value::Null,
+            "callers": [],
+            "callees": [],
+            "caller_count": 0,
+            "callee_count": 0,
+            "truncated": false,
+        })));
     }
 
     let (start_idx, _) = &matches[0];

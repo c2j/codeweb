@@ -344,6 +344,7 @@ name = "codeweb"
 version = "0.8.9"
 dependencies = [
  "axum",
+ "chrono",
  "bincode",
  "bitflags 2.13.1",
  "blake3",
