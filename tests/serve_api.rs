@@ -201,4 +201,37 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["total"], 0);
     }
+
+    #[test]
+    fn test_serve_access_log_combined_format() {
+        let port = 19883;
+        let mut child = start_server(port);
+
+        get(port, "/api/v1/stats");
+        let (status, _) = get(port, "/api/v1/nope-not-a-route");
+        assert_eq!(status, 404);
+        stop_server(&mut child);
+
+        let log_path = project_root().join(".codeweb/http.log");
+        let content = std::fs::read_to_string(&log_path)
+            .expect("http.log should be written to <project>/.codeweb/http.log");
+        let re = regex::Regex::new(
+            r#"^\S+ - - \[[0-9]{2}/[A-Z][a-z]{2}/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2} [+-][0-9]{4}\] "GET /api/v1/stats HTTP/1\.1" 200 - "[^"]*" "[^"]*" [0-9]+ms$"#,
+        )
+        .expect("valid regex");
+        assert!(
+            content.lines().any(|l| re.is_match(l)),
+            "expected a combined-format access log line, got:\n{}",
+            content
+        );
+        let re_404 = regex::Regex::new(
+            r#"^[^\s]+ - - \[[^\]]*\] "GET /api/v1/nope-not-a-route HTTP/1\.1" 404 - "[^"]*" "[^"]*" [0-9]+ms$"#,
+        )
+        .expect("valid 404 regex");
+        assert!(
+            content.lines().any(|l| re_404.is_match(l)),
+            "expected a 404 (fallback-served) request to be access-logged, got:\n{}",
+            content
+        );
+    }
 }
