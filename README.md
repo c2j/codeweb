@@ -331,6 +331,7 @@ cargo fmt -- --check         # format check
 
 ## Documentation
 
+- [Getting Started](docs/getting-started.md) — 30-minute tutorial with real examples
 - [User Guide](docs/user-guide.md) — Complete user manual (Chinese)
 - [Roadmap](docs/plans/roadmap.md) — Implementation roadmap (Chinese)
 - [CGEF User Guide](docs/cgef-user-guide.md) — Graph import/merge format (Chinese)
@@ -667,6 +668,7 @@ cargo fmt -- --check         # 格式检查
 
 ## 文档
 
+- [入门指南](docs/getting-started_zh.md) — 30 分钟上手教程（含可运行示例）
 - [用户指南](docs/user-guide.md) — 完整的用户使用手册
 - [实施路线图](docs/plans/roadmap.md) — 完整的实施计划
 - [CGEF 用户指南](docs/cgef-user-guide.md) — 图谱导入/合并格式说明
