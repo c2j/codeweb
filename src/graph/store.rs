@@ -1969,38 +1969,52 @@ impl GraphStore {
                     .push(edge_idx);
             }
 
-            let mut edges_removed_count = 0usize;
+            // Phase A: collect all edge data and TableAccess merge info
+            // BEFORE any removal. petgraph remove_edge uses swap_remove,
+            // so interleaving access with removal can panic when a cached
+            // EdgeIndex equals the swapped-out last slot.
+            let mut to_remove: Vec<petgraph::graph::EdgeIndex> = Vec::new();
             for ((_src, _dst, tag), mut group) in edge_groups {
                 if group.len() <= 1 {
                     continue;
                 }
                 let keep = group.remove(0);
-                for &remove_idx in &group {
-                    if tag == "table_access" {
-                        // Merge TableAccess modes/write_kinds from remove into keep.
-                        let extra = &self.graph[remove_idx];
-                        let (extra_modes, extra_kinds) =
-                            if let crate::graph::Edge::TableAccess {
-                                modes, write_kinds, ..
-                            } = extra
-                            {
-                                (*modes, write_kinds.clone())
-                            } else {
-                                unreachable!()
-                            };
+                if tag == "table_access" {
+                    // Merge modes/write_kinds from all remove edges into keep.
+                    let mut merged_modes: Option<crate::graph::AccessMode> = None;
+                    let mut merged_kinds: Vec<crate::graph::WriteKind> = Vec::new();
+                    for &remove_idx in &group {
                         if let crate::graph::Edge::TableAccess {
                             modes, write_kinds, ..
-                        } = &mut self.graph[keep]
+                        } = &self.graph[remove_idx]
                         {
-                            *modes |= extra_modes;
-                            write_kinds.extend(extra_kinds);
+                            merged_modes = Some(merged_modes.map_or(*modes, |m| m | *modes));
+                            merged_kinds.extend(write_kinds.iter().copied());
                         }
                     }
-                    self.graph.remove_edge(remove_idx);
-                    edges_removed_count += 1;
+                    if let Some(modes) = merged_modes {
+                        if let crate::graph::Edge::TableAccess {
+                            modes: keep_modes,
+                            write_kinds: keep_kinds,
+                            ..
+                        } = &mut self.graph[keep]
+                        {
+                            *keep_modes |= modes;
+                            keep_kinds.extend(merged_kinds);
+                        }
+                    }
                 }
+                to_remove.extend(group.iter().copied());
             }
-            edges_removed = edges_removed_count;
+
+            // Phase B: remove edges in descending index order.
+            // Higher indices removed first → lower pending indices stay valid.
+            to_remove.sort_unstable();
+            to_remove.dedup();
+            edges_removed = to_remove.len();
+            for idx in to_remove.into_iter().rev() {
+                self.graph.remove_edge(idx);
+            }
         }
 
         self.rebuild_all_indexes();
