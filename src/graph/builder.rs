@@ -3033,11 +3033,15 @@ impl GraphBuilder {
         let mut seen_from = std::collections::HashSet::new();
         merges.retain(|(from, _)| seen_from.insert(*from));
 
-        for (from_idx, into_idx) in merges {
-            // Guard: skip if the target was already removed in a previous
-            // merge iteration (can happen when a Phase 2 qualified node
-            // was also Phase 1's from_idx and got removed first).
-            if graph.node_weight(into_idx).is_none() {
+        // Phase A: rewire all edges from merged nodes to their targets.
+        // This must happen BEFORE any removal because petgraph's Graph uses
+        // swap_remove semantics — removing a node invalidates any cached
+        // NodeIndex that pointed to the old last slot. Doing all rewiring
+        // first (without removals) keeps every index in `merges` valid.
+        for &(from_idx, into_idx) in &merges {
+            // Skip if the target is no longer present (shouldn't happen
+            // before removal, but guard defensively).
+            if graph.node_weight(from_idx).is_none() || graph.node_weight(into_idx).is_none() {
                 continue;
             }
             let sources: Vec<_> = graph
@@ -3064,7 +3068,23 @@ impl GraphBuilder {
                     graph.add_edge(into_idx, dst, weight);
                 }
             }
-            graph.remove_node(from_idx);
+        }
+
+        // Phase B: remove all merged nodes in descending index order.
+        // Removing higher indices first guarantees lower indices stay
+        // valid under petgraph's swap_remove semantics (the same pattern
+        // used by resolve_unresolved_nodes).
+        let mut to_remove: Vec<petgraph::graph::NodeIndex> =
+            merges.iter().map(|(from, _)| *from).collect();
+        to_remove.sort_unstable();
+        to_remove.dedup();
+        for idx in to_remove.into_iter().rev() {
+            // Guard: the node may already be gone if a Phase 1 merge's
+            // from_idx was targeted as into_idx by another iteration
+            // (Phase A rewiring already handled that chain).
+            if graph.node_weight(idx).is_some() {
+                graph.remove_node(idx);
+            }
         }
     }
 
@@ -4169,7 +4189,13 @@ fn apply_deferred_column_comments(ctx: &mut GraphBuildContext) {
         let Some(&table_idx) = ctx.table_index.get(&dc.table_key) else {
             continue;
         };
-        if let Node::Table { columns, .. } = &mut ctx.graph[table_idx] {
+        // Guard: table_index may be stale after dedup_table_view_nodes
+        // merged/removed Table nodes. NodeIndex survives swap_remove only
+        // if it wasn't the swapped-out last slot.
+        let Some(node) = ctx.graph.node_weight_mut(table_idx) else {
+            continue;
+        };
+        if let Node::Table { columns, .. } = node {
             for col in columns.iter_mut() {
                 if col.name.eq_ignore_ascii_case(&dc.col_name) {
                     col.comment = Some(dc.comment.clone());
