@@ -296,9 +296,7 @@ impl<'a> GraphTraversal<'a> {
                 .as_ref()
                 .is_some_and(|u| u(&self.graph[neighbor]));
 
-            if is_until {
-                paths.push(current_path.clone());
-            } else if Some(neighbor) == self.target {
+            if is_until || Some(neighbor) == self.target {
                 paths.push(current_path.clone());
             } else {
                 self.dfs_paths_to_target(neighbor, depth + 1, visited, current_path, paths);

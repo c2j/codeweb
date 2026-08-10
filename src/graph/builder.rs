@@ -3269,14 +3269,14 @@ impl GraphBuilder {
                     // Collect source nodes with their schemas for per-edge logic.
                     let sources: Vec<(petgraph::graph::NodeIndex, Option<String>)> = graph
                         .neighbors_directed(*unres_idx, petgraph::Direction::Incoming)
-                        .filter_map(|src| {
+                        .map(|src| {
                             let schema = match &graph[src] {
                                 Node::Procedure { id, .. } | Node::Function { id, .. } => {
                                     id.schema.as_ref().map(|s| s.to_lowercase())
                                 }
                                 _ => None,
                             };
-                            Some((src, schema))
+                            (src, schema)
                         })
                         .collect();
 

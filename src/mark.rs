@@ -151,14 +151,14 @@ pub fn classify_row(
                 };
             }
         }
-        Node::Procedure { id, .. } | Node::Function { id, .. } => {
-            if contains_routine_call(sql_text, &id.name) {
-                let path = build_all_caller_paths(target_idx, target_idx, parent, store);
-                return MatchResult {
-                    match_type: MatchType::Direct,
-                    matched_by: Some(path),
-                };
-            }
+        Node::Procedure { id, .. } | Node::Function { id, .. }
+            if contains_routine_call(sql_text, &id.name) =>
+        {
+            let path = build_all_caller_paths(target_idx, target_idx, parent, store);
+            return MatchResult {
+                match_type: MatchType::Direct,
+                matched_by: Some(path),
+            };
         }
         _ => {}
     }

@@ -157,7 +157,7 @@ fn collect_java_refs_recursive(
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or("");
                 if let (Some(obj), m) = (object, method) {
-                    if !m.is_empty() && obj.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    if !m.is_empty() && obj.chars().next().is_some_and(|c| c.is_uppercase()) {
                         // Static method call: ClassName.method()
                         refs.push(JspJavaRef {
                             class_name: obj.to_string(),
