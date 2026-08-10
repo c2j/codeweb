@@ -603,7 +603,7 @@ async fn export(
         },
         "ndjson" => {
             let mut buf = Vec::new();
-            if let Err(_) = crate::export::ndjson::to_ndjson(graph, &mut buf) {
+            if crate::export::ndjson::to_ndjson(graph, &mut buf).is_err() {
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
             (

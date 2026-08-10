@@ -1990,9 +1990,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
             lines
         };
         for (i, l) in display.iter().enumerate() {
-            if i == display.len() - 1 && total <= max_lines {
-                println_stdout!("    sql:   {} [{}]", l, kind_tag);
-            } else if i == display.len() - 1 {
+            if i == display.len() - 1 {
                 println_stdout!("    sql:   {} [{}]", l, kind_tag);
             } else {
                 println_stdout!("    sql:   {}", l);
@@ -2440,18 +2438,20 @@ fn format_referenced_tables(graph: &crate::graph::CodeGraph, view_idx: NodeIndex
                     lines.push(format!("    {}", col.name));
                 }
             }
-            Node::View { location, .. } => {
-                if let Some(loc) = location {
-                    lines.push(format!(
-                        "  {}  {}  [file: {}:{}]",
-                        tag,
-                        display,
-                        loc.file.to_string_lossy(),
-                        loc.line
-                    ));
-                } else {
-                    lines.push(format!("  {}  {}", tag, display));
-                }
+            Node::View {
+                location: Some(loc),
+                ..
+            } => {
+                lines.push(format!(
+                    "  {}  {}  [file: {}:{}]",
+                    tag,
+                    display,
+                    loc.file.to_string_lossy(),
+                    loc.line
+                ));
+            }
+            Node::View { .. } => {
+                lines.push(format!("  {}  {}", tag, display));
             }
             Node::MaterializedView { location, .. } => {
                 lines.push(format!(

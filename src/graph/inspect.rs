@@ -257,6 +257,7 @@ fn build_reverse_adjacency(
 /// Recursively render a child node and its subtree in the reverse convergence tree.
 /// `edge_label` describes the call from this child to its parent.
 /// `visited` prevents infinite recursion on cyclic reverse adjacencies.
+#[allow(clippy::too_many_arguments)]
 fn render_reverse_child(
     graph: &CodeGraph,
     adj: &BTreeMap<NodeIndex, Vec<(NodeIndex, String)>>,
