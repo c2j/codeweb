@@ -673,7 +673,7 @@ enum Commands {
               value_parser = ["upstream", "downstream", "both"])]
         direction: String,
 
-        /// Maximum depth (default: 10)
+        /// Maximum depth for column-level lineage (table lineage is always 1-hop)
         #[arg(long, default_value = "10")]
         depth: usize,
 
@@ -4071,8 +4071,28 @@ fn cmd_lineage(
     };
     let graph = store.graph();
 
-    if target.contains('.') {
-        cmd_column_lineage(
+    // A `.` may separate schema.table (table lineage) or table.column (column
+    // lineage). Prefer table lineage when the full name matches a table/view.
+    let is_table = graph.node_indices().any(|idx| match &graph[idx] {
+        crate::graph::Node::Table { schema, name, .. } => {
+            let full = schema
+                .as_ref()
+                .map(|s| format!("{}.{}", s, name))
+                .unwrap_or_else(|| name.clone());
+            full.eq_ignore_ascii_case(target) || name.eq_ignore_ascii_case(target)
+        }
+        crate::graph::Node::View { schema, name, .. } => {
+            let full = schema
+                .as_ref()
+                .map(|s| format!("{}.{}", s, name))
+                .unwrap_or_else(|| name.clone());
+            full.eq_ignore_ascii_case(target) || name.eq_ignore_ascii_case(target)
+        }
+        _ => false,
+    });
+
+    if is_table || !target.contains('.') {
+        cmd_table_lineage(
             graph,
             target,
             direction,
@@ -4082,7 +4102,7 @@ fn cmd_lineage(
             show_procedures,
         )
     } else {
-        cmd_table_lineage(
+        cmd_column_lineage(
             graph,
             target,
             direction,
@@ -4507,10 +4527,11 @@ fn write_or_print(content: &str, output: Option<&Path>) -> Result<()> {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 

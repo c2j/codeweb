@@ -297,8 +297,8 @@ impl NodeKey {
                 ref name,
                 ..
             } => NodeKey::Column {
-                table: owner_table.clone(),
-                name: name.clone(),
+                table: owner_table.to_lowercase(),
+                name: name.to_lowercase(),
             },
         }
     }

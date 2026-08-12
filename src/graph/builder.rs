@@ -4316,16 +4316,20 @@ fn clean_col_owner(col_ref: &str) -> String {
     if let Some(dot) = col_ref.rfind('.') {
         let owner = &col_ref[..dot];
         let col_name = &col_ref[dot + 1..];
-        if owner.starts_with("proc:")
-            || owner.starts_with("func:")
-            || owner.starts_with("prc_")
-            || owner.starts_with("pkg_")
-            || owner.starts_with("fnc_")
-        {
+        if is_proc_owner(owner) {
             return col_name.to_string();
         }
     }
     col_ref.to_string()
+}
+
+/// Whether an owner name denotes a procedure/function (not a table/view).
+fn is_proc_owner(owner: &str) -> bool {
+    owner.starts_with("proc:")
+        || owner.starts_with("func:")
+        || owner.starts_with("prc_")
+        || owner.starts_with("pkg_")
+        || owner.starts_with("fnc_")
 }
 
 /// In-place clean of a column ID stored in edge data.
@@ -4726,15 +4730,17 @@ fn add_column_lineage_edges(
     count
 }
 
-/// Strip proc:/func: prefixes from ALL column node IDs and column edge data.
+/// Strip proc:/func:/prc_/pkg_/fnc_ owner prefixes from ALL column node IDs
+/// and column edge data, so no procedure-owned IDs leak into the final graph.
 fn clean_column_lineage(graph: &mut CodeGraph) {
     for idx in graph.node_indices().collect::<Vec<_>>() {
         if let Node::Column { ref mut id, .. } = graph[idx] {
-            if let Some(rest) = id
-                .strip_prefix("col:proc:")
-                .or_else(|| id.strip_prefix("col:func:"))
-            {
-                *id = format!("col:{}", rest);
+            if let Some(rest) = id.strip_prefix("col:") {
+                if let Some(dot) = rest.rfind('.') {
+                    if is_proc_owner(&rest[..dot]) {
+                        *id = format!("col:{}", &rest[dot + 1..]);
+                    }
+                }
             }
         }
     }
@@ -4785,12 +4791,16 @@ fn upsert_column_node(
     owner_table: &str,
     col_name: &str,
 ) -> petgraph::graph::NodeIndex {
-    // Strip proc:/func: prefixes so all column nodes use table names.
-    let clean_id = col_id
-        .strip_prefix("col:proc:")
-        .or_else(|| col_id.strip_prefix("col:func:"))
-        .map(|rest| format!("col:{}", rest))
-        .unwrap_or_else(|| col_id.to_string());
+    // Strip procedure/function owner prefixes so all column nodes use table names.
+    let clean_id = match col_id.strip_prefix("col:") {
+        Some(rest) => match rest.rfind('.') {
+            Some(dot) if is_proc_owner(&rest[..dot]) => {
+                format!("col:{}", &rest[dot + 1..])
+            }
+            _ => col_id.to_string(),
+        },
+        None => col_id.to_string(),
+    };
     if let Some(idx) = find_column_node(graph, &clean_id) {
         return idx;
     }
