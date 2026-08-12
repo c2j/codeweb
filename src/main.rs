@@ -1338,7 +1338,10 @@ fn cmd_lineage(
     let table_name = if target.contains('.') {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() != 2 {
-            eprintln!("Invalid target format: {}. Use 'table' or 'table.column'", target);
+            eprintln!(
+                "Invalid target format: {}. Use 'table' or 'table.column'",
+                target
+            );
             return Ok(());
         }
         parts[0]
@@ -1380,7 +1383,10 @@ fn cmd_lineage(
         "upstream" => graph::lineage::LineageDirection::Upstream,
         "downstream" => graph::lineage::LineageDirection::Downstream,
         _ => {
-            eprintln!("Unknown direction: {}. Use 'upstream' or 'downstream'", direction);
+            eprintln!(
+                "Unknown direction: {}. Use 'upstream' or 'downstream'",
+                direction
+            );
             return Ok(());
         }
     };
@@ -1391,7 +1397,8 @@ fn cmd_lineage(
     // Format and output
     match format.to_lowercase().as_str() {
         "tree" => {
-            let tree_str = graph::lineage::format_lineage_tree(&lineage_node, graph, lineage_dir, 0);
+            let tree_str =
+                graph::lineage::format_lineage_tree(&lineage_node, graph, lineage_dir, 0);
             println_stdout!("{}", tree_str);
         }
         "json" => {

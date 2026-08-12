@@ -41,7 +41,10 @@ fn project_with_sql(dir: &TempDir, sql: &str) -> std::path::PathBuf {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("t.sql"), sql).unwrap();
 
-    let out = run_codeweb_in(&root, &["init", "lineage-test", "--dir", src.to_str().unwrap()]);
+    let out = run_codeweb_in(
+        &root,
+        &["init", "lineage-test", "--dir", src.to_str().unwrap()],
+    );
     assert!(
         out.status.success(),
         "init failed: {}",
@@ -99,10 +102,22 @@ fn upstream_walks_back_through_writing_routines() {
     // final_tbl is written by prc_step2, which reads mid_tbl; mid_tbl is written by
     // prc_step1, which reads source_tbl.
     assert!(out.contains("final_tbl"), "missing root node:\n{out}");
-    assert!(out.contains("prc_step2"), "missing writer of final_tbl:\n{out}");
-    assert!(out.contains("mid_tbl"), "missing 1-hop upstream table:\n{out}");
-    assert!(out.contains("prc_step1"), "missing writer of mid_tbl:\n{out}");
-    assert!(out.contains("source_tbl"), "missing 2-hop upstream table:\n{out}");
+    assert!(
+        out.contains("prc_step2"),
+        "missing writer of final_tbl:\n{out}"
+    );
+    assert!(
+        out.contains("mid_tbl"),
+        "missing 1-hop upstream table:\n{out}"
+    );
+    assert!(
+        out.contains("prc_step1"),
+        "missing writer of mid_tbl:\n{out}"
+    );
+    assert!(
+        out.contains("source_tbl"),
+        "missing 2-hop upstream table:\n{out}"
+    );
 }
 
 #[test]
@@ -113,9 +128,18 @@ fn downstream_walks_forward_through_reading_routines() {
     let out = lineage(&root, "source_tbl", "downstream", "tree");
 
     assert!(out.contains("source_tbl"), "missing root node:\n{out}");
-    assert!(out.contains("prc_step1"), "missing reader of source_tbl:\n{out}");
-    assert!(out.contains("mid_tbl"), "missing 1-hop downstream table:\n{out}");
-    assert!(out.contains("final_tbl"), "missing 2-hop downstream table:\n{out}");
+    assert!(
+        out.contains("prc_step1"),
+        "missing reader of source_tbl:\n{out}"
+    );
+    assert!(
+        out.contains("mid_tbl"),
+        "missing 1-hop downstream table:\n{out}"
+    );
+    assert!(
+        out.contains("final_tbl"),
+        "missing 2-hop downstream table:\n{out}"
+    );
 }
 
 #[test]
@@ -139,7 +163,8 @@ fn json_output_is_a_nested_node_via_children_tree() {
     let root = project_with_sql(&dir, PIPELINE_SQL);
 
     let out = lineage(&root, "final_tbl", "upstream", "json");
-    let json: serde_json::Value = serde_json::from_str(&out).expect("lineage --format json must emit valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&out).expect("lineage --format json must emit valid JSON");
 
     assert!(json["node"].as_str().unwrap().contains("final_tbl"));
     assert!(json["via"]
@@ -199,10 +224,7 @@ CREATE VIEW v_derived AS SELECT id FROM base_tbl;
     for line in out.lines() {
         if let Some((node, label)) = line.split_once("  [") {
             let node = node.trim();
-            assert!(
-                !label.contains(node),
-                "node listed as its own step: {line}"
-            );
+            assert!(!label.contains(node), "node listed as its own step: {line}");
         }
     }
 }

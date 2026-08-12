@@ -41,7 +41,10 @@ fn project_with_sql(dir: &TempDir, sql: &str) -> std::path::PathBuf {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("t.sql"), sql).unwrap();
 
-    let out = run_codeweb_in(&root, &["init", "union-test", "--dir", src.to_str().unwrap()]);
+    let out = run_codeweb_in(
+        &root,
+        &["init", "union-test", "--dir", src.to_str().unwrap()],
+    );
     assert!(
         out.status.success(),
         "init failed: {}",
@@ -123,7 +126,10 @@ CREATE VIEW v_four AS
 
     let out = detail(&root, "v_four");
     for t in ["table:ta", "table:tb", "table:tc", "table:td"] {
-        assert!(out.contains(t), "{t} missing from view dependencies:\n{out}");
+        assert!(
+            out.contains(t),
+            "{t} missing from view dependencies:\n{out}"
+        );
     }
 }
 
@@ -167,6 +173,9 @@ CREATE VIEW v_par_bond AS
         "table:par_sys_assurance",
         "table:par_sys_debt_loan",
     ] {
-        assert!(out.contains(t), "{t} missing from view dependencies:\n{out}");
+        assert!(
+            out.contains(t),
+            "{t} missing from view dependencies:\n{out}"
+        );
     }
 }

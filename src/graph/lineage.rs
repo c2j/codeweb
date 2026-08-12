@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
 use petgraph::graph::NodeIndex;
-use petgraph::Direction;
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::graph::{CodeGraph, Edge, AccessMode};
+use crate::graph::{AccessMode, CodeGraph, Edge};
 
 /// Direction of lineage traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub struct LineageStep {
 pub struct LineageNode {
     pub idx: NodeIndex,
     pub _depth: usize,
-    pub steps: Vec<LineageStep>,  // How we got here (immediate incoming routine steps)
+    pub steps: Vec<LineageStep>, // How we got here (immediate incoming routine steps)
     pub children: Vec<LineageNode>,
 }
 
@@ -143,7 +143,9 @@ pub fn lineage_table(
                 for (routine_idx, routine_modes) in routine_accesses {
                     for edge_ref in graph.edges_directed(routine_idx, Direction::Outgoing) {
                         match edge_ref.weight() {
-                            Edge::TableAccess { modes, .. } if modes.contains(AccessMode::Write) => {
+                            Edge::TableAccess { modes, .. }
+                                if modes.contains(AccessMode::Write) =>
+                            {
                                 let target_table = edge_ref.target();
                                 if !visited.contains(&target_table) {
                                     visited.insert(target_table);
@@ -210,9 +212,7 @@ pub fn lineage_table(
     ) -> LineageNode {
         let (mut immediate_children, mut steps) = if let Some(entries) = children_map.get(&idx) {
             let mut stps: Vec<LineageStep> = entries.iter().map(|(_, s)| s.clone()).collect();
-            stps.sort_by(|a, b| {
-                a.routine_idx.index().cmp(&b.routine_idx.index())
-            });
+            stps.sort_by_key(|a| a.routine_idx.index());
             let children: Vec<LineageNode> = entries
                 .iter()
                 .map(|(child_template, _)| build_node(child_template.idx, children_map))
@@ -230,7 +230,7 @@ pub fn lineage_table(
         });
 
         // De-duplicate children
-        immediate_children.sort_by(|a, b| a.idx.index().cmp(&b.idx.index()));
+        immediate_children.sort_by_key(|a| a.idx.index());
         immediate_children.dedup_by(|a, b| a.idx == b.idx);
 
         LineageNode {
