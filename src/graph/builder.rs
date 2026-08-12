@@ -4315,7 +4315,7 @@ fn clean_col_owner(col_ref: &str) -> String {
     if let Some(dot) = col_ref.rfind('.') {
         let owner = &col_ref[..dot];
         let col_name = &col_ref[dot + 1..];
-        if owner.starts_with("proc:") || owner.starts_with("func:") {
+        if owner.starts_with("proc:") || owner.starts_with("func:") || owner.starts_with("prc_") || owner.starts_with("pkg_") || owner.starts_with("fnc_") {
             return col_name.to_string();
         }
     }
