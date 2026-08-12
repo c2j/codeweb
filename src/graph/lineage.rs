@@ -300,3 +300,323 @@ pub fn format_lineage_json(node: &LineageNode, graph: &CodeGraph) -> serde_json:
         "children": children_json,
     })
 }
+
+// ── Column-level lineage (#136) ──────────────────────────────────────────────
+
+use crate::parser::{ColumnMapping, ColumnSource, MappingKind};
+
+/// One column of one table or view, and where its value comes from (or goes to).
+#[derive(Debug, Clone)]
+pub struct ColumnLineageNode {
+    pub table: String,
+    pub column: String,
+    pub steps: Vec<ColumnLineageStep>,
+}
+
+/// A single hop of column-level data flow.
+#[derive(Debug, Clone)]
+pub struct ColumnLineageStep {
+    /// The routine performing the write (upstream) or the read (downstream).
+    pub via: NodeIndex,
+    pub kind: MappingKind,
+    /// Source expression text, when the value is not a plain column copy.
+    pub expression: Option<String>,
+    /// The column, literal, variable, or dynamic marker on the other side.
+    pub source: ColumnSource,
+    /// Set only when `source` is a column that could be resolved and walked further.
+    /// A literal, an unresolved variable, or dynamic SQL ends the chain here.
+    pub next: Option<ColumnLineageNode>,
+}
+
+/// Collect the column mappings a routine declares, deduplicated.
+///
+/// The same per-statement `ColumnAnalysis` is attached to every edge of that statement,
+/// so `INSERT INTO a SELECT FROM b` carries identical mappings on both the write edge to
+/// `a` and the read edge from `b`. Gathering across all of a routine's edges and then
+/// deduplicating is what keeps a self-referencing `UPDATE` from reporting every mapping
+/// twice.
+fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMapping> {
+    let mut out: Vec<ColumnMapping> = Vec::new();
+    for dir in [Direction::Outgoing, Direction::Incoming] {
+        for edge_ref in graph.edges_directed(routine, dir) {
+            if let Edge::TableAccess {
+                column_analysis: Some(analysis),
+                ..
+            } = edge_ref.weight()
+            {
+                for m in &analysis.column_mappings {
+                    if !out.contains(m) {
+                        out.push(m.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Find the Table or View node named `name`, case-insensitively.
+fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
+    graph.node_indices().find(|idx| {
+        let node_name = match &graph[*idx] {
+            crate::graph::Node::Table { name, .. } | crate::graph::Node::View { name, .. } => name,
+            _ => return false,
+        };
+        node_name.eq_ignore_ascii_case(name)
+    })
+}
+
+fn eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Trace one column's data flow.
+///
+/// Upstream answers "what feeds this column": for each routine writing the table, the
+/// mappings targeting this column, then recursively each of their source columns.
+/// Downstream answers "where does this column go": for each routine reading the table,
+/// the mappings that consume this column, then recursively their target columns.
+pub fn lineage_column(
+    graph: &CodeGraph,
+    table: &str,
+    column: &str,
+    direction: LineageDirection,
+    depth: usize,
+) -> ColumnLineageNode {
+    let mut seen = HashSet::new();
+    lineage_column_inner(graph, table, column, direction, depth, &mut seen)
+}
+
+fn lineage_column_inner(
+    graph: &CodeGraph,
+    table: &str,
+    column: &str,
+    direction: LineageDirection,
+    depth: usize,
+    seen: &mut HashSet<(String, String)>,
+) -> ColumnLineageNode {
+    let mut node = ColumnLineageNode {
+        table: table.to_string(),
+        column: column.to_string(),
+        steps: Vec::new(),
+    };
+
+    let key = (table.to_lowercase(), column.to_lowercase());
+    if depth == 0 || !seen.insert(key) {
+        return node;
+    }
+
+    let Some(table_idx) = find_table_node(graph, table) else {
+        return node;
+    };
+
+    // Routines on the relevant side of this table: writers for upstream, readers for
+    // downstream.
+    let wanted = match direction {
+        LineageDirection::Upstream => AccessMode::Write,
+        LineageDirection::Downstream => AccessMode::Read,
+    };
+    let mut routines: Vec<NodeIndex> = Vec::new();
+    for edge_ref in graph.edges_directed(table_idx, Direction::Incoming) {
+        if let Edge::TableAccess { modes, .. } = edge_ref.weight() {
+            if modes.contains(wanted) && !routines.contains(&edge_ref.source()) {
+                routines.push(edge_ref.source());
+            }
+        }
+    }
+
+    for routine in routines {
+        for mapping in mappings_of_routine(graph, routine) {
+            match direction {
+                LineageDirection::Upstream => {
+                    let targets_this_column = mapping
+                        .target_table
+                        .as_deref()
+                        .is_some_and(|t| eq(t, table))
+                        && eq(&mapping.target_column, column);
+                    if !targets_this_column {
+                        continue;
+                    }
+                    for source in &mapping.sources {
+                        let next = match source {
+                            ColumnSource::Column {
+                                table: Some(src_table),
+                                column: src_column,
+                            } => Some(lineage_column_inner(
+                                graph,
+                                src_table,
+                                src_column,
+                                direction,
+                                depth - 1,
+                                seen,
+                            )),
+                            _ => None,
+                        };
+                        node.steps.push(ColumnLineageStep {
+                            via: routine,
+                            kind: mapping.kind.clone(),
+                            expression: mapping.expression.clone(),
+                            source: source.clone(),
+                            next,
+                        });
+                    }
+                }
+                LineageDirection::Downstream => {
+                    // This column is consumed if it appears among the mapping's sources.
+                    let consumes_this_column = mapping.sources.iter().any(|s| match s {
+                        ColumnSource::Column {
+                            table: Some(t),
+                            column: c,
+                        } => eq(t, table) && eq(c, column),
+                        _ => false,
+                    });
+                    if !consumes_this_column {
+                        continue;
+                    }
+                    let Some(target_table) = mapping.target_table.as_deref() else {
+                        continue;
+                    };
+                    let next = lineage_column_inner(
+                        graph,
+                        target_table,
+                        &mapping.target_column,
+                        direction,
+                        depth - 1,
+                        seen,
+                    );
+                    node.steps.push(ColumnLineageStep {
+                        via: routine,
+                        kind: mapping.kind.clone(),
+                        expression: mapping.expression.clone(),
+                        source: ColumnSource::Column {
+                            table: Some(target_table.to_string()),
+                            column: mapping.target_column.clone(),
+                        },
+                        next: Some(next),
+                    });
+                }
+            }
+        }
+    }
+
+    seen.remove(&(table.to_lowercase(), column.to_lowercase()));
+    node
+}
+
+fn describe_kind(kind: &MappingKind) -> String {
+    match kind {
+        MappingKind::Direct => "direct".to_string(),
+        MappingKind::Derived => "derived".to_string(),
+        MappingKind::Aggregated { function, distinct } => {
+            if *distinct {
+                format!("{} DISTINCT", function)
+            } else {
+                function.clone()
+            }
+        }
+    }
+}
+
+fn describe_source(source: &ColumnSource) -> String {
+    match source {
+        ColumnSource::Column {
+            table: Some(t),
+            column,
+        } => format!("{}.{}", t, column),
+        ColumnSource::Column {
+            table: None,
+            column,
+        } => format!("?.{}", column),
+        ColumnSource::Literal { value } => format!("literal {}", value),
+        ColumnSource::Variable { name } => format!("variable {}", name),
+        ColumnSource::Dynamic => "dynamic SQL".to_string(),
+    }
+}
+
+pub fn format_column_lineage_tree(
+    node: &ColumnLineageNode,
+    graph: &CodeGraph,
+    direction: LineageDirection,
+    indent: usize,
+) -> String {
+    let mut out = String::new();
+    if indent == 0 {
+        out.push_str(&format!("{}.{}\n", node.table, node.column));
+    }
+    let pad = "  ".repeat(indent + 1);
+    let arrow = match direction {
+        LineageDirection::Upstream => "\u{2190}",
+        LineageDirection::Downstream => "\u{2192}",
+    };
+
+    // One mapping fans out into a step per source, all sharing its expression. Printing
+    // that expression on every line buries the sources it is meant to explain, so it is
+    // shown once per run and abbreviated when long.
+    let mut last_expression: Option<&str> = None;
+    for step in &node.steps {
+        let via = crate::graph::key::NodeKey::from_node(&graph[step.via]);
+        let mut line = format!(
+            "{}{} {}  [{}]",
+            pad,
+            arrow,
+            describe_source(&step.source),
+            describe_kind(&step.kind)
+        );
+        match step.expression.as_deref() {
+            Some(expr) if last_expression != Some(expr) => {
+                line.push_str(&format!(" {}", abbreviate(expr, 96)));
+                last_expression = Some(expr);
+            }
+            Some(_) => {}
+            None => last_expression = None,
+        }
+        line.push_str(&format!("  via {}", via));
+        out.push_str(&line);
+        out.push('\n');
+
+        if let Some(next) = &step.next {
+            out.push_str(&format_column_lineage_tree(
+                next,
+                graph,
+                direction,
+                indent + 1,
+            ));
+        }
+    }
+    out
+}
+
+/// Shorten an expression for display, cutting on a char boundary so multi-byte text
+/// (Chinese identifiers and string literals are common in this codebase) stays valid.
+fn abbreviate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    format!("{}…", head.trim_end())
+}
+
+pub fn format_column_lineage_json(
+    node: &ColumnLineageNode,
+    graph: &CodeGraph,
+) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = node
+        .steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "source": describe_source(&step.source),
+                "kind": describe_kind(&step.kind),
+                "expression": step.expression,
+                "via": crate::graph::key::NodeKey::from_node(&graph[step.via]).to_string(),
+                "next": step.next.as_ref().map(|n| format_column_lineage_json(n, graph)),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "table": node.table,
+        "column": node.column,
+        "steps": steps,
+    })
+}

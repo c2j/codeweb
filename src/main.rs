@@ -1334,20 +1334,59 @@ fn cmd_lineage(
     let store = proj.load_store()?;
     let graph = store.graph();
 
-    // Parse target: could be "table_name" or "table.column" for future column-level support
-    let table_name = if target.contains('.') {
-        let parts: Vec<&str> = target.split('.').collect();
-        if parts.len() != 2 {
+    // `table` traces the table; `table.column` traces one column through it.
+    let (table_name, column_name) = match target.split_once('.') {
+        Some((table, column)) if !table.is_empty() && !column.is_empty() => (table, Some(column)),
+        Some(_) => {
             eprintln!(
                 "Invalid target format: {}. Use 'table' or 'table.column'",
                 target
             );
             return Ok(());
         }
-        parts[0]
-    } else {
-        target
+        None => (target, None),
     };
+
+    // Parse direction up front — both the table and column paths need it.
+    let lineage_dir = match direction.to_lowercase().as_str() {
+        "upstream" => graph::lineage::LineageDirection::Upstream,
+        "downstream" => graph::lineage::LineageDirection::Downstream,
+        _ => {
+            eprintln!(
+                "Unknown direction: {}. Use 'upstream' or 'downstream'",
+                direction
+            );
+            return Ok(());
+        }
+    };
+
+    if let Some(column) = column_name {
+        let node = graph::lineage::lineage_column(graph, table_name, column, lineage_dir, depth);
+        if node.steps.is_empty() {
+            eprintln!(
+                "No column lineage for {}.{} — the column may be unknown, or its writers \
+                 may not have been analyzed with column mappings.",
+                table_name, column
+            );
+        }
+        match format.to_lowercase().as_str() {
+            "tree" => {
+                println_stdout!(
+                    "{}",
+                    graph::lineage::format_column_lineage_tree(&node, graph, lineage_dir, 0)
+                );
+            }
+            "json" => {
+                let json = graph::lineage::format_column_lineage_json(&node, graph);
+                match serde_json::to_string_pretty(&json) {
+                    Ok(s) => println_stdout!("{}", s),
+                    Err(e) => eprintln!("Failed to format JSON: {}", e),
+                }
+            }
+            _ => eprintln!("Unknown format: {}. Use 'tree' or 'json'", format),
+        }
+        return Ok(());
+    }
 
     // Find the table node (use substring matching for flexibility)
     let result = store.resolve_single_node(
@@ -1377,19 +1416,6 @@ fn cmd_lineage(
         eprintln!("'{}' is not a table or view", table_name);
         return Ok(());
     }
-
-    // Parse direction
-    let lineage_dir = match direction.to_lowercase().as_str() {
-        "upstream" => graph::lineage::LineageDirection::Upstream,
-        "downstream" => graph::lineage::LineageDirection::Downstream,
-        _ => {
-            eprintln!(
-                "Unknown direction: {}. Use 'upstream' or 'downstream'",
-                direction
-            );
-            return Ok(());
-        }
-    };
 
     // Compute lineage
     let lineage_node = graph::lineage::lineage_table(graph, table_idx, lineage_dir, depth);
