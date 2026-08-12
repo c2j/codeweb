@@ -145,6 +145,7 @@ fn node_name_and_schema(node: &Node) -> (String, Option<String>) {
             let preview: String = sql.chars().take(60).collect();
             (preview, None)
         }
+        Node::Column { name, .. } => (name.clone(), None),
     }
 }
 
@@ -173,6 +174,7 @@ fn node_json_type(node: &Node) -> &'static str {
         Node::JspPage { .. } => "jsp",
         #[cfg(feature = "jsp")]
         Node::JspSql { .. } => "jspsql",
+        Node::Column { .. } => "column",
     }
 }
 
@@ -198,5 +200,8 @@ fn edge_json_type(edge: &Edge) -> &str {
         Edge::IndexesTable { .. } => "indexes_table",
         Edge::AliasesObject { .. } => "aliases_object",
         Edge::CustomEdge { type_name, .. } => type_name.as_str(),
+        Edge::DataFlow { .. } => "data_flow",
+        Edge::Derived { .. } => "derived",
+        Edge::Aggregated { .. } => "aggregated",
     }
 }

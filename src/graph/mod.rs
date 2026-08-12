@@ -291,6 +291,19 @@ pub struct ProcedureBodySql {
     pub line: Option<usize>,
 }
 
+/// 聚合信息（OLAP 场景：区分维度键和聚合度量）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationInfo {
+    /// 聚合函数名 (SUM, COUNT, AVG, MAX, MIN, ...)
+    pub function: String,
+    /// 是否包含 DISTINCT
+    #[serde(default)]
+    pub distinct: bool,
+    /// GROUP BY 列列表
+    #[serde(default)]
+    pub group_by_cols: Vec<String>,
+}
+
 /// A node in the call graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
@@ -510,6 +523,30 @@ pub enum Node {
         #[serde(default)]
         parsed: bool,
     },
+    /// 列节点 — 列级血缘分析启用时创建
+    Column {
+        /// 稳定 ID: "col:<table_canonical>.<column_name>"
+        id: String,
+        /// 所属表/视图的 canonical 名称
+        owner_table: String,
+        /// 列名
+        name: String,
+        /// 数据类型（来自 DDL 推断，或 None）
+        #[serde(default)]
+        data_type: Option<String>,
+        /// 表达式文本（仅当列为计算派生列时非 None）
+        #[serde(default)]
+        expression: Option<String>,
+        /// 聚合信息（仅当列涉及聚合时非 None）
+        #[serde(default)]
+        aggregation: Option<Box<AggregationInfo>>,
+        /// 是否为 GROUP BY 键（OLAP: 维度列）
+        #[serde(default)]
+        is_grouping_key: bool,
+        /// 来源位置
+        #[serde(default)]
+        location: Option<SourceLocation>,
+    },
 }
 
 /// Returns the short type tag string for a node (e.g. "proc", "table", "mapper").
@@ -546,6 +583,7 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::JspPage { .. } => "jsp",
         #[cfg(feature = "jsp")]
         Node::JspSql { .. } => "jspsql",
+        Node::Column { .. } => "col",
     }
 }
 
@@ -567,7 +605,10 @@ pub fn node_display_name(node: &Node) -> String {
         let short = crate::parser::jsp_preprocessor::compute_display_name(file);
         return format!("jspsql:{}:{}", short, line);
     }
-    key::NodeKey::from_node(node).to_string()
+    match node {
+        Node::Column { ref id, .. } => id.clone(),
+        _ => key::NodeKey::from_node(node).to_string(),
+    }
 }
 
 /// Returns a detailed sub-type tag for nodes that have internal categories.
@@ -651,6 +692,34 @@ pub enum Edge {
     AliasesObject {
         location: SourceLocation,
     },
+    /// 列直接映射: source.col → target.col (SELECT a AS b)
+    DataFlow {
+        source_col_id: String,
+        target_col_id: String,
+        location: Option<SourceLocation>,
+    },
+    /// 列表达式派生: source.col(s) → target.col (SELECT a + 1 AS b)
+    Derived {
+        source_col_ids: Vec<String>,
+        target_col_id: String,
+        /// SQL 表达式文本
+        expression: String,
+        location: Option<SourceLocation>,
+    },
+    /// 列聚合: source.col → target.col (SELECT SUM(a) AS total GROUP BY x)
+    Aggregated {
+        source_col_ids: Vec<String>,
+        target_col_id: String,
+        /// 聚合函数名
+        function: String,
+        /// 是否 DISTINCT
+        #[serde(default)]
+        distinct: bool,
+        /// GROUP BY 列节点 ID 列表
+        #[serde(default)]
+        group_by_col_ids: Vec<String>,
+        location: Option<SourceLocation>,
+    },
     CustomEdge {
         type_name: String,
         properties: JsonMap,
@@ -674,6 +743,9 @@ impl Edge {
             #[cfg(feature = "jsp")]
             Edge::ContainsSql => EdgeCategory::Composition,
             Edge::TableAccess { .. } | Edge::DependsOn { .. } => EdgeCategory::DataFlow,
+            Edge::DataFlow { .. } | Edge::Derived { .. } | Edge::Aggregated { .. } => {
+                EdgeCategory::DataFlow
+            }
             Edge::TriggersRoutine { .. }
             | Edge::ReferencesType { .. }
             | Edge::UsesSequence { .. }
@@ -736,6 +808,10 @@ impl Node {
             Node::JspPage { path, .. } => path.as_path(),
             #[cfg(feature = "jsp")]
             Node::JspSql { file, .. } => file.as_path(),
+            Node::Column { location, .. } => location
+                .as_ref()
+                .map(|l| l.file.as_path())
+                .unwrap_or(Path::new("")),
         }
     }
 }

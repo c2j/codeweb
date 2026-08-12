@@ -36,6 +36,7 @@ pub enum NodeKind {
     JspPage,
     #[cfg(feature = "jsp")]
     JspSql,
+    Column,
 }
 
 impl NodeKind {
@@ -64,6 +65,7 @@ impl NodeKind {
             Node::JspPage { .. } => NodeKind::JspPage,
             #[cfg(feature = "jsp")]
             Node::JspSql { .. } => NodeKind::JspSql,
+            Node::Column { .. } => NodeKind::Column,
         }
     }
 
@@ -93,6 +95,7 @@ impl NodeKind {
             NodeKind::JspPage => "jsp",
             #[cfg(feature = "jsp")]
             NodeKind::JspSql => "jspsql",
+            NodeKind::Column => "col",
         }
     }
 }
@@ -139,6 +142,9 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
         Edge::ContainsMethod | Edge::ContainsRoutine => Some(config.composition),
         #[cfg(feature = "jsp")]
         Edge::ContainsSql => Some(config.composition),
+        Edge::DataFlow { .. } | Edge::Derived { .. } | Edge::Aggregated { .. } => {
+            Some(config.data_flow)
+        }
     }
 }
 

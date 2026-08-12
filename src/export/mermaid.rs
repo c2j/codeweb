@@ -128,6 +128,9 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
                 let short: String = sql.chars().take(30).collect();
                 (format!("{}|{}", kind.as_str(), short), ("[\"", "\"]"))
             }
+            Node::Column {
+                owner_table, name, ..
+            } => (format!("{}.{}", owner_table, name), ("[\"", "\"]")),
         };
         let safe_id = safe_mermaid_id(idx.index());
         let escaped = mermaid_escape(&label);
@@ -172,6 +175,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::IndexesTable { .. } => "-.->",
             Edge::AliasesObject { .. } => "-.->",
             Edge::CustomEdge { .. } => "-.->",
+            Edge::DataFlow { .. } | Edge::Derived { .. } | Edge::Aggregated { .. } => "-.->",
         };
 
         out.push_str(&format!("    {} {} {}\n", src_id, arrow, dst_id));

@@ -211,6 +211,13 @@ fn node_dot_line(graph: &CodeGraph, idx: NodeIndex) -> Option<String> {
                 ", style=filled, fillcolor=\"#FFFACD\"",
             )
         }
+        Node::Column {
+            owner_table, name, ..
+        } => (
+            format!("{}.{}", owner_table, name),
+            "ellipse",
+            ", style=filled, fillcolor=\"#E6E6FA\"",
+        ),
     };
     let escaped = dot_escape(&label);
     Some(format!(
@@ -378,6 +385,18 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
         Edge::CustomEdge { type_name, .. } => (
             format!("label=\"{}\"", dot_escape(type_name)),
             "style=dashed,".to_string(),
+        ),
+        Edge::DataFlow { .. } => ("label=\"df\"".to_string(), "color=deeppink,".to_string()),
+        Edge::Derived { expression, .. } => (
+            format!(
+                "label=\"derived:{}\"",
+                dot_escape(&truncate(expression, 20))
+            ),
+            "color=deeppink,".to_string(),
+        ),
+        Edge::Aggregated { function, .. } => (
+            format!("label=\"agg:{}\"", dot_escape(function)),
+            "color=deeppink,".to_string(),
         ),
     }
 }

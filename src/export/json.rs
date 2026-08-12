@@ -43,6 +43,7 @@ fn build_type_mapping() -> std::collections::BTreeMap<&'static str, &'static str
     m.insert("event", "event");
     m.insert("builtin", "builtin_function");
     m.insert("custom", "custom");
+    m.insert("col", "column");
     #[cfg(feature = "jsp")]
     {
         m.insert("jsp", "jsp");
@@ -245,6 +246,24 @@ enum NodeKindJson {
         kind: String,
         parsed: bool,
     },
+    #[serde(rename = "col")]
+    Column {
+        id: String,
+        owner_table: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expression: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggregation: Option<crate::graph::AggregationInfo>,
+        #[serde(skip_serializing_if = "is_false")]
+        is_grouping_key: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
+    },
 }
 
 #[derive(Serialize)]
@@ -312,6 +331,33 @@ enum EdgeKindJson {
     CustomEdge {
         custom_type: String,
         properties: serde_json::Value,
+        file: Option<String>,
+        line: Option<usize>,
+    },
+    #[serde(rename = "data_flow")]
+    DataFlow {
+        source_col_id: String,
+        target_col_id: String,
+        file: Option<String>,
+        line: Option<usize>,
+    },
+    #[serde(rename = "derived")]
+    Derived {
+        source_col_ids: Vec<String>,
+        target_col_id: String,
+        expression: String,
+        file: Option<String>,
+        line: Option<usize>,
+    },
+    #[serde(rename = "aggregated")]
+    Aggregated {
+        source_col_ids: Vec<String>,
+        target_col_id: String,
+        function: String,
+        #[serde(skip_serializing_if = "is_false")]
+        distinct: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        group_by_col_ids: Vec<String>,
         file: Option<String>,
         line: Option<usize>,
     },
@@ -675,6 +721,31 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     parsed: *parsed,
                 },
             },
+            Node::Column {
+                id,
+                owner_table,
+                name,
+                data_type,
+                expression,
+                aggregation,
+                is_grouping_key,
+                location,
+            } => NodeJson {
+                id: idx.index(),
+                kind: NodeKindJson::Column {
+                    id: id.clone(),
+                    owner_table: owner_table.clone(),
+                    name: name.clone(),
+                    data_type: data_type.clone(),
+                    expression: expression.clone(),
+                    aggregation: aggregation.as_deref().cloned(),
+                    is_grouping_key: *is_grouping_key,
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
+                },
+            },
         };
         nodes.push(node_json);
     }
@@ -886,6 +957,62 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::ContainsSql,
+            },
+            Edge::DataFlow {
+                source_col_id,
+                target_col_id,
+                location,
+            } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::DataFlow {
+                    source_col_id: source_col_id.clone(),
+                    target_col_id: target_col_id.clone(),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
+                },
+            },
+            Edge::Derived {
+                source_col_ids,
+                target_col_id,
+                expression,
+                location,
+            } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::Derived {
+                    source_col_ids: source_col_ids.clone(),
+                    target_col_id: target_col_id.clone(),
+                    expression: expression.clone(),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
+                },
+            },
+            Edge::Aggregated {
+                source_col_ids,
+                target_col_id,
+                function,
+                distinct,
+                group_by_col_ids,
+                location,
+            } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::Aggregated {
+                    source_col_ids: source_col_ids.clone(),
+                    target_col_id: target_col_id.clone(),
+                    function: function.clone(),
+                    distinct: *distinct,
+                    group_by_col_ids: group_by_col_ids.clone(),
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
+                },
             },
         };
         edges.push(edge_json);

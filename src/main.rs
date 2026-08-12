@@ -1417,6 +1417,7 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
         #[cfg(feature = "jsp")]
         Node::JspSql { .. } => std::borrow::Cow::Borrowed("jspsql"),
+        Node::Column { .. } => std::borrow::Cow::Borrowed("col"),
     }
 }
 
@@ -3353,6 +3354,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut builtin_functions = 0usize;
     let mut partial = 0usize;
     let mut custom_nodes = 0usize;
+    let mut columns = 0usize;
     #[cfg(feature = "jsp")]
     let mut jsp_pages = 0usize;
     #[cfg(feature = "jsp")]
@@ -3391,6 +3393,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::JspPage { .. } => jsp_pages += 1,
             #[cfg(feature = "jsp")]
             Node::JspSql { .. } => jsp_sql += 1,
+            Node::Column { .. } => columns += 1,
         }
     }
 
@@ -3405,14 +3408,14 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
 
     if include_unresolved {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} unresolved, {} builtin, {} edges{}",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, unresolved, builtin_functions, edges,
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} columns, {} unresolved, {} builtin, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, columns, unresolved, builtin_functions, edges,
             jsp_fragment
         );
     } else {
         eprintln!(
-            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} builtin, {} edges{}",
-            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, builtin_functions, edges,
+            "graph: {} procedures, {} functions, {} packages, {} triggers, {} types, {} sequences, {} indexes, {} views, {} materialized views, {} synonyms, {} events, {} tables, {} mappers, {} java-sql, {} java-methods, {} java-classes, {} custom, {} columns, {} builtin, {} edges{}",
+            procedures, functions, packages, triggers, types, sequences, indexes, views, materialized_views, synonyms, events, tables, mappers, java_sql, java_methods, java_classes, custom_nodes, columns, builtin_functions, edges,
             jsp_fragment
         );
     }
@@ -3936,6 +3939,9 @@ fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
         Edge::IndexesTable { location, .. } => Some(location.line),
         Edge::AliasesObject { location, .. } => Some(location.line),
         Edge::CustomEdge { location, .. } => location.as_ref().map(|l| l.line),
+        Edge::DataFlow { location, .. }
+        | Edge::Derived { location, .. }
+        | Edge::Aggregated { location, .. } => location.as_ref().map(|l| l.line),
         Edge::ContainsMethod | Edge::ContainsRoutine => None,
         #[cfg(feature = "jsp")]
         Edge::ContainsSql => None,

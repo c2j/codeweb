@@ -88,6 +88,11 @@ pub enum NodeKey {
         line: usize,
         sql_hash: String,
     },
+    /// 列节点
+    Column {
+        table: String,
+        name: String,
+    },
 }
 
 impl fmt::Display for NodeKey {
@@ -174,6 +179,9 @@ impl fmt::Display for NodeKey {
                 line,
                 sql_hash,
             } => write!(f, "jspsql:{}:{}:{}", file, line, sql_hash),
+            NodeKey::Column { table, name } => {
+                write!(f, "col:{}.{}", table, name)
+            }
         }
     }
 }
@@ -284,6 +292,14 @@ impl NodeKey {
                     sql_hash,
                 }
             }
+            super::Node::Column {
+                ref owner_table,
+                ref name,
+                ..
+            } => NodeKey::Column {
+                table: owner_table.clone(),
+                name: name.clone(),
+            },
         }
     }
 

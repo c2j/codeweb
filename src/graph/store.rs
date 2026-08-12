@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 6;
+const STORE_VERSION: u32 = 7;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +589,7 @@ impl GraphStore {
                 Node::JspPage { .. } => s.jsp_pages += 1,
                 #[cfg(feature = "jsp")]
                 Node::JspSql { .. } => s.jsp_sql += 1,
+                Node::Column { .. } => s.columns += 1,
             }
         }
         s.edges = self.graph.edge_count();
@@ -1703,6 +1704,7 @@ pub fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::JspPage { path, .. } => Some(path.clone()),
         #[cfg(feature = "jsp")]
         Node::JspSql { file, .. } => Some(file.clone()),
+        Node::Column { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
     }
 }
 
@@ -1742,6 +1744,9 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::CustomEdge { type_name, .. } => {
             return format!("custom:{}", type_name);
         }
+        crate::graph::Edge::DataFlow { .. } => "data_flow",
+        crate::graph::Edge::Derived { .. } => "derived",
+        crate::graph::Edge::Aggregated { .. } => "aggregated",
     }
     .to_string()
 }
@@ -1791,6 +1796,7 @@ pub struct StoreStats {
     pub builtin_functions: usize,
     pub custom_nodes: usize,
     pub custom_edges: usize,
+    pub columns: usize,
     pub edges: usize,
     pub files: usize,
     #[cfg(feature = "jsp")]

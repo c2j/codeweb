@@ -963,6 +963,7 @@ fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
         Node::JspPage { .. } => (std::borrow::Cow::Borrowed("jsp"), Color::LightYellow),
         #[cfg(feature = "jsp")]
         Node::JspSql { .. } => (std::borrow::Cow::Borrowed("jspsql"), Color::LightMagenta),
+        Node::Column { .. } => (std::borrow::Cow::Borrowed("col"), Color::LightBlue),
     }
 }
 
