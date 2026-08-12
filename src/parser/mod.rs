@@ -1,3 +1,4 @@
+mod column_lineage;
 mod extractor;
 pub mod fingerprint;
 pub mod ibatis_loader;
@@ -13,6 +14,8 @@ mod loader;
 pub mod scanner;
 pub mod snippet;
 
+#[allow(unused_imports)]
+pub use column_lineage::{ColumnEdge, ColumnLineageExtractor};
 #[allow(unused_imports)]
 pub use extractor::{
     extract_body_sql, pl_type_decl_name, CallEdge, CallExtractor, ColumnAccessExtractor,

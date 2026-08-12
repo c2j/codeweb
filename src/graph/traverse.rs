@@ -660,6 +660,257 @@ pub fn format_chain(
     }
 }
 
+/// A single hop in a column-level lineage path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ColumnLineageStep {
+    pub source_col_id: String,
+    pub target_col_id: String,
+    /// `"dataflow"` | `"derived"` | `"aggregated"`
+    pub edge_kind: String,
+    pub expression: Option<String>,
+    pub aggregation: Option<String>,
+    pub depth: usize,
+}
+
+/// Column-lineage query operations for [`crate::graph::CodeGraph`].
+pub trait ColumnLineageQuery {
+    /// Find a column node by its `col:<table>.<column>` id.
+    fn find_column_node(&self, col_id: &str) -> Option<NodeIndex>;
+
+    /// Trace column-level lineage from the given column node.
+    ///
+    /// `direction` is one of `"upstream"` (incoming lineage), `"downstream"`
+    /// (outgoing lineage) or `"both"`. Returns one path per leaf reached from
+    /// the start node; each path is a list of [`ColumnLineageStep`]s.
+    fn column_lineage(
+        &self,
+        col_id: &str,
+        direction: &str,
+        max_depth: usize,
+    ) -> Vec<Vec<ColumnLineageStep>>;
+
+    /// Human-readable description of a column node.
+    fn column_description(&self, col_id: &str) -> Option<String>;
+}
+
+impl ColumnLineageQuery for crate::graph::CodeGraph {
+    fn find_column_node(&self, col_id: &str) -> Option<NodeIndex> {
+        self.node_indices().find(|&idx| {
+            matches!(&self[idx], crate::graph::Node::Column { id, .. } if id == col_id)
+        })
+    }
+
+    fn column_lineage(
+        &self,
+        col_id: &str,
+        direction: &str,
+        max_depth: usize,
+    ) -> Vec<Vec<ColumnLineageStep>> {
+        let start_node = match self.find_column_node(col_id) {
+            Some(idx) => idx,
+            None => return vec![],
+        };
+
+        fn dfs(
+            graph: &crate::graph::CodeGraph,
+            current: NodeIndex,
+            depth: usize,
+            max_depth: usize,
+            direction: &str,
+            visited: &mut HashSet<NodeIndex>,
+            current_path: &mut Vec<ColumnLineageStep>,
+            all_paths: &mut Vec<Vec<ColumnLineageStep>>,
+        ) {
+            if depth > max_depth {
+                return;
+            }
+            visited.insert(current);
+
+            let edges: Vec<(NodeIndex, String, String, String, Option<String>, Option<String>)> =
+                if direction == "upstream" || direction == "both" {
+                    graph
+                        .edges_directed(current, Direction::Incoming)
+                        .filter_map(|e| {
+                            use petgraph::visit::EdgeRef;
+                            match &graph[e.id()] {
+                                crate::graph::Edge::DataFlow {
+                                    source_col_id,
+                                    target_col_id,
+                                    location: _,
+                                } => Some((
+                                    e.source(),
+                                    "dataflow".to_string(),
+                                    source_col_id.clone(),
+                                    target_col_id.clone(),
+                                    None,
+                                    None,
+                                )),
+                                crate::graph::Edge::Derived {
+                                    source_col_ids,
+                                    target_col_id,
+                                    expression,
+                                    location: _,
+                                } => Some((
+                                    e.source(),
+                                    "derived".to_string(),
+                                    source_col_ids.join(","),
+                                    target_col_id.clone(),
+                                    Some(expression.clone()),
+                                    None,
+                                )),
+                                crate::graph::Edge::Aggregated {
+                                    source_col_ids,
+                                    target_col_id,
+                                    function,
+                                    distinct: _,
+                                    group_by_col_ids: _,
+                                    location: _,
+                                } => Some((
+                                    e.source(),
+                                    "aggregated".to_string(),
+                                    source_col_ids.join(","),
+                                    target_col_id.clone(),
+                                    None,
+                                    Some(function.clone()),
+                                )),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                } else {
+                    graph
+                        .edges_directed(current, Direction::Outgoing)
+                        .filter_map(|e| {
+                            use petgraph::visit::EdgeRef;
+                            match &graph[e.id()] {
+                                crate::graph::Edge::DataFlow {
+                                    source_col_id,
+                                    target_col_id,
+                                    location: _,
+                                } => Some((
+                                    e.target(),
+                                    "dataflow".to_string(),
+                                    source_col_id.clone(),
+                                    target_col_id.clone(),
+                                    None,
+                                    None,
+                                )),
+                                crate::graph::Edge::Derived {
+                                    source_col_ids,
+                                    target_col_id,
+                                    expression,
+                                    location: _,
+                                } => Some((
+                                    e.target(),
+                                    "derived".to_string(),
+                                    source_col_ids.join(","),
+                                    target_col_id.clone(),
+                                    Some(expression.clone()),
+                                    None,
+                                )),
+                                crate::graph::Edge::Aggregated {
+                                    source_col_ids,
+                                    target_col_id,
+                                    function,
+                                    distinct: _,
+                                    group_by_col_ids: _,
+                                    location: _,
+                                } => Some((
+                                    e.target(),
+                                    "aggregated".to_string(),
+                                    source_col_ids.join(","),
+                                    target_col_id.clone(),
+                                    None,
+                                    Some(function.clone()),
+                                )),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                };
+
+            if edges.is_empty() {
+                if !current_path.is_empty() {
+                    all_paths.push(current_path.clone());
+                }
+                return;
+            }
+
+            for (neighbor, kind, source_id, target_id, expr, agg) in &edges {
+                if !visited.contains(neighbor) {
+                    let step = ColumnLineageStep {
+                        source_col_id: source_id.clone(),
+                        target_col_id: target_id.clone(),
+                        edge_kind: kind.clone(),
+                        expression: expr.clone(),
+                        aggregation: agg.clone(),
+                        depth: depth + 1,
+                    };
+                    current_path.push(step);
+
+                    dfs(
+                        graph,
+                        *neighbor,
+                        depth + 1,
+                        max_depth,
+                        direction,
+                        visited,
+                        current_path,
+                        all_paths,
+                    );
+
+                    current_path.pop();
+                }
+            }
+        }
+
+        let mut all_paths: Vec<Vec<ColumnLineageStep>> = vec![];
+        let mut visited = HashSet::new();
+        let mut path = vec![];
+        dfs(
+            self,
+            start_node,
+            0,
+            max_depth,
+            direction,
+            &mut visited,
+            &mut path,
+            &mut all_paths,
+        );
+
+        all_paths
+    }
+
+    /// Human-readable description of a column node.
+    fn column_description(&self, col_id: &str) -> Option<String> {
+        self.find_column_node(col_id).map(|idx| {
+            match &self[idx] {
+                crate::graph::Node::Column {
+                    owner_table,
+                    name,
+                    is_grouping_key,
+                    aggregation,
+                    expression,
+                    ..
+                } => {
+                    let mut desc = format!("{}.{}", owner_table, name);
+                    if *is_grouping_key {
+                        desc.push_str(" [GROUP BY key]");
+                    }
+                    if let Some(ref agg) = aggregation {
+                        desc.push_str(&format!(" [Aggregated: {}(DISTINCT)]", agg.function));
+                    }
+                    if let Some(ref expr) = expression {
+                        desc.push_str(&format!(" [Derived: {}]", expr));
+                    }
+                    desc
+                }
+                _ => col_id.to_string(),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1250,118 @@ mod tests {
                 edge
             );
         }
+    }
+
+    // ── column lineage traversal tests ──
+
+    fn add_column_node(
+        graph: &mut crate::graph::CodeGraph,
+        id: &str,
+        owner_table: &str,
+        name: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Column {
+            id: id.to_string(),
+            owner_table: owner_table.to_string(),
+            name: name.to_string(),
+            data_type: None,
+            expression: None,
+            aggregation: None,
+            is_grouping_key: false,
+            location: None,
+        })
+    }
+
+    #[test]
+    fn column_lineage_traces_upstream() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_column_node(&mut graph, "col:t.a", "t", "a");
+        let x = add_column_node(&mut graph, "col:v.x", "v", "x");
+        graph.add_edge(
+            a,
+            x,
+            crate::graph::Edge::DataFlow {
+                source_col_id: "col:t.a".into(),
+                target_col_id: "col:v.x".into(),
+                location: None,
+            },
+        );
+
+        let paths = graph.column_lineage("col:v.x", "upstream", 5);
+        assert_eq!(paths.len(), 1, "expected one upstream path");
+        assert_eq!(paths[0].len(), 1, "expected one step");
+        assert_eq!(paths[0][0].source_col_id, "col:t.a");
+        assert_eq!(paths[0][0].target_col_id, "col:v.x");
+        assert_eq!(paths[0][0].edge_kind, "dataflow");
+        assert_eq!(paths[0][0].depth, 1);
+    }
+
+    #[test]
+    fn column_lineage_traces_downstream() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_column_node(&mut graph, "col:t.a", "t", "a");
+        let x = add_column_node(&mut graph, "col:v.x", "v", "x");
+        graph.add_edge(
+            a,
+            x,
+            crate::graph::Edge::DataFlow {
+                source_col_id: "col:t.a".into(),
+                target_col_id: "col:v.x".into(),
+                location: None,
+            },
+        );
+
+        let paths = graph.column_lineage("col:t.a", "downstream", 5);
+        assert_eq!(paths.len(), 1, "expected one downstream path");
+        assert_eq!(paths[0][0].target_col_id, "col:v.x");
+        assert_eq!(paths[0][0].edge_kind, "dataflow");
+    }
+
+    #[test]
+    fn column_lineage_unknown_column_returns_empty() {
+        let graph = crate::graph::CodeGraph::new();
+        let paths = graph.column_lineage("col:missing.x", "upstream", 5);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn column_lineage_aggregated_edge_kind() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let b = add_column_node(&mut graph, "col:t.b", "t", "b");
+        let total = add_column_node(&mut graph, "col:v.total", "v", "total");
+        graph.add_edge(
+            b,
+            total,
+            crate::graph::Edge::Aggregated {
+                source_col_ids: vec!["col:t.b".into()],
+                target_col_id: "col:v.total".into(),
+                function: "SUM".into(),
+                distinct: false,
+                group_by_col_ids: vec![],
+                location: None,
+            },
+        );
+
+        let paths = graph.column_lineage("col:v.total", "upstream", 5);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0][0].edge_kind, "aggregated");
+        assert_eq!(paths[0][0].aggregation.as_deref(), Some("SUM"));
+    }
+
+    #[test]
+    fn column_description_formats_column() {
+        let mut graph = crate::graph::CodeGraph::new();
+        add_column_node(&mut graph, "col:t.a", "t", "a");
+        let desc = graph.column_description("col:t.a");
+        assert_eq!(desc.as_deref(), Some("t.a"));
+        assert_eq!(graph.column_description("col:missing.x"), None);
+    }
+
+    #[test]
+    fn find_column_node_lookup() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let idx = add_column_node(&mut graph, "col:t.a", "t", "a");
+        assert_eq!(graph.find_column_node("col:t.a"), Some(idx));
+        assert_eq!(graph.find_column_node("col:t.b"), None);
     }
 }

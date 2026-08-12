@@ -109,7 +109,13 @@ fn is_system(schema: Option<&str>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub struct GraphBuilder;
+pub struct GraphBuilder {
+    /// When enabled, column-level lineage edges (`DataFlow` / `Derived` /
+    /// `Aggregated`) are extracted from `SELECT` statements and injected into
+    /// the graph as `Node::Column` nodes. Default: disabled (MVP keeps column
+    /// lineage opt-in).
+    pub enable_column_lineage: bool,
+}
 
 /// A column comment from a standalone `COMMENT ON COLUMN` statement,
 /// deferred until all table columns are populated in `finalize_graph`.
@@ -167,11 +173,19 @@ pub(crate) struct ExtractedCall {
 
 impl GraphBuilder {
     pub fn new() -> Self {
-        Self
+        Self {
+            enable_column_lineage: false,
+        }
+    }
+
+    /// Enable or disable column-level lineage extraction.
+    pub fn with_column_lineage(mut self, enabled: bool) -> Self {
+        self.enable_column_lineage = enabled;
+        self
     }
 
     pub fn build(&self, files: &[ParsedFile]) -> CodeGraph {
-        Self::build_graph_internal(files, &[], &[], &[])
+        Self::build_graph_internal(files, &[], &[], &[], self.enable_column_lineage)
     }
 
     #[cfg_attr(feature = "jsp", allow(dead_code))]
@@ -181,6 +195,7 @@ impl GraphBuilder {
             &all.ibatis_files,
             &all.java_files,
             &all.java_method_results,
+            self.enable_column_lineage,
         )
     }
 
@@ -191,6 +206,7 @@ impl GraphBuilder {
             &all.ibatis_files,
             &all.java_files,
             &all.java_method_results,
+            self.enable_column_lineage,
         );
         GraphStore::from_graph(project_name, graph)
     }
@@ -200,10 +216,11 @@ impl GraphBuilder {
         ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         java_method_results: &[crate::parser::java_method::JavaParseResult],
+        enable_column_lineage: bool,
     ) -> CodeGraph {
         let mut ctx = GraphBuildContext::new();
 
-        Self::build_sql_chunk(&mut ctx, sql_files);
+        Self::build_sql_chunk(&mut ctx, sql_files, enable_column_lineage);
         Self::add_ibatis_nodes_from_parsed(
             ibatis_files,
             &mut ctx.graph,
@@ -239,7 +256,7 @@ impl GraphBuilder {
         jsp_files: &[crate::parser::jsp_loader::JspFileResult],
     ) -> CodeGraph {
         let mut ctx = GraphBuildContext::new();
-        Self::build_sql_chunk(&mut ctx, &all.sql_files);
+        Self::build_sql_chunk(&mut ctx, &all.sql_files, self.enable_column_lineage);
         Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
             &mut ctx.graph,
@@ -277,7 +294,11 @@ impl GraphBuilder {
     /// Process a single chunk of parsed SQL files into the accumulating context.
     /// The context's indices are updated so that subsequent chunks can
     /// reference nodes created in earlier chunks.
-    pub fn build_sql_chunk(ctx: &mut GraphBuildContext, sql_files: &[ParsedFile]) {
+    pub fn build_sql_chunk(
+        ctx: &mut GraphBuildContext,
+        sql_files: &[ParsedFile],
+        enable_column_lineage: bool,
+    ) {
         Self::create_sql_nodes(
             sql_files,
             &mut ctx.graph,
@@ -295,6 +316,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &ctx.type_index,
             &mut ctx.builtin_index,
+            enable_column_lineage,
         );
         Self::create_object_ref_edges(
             sql_files,
@@ -1574,6 +1596,7 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         builtin_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        enable_column_lineage: bool,
     ) {
         let mut all_edges = Vec::new();
 
@@ -1636,6 +1659,7 @@ impl GraphBuilder {
                                 proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
+                                enable_column_lineage,
                             );
                         }
                     }
@@ -1649,6 +1673,7 @@ impl GraphBuilder {
                                 proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
+                                enable_column_lineage,
                             );
                         }
                     }
@@ -1661,6 +1686,7 @@ impl GraphBuilder {
                             proc_index,
                             graph,
                             table_index,
+                            enable_column_lineage,
                         );
                     }
                     Statement::CreatePackageBody(pkg) => {
@@ -1672,6 +1698,7 @@ impl GraphBuilder {
                             proc_index,
                             graph,
                             table_index,
+                            enable_column_lineage,
                         );
                     }
                     _ => {}
@@ -2413,6 +2440,7 @@ impl GraphBuilder {
                         None,
                         graph,
                         table_index,
+                        false,
                     );
                 }
             }
@@ -2621,6 +2649,7 @@ impl GraphBuilder {
                         None,
                         graph,
                         table_index,
+                        false,
                     );
                 }
 
@@ -2673,6 +2702,7 @@ impl GraphBuilder {
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        enable_column_lineage: bool,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
@@ -2717,12 +2747,14 @@ impl GraphBuilder {
                         schema_part.as_deref(),
                         graph,
                         table_index,
+                        enable_column_lineage,
                     );
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_table_access_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
@@ -2730,7 +2762,10 @@ impl GraphBuilder {
         owner_schema: Option<&str>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        enable_column_lineage: bool,
     ) {
+        let lineage_owner = crate::graph::node_display_name(&graph[source_idx]);
+
         for info in statements {
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
@@ -2745,6 +2780,18 @@ impl GraphBuilder {
                 || !column_analysis.insert_columns.is_empty()
                 || !column_analysis.update_columns.is_empty()
                 || !column_analysis.select_into.is_empty();
+
+            if enable_column_lineage {
+                add_column_lineage_edges(
+                    graph,
+                    std::slice::from_ref(info),
+                    &lineage_owner,
+                    &SourceLocation {
+                        file: file_path.clone(),
+                        line: info.start_line,
+                    },
+                );
+            }
 
             for access in &extractor.accesses {
                 let key = if access.schema.is_none() && owner_schema.is_some() {
@@ -2927,6 +2974,7 @@ impl GraphBuilder {
                         None,
                         &mut ctx.graph,
                         &mut ctx.table_index,
+                        false,
                     );
                 }
             }
@@ -4256,6 +4304,217 @@ impl Default for GraphBuilder {
     }
 }
 
+/// Forwards `visit_select` to [`ColumnLineageExtractor::analyze_select_statement`]
+/// so that `walk_statement` analyzes SELECTs nested anywhere in a statement
+/// (e.g. inside a procedure body or an INSERT ... SELECT source).
+struct ColumnLineageWalker<'a> {
+    extractor: &'a mut crate::parser::ColumnLineageExtractor,
+}
+
+impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
+    fn visit_select(
+        &mut self,
+        select: &ogsql_parser::ast::SelectStatement,
+    ) -> ogsql_parser::VisitorResult {
+        self.extractor.analyze_select_statement(select);
+        ogsql_parser::VisitorResult::Continue
+    }
+}
+
+/// Extract column-level lineage from SELECT statements and add it to the graph.
+///
+/// Every `SELECT` reachable from `statements` (including nested selects inside
+/// procedure bodies and `INSERT ... SELECT` sources) is analyzed; the resulting
+/// `ColumnEdge`s become `Node::Column` nodes connected by `Edge::DataFlow` /
+/// `Edge::Derived` / `Edge::Aggregated` edges. Returns the number of edges added.
+fn add_column_lineage_edges(
+    graph: &mut CodeGraph,
+    statements: &[ogsql_parser::StatementInfo],
+    owner_table: &str,
+    location: &SourceLocation,
+) -> usize {
+    let mut extractor = crate::parser::ColumnLineageExtractor::new();
+    extractor.set_output(owner_table);
+
+    for info in statements {
+        let mut walker = ColumnLineageWalker {
+            extractor: &mut extractor,
+        };
+        walk_statement(&mut walker, &info.statement);
+    }
+
+    let column_edges = extractor.finish();
+    let mut count = 0;
+
+    for edge in &column_edges {
+        match edge {
+            crate::parser::ColumnEdge::Flow {
+                target_col,
+                source_table,
+                source_col,
+                location: _,
+            } => {
+                let source_owner = source_table.as_deref().unwrap_or(owner_table);
+                let source_id = format!("col:{}.{}", source_owner, source_col);
+                let target_id = format!("col:{}", target_col);
+
+                let source_idx = upsert_column_node(graph, &source_id, source_owner, source_col);
+                let target_idx = upsert_column_node(
+                    graph,
+                    &target_id,
+                    owner_table,
+                    extract_col_name(target_col),
+                );
+
+                graph.add_edge(
+                    source_idx,
+                    target_idx,
+                    Edge::DataFlow {
+                        source_col_id: source_id,
+                        target_col_id: target_id,
+                        location: Some(location.clone()),
+                    },
+                );
+                count += 1;
+            }
+            crate::parser::ColumnEdge::Derived {
+                target_col,
+                source_cols,
+                expression,
+                location: _,
+            } => {
+                let target_id = format!("col:{}", target_col);
+                let target_idx = upsert_column_node(
+                    graph,
+                    &target_id,
+                    owner_table,
+                    extract_col_name(target_col),
+                );
+
+                let mut source_ids = Vec::new();
+                let mut source_idxs = Vec::new();
+                for (src_table, src_col) in source_cols {
+                    let src_owner = src_table.as_deref().unwrap_or(owner_table);
+                    let src_id = format!("col:{}.{}", src_owner, src_col);
+                    let src_idx = upsert_column_node(graph, &src_id, src_owner, src_col);
+                    source_ids.push(src_id);
+                    source_idxs.push(src_idx);
+                }
+
+                for src_idx in source_idxs {
+                    graph.add_edge(
+                        src_idx,
+                        target_idx,
+                        Edge::Derived {
+                            source_col_ids: source_ids.clone(),
+                            target_col_id: target_id.clone(),
+                            expression: expression.clone(),
+                            location: Some(location.clone()),
+                        },
+                    );
+                }
+                count += 1;
+            }
+            crate::parser::ColumnEdge::Aggregated {
+                target_col,
+                source_cols,
+                function,
+                distinct,
+                group_by_cols,
+                location: _,
+            } => {
+                let target_id = format!("col:{}", target_col);
+                let target_idx = upsert_column_node(
+                    graph,
+                    &target_id,
+                    owner_table,
+                    extract_col_name(target_col),
+                );
+
+                let mut source_ids = Vec::new();
+                let mut source_idxs = Vec::new();
+                for (src_table, src_col) in source_cols {
+                    let src_owner = src_table.as_deref().unwrap_or(owner_table);
+                    let src_id = format!("col:{}.{}", src_owner, src_col);
+                    let src_idx = upsert_column_node(graph, &src_id, src_owner, src_col);
+                    source_ids.push(src_id);
+                    source_idxs.push(src_idx);
+                }
+
+                let group_by_col_ids: Vec<String> = group_by_cols
+                    .iter()
+                    .map(|c| format!("col:{}.{}", owner_table, c))
+                    .collect();
+
+                // Ensure GROUP BY column nodes exist and mark them as grouping keys
+                for gb_id in &group_by_col_ids {
+                    let gb_col_name = extract_col_name(gb_id);
+                    let gb_idx = upsert_column_node(graph, gb_id, owner_table, gb_col_name);
+                    if let Node::Column {
+                        ref mut is_grouping_key,
+                        ..
+                    } = graph[gb_idx]
+                    {
+                        *is_grouping_key = true;
+                    }
+                }
+
+                for src_idx in source_idxs {
+                    graph.add_edge(
+                        src_idx,
+                        target_idx,
+                        Edge::Aggregated {
+                            source_col_ids: source_ids.clone(),
+                            target_col_id: target_id.clone(),
+                            function: function.clone(),
+                            distinct: *distinct,
+                            group_by_col_ids: group_by_col_ids.clone(),
+                            location: Some(location.clone()),
+                        },
+                    );
+                }
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
+/// Find or create a column node, returning its `NodeIndex`.
+fn upsert_column_node(
+    graph: &mut CodeGraph,
+    col_id: &str,
+    owner_table: &str,
+    col_name: &str,
+) -> petgraph::graph::NodeIndex {
+    if let Some(idx) = find_column_node(graph, col_id) {
+        return idx;
+    }
+    graph.add_node(Node::Column {
+        id: col_id.to_string(),
+        owner_table: owner_table.to_string(),
+        name: col_name.to_string(),
+        data_type: None,
+        expression: None,
+        aggregation: None,
+        is_grouping_key: false,
+        location: None,
+    })
+}
+
+/// Find a column node by its `col:<table>.<column>` id.
+fn find_column_node(graph: &CodeGraph, col_id: &str) -> Option<petgraph::graph::NodeIndex> {
+    graph.node_indices().find(|&idx| {
+        matches!(&graph[idx], Node::Column { id, .. } if id == col_id)
+    })
+}
+
+/// Extract the column name from a `table.column` qualified name.
+fn extract_col_name(qualified: &str) -> &str {
+    qualified.rsplit('.').next().unwrap_or(qualified)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::graph::builder::GraphBuilder;
@@ -5054,7 +5313,7 @@ mod tests {
             statements: parse_sql("CREATE VIEW v1 AS SELECT * FROM bigfund.orders;"),
             content_hash: String::new(),
         };
-        GraphBuilder::build_sql_chunk(&mut ctx, &[file1]);
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file1], false);
 
         // Chunk 2: View "bigfund.orders" + bare Table "orders" from procedure
         let file2 = ParsedFile {
@@ -5070,7 +5329,7 @@ mod tests {
             ),
             content_hash: String::new(),
         };
-        GraphBuilder::build_sql_chunk(&mut ctx, &[file2]);
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file2], false);
 
         // This would panic before the fix. After the fix, it completes.
         GraphBuilder::finalize_graph(&mut ctx);
@@ -5803,7 +6062,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         };
 
         let mut ctx = GraphBuildContext::new();
-        GraphBuilder::build_sql_chunk(&mut ctx, &parsed_sql);
+        GraphBuilder::build_sql_chunk(&mut ctx, &parsed_sql, false);
         GraphBuilder::add_ibatis_nodes_from_parsed(
             std::slice::from_ref(&ibatis_file),
             &mut ctx.graph,
@@ -7247,5 +7506,95 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         } else {
             panic!("expected table node");
         }
+    }
+
+    // ── column lineage integration tests ──
+
+    #[test]
+    fn column_lineage_disabled_by_default() {
+        let sql = "CREATE OR REPLACE PROCEDURE p1() AS $$ BEGIN SELECT a AS x FROM t1; END; $$;";
+        let files = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let graph = GraphBuilder::new().build(&files);
+
+        let col_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Column { .. }))
+            .collect();
+        assert!(
+            col_nodes.is_empty(),
+            "column lineage must be disabled by default, found {} column nodes",
+            col_nodes.len()
+        );
+    }
+
+    #[test]
+    fn column_lineage_adds_flow_and_aggregated_edges_when_enabled() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p1() AS $$
+            BEGIN
+                SELECT a AS x FROM t1;
+                SELECT SUM(b) AS total FROM t2 GROUP BY c;
+            END;
+            $$;
+        "#;
+        let files = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let graph = GraphBuilder::new()
+            .with_column_lineage(true)
+            .build(&files);
+
+        let col_nodes: Vec<_> = graph
+            .node_indices()
+            .filter(|i| matches!(&graph[*i], Node::Column { .. }))
+            .collect();
+        assert!(
+            !col_nodes.is_empty(),
+            "expected column nodes when column lineage is enabled"
+        );
+
+        let has_dataflow = graph
+            .edge_indices()
+            .any(|e| matches!(&graph[e], Edge::DataFlow { .. }));
+        let has_aggregated = graph
+            .edge_indices()
+            .any(|e| matches!(&graph[e], Edge::Aggregated { .. }));
+        assert!(has_dataflow, "expected a DataFlow edge for SELECT a AS x");
+        assert!(
+            has_aggregated,
+            "expected an Aggregated edge for SELECT SUM(b) AS total"
+        );
+
+        let grouping_keys: Vec<_> = col_nodes
+            .iter()
+            .filter(|i| {
+                matches!(&graph[**i], Node::Column { is_grouping_key: true, .. })
+            })
+            .collect();
+        assert_eq!(grouping_keys.len(), 1, "expected exactly one GROUP BY key");
+    }
+
+    #[test]
+    fn column_lineage_derived_expression_edge() {
+        let sql = "CREATE OR REPLACE PROCEDURE p2() AS $$ BEGIN SELECT t.a + t.b AS c FROM t; END; $$;";
+        let files = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let graph = GraphBuilder::new()
+            .with_column_lineage(true)
+            .build(&files);
+
+        let has_derived = graph
+            .edge_indices()
+            .any(|e| matches!(&graph[e], Edge::Derived { .. }));
+        assert!(has_derived, "expected a Derived edge for SELECT t.a + t.b AS c");
     }
 }

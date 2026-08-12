@@ -230,7 +230,7 @@ impl Project {
                 all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Sql));
             }
 
-            GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+            GraphBuilder::build_sql_chunk(&mut ctx, &parsed, false);
             // parsed dropped here — AST memory freed
         }
 
