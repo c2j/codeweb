@@ -78,6 +78,48 @@ fn make_cursor_flow(table: &str, target_col: &str, c: &CursorColumn) -> ColumnEd
     }
 }
 
+/// Recursively collect field names referenced by a value expression.
+/// Handles simple field access (`r.accrual`) and complex expressions
+/// (`decode(..., r.accrual2, r.accrual)`, arithmetic, etc.).
+fn collect_expr_field_names(expr: &Expr) -> Vec<String> {
+    let mut names = Vec::new();
+    match expr {
+        Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+            if let Some(p) = parts.last() {
+                names.push(p.value.to_lowercase());
+            }
+        }
+        Expr::FieldAccess { field, .. } => {
+            names.push(field.to_lowercase());
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                names.extend(collect_expr_field_names(a));
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            names.extend(collect_expr_field_names(left));
+            names.extend(collect_expr_field_names(right));
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Parenthesized(inner) => {
+            names.extend(collect_expr_field_names(inner));
+        }
+        Expr::Case {
+            whens, else_expr, ..
+        } => {
+            for w in whens {
+                names.extend(collect_expr_field_names(&w.condition));
+                names.extend(collect_expr_field_names(&w.result));
+            }
+            if let Some(ref e) = else_expr {
+                names.extend(collect_expr_field_names(e));
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
 impl ColumnLineageExtractor {
     pub fn new() -> Self {
         Self {
@@ -180,34 +222,35 @@ impl ColumnLineageExtractor {
                     .cloned()
                     .unwrap_or_else(|| format!("col_{}", i));
 
-                let var_name = match value {
-                    Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
-                        parts.last().map(|p| p.value.to_lowercase())
-                    }
-                    Expr::FieldAccess { field, .. } => Some(field.to_lowercase()),
-                    _ => None,
-                };
+                // Collect field names referenced by this value expression.
+                //   Simple field access: r.accrual → ["accrual"]
+                //   Complex expression: decode(..., r.accrual2, r.accrual) → ["accrual2", "accrual"]
+                let field_names = collect_expr_field_names(value);
+                if field_names.is_empty() {
+                    continue;
+                }
 
-                let Some(var_name) = var_name else { continue };
-
-                let mut found = false;
-                for (cursor, vars) in &self.fetch_vars {
-                    if let Some(pos) = vars.iter().position(|v| v.to_lowercase() == var_name) {
-                        if let Some(src_cols) = self.cursor_sources.get(cursor) {
-                            if let Some(c) = src_cols.get(pos) {
-                                new_edges.push(make_cursor_flow(table, &target_col, c));
-                                found = true;
+                for field_name in &field_names {
+                    let mut found = false;
+                    for (cursor, vars) in &self.fetch_vars {
+                        if let Some(pos) = vars.iter().position(|v| v.to_lowercase() == *field_name)
+                        {
+                            if let Some(src_cols) = self.cursor_sources.get(cursor) {
+                                if let Some(c) = src_cols.get(pos) {
+                                    new_edges.push(make_cursor_flow(table, &target_col, c));
+                                    found = true;
+                                }
                             }
                         }
                     }
-                }
-                if !found {
-                    for src_cols in self.cursor_sources.values() {
-                        if let Some(c) = src_cols
-                            .iter()
-                            .find(|c| c.output_name.to_lowercase() == var_name)
-                        {
-                            new_edges.push(make_cursor_flow(table, &target_col, c));
+                    if !found {
+                        for src_cols in self.cursor_sources.values() {
+                            if let Some(c) = src_cols
+                                .iter()
+                                .find(|c| c.output_name.to_lowercase() == *field_name)
+                            {
+                                new_edges.push(make_cursor_flow(table, &target_col, c));
+                            }
                         }
                     }
                 }
