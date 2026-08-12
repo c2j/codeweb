@@ -1027,7 +1027,14 @@ fn run() -> Result<()> {
             format,
             output,
             project,
-        }) => cmd_lineage(&target, &direction, depth, &format, output.as_deref(), &project),
+        }) => cmd_lineage(
+            &target,
+            &direction,
+            depth,
+            &format,
+            output.as_deref(),
+            &project,
+        ),
         Some(Commands::Inspect {
             nodes,
             project,
@@ -4031,6 +4038,7 @@ fn print_grouped_entries(entries: &[ImpactEntry]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_lineage(
     target: &str,
     direction: &str,
@@ -4039,8 +4047,6 @@ fn cmd_lineage(
     output: Option<&Path>,
     project: &Path,
 ) -> Result<()> {
-    use crate::graph::traverse::ColumnLineageQuery;
-
     let mut proj = project::Project::find(project)?;
     let store = match proj.load_store() {
         Ok(s) => s,
@@ -4058,6 +4064,7 @@ fn cmd_lineage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_column_lineage(
     graph: &crate::graph::CodeGraph,
     col_target: &str,
@@ -4114,7 +4121,7 @@ fn cmd_table_lineage(
     format: &str,
     output: Option<&Path>,
 ) -> Result<()> {
-    use crate::graph::{node_display_name, AccessMode, Edge, Node};
+    use crate::graph::{node_display_name, Node};
 
     let table_node = graph.node_indices().find(|&idx| match &graph[idx] {
         Node::Table { name, .. } => name.eq_ignore_ascii_case(table_target),
@@ -4280,15 +4287,11 @@ fn format_col_lineage_tree(
     out
 }
 
-fn format_col_lineage_table(
-    paths: &[Vec<crate::graph::traverse::ColumnLineageStep>],
-) -> String {
+fn format_col_lineage_table(paths: &[Vec<crate::graph::traverse::ColumnLineageStep>]) -> String {
     let mut out = String::from(
         "SOURCE_COLUMN           | TRANSFORM       | TARGET_COLUMN           | DEPTH\n",
     );
-    out.push_str(
-        "------------------------+-----------------+-------------------------+-------\n",
-    );
+    out.push_str("------------------------+-----------------+-------------------------+-------\n");
     for path in paths {
         for step in path {
             let expr = step.expression.as_deref().unwrap_or("-");
@@ -4304,6 +4307,7 @@ fn format_col_lineage_table(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_tbl_lineage_tree(
     graph: &crate::graph::CodeGraph,
     target: &str,
@@ -4356,11 +4360,9 @@ fn format_tbl_lineage_table(
 
 fn write_or_print(content: &str, output: Option<&Path>) -> Result<()> {
     if let Some(path) = output {
-        std::fs::write(path, content).map_err(|e| {
-            crate::error::CodeWebError::FileRead {
-                path: path.to_path_buf(),
-                source: e,
-            }
+        std::fs::write(path, content).map_err(|e| crate::error::CodeWebError::FileRead {
+            path: path.to_path_buf(),
+            source: e,
         })?;
         eprintln!("Output written to {}", path.display());
     } else {

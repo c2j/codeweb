@@ -690,16 +690,18 @@ pub trait ColumnLineageQuery {
     ) -> Vec<Vec<ColumnLineageStep>>;
 
     /// Human-readable description of a column node.
+    #[allow(dead_code)]
     fn column_description(&self, col_id: &str) -> Option<String>;
 }
 
 impl ColumnLineageQuery for crate::graph::CodeGraph {
     fn find_column_node(&self, col_id: &str) -> Option<NodeIndex> {
-        self.node_indices().find(|&idx| {
-            matches!(&self[idx], crate::graph::Node::Column { id, .. } if id == col_id)
-        })
+        self.node_indices().find(
+            |&idx| matches!(&self[idx], crate::graph::Node::Column { id, .. } if id == col_id),
+        )
     }
 
+    #[allow(clippy::type_complexity)]
     fn column_lineage(
         &self,
         col_id: &str,
@@ -711,6 +713,7 @@ impl ColumnLineageQuery for crate::graph::CodeGraph {
             None => return vec![],
         };
 
+        #[allow(clippy::too_many_arguments)]
         fn dfs(
             graph: &crate::graph::CodeGraph,
             current: NodeIndex,
@@ -726,108 +729,114 @@ impl ColumnLineageQuery for crate::graph::CodeGraph {
             }
             visited.insert(current);
 
-            let edges: Vec<(NodeIndex, String, String, String, Option<String>, Option<String>)> =
-                if direction == "upstream" || direction == "both" {
-                    graph
-                        .edges_directed(current, Direction::Incoming)
-                        .filter_map(|e| {
-                            use petgraph::visit::EdgeRef;
-                            match &graph[e.id()] {
-                                crate::graph::Edge::DataFlow {
-                                    source_col_id,
-                                    target_col_id,
-                                    location: _,
-                                } => Some((
-                                    e.source(),
-                                    "dataflow".to_string(),
-                                    source_col_id.clone(),
-                                    target_col_id.clone(),
-                                    None,
-                                    None,
-                                )),
-                                crate::graph::Edge::Derived {
-                                    source_col_ids,
-                                    target_col_id,
-                                    expression,
-                                    location: _,
-                                } => Some((
-                                    e.source(),
-                                    "derived".to_string(),
-                                    source_col_ids.join(","),
-                                    target_col_id.clone(),
-                                    Some(expression.clone()),
-                                    None,
-                                )),
-                                crate::graph::Edge::Aggregated {
-                                    source_col_ids,
-                                    target_col_id,
-                                    function,
-                                    distinct: _,
-                                    group_by_col_ids: _,
-                                    location: _,
-                                } => Some((
-                                    e.source(),
-                                    "aggregated".to_string(),
-                                    source_col_ids.join(","),
-                                    target_col_id.clone(),
-                                    None,
-                                    Some(function.clone()),
-                                )),
-                                _ => None,
-                            }
-                        })
-                        .collect()
-                } else {
-                    graph
-                        .edges_directed(current, Direction::Outgoing)
-                        .filter_map(|e| {
-                            use petgraph::visit::EdgeRef;
-                            match &graph[e.id()] {
-                                crate::graph::Edge::DataFlow {
-                                    source_col_id,
-                                    target_col_id,
-                                    location: _,
-                                } => Some((
-                                    e.target(),
-                                    "dataflow".to_string(),
-                                    source_col_id.clone(),
-                                    target_col_id.clone(),
-                                    None,
-                                    None,
-                                )),
-                                crate::graph::Edge::Derived {
-                                    source_col_ids,
-                                    target_col_id,
-                                    expression,
-                                    location: _,
-                                } => Some((
-                                    e.target(),
-                                    "derived".to_string(),
-                                    source_col_ids.join(","),
-                                    target_col_id.clone(),
-                                    Some(expression.clone()),
-                                    None,
-                                )),
-                                crate::graph::Edge::Aggregated {
-                                    source_col_ids,
-                                    target_col_id,
-                                    function,
-                                    distinct: _,
-                                    group_by_col_ids: _,
-                                    location: _,
-                                } => Some((
-                                    e.target(),
-                                    "aggregated".to_string(),
-                                    source_col_ids.join(","),
-                                    target_col_id.clone(),
-                                    None,
-                                    Some(function.clone()),
-                                )),
-                                _ => None,
-                            }
-                        })
-                        .collect()
-                };
+            let edges: Vec<(
+                NodeIndex,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            )> = if direction == "upstream" || direction == "both" {
+                graph
+                    .edges_directed(current, Direction::Incoming)
+                    .filter_map(|e| {
+                        use petgraph::visit::EdgeRef;
+                        match &graph[e.id()] {
+                            crate::graph::Edge::DataFlow {
+                                source_col_id,
+                                target_col_id,
+                                location: _,
+                            } => Some((
+                                e.source(),
+                                "dataflow".to_string(),
+                                source_col_id.clone(),
+                                target_col_id.clone(),
+                                None,
+                                None,
+                            )),
+                            crate::graph::Edge::Derived {
+                                source_col_ids,
+                                target_col_id,
+                                expression,
+                                location: _,
+                            } => Some((
+                                e.source(),
+                                "derived".to_string(),
+                                source_col_ids.join(","),
+                                target_col_id.clone(),
+                                Some(expression.clone()),
+                                None,
+                            )),
+                            crate::graph::Edge::Aggregated {
+                                source_col_ids,
+                                target_col_id,
+                                function,
+                                distinct: _,
+                                group_by_col_ids: _,
+                                location: _,
+                            } => Some((
+                                e.source(),
+                                "aggregated".to_string(),
+                                source_col_ids.join(","),
+                                target_col_id.clone(),
+                                None,
+                                Some(function.clone()),
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            } else {
+                graph
+                    .edges_directed(current, Direction::Outgoing)
+                    .filter_map(|e| {
+                        use petgraph::visit::EdgeRef;
+                        match &graph[e.id()] {
+                            crate::graph::Edge::DataFlow {
+                                source_col_id,
+                                target_col_id,
+                                location: _,
+                            } => Some((
+                                e.target(),
+                                "dataflow".to_string(),
+                                source_col_id.clone(),
+                                target_col_id.clone(),
+                                None,
+                                None,
+                            )),
+                            crate::graph::Edge::Derived {
+                                source_col_ids,
+                                target_col_id,
+                                expression,
+                                location: _,
+                            } => Some((
+                                e.target(),
+                                "derived".to_string(),
+                                source_col_ids.join(","),
+                                target_col_id.clone(),
+                                Some(expression.clone()),
+                                None,
+                            )),
+                            crate::graph::Edge::Aggregated {
+                                source_col_ids,
+                                target_col_id,
+                                function,
+                                distinct: _,
+                                group_by_col_ids: _,
+                                location: _,
+                            } => Some((
+                                e.target(),
+                                "aggregated".to_string(),
+                                source_col_ids.join(","),
+                                target_col_id.clone(),
+                                None,
+                                Some(function.clone()),
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            };
 
             if edges.is_empty() {
                 if !current_path.is_empty() {
@@ -882,31 +891,30 @@ impl ColumnLineageQuery for crate::graph::CodeGraph {
     }
 
     /// Human-readable description of a column node.
+    #[allow(dead_code)]
     fn column_description(&self, col_id: &str) -> Option<String> {
-        self.find_column_node(col_id).map(|idx| {
-            match &self[idx] {
-                crate::graph::Node::Column {
-                    owner_table,
-                    name,
-                    is_grouping_key,
-                    aggregation,
-                    expression,
-                    ..
-                } => {
-                    let mut desc = format!("{}.{}", owner_table, name);
-                    if *is_grouping_key {
-                        desc.push_str(" [GROUP BY key]");
-                    }
-                    if let Some(ref agg) = aggregation {
-                        desc.push_str(&format!(" [Aggregated: {}(DISTINCT)]", agg.function));
-                    }
-                    if let Some(ref expr) = expression {
-                        desc.push_str(&format!(" [Derived: {}]", expr));
-                    }
-                    desc
+        self.find_column_node(col_id).map(|idx| match &self[idx] {
+            crate::graph::Node::Column {
+                owner_table,
+                name,
+                is_grouping_key,
+                aggregation,
+                expression,
+                ..
+            } => {
+                let mut desc = format!("{}.{}", owner_table, name);
+                if *is_grouping_key {
+                    desc.push_str(" [GROUP BY key]");
                 }
-                _ => col_id.to_string(),
+                if let Some(ref agg) = aggregation {
+                    desc.push_str(&format!(" [Aggregated: {}(DISTINCT)]", agg.function));
+                }
+                if let Some(ref expr) = expression {
+                    desc.push_str(&format!(" [Derived: {}]", expr));
+                }
+                desc
             }
+            _ => col_id.to_string(),
         })
     }
 }

@@ -179,6 +179,7 @@ impl GraphBuilder {
     }
 
     /// Enable or disable column-level lineage extraction.
+    #[allow(dead_code)]
     pub fn with_column_lineage(mut self, enabled: bool) -> Self {
         self.enable_column_lineage = enabled;
         self
@@ -4505,9 +4506,9 @@ fn upsert_column_node(
 
 /// Find a column node by its `col:<table>.<column>` id.
 fn find_column_node(graph: &CodeGraph, col_id: &str) -> Option<petgraph::graph::NodeIndex> {
-    graph.node_indices().find(|&idx| {
-        matches!(&graph[idx], Node::Column { id, .. } if id == col_id)
-    })
+    graph
+        .node_indices()
+        .find(|&idx| matches!(&graph[idx], Node::Column { id, .. } if id == col_id))
 }
 
 /// Extract the column name from a `table.column` qualified name.
@@ -7546,9 +7547,7 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             statements: parse_sql(sql),
             content_hash: String::new(),
         }];
-        let graph = GraphBuilder::new()
-            .with_column_lineage(true)
-            .build(&files);
+        let graph = GraphBuilder::new().with_column_lineage(true).build(&files);
 
         let col_nodes: Vec<_> = graph
             .node_indices()
@@ -7574,7 +7573,13 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
         let grouping_keys: Vec<_> = col_nodes
             .iter()
             .filter(|i| {
-                matches!(&graph[**i], Node::Column { is_grouping_key: true, .. })
+                matches!(
+                    &graph[**i],
+                    Node::Column {
+                        is_grouping_key: true,
+                        ..
+                    }
+                )
             })
             .collect();
         assert_eq!(grouping_keys.len(), 1, "expected exactly one GROUP BY key");
@@ -7582,19 +7587,21 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
 
     #[test]
     fn column_lineage_derived_expression_edge() {
-        let sql = "CREATE OR REPLACE PROCEDURE p2() AS $$ BEGIN SELECT t.a + t.b AS c FROM t; END; $$;";
+        let sql =
+            "CREATE OR REPLACE PROCEDURE p2() AS $$ BEGIN SELECT t.a + t.b AS c FROM t; END; $$;";
         let files = vec![ParsedFile {
             path: PathBuf::from("test.sql"),
             statements: parse_sql(sql),
             content_hash: String::new(),
         }];
-        let graph = GraphBuilder::new()
-            .with_column_lineage(true)
-            .build(&files);
+        let graph = GraphBuilder::new().with_column_lineage(true).build(&files);
 
         let has_derived = graph
             .edge_indices()
             .any(|e| matches!(&graph[e], Edge::Derived { .. }));
-        assert!(has_derived, "expected a Derived edge for SELECT t.a + t.b AS c");
+        assert!(
+            has_derived,
+            "expected a Derived edge for SELECT t.a + t.b AS c"
+        );
     }
 }
