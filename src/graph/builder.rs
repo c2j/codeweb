@@ -4317,6 +4317,12 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
         &mut self,
         select: &ogsql_parser::ast::SelectStatement,
     ) -> ogsql_parser::VisitorResult {
+        // Extract per-SELECT alias map from the FROM clause to avoid
+        // alias shadowing across different sub-selects in the same procedure.
+        self.extractor
+            .set_alias_map(crate::parser::ColumnLineageExtractor::extract_aliases_from_from(
+                &select.from,
+            ));
         self.extractor.analyze_select_statement(select);
         ogsql_parser::VisitorResult::Continue
     }
@@ -4338,13 +4344,6 @@ fn add_column_lineage_edges(
     extractor.set_output(owner_table);
 
     for info in statements {
-        // Run the base ColumnAccessExtractor first to populate alias_map
-        // (resolves aliases like "t" → "mid_yjqs_detail" for physical table names)
-        let mut base_extractor = crate::parser::ColumnAccessExtractor::new();
-        walk_statement(&mut base_extractor, &info.statement);
-        let base_analysis = base_extractor.finish();
-        extractor.set_alias_map(base_analysis.alias_map);
-
         let mut walker = ColumnLineageWalker {
             extractor: &mut extractor,
         };

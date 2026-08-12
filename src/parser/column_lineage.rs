@@ -97,6 +97,19 @@ impl ColumnLineageExtractor {
         self.base.set_alias_map(aliases);
     }
 
+    /// Extract table aliases from a SELECT's FROM clause.
+    /// Returns a fresh alias_map scoped to this SELECT only,
+    /// avoiding alias shadowing across sub-selects.
+    pub fn extract_aliases_from_from(
+        from: &[ogsql_parser::ast::TableRef],
+    ) -> BTreeMap<String, crate::parser::TableAlias> {
+        let mut aliases = BTreeMap::new();
+        for tbl in from {
+            extract_aliases_recursive(tbl, &mut aliases);
+        }
+        aliases
+    }
+
     /// Convenience entry point for a whole `SELECT` statement: records the
     /// GROUP BY columns, then analyzes the target list.
     pub fn analyze_select_statement(&mut self, select: &SelectStatement) {
@@ -391,6 +404,50 @@ fn expr_to_source_text(expr: &Expr) -> String {
                 dbg
             }
         }
+    }
+}
+
+/// Recursively extract table aliases from a TableRef tree (tables, joins, subqueries).
+fn extract_aliases_recursive(
+    tbl: &ogsql_parser::ast::TableRef,
+    aliases: &mut BTreeMap<String, crate::parser::TableAlias>,
+) {
+    match tbl {
+        ogsql_parser::ast::TableRef::Table { name, alias, .. } => {
+            let tbl_name = name.last().map(|i| i.value.clone()).unwrap_or_default();
+            let schema = if name.len() >= 2 {
+                Some(name[0].value.clone())
+            } else {
+                None
+            };
+            let key = alias
+                .as_ref()
+                .map(|a| a.value.to_lowercase())
+                .unwrap_or_else(|| tbl_name.to_lowercase());
+            aliases.insert(
+                key,
+                crate::parser::TableAlias {
+                    schema,
+                    table: tbl_name,
+                },
+            );
+        }
+        ogsql_parser::ast::TableRef::Join { left, right, .. } => {
+            extract_aliases_recursive(left, aliases);
+            extract_aliases_recursive(right, aliases);
+        }
+        ogsql_parser::ast::TableRef::Subquery { alias, .. } => {
+            if let Some(ref a) = alias {
+                aliases.insert(
+                    a.value.to_lowercase(),
+                    crate::parser::TableAlias {
+                        schema: None,
+                        table: format!("<subquery:{}>", a.value),
+                    },
+                );
+            }
+        }
+        _ => {}
     }
 }
 
