@@ -54,7 +54,7 @@ pub struct ColumnLineageExtractor {
     current_output: Option<OutputContext>,
     cursor_sources: std::collections::HashMap<String, Vec<CursorColumn>>,
     fetch_vars: std::collections::HashMap<String, Vec<String>>,
-    pending_insert: Option<(String, Vec<String>, Vec<Expr>)>,
+    pending_inserts: Vec<(String, Vec<String>, Vec<Expr>)>,
 }
 
 struct OutputContext {
@@ -87,7 +87,7 @@ impl ColumnLineageExtractor {
             current_output: None,
             cursor_sources: std::collections::HashMap::new(),
             fetch_vars: std::collections::HashMap::new(),
-            pending_insert: None,
+            pending_inserts: Vec::new(),
         }
     }
 
@@ -132,7 +132,8 @@ impl ColumnLineageExtractor {
 
     /// Record an INSERT ... VALUES target table, column list, and value exprs.
     pub fn record_insert_values(&mut self, table: &str, columns: Vec<String>, values: Vec<Expr>) {
-        self.pending_insert = Some((table.to_string(), columns, values));
+        self.pending_inserts
+            .push((table.to_string(), columns, values));
     }
 
     /// Extract table aliases from a SELECT's FROM clause.
@@ -167,48 +168,47 @@ impl ColumnLineageExtractor {
     /// INSERT INTO target VALUES(v1, v2);`
     /// Produces Flow edges: t.a → target.col1, t.b → target.col2.
     fn resolve_cursor_insert_flow(&mut self) {
-        let Some((table, columns, values)) = self.pending_insert.take() else {
+        let pending = std::mem::take(&mut self.pending_inserts);
+        if pending.is_empty() {
             return;
-        };
+        }
         let mut new_edges: Vec<ColumnEdge> = Vec::new();
-        for (i, value) in values.iter().enumerate() {
-            let target_col = columns
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{}", i));
+        for (table, columns, values) in &pending {
+            for (i, value) in values.iter().enumerate() {
+                let target_col = columns
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col_{}", i));
 
-            // Match value against cursor output columns.
-            // Two cases:
-            //   1. Bare variable (v1) — match by FETCH position
-            //   2. Record field (r.accrual) — match by cursor output column NAME
-            let var_name = match value {
-                Expr::ColumnRef(parts) if parts.len() == 1 => Some(parts[0].value.to_lowercase()),
-                Expr::FieldAccess { field, .. } => Some(field.to_lowercase()),
-                _ => None,
-            };
+                let var_name = match value {
+                    Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+                        parts.last().map(|p| p.value.to_lowercase())
+                    }
+                    Expr::FieldAccess { field, .. } => Some(field.to_lowercase()),
+                    _ => None,
+                };
 
-            let Some(var_name) = var_name else { continue };
+                let Some(var_name) = var_name else { continue };
 
-            // First try position-based matching via FETCH vars.
-            let mut found = false;
-            for (cursor, vars) in &self.fetch_vars {
-                if let Some(pos) = vars.iter().position(|v| v.to_lowercase() == var_name) {
-                    if let Some(src_cols) = self.cursor_sources.get(cursor) {
-                        if let Some(c) = src_cols.get(pos) {
-                            new_edges.push(make_cursor_flow(&table, &target_col, c));
-                            found = true;
+                let mut found = false;
+                for (cursor, vars) in &self.fetch_vars {
+                    if let Some(pos) = vars.iter().position(|v| v.to_lowercase() == var_name) {
+                        if let Some(src_cols) = self.cursor_sources.get(cursor) {
+                            if let Some(c) = src_cols.get(pos) {
+                                new_edges.push(make_cursor_flow(table, &target_col, c));
+                                found = true;
+                            }
                         }
                     }
                 }
-            }
-            // Fall back to name-based matching against cursor output column names.
-            if !found {
-                for src_cols in self.cursor_sources.values() {
-                    if let Some(c) = src_cols
-                        .iter()
-                        .find(|c| c.output_name.to_lowercase() == var_name)
-                    {
-                        new_edges.push(make_cursor_flow(&table, &target_col, c));
+                if !found {
+                    for src_cols in self.cursor_sources.values() {
+                        if let Some(c) = src_cols
+                            .iter()
+                            .find(|c| c.output_name.to_lowercase() == var_name)
+                        {
+                            new_edges.push(make_cursor_flow(table, &target_col, c));
+                        }
                     }
                 }
             }
@@ -537,9 +537,7 @@ fn extract_aliases_recursive(
             extract_aliases_recursive(left, aliases);
             extract_aliases_recursive(right, aliases);
         }
-        ogsql_parser::ast::TableRef::Subquery {
-            alias: Some(a), ..
-        } => {
+        ogsql_parser::ast::TableRef::Subquery { alias: Some(a), .. } => {
             aliases.insert(
                 a.value.to_lowercase(),
                 crate::parser::TableAlias {

@@ -4425,7 +4425,8 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
     ) -> ogsql_parser::VisitorResult {
         if let ogsql_parser::ast::plpgsql::PlStatement::Fetch(fetch) = stmt {
             let cursor_name = match &fetch.node.cursor {
-                ogsql_parser::ast::Expr::ColumnRef(parts) => {
+                ogsql_parser::ast::Expr::ColumnRef(parts)
+                | ogsql_parser::ast::Expr::PlVariable(parts) => {
                     parts.last().map(|i| i.value.clone()).unwrap_or_default()
                 }
                 _ => String::new(),
@@ -4440,7 +4441,7 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
 /// Extract a bare variable name from an expression (single-part column ref).
 fn expr_var_name(expr: &ogsql_parser::ast::Expr) -> String {
     match expr {
-        ogsql_parser::ast::Expr::ColumnRef(parts) => {
+        ogsql_parser::ast::Expr::ColumnRef(parts) | ogsql_parser::ast::Expr::PlVariable(parts) => {
             parts.last().map(|i| i.value.clone()).unwrap_or_default()
         }
         _ => String::new(),
@@ -7887,5 +7888,41 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             has_derived,
             "expected a Derived edge for SELECT t.a + t.b AS c"
         );
+    }
+
+    #[test]
+    fn column_lineage_cursor_insert_values() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p3(p_date VARCHAR2) AS
+                CURSOR c IS SELECT a.accrual, a.cjsl FROM mid_yjqs_detail a;
+                r c%ROWTYPE;
+            BEGIN
+                OPEN c;
+                LOOP
+                    FETCH c INTO r;
+                    EXIT WHEN c%NOTFOUND;
+                    INSERT INTO dat_fund_cjqs (accrual, cjsl) VALUES (r.accrual, r.cjsl);
+                END LOOP;
+                CLOSE c;
+            END;
+        "#;
+        let files = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+
+        // Directly test the extractor's cursor tracking.
+        let mut ext = crate::parser::ColumnLineageExtractor::new();
+        for info in &files[0].statements {
+            let mut walker = super::ColumnLineageWalker {
+                extractor: &mut ext,
+                current_cursor: None,
+            };
+            ogsql_parser::walk_statement(&mut walker, &info.statement);
+        }
+        let edges = ext.finish();
+        for e in &edges {}
+        assert!(!edges.is_empty(), "expected cursor-based column edges");
     }
 }
