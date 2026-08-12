@@ -335,6 +335,7 @@ impl GraphBuilder {
         apply_deferred_column_comments(ctx);
         Self::merge_table_access_edges(&mut ctx.graph);
         Self::resolve_unresolved_nodes(&mut ctx.graph);
+        clean_column_lineage(&mut ctx.graph);
     }
 
     // ── Pass 1: Create all SQL nodes ─────────────────────────────
@@ -4544,10 +4545,6 @@ fn add_column_lineage_edges(
             }
         }
     }
-
-    // Post-process: strip proc:/func: prefixes from ALL column nodes and edge data
-    // to ensure no procedure-owned column IDs leak into the final graph.
-    clean_column_lineage(graph);
 
     count
 }
