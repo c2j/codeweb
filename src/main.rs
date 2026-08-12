@@ -654,6 +654,39 @@ enum Commands {
         regex: bool,
     },
 
+    /// Query table-level or column-level data lineage
+    ///
+    /// Pass a table name for table-level lineage, or "table.column" for
+    /// column-level lineage. Requires column lineage to be enabled during
+    /// analysis (`codeweb analyze --column-lineage`).
+    Lineage {
+        /// Starting node: "table_name" (table-level) or "table.column" (column-level)
+        #[arg(value_name = "TARGET")]
+        target: String,
+
+        /// Direction: upstream (backward), downstream (forward), or both
+        #[arg(short = 'd', long, default_value = "upstream",
+              value_parser = ["upstream", "downstream", "both"])]
+        direction: String,
+
+        /// Maximum depth (default: 10)
+        #[arg(long, default_value = "10")]
+        depth: usize,
+
+        /// Output format: tree (default), table, or json
+        #[arg(short = 'f', long, default_value = "tree",
+              value_parser = ["tree", "table", "json"])]
+        format: String,
+
+        /// Output file (default: stdout)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// Project directory (default: current directory)
+        #[arg(short = 'p', long, default_value = ".")]
+        project: PathBuf,
+    },
+
     /// Find reachability paths connecting multiple nodes
     ///
     /// Given two or more node names, discovers all directed paths
@@ -987,6 +1020,14 @@ fn run() -> Result<()> {
                 match_mode_from_flags(exact, regex),
             )
         }
+        Some(Commands::Lineage {
+            target,
+            direction,
+            depth,
+            format,
+            output,
+            project,
+        }) => cmd_lineage(&target, &direction, depth, &format, output.as_deref(), &project),
         Some(Commands::Inspect {
             nodes,
             project,
@@ -3987,6 +4028,352 @@ fn print_grouped_entries(entries: &[ImpactEntry]) {
             let line_tag = entry.line.map(|l| format!(":{}", l)).unwrap_or_default();
             println_stdout!("    {}{}", entry.symbol, line_tag);
         }
+    }
+}
+
+fn cmd_lineage(
+    target: &str,
+    direction: &str,
+    depth: usize,
+    format: &str,
+    output: Option<&Path>,
+    project: &Path,
+) -> Result<()> {
+    use crate::graph::traverse::ColumnLineageQuery;
+
+    let mut proj = project::Project::find(project)?;
+    let store = match proj.load_store() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Project not analyzed. Run `codeweb analyze` first.");
+            return Ok(());
+        }
+    };
+    let graph = store.graph();
+
+    if target.contains('.') {
+        cmd_column_lineage(graph, target, direction, depth, format, output)
+    } else {
+        cmd_table_lineage(graph, target, direction, depth, format, output)
+    }
+}
+
+fn cmd_column_lineage(
+    graph: &crate::graph::CodeGraph,
+    col_target: &str,
+    direction: &str,
+    depth: usize,
+    format: &str,
+    output: Option<&Path>,
+) -> Result<()> {
+    use crate::graph::traverse::ColumnLineageQuery;
+
+    let parts: Vec<&str> = col_target.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        eprintln!("Invalid column target format. Use 'table.column'");
+        return Ok(());
+    }
+    let table = parts[0];
+    let column = parts[1];
+
+    let col_ids = [
+        format!("col:{}.{}", table, column),
+        format!("col:public.{}.{}", table, column),
+    ];
+
+    let mut all_paths = vec![];
+    for col_id in &col_ids {
+        let paths = graph.column_lineage(col_id, direction, depth);
+        if !paths.is_empty() {
+            all_paths = paths;
+            break;
+        }
+    }
+
+    if all_paths.is_empty() {
+        eprintln!("No column lineage found for '{}'", col_target);
+        eprintln!("Hint: column lineage requires 'codeweb analyze --column-lineage'.");
+        return Ok(());
+    }
+
+    let output_str = match format {
+        "tree" => format_col_lineage_tree(&all_paths, col_target),
+        "table" => format_col_lineage_table(&all_paths),
+        "json" => serde_json::to_string_pretty(&all_paths).unwrap_or_default(),
+        _ => unreachable!(),
+    };
+
+    write_or_print(&output_str, output)
+}
+
+fn cmd_table_lineage(
+    graph: &crate::graph::CodeGraph,
+    table_target: &str,
+    direction: &str,
+    depth: usize,
+    format: &str,
+    output: Option<&Path>,
+) -> Result<()> {
+    use crate::graph::{node_display_name, AccessMode, Edge, Node};
+
+    let table_node = graph.node_indices().find(|&idx| match &graph[idx] {
+        Node::Table { name, .. } => name.eq_ignore_ascii_case(table_target),
+        Node::View { name, .. } => name.eq_ignore_ascii_case(table_target),
+        _ => false,
+    });
+
+    let Some(start_node) = table_node else {
+        eprintln!("Table '{}' not found in graph", table_target);
+        return Ok(());
+    };
+
+    let (upstream, downstream) = if direction == "upstream" || direction == "both" {
+        let up = trace_table_upstream(graph, start_node, depth);
+        let down = if direction == "both" {
+            trace_table_downstream(graph, start_node, depth)
+        } else {
+            vec![]
+        };
+        (up, down)
+    } else {
+        (vec![], trace_table_downstream(graph, start_node, depth))
+    };
+
+    let output_str = match format {
+        "tree" => format_tbl_lineage_tree(graph, table_target, &upstream, &downstream, direction),
+        "table" => format_tbl_lineage_table(graph, &upstream, &downstream, direction),
+        "json" => {
+            let result = serde_json::json!({
+                "target": table_target,
+                "direction": direction,
+                "upstream": upstream.iter().map(|(n, _)| node_display_name(&graph[*n])).collect::<Vec<_>>(),
+                "downstream": downstream.iter().map(|(n, _)| node_display_name(&graph[*n])).collect::<Vec<_>>(),
+            });
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        }
+        _ => unreachable!(),
+    };
+
+    write_or_print(&output_str, output)
+}
+
+fn trace_table_upstream(
+    graph: &crate::graph::CodeGraph,
+    start: NodeIndex,
+    max_depth: usize,
+) -> Vec<(NodeIndex, String)> {
+    let mut results = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((start, 0));
+
+    while let Some((node, d)) = queue.pop_front() {
+        if d > max_depth || !visited.insert(node) {
+            continue;
+        }
+        for edge in graph.edges_directed(node, petgraph::Direction::Incoming) {
+            if matches!(&graph[edge.id()], crate::graph::Edge::TableAccess { .. }) {
+                let source = edge.source();
+                let mode = match &graph[edge.id()] {
+                    crate::graph::Edge::TableAccess { modes, .. } => {
+                        let mut flags = Vec::new();
+                        if modes.contains(crate::graph::AccessMode::Read) {
+                            flags.push("R");
+                        }
+                        if modes.contains(crate::graph::AccessMode::Write) {
+                            flags.push("W");
+                        }
+                        flags.join("/")
+                    }
+                    _ => String::new(),
+                };
+                results.push((source, mode));
+                queue.push_back((source, d + 1));
+            }
+        }
+    }
+    results
+}
+
+fn trace_table_downstream(
+    graph: &crate::graph::CodeGraph,
+    start: NodeIndex,
+    max_depth: usize,
+) -> Vec<(NodeIndex, String)> {
+    let mut results = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((start, 0));
+
+    while let Some((node, d)) = queue.pop_front() {
+        if d > max_depth || !visited.insert(node) {
+            continue;
+        }
+        for edge in graph.edges_directed(node, petgraph::Direction::Outgoing) {
+            if matches!(&graph[edge.id()], crate::graph::Edge::TableAccess { .. }) {
+                let target = edge.target();
+                let mode = match &graph[edge.id()] {
+                    crate::graph::Edge::TableAccess { modes, .. } => {
+                        let mut flags = Vec::new();
+                        if modes.contains(crate::graph::AccessMode::Read) {
+                            flags.push("R");
+                        }
+                        if modes.contains(crate::graph::AccessMode::Write) {
+                            flags.push("W");
+                        }
+                        flags.join("/")
+                    }
+                    _ => String::new(),
+                };
+                results.push((target, mode));
+                queue.push_back((target, d + 1));
+            }
+        }
+    }
+    results
+}
+
+fn format_col_lineage_tree(
+    paths: &[Vec<crate::graph::traverse::ColumnLineageStep>],
+    target: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(target);
+    out.push('\n');
+
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        for (i, step) in path.iter().enumerate() {
+            let indent = "  ".repeat(i);
+            let prefix = if i == path.len() - 1 {
+                "  └── "
+            } else {
+                "  ├── "
+            };
+
+            let kind_label = match step.edge_kind.as_str() {
+                "dataflow" => "DataFlow",
+                "derived" => match &step.expression {
+                    Some(e) if !e.is_empty() => {
+                        return format!("{}Derived: {}", "", &e[..e.len().min(60)]);
+                    }
+                    _ => "Derived",
+                },
+                "aggregated" => match &step.aggregation {
+                    Some(a) => {
+                        return format!("{}Aggregated: {}", "", a);
+                    }
+                    _ => "Aggregated",
+                },
+                _ => &step.edge_kind,
+            };
+
+            let line = format!(
+                "{}{}{} [{}]\n",
+                indent, prefix, step.source_col_id, kind_label
+            );
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
+fn format_col_lineage_table(
+    paths: &[Vec<crate::graph::traverse::ColumnLineageStep>],
+) -> String {
+    let mut out = String::from(
+        "SOURCE_COLUMN           | TRANSFORM       | TARGET_COLUMN           | DEPTH\n",
+    );
+    out.push_str(
+        "------------------------+-----------------+-------------------------+-------\n",
+    );
+    for path in paths {
+        for step in path {
+            let expr = step.expression.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "{:<24} | {:<15} | {:<24} | {}\n",
+                truncate_str(&step.source_col_id, 24),
+                truncate_str(expr, 15),
+                truncate_str(&step.target_col_id, 24),
+                step.depth,
+            ));
+        }
+    }
+    out
+}
+
+fn format_tbl_lineage_tree(
+    graph: &crate::graph::CodeGraph,
+    target: &str,
+    upstream: &[(NodeIndex, String)],
+    downstream: &[(NodeIndex, String)],
+    direction: &str,
+) -> String {
+    use crate::graph::node_display_name;
+    let mut out = String::new();
+    out.push_str(&format!("{} [table]\n", target));
+
+    if (direction == "upstream" || direction == "both") && !upstream.is_empty() {
+        for (node, mode) in upstream {
+            let name = node_display_name(&graph[*node]);
+            out.push_str(&format!("  ← {} [{}]\n", name, mode));
+        }
+    }
+    if (direction == "downstream" || direction == "both") && !downstream.is_empty() {
+        for (node, mode) in downstream {
+            let name = node_display_name(&graph[*node]);
+            out.push_str(&format!("  → {} [{}]\n", name, mode));
+        }
+    }
+    out
+}
+
+fn format_tbl_lineage_table(
+    graph: &crate::graph::CodeGraph,
+    upstream: &[(NodeIndex, String)],
+    downstream: &[(NodeIndex, String)],
+    direction: &str,
+) -> String {
+    use crate::graph::node_display_name;
+    let mut out = String::from("DIRECTION  | TABLE                   | MODE\n");
+    out.push_str("-----------+-------------------------+------\n");
+    if direction == "upstream" || direction == "both" {
+        for (node, mode) in upstream {
+            let name = node_display_name(&graph[*node]);
+            out.push_str(&format!("upstream   | {:<23} | {}\n", name, mode));
+        }
+    }
+    if direction == "downstream" || direction == "both" {
+        for (node, mode) in downstream {
+            let name = node_display_name(&graph[*node]);
+            out.push_str(&format!("downstream | {:<23} | {}\n", name, mode));
+        }
+    }
+    out
+}
+
+fn write_or_print(content: &str, output: Option<&Path>) -> Result<()> {
+    if let Some(path) = output {
+        std::fs::write(path, content).map_err(|e| {
+            crate::error::CodeWebError::FileRead {
+                path: path.to_path_buf(),
+                source: e,
+            }
+        })?;
+        eprintln!("Output written to {}", path.display());
+    } else {
+        println_stdout!("{}", content);
+    }
+    Ok(())
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
     }
 }
 
