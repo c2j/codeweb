@@ -7922,7 +7922,45 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             ogsql_parser::walk_statement(&mut walker, &info.statement);
         }
         let edges = ext.finish();
-        for e in &edges {}
         assert!(!edges.is_empty(), "expected cursor-based column edges");
+    }
+
+    #[test]
+    fn column_lineage_package_body_cursor() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY PKG_TEST IS
+              PROCEDURE prc_x(p_date VARCHAR2) IS
+                CURSOR c IS SELECT a.accrual, a.cjsl FROM mid_yjqs_detail a;
+                r c%ROWTYPE;
+              BEGIN
+                OPEN c;
+                LOOP
+                  FETCH c INTO r;
+                  EXIT WHEN c%NOTFOUND;
+                  INSERT INTO dat_fund_cjqs (accrual, cjsl) VALUES (r.accrual, r.cjsl);
+                END LOOP;
+                CLOSE c;
+              END;
+            END PKG_TEST;
+        "#;
+        let files = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let mut ext = crate::parser::ColumnLineageExtractor::new();
+        for info in &files[0].statements {
+            let mut walker = super::ColumnLineageWalker {
+                extractor: &mut ext,
+                current_cursor: None,
+            };
+            ogsql_parser::walk_statement(&mut walker, &info.statement);
+        }
+        let edges = ext.finish();
+        let has_dat_fund = edges.iter().any(|e| {
+            matches!(e, crate::parser::ColumnEdge::Flow { target_col, .. }
+                if target_col.contains("dat_fund_cjqs"))
+        });
+        assert!(has_dat_fund, "expected cursor flow into dat_fund_cjqs, got {:?}", edges);
     }
 }
