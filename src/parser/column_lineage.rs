@@ -153,6 +153,12 @@ impl ColumnLineageExtractor {
             .as_ref()
             .map(|c| c.owner_table.clone())
             .unwrap_or_default();
+        // Strip proc:/func: prefixes so column IDs use table names.
+        let owner = owner
+            .strip_prefix("proc:")
+            .or_else(|| owner.strip_prefix("func:"))
+            .unwrap_or(&owner)
+            .to_string();
 
         match expr {
             // Aggregate function: SUM(col) / COUNT(*) / AVG(col) ...

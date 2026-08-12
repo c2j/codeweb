@@ -4310,7 +4310,25 @@ impl Default for GraphBuilder {
     }
 }
 
-/// Extract the target table name from an INSERT/SELECT INTO/CREATE TABLE AS statement.
+/// Clean column ID by stripping procedure/function prefixes.
+fn clean_col_owner(col_ref: &str) -> String {
+    if let Some(dot) = col_ref.rfind('.') {
+        let owner = &col_ref[..dot];
+        let col_name = &col_ref[dot + 1..];
+        if owner.starts_with("proc:") || owner.starts_with("func:") {
+            return col_name.to_string();
+        }
+    }
+    col_ref.to_string()
+}
+
+/// In-place clean of a column ID stored in edge data.
+fn clean_edge_col_id(col_id: &mut String) {
+    let cleaned = clean_col_owner(col_id);
+    if cleaned != *col_id {
+        *col_id = cleaned;
+    }
+}
 fn extract_insert_target(stmt: &ogsql_parser::Statement) -> Option<String> {
     use ogsql_parser::Statement;
     match stmt {
@@ -4382,16 +4400,8 @@ fn add_column_lineage_edges(
     owner_table: &str,
     location: &SourceLocation,
 ) -> usize {
-    // If owner is a procedure (starts with "proc:"), don't use it for
-    // column node IDs. Column nodes belong to tables, not procedures.
-    let table_owner = if owner_table.starts_with("proc:") {
-        ""
-    } else {
-        owner_table
-    };
-
     let mut extractor = crate::parser::ColumnLineageExtractor::new();
-    extractor.set_output(table_owner);
+    extractor.set_output(owner_table);
 
     for info in statements {
         let mut walker = ColumnLineageWalker {
@@ -4413,7 +4423,7 @@ fn add_column_lineage_edges(
             } => {
                 let source_owner = source_table.as_deref().unwrap_or(owner_table);
                 let source_id = format!("col:{}.{}", source_owner, source_col);
-                let target_id = format!("col:{}", target_col);
+                let target_id = format!("col:{}", clean_col_owner(target_col));
 
                 let source_idx = upsert_column_node(graph, &source_id, source_owner, source_col);
                 let target_idx = upsert_column_node(
@@ -4440,7 +4450,7 @@ fn add_column_lineage_edges(
                 expression,
                 location: _,
             } => {
-                let target_id = format!("col:{}", target_col);
+                let target_id = format!("col:{}", clean_col_owner(target_col));
                 let target_idx = upsert_column_node(
                     graph,
                     &target_id,
@@ -4480,7 +4490,7 @@ fn add_column_lineage_edges(
                 group_by_cols,
                 location: _,
             } => {
-                let target_id = format!("col:{}", target_col);
+                let target_id = format!("col:{}", clean_col_owner(target_col));
                 let target_idx = upsert_column_node(
                     graph,
                     &target_id,
@@ -4535,7 +4545,63 @@ fn add_column_lineage_edges(
         }
     }
 
+    // Post-process: strip proc:/func: prefixes from ALL column nodes and edge data
+    // to ensure no procedure-owned column IDs leak into the final graph.
+    clean_column_lineage(graph);
+
     count
+}
+
+/// Strip proc:/func: prefixes from ALL column node IDs and column edge data.
+fn clean_column_lineage(graph: &mut CodeGraph) {
+    for idx in graph.node_indices().collect::<Vec<_>>() {
+        if let Node::Column { ref mut id, .. } = graph[idx] {
+            if let Some(rest) = id
+                .strip_prefix("col:proc:")
+                .or_else(|| id.strip_prefix("col:func:"))
+            {
+                *id = format!("col:{}", rest);
+            }
+        }
+    }
+    for edge_idx in graph.edge_indices().collect::<Vec<_>>() {
+        let edge = &mut graph[edge_idx];
+        match edge {
+            Edge::DataFlow {
+                ref mut source_col_id,
+                ref mut target_col_id,
+                ..
+            } => {
+                clean_edge_col_id(source_col_id);
+                clean_edge_col_id(target_col_id);
+            }
+            Edge::Derived {
+                ref mut source_col_ids,
+                ref mut target_col_id,
+                ..
+            } => {
+                for id in source_col_ids.iter_mut() {
+                    clean_edge_col_id(id);
+                }
+                clean_edge_col_id(target_col_id);
+            }
+            Edge::Aggregated {
+                ref mut source_col_ids,
+                ref mut target_col_id,
+                ref mut group_by_col_ids,
+                ..
+            } => {
+                for id in source_col_ids.iter_mut() {
+                    clean_edge_col_id(id);
+                }
+                clean_edge_col_id(target_col_id);
+                for id in group_by_col_ids.iter_mut() {
+                    clean_edge_col_id(id);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Find or create a column node, returning its `NodeIndex`.
@@ -4545,11 +4611,17 @@ fn upsert_column_node(
     owner_table: &str,
     col_name: &str,
 ) -> petgraph::graph::NodeIndex {
-    if let Some(idx) = find_column_node(graph, col_id) {
+    // Strip proc:/func: prefixes so all column nodes use table names.
+    let clean_id = col_id
+        .strip_prefix("col:proc:")
+        .or_else(|| col_id.strip_prefix("col:func:"))
+        .map(|rest| format!("col:{}", rest))
+        .unwrap_or_else(|| col_id.to_string());
+    if let Some(idx) = find_column_node(graph, &clean_id) {
         return idx;
     }
     graph.add_node(Node::Column {
-        id: col_id.to_string(),
+        id: clean_id,
         owner_table: owner_table.to_string(),
         name: col_name.to_string(),
         data_type: None,
