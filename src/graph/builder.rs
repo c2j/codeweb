@@ -2768,6 +2768,11 @@ impl GraphBuilder {
         let lineage_owner = crate::graph::node_display_name(&graph[source_idx]);
 
         for info in statements {
+            // For INSERT/SELECT INTO statements, use the target TABLE name
+            // as the column owner (not the procedure name), so column lineage
+            // shows table→table flow instead of procedure→table.
+            let column_owner = extract_insert_target(&info.statement)
+                .unwrap_or_else(|| lineage_owner.clone());
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
 
@@ -2786,7 +2791,7 @@ impl GraphBuilder {
                 add_column_lineage_edges(
                     graph,
                     std::slice::from_ref(info),
-                    &lineage_owner,
+                    &column_owner,
                     &SourceLocation {
                         file: file_path.clone(),
                         line: info.start_line,
@@ -4305,6 +4310,28 @@ impl Default for GraphBuilder {
     }
 }
 
+/// Extract the target table name from an INSERT/SELECT INTO/CREATE TABLE AS statement.
+fn extract_insert_target(stmt: &ogsql_parser::Statement) -> Option<String> {
+    use ogsql_parser::Statement;
+    match stmt {
+        Statement::Insert(inner) => Some(
+            inner
+                .table
+                .last()
+                .map(|i| i.value.clone())
+                .unwrap_or_default(),
+        ),
+        Statement::CreateTableAs(inner) => Some(
+            inner
+                .name
+                .last()
+                .map(|i| i.value.clone())
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    }
+}
+
 /// Forwards `visit_select` to [`ColumnLineageExtractor::analyze_select_statement`]
 /// so that `walk_statement` analyzes SELECTs nested anywhere in a statement
 /// (e.g. inside a procedure body or an INSERT ... SELECT source).
@@ -4313,6 +4340,21 @@ struct ColumnLineageWalker<'a> {
 }
 
 impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
+    fn visit_insert(
+        &mut self,
+        insert: &ogsql_parser::ast::InsertStatement,
+    ) -> ogsql_parser::VisitorResult {
+        // Use the INSERT target TABLE as the column owner, not the procedure name.
+        // This makes column lineage show table→table flow.
+        let target_table = insert
+            .table
+            .last()
+            .map(|i| i.value.clone())
+            .unwrap_or_default();
+        self.extractor.set_output(&target_table);
+        ogsql_parser::VisitorResult::Continue
+    }
+
     fn visit_select(
         &mut self,
         select: &ogsql_parser::ast::SelectStatement,
@@ -4340,8 +4382,16 @@ fn add_column_lineage_edges(
     owner_table: &str,
     location: &SourceLocation,
 ) -> usize {
+    // If owner is a procedure (starts with "proc:"), don't use it for
+    // column node IDs. Column nodes belong to tables, not procedures.
+    let table_owner = if owner_table.starts_with("proc:") {
+        ""
+    } else {
+        owner_table
+    };
+
     let mut extractor = crate::parser::ColumnLineageExtractor::new();
-    extractor.set_output(owner_table);
+    extractor.set_output(table_owner);
 
     for info in statements {
         let mut walker = ColumnLineageWalker {
