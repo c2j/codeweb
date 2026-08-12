@@ -4167,13 +4167,13 @@ fn cmd_table_lineage(
 
     let output_str = match format {
         "tree" => format_tbl_lineage_tree(graph, table_target, &upstream, &downstream, direction),
-        "table" => format_tbl_lineage_table(graph, &upstream, &downstream, direction),
+        "table" => format_tbl_lineage_table(graph, table_target, &upstream, &downstream, direction),
         "json" => {
             let result = serde_json::json!({
                 "target": table_target,
                 "direction": direction,
-                "upstream": upstream.iter().map(|(n, _)| node_display_name(&graph[*n])).collect::<Vec<_>>(),
-                "downstream": downstream.iter().map(|(n, _)| node_display_name(&graph[*n])).collect::<Vec<_>>(),
+                "upstream": upstream.iter().map(|t| format_table_ref(graph, t)).collect::<Vec<_>>(),
+                "downstream": downstream.iter().map(|t| format_table_ref(graph, t)).collect::<Vec<_>>(),
             });
             serde_json::to_string_pretty(&result).unwrap_or_default()
         }
@@ -4183,38 +4183,42 @@ fn cmd_table_lineage(
     write_or_print(&output_str, output)
 }
 
+/// Table lineage reference: table accessed + how (R/W) + via which procedure.
+struct TableRef {
+    table_name: String,
+    mode: String,
+    via_proc: String,
+}
+
 fn trace_table_upstream(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
     max_depth: usize,
-) -> Vec<(NodeIndex, String)> {
+) -> Vec<TableRef> {
+    use crate::graph::node_display_name;
     let mut results = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((start, 0));
-
-    while let Some((node, d)) = queue.pop_front() {
-        if d > max_depth || !visited.insert(node) {
-            continue;
-        }
-        for edge in graph.edges_directed(node, petgraph::Direction::Incoming) {
-            if matches!(&graph[edge.id()], crate::graph::Edge::TableAccess { .. }) {
-                let source = edge.source();
-                let mode = match &graph[edge.id()] {
-                    crate::graph::Edge::TableAccess { modes, .. } => {
-                        let mut flags = Vec::new();
-                        if modes.contains(crate::graph::AccessMode::Read) {
-                            flags.push("R");
+    // Find procedures that WRITE to this table (incoming W edges to start)
+    for edge in graph.edges_directed(start, petgraph::Direction::Incoming) {
+        if let crate::graph::Edge::TableAccess { modes, .. } = &graph[edge.id()] {
+            if modes.contains(crate::graph::AccessMode::Write) {
+                let proc_idx = edge.source();
+                let proc_name = node_display_name(&graph[proc_idx]);
+                // Find tables this procedure READS from (outgoing R edges from proc)
+                for e2 in graph.edges_directed(proc_idx, petgraph::Direction::Outgoing) {
+                    if let crate::graph::Edge::TableAccess { modes: m2, .. } = &graph[e2.id()] {
+                        if m2.contains(crate::graph::AccessMode::Read) {
+                            let table_idx = e2.target();
+                            if table_idx != start {
+                                // Don't show self-reference
+                                results.push(TableRef {
+                                    table_name: node_display_name(&graph[table_idx]),
+                                    mode: format_mode(m2),
+                                    via_proc: proc_name.clone(),
+                                });
+                            }
                         }
-                        if modes.contains(crate::graph::AccessMode::Write) {
-                            flags.push("W");
-                        }
-                        flags.join("/")
                     }
-                    _ => String::new(),
-                };
-                results.push((source, mode));
-                queue.push_back((source, d + 1));
+                }
             }
         }
     }
@@ -4225,38 +4229,45 @@ fn trace_table_downstream(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
     max_depth: usize,
-) -> Vec<(NodeIndex, String)> {
+) -> Vec<TableRef> {
+    use crate::graph::node_display_name;
     let mut results = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((start, 0));
-
-    while let Some((node, d)) = queue.pop_front() {
-        if d > max_depth || !visited.insert(node) {
-            continue;
-        }
-        for edge in graph.edges_directed(node, petgraph::Direction::Outgoing) {
-            if matches!(&graph[edge.id()], crate::graph::Edge::TableAccess { .. }) {
-                let target = edge.target();
-                let mode = match &graph[edge.id()] {
-                    crate::graph::Edge::TableAccess { modes, .. } => {
-                        let mut flags = Vec::new();
-                        if modes.contains(crate::graph::AccessMode::Read) {
-                            flags.push("R");
+    // Find procedures that READ from this table (incoming R edges to start)
+    for edge in graph.edges_directed(start, petgraph::Direction::Incoming) {
+        if let crate::graph::Edge::TableAccess { modes, .. } = &graph[edge.id()] {
+            if modes.contains(crate::graph::AccessMode::Read) {
+                let proc_idx = edge.source();
+                let proc_name = node_display_name(&graph[proc_idx]);
+                // Find tables this procedure WRITES to (outgoing W edges from proc)
+                for e2 in graph.edges_directed(proc_idx, petgraph::Direction::Outgoing) {
+                    if let crate::graph::Edge::TableAccess { modes: m2, .. } = &graph[e2.id()] {
+                        if m2.contains(crate::graph::AccessMode::Write) {
+                            let table_idx = e2.target();
+                            if table_idx != start {
+                                results.push(TableRef {
+                                    table_name: node_display_name(&graph[table_idx]),
+                                    mode: format_mode(m2),
+                                    via_proc: proc_name.clone(),
+                                });
+                            }
                         }
-                        if modes.contains(crate::graph::AccessMode::Write) {
-                            flags.push("W");
-                        }
-                        flags.join("/")
                     }
-                    _ => String::new(),
-                };
-                results.push((target, mode));
-                queue.push_back((target, d + 1));
+                }
             }
         }
     }
     results
+}
+
+fn format_mode(m: &crate::graph::AccessMode) -> String {
+    let mut flags = Vec::new();
+    if m.contains(crate::graph::AccessMode::Read) { flags.push("R"); }
+    if m.contains(crate::graph::AccessMode::Write) { flags.push("W"); }
+    flags.join("/")
+}
+
+fn format_table_ref(graph: &crate::graph::CodeGraph, t: &TableRef) -> String {
+    format!("{} [{}:{}]", t.table_name, t.mode, t.via_proc)
 }
 
 fn format_col_lineage_tree(
@@ -4328,48 +4339,57 @@ fn format_col_lineage_table(paths: &[Vec<crate::graph::traverse::ColumnLineageSt
 fn format_tbl_lineage_tree(
     graph: &crate::graph::CodeGraph,
     target: &str,
-    upstream: &[(NodeIndex, String)],
-    downstream: &[(NodeIndex, String)],
+    upstream: &[TableRef],
+    downstream: &[TableRef],
     direction: &str,
 ) -> String {
-    use crate::graph::node_display_name;
     let mut out = String::new();
     out.push_str(&format!("{} [table]\n", target));
 
     if (direction == "upstream" || direction == "both") && !upstream.is_empty() {
-        for (node, mode) in upstream {
-            let name = node_display_name(&graph[*node]);
-            out.push_str(&format!("  ← {} [{}]\n", name, mode));
+        out.push_str("  Upstream (source tables → this table):\n");
+        for t in upstream {
+            out.push_str(&format!(
+                "    {} [{} via {}]\n",
+                t.table_name, t.mode, t.via_proc
+            ));
         }
     }
     if (direction == "downstream" || direction == "both") && !downstream.is_empty() {
-        for (node, mode) in downstream {
-            let name = node_display_name(&graph[*node]);
-            out.push_str(&format!("  → {} [{}]\n", name, mode));
+        out.push_str("  Downstream (this table → target tables):\n");
+        for t in downstream {
+            out.push_str(&format!(
+                "    {} [{} via {}]\n",
+                t.table_name, t.mode, t.via_proc
+            ));
         }
     }
     out
 }
 
 fn format_tbl_lineage_table(
-    graph: &crate::graph::CodeGraph,
-    upstream: &[(NodeIndex, String)],
-    downstream: &[(NodeIndex, String)],
+    _graph: &crate::graph::CodeGraph,
+    table_target: &str,
+    upstream: &[TableRef],
+    downstream: &[TableRef],
     direction: &str,
 ) -> String {
-    use crate::graph::node_display_name;
-    let mut out = String::from("DIRECTION  | TABLE                   | MODE\n");
-    out.push_str("-----------+-------------------------+------\n");
+    let mut out = String::from("DIRECTION  | SOURCE_TABLE            | TARGET_TABLE            | MODE | VIA\n");
+    out.push_str("-----------+-------------------------+-------------------------+------+----\n");
     if direction == "upstream" || direction == "both" {
-        for (node, mode) in upstream {
-            let name = node_display_name(&graph[*node]);
-            out.push_str(&format!("upstream   | {:<23} | {}\n", name, mode));
+        for t in upstream {
+            out.push_str(&format!(
+                "upstream   | {:<23} | {:<23} | {:<4} | {}\n",
+                t.table_name, table_target, t.mode, t.via_proc,
+            ));
         }
     }
     if direction == "downstream" || direction == "both" {
-        for (node, mode) in downstream {
-            let name = node_display_name(&graph[*node]);
-            out.push_str(&format!("downstream | {:<23} | {}\n", name, mode));
+        for t in downstream {
+            out.push_str(&format!(
+                "downstream | {:<23} | {:<23} | {:<4} | {}\n",
+                table_target, t.table_name, t.mode, t.via_proc,
+            ));
         }
     }
     out

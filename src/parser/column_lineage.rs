@@ -7,6 +7,7 @@
 use crate::graph::SourceLocation;
 use crate::parser::ColumnAccessExtractor;
 use ogsql_parser::ast::{Expr, GroupByItem, Ident, SelectStatement, SelectTarget};
+use std::collections::BTreeMap;
 
 /// Column-level lineage edge (intermediate representation during extraction).
 #[derive(Debug, Clone)]
@@ -91,6 +92,11 @@ impl ColumnLineageExtractor {
         self.group_by_columns = cols.to_vec();
     }
 
+    /// Inject an already-populated alias map from a prior `ColumnAccessExtractor` run.
+    pub fn set_alias_map(&mut self, aliases: BTreeMap<String, crate::parser::TableAlias>) {
+        self.base.set_alias_map(aliases);
+    }
+
     /// Convenience entry point for a whole `SELECT` statement: records the
     /// GROUP BY columns, then analyzes the target list.
     pub fn analyze_select_statement(&mut self, select: &SelectStatement) {
@@ -143,7 +149,8 @@ impl ColumnLineageExtractor {
                 distinct,
                 ..
             } if is_aggregate_function(name) => {
-                let source_cols = extract_arg_columns(args);
+                let mut source_cols = extract_arg_columns(args);
+                self.resolve_all_aliases(&mut source_cols);
                 let func_name = name
                     .last()
                     .map(|n| n.value.to_uppercase())
@@ -159,7 +166,8 @@ impl ColumnLineageExtractor {
             }
             // Simple column reference: SELECT col or SELECT t.col
             expr if is_simple_column_ref(expr) => {
-                let (table, col) = extract_column_ref(expr);
+                let (mut table, col) = extract_column_ref(expr);
+                self.resolve_alias(&mut table);
                 self.column_edges.push(ColumnEdge::Flow {
                     target_col: format!("{}.{}", owner, target_col),
                     source_table: table,
@@ -169,7 +177,8 @@ impl ColumnLineageExtractor {
             }
             // Other expressions: a + b, DECODE(...), CASE WHEN ...
             _ => {
-                let source_cols = extract_all_columns(expr);
+                let mut source_cols = extract_all_columns(expr);
+                self.resolve_all_aliases(&mut source_cols);
                 let expr_text = expr_to_source_text(expr);
                 self.column_edges.push(ColumnEdge::Derived {
                     target_col: format!("{}.{}", owner, target_col),
@@ -188,6 +197,22 @@ impl ColumnLineageExtractor {
                 parts.last().map(|p| p.value.clone())
             }
             _ => None,
+        }
+    }
+
+    /// Resolve a single table alias to its physical table name.
+    fn resolve_alias(&self, table: &mut Option<String>) {
+        if let Some(ref alias) = table {
+            if let Some(resolved) = self.base.resolve_alias(alias) {
+                *table = Some(resolved.table.clone());
+            }
+        }
+    }
+
+    /// Resolve all table aliases in a list of `(table, column)` pairs.
+    fn resolve_all_aliases(&self, cols: &mut Vec<(Option<String>, String)>) {
+        for (table, _col) in cols.iter_mut() {
+            self.resolve_alias(table);
         }
     }
 }

@@ -4338,6 +4338,13 @@ fn add_column_lineage_edges(
     extractor.set_output(owner_table);
 
     for info in statements {
+        // Run the base ColumnAccessExtractor first to populate alias_map
+        // (resolves aliases like "t" → "mid_yjqs_detail" for physical table names)
+        let mut base_extractor = crate::parser::ColumnAccessExtractor::new();
+        walk_statement(&mut base_extractor, &info.statement);
+        let base_analysis = base_extractor.finish();
+        extractor.set_alias_map(base_analysis.alias_map);
+
         let mut walker = ColumnLineageWalker {
             extractor: &mut extractor,
         };

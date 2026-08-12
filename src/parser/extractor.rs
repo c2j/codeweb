@@ -1500,11 +1500,15 @@ impl ColumnAccessExtractor {
         }
     }
 
+    pub fn set_alias_map(&mut self, aliases: BTreeMap<String, TableAlias>) {
+        self.alias_map.extend(aliases);
+    }
+
     fn current_clause(&self) -> Option<ColumnContext> {
         self.clause_stack.last().copied()
     }
 
-    fn resolve_alias(&self, prefix: &str) -> Option<&TableAlias> {
+    pub(crate) fn resolve_alias(&self, prefix: &str) -> Option<&TableAlias> {
         self.alias_map.get(&prefix.to_lowercase())
     }
 
