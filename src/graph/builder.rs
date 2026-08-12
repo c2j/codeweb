@@ -4456,6 +4456,9 @@ fn collect_select_sources(
     select: &ogsql_parser::ast::SelectStatement,
     extractor: &crate::parser::ColumnLineageExtractor,
 ) -> Vec<crate::parser::CursorColumn> {
+    // For single-table queries, un-prefixed column refs (e.g. "fund_code")
+    // resolve to the sole FROM table.
+    let default_table = single_table_name(&select.from);
     let mut sources = Vec::new();
     for target in &select.targets {
         if let ogsql_parser::ast::SelectTarget::Expr(expr, alias) = target {
@@ -4464,12 +4467,14 @@ fn collect_select_sources(
                 .map(|a| a.value.clone())
                 .unwrap_or_else(|| derive_output_name(expr));
             let mut cols = collect_columns_from_expr(expr);
-            // Resolve aliases using the extractor's alias map.
+            // Resolve aliases, then fall back to the single-table name.
             for (table, _col) in cols.iter_mut() {
                 if let Some(ref alias) = table {
                     if let Some(resolved) = extractor.base().resolve_alias(alias) {
                         *table = Some(resolved.table.clone());
                     }
+                } else if let Some(ref dt) = default_table {
+                    *table = Some(dt.clone());
                 }
             }
             // If single source column, use it; otherwise mark as expression-derived.
@@ -4492,6 +4497,16 @@ fn collect_select_sources(
         }
     }
     sources
+}
+
+/// Return the table name if this is a single-table query (no JOIN, no subquery).
+fn single_table_name(from: &[ogsql_parser::ast::TableRef]) -> Option<String> {
+    if from.len() == 1 {
+        if let ogsql_parser::ast::TableRef::Table { name, .. } = &from[0] {
+            return name.last().map(|i| i.value.clone());
+        }
+    }
+    None
 }
 
 /// Derive an output column name from an expression (for SELECT without alias).
