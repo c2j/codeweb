@@ -4098,26 +4098,44 @@ fn cmd_column_lineage(
     let table = parts[0];
     let column = parts[1];
 
-    // Try exact table.column match first, then fall back to name-only search.
-    let exact_id = format!("col:{}.{}", table, column);
-    let mut col_ids = vec![exact_id];
-    // Also add name-only matches for robustness.
-    let name_matches: Vec<String> = graph
+    // Search by owner_table.name (more robust than string ID matching).
+    let mut col_ids: Vec<String> = graph
         .node_indices()
         .filter(|&idx| matches!(&graph[idx], crate::graph::Node::Column { .. }))
         .filter_map(|idx| {
-            if let crate::graph::Node::Column { id, name, .. } = &graph[idx] {
-                if name == column && id != &col_ids[0] {
-                    Some(id.clone())
+            if let crate::graph::Node::Column {
+                id,
+                ref owner_table,
+                ref name,
+                ..
+            } = &graph[idx]
+            {
+                if name == column && owner_table == table {
+                    return Some(id.clone());
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Fall back to name-only search.
+    if col_ids.is_empty() {
+        col_ids = graph
+            .node_indices()
+            .filter(|&idx| matches!(&graph[idx], crate::graph::Node::Column { .. }))
+            .filter_map(|idx| {
+                if let crate::graph::Node::Column { id, name, .. } = &graph[idx] {
+                    if name == column {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        })
-        .collect();
-    col_ids.extend(name_matches);
+            })
+            .collect();
+    }
 
     let mut all_paths = vec![];
     for col_id in &col_ids {
