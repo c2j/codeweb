@@ -689,6 +689,10 @@ enum Commands {
         /// Project directory (default: current directory)
         #[arg(short = 'p', long, default_value = ".")]
         project: PathBuf,
+
+        /// Show intermediate procedure-level column nodes (default: hide)
+        #[arg(long)]
+        show_procedures: bool,
     },
 
     /// Find reachability paths connecting multiple nodes
@@ -1034,6 +1038,7 @@ fn run() -> Result<()> {
             format,
             output,
             project,
+            show_procedures,
         }) => cmd_lineage(
             &target,
             &direction,
@@ -1041,6 +1046,7 @@ fn run() -> Result<()> {
             &format,
             output.as_deref(),
             &project,
+            show_procedures,
         ),
         Some(Commands::Inspect {
             nodes,
@@ -4053,6 +4059,7 @@ fn cmd_lineage(
     format: &str,
     output: Option<&Path>,
     project: &Path,
+    show_procedures: bool,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
     let store = match proj.load_store() {
@@ -4065,9 +4072,9 @@ fn cmd_lineage(
     let graph = store.graph();
 
     if target.contains('.') {
-        cmd_column_lineage(graph, target, direction, depth, format, output)
+        cmd_column_lineage(graph, target, direction, depth, format, output, show_procedures)
     } else {
-        cmd_table_lineage(graph, target, direction, depth, format, output)
+        cmd_table_lineage(graph, target, direction, depth, format, output, show_procedures)
     }
 }
 
@@ -4079,6 +4086,7 @@ fn cmd_column_lineage(
     depth: usize,
     format: &str,
     output: Option<&Path>,
+    show_procedures: bool,
 ) -> Result<()> {
     use crate::graph::traverse::ColumnLineageQuery;
 
@@ -4123,7 +4131,7 @@ fn cmd_column_lineage(
     }
 
     let output_str = match format {
-        "tree" => format_col_lineage_tree(&all_paths, col_target),
+        "tree" => format_col_lineage_tree(&all_paths, col_target, show_procedures),
         "table" => format_col_lineage_table(&all_paths),
         "json" => serde_json::to_string_pretty(&all_paths).unwrap_or_default(),
         _ => unreachable!(),
@@ -4139,6 +4147,7 @@ fn cmd_table_lineage(
     depth: usize,
     format: &str,
     output: Option<&Path>,
+    _show_procedures: bool,
 ) -> Result<()> {
     use crate::graph::{node_display_name, Node};
 
@@ -4273,18 +4282,27 @@ fn format_table_ref(graph: &crate::graph::CodeGraph, t: &TableRef) -> String {
 fn format_col_lineage_tree(
     paths: &[Vec<crate::graph::traverse::ColumnLineageStep>],
     target: &str,
+    show_procedures: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str(target);
     out.push('\n');
 
     for path in paths {
-        if path.is_empty() {
+        // Filter out procedure-owned intermediate column nodes unless --show-procedures.
+        let filtered: Vec<&crate::graph::traverse::ColumnLineageStep> = if show_procedures {
+            path.iter().collect()
+        } else {
+            path.iter()
+                .filter(|s| !(is_proc_col(&s.source_col_id) && is_proc_col(&s.target_col_id)))
+                .collect()
+        };
+        if filtered.is_empty() {
             continue;
         }
-        for (i, step) in path.iter().enumerate() {
+        for (i, step) in filtered.iter().enumerate() {
             let indent = "  ".repeat(i);
-            let prefix = if i == path.len() - 1 {
+            let prefix = if i == filtered.len() - 1 {
                 "  └── "
             } else {
                 "  ├── "
@@ -4305,14 +4323,45 @@ fn format_col_lineage_tree(
                 _ => step.edge_kind.clone(),
             };
 
+            // Show clean column names (strip proc:/func: prefixes for readability)
+            let display_id = clean_display_id(&step.source_col_id);
             let line = format!(
                 "{}{}{} [{}]\n",
-                indent, prefix, step.source_col_id, kind_label
+                indent, prefix, display_id, kind_label
             );
             out.push_str(&line);
         }
     }
     out
+}
+
+/// Check if a column ID belongs to a procedure (not a table).
+fn is_proc_col(col_id: &str) -> bool {
+    let id = col_id.strip_prefix("col:").unwrap_or(col_id);
+    id.starts_with("proc:")
+        || id.starts_with("func:")
+        || id.starts_with("prc_")
+        || id.starts_with("pkg_")
+        || id.starts_with("fnc_")
+}
+
+/// Clean column ID for display: strip col: prefix and proc:/func: prefixes.
+fn clean_display_id(col_id: &str) -> String {
+    let id = col_id.strip_prefix("col:").unwrap_or(col_id);
+    // Strip procedure indicators, keep just column name
+    if let Some(dot) = id.rfind('.') {
+        let owner = &id[..dot];
+        let col = &id[dot + 1..];
+        if owner.starts_with("proc:")
+            || owner.starts_with("func:")
+            || owner.starts_with("prc_")
+            || owner.starts_with("pkg_")
+            || owner.starts_with("fnc_")
+        {
+            return col.to_string();
+        }
+    }
+    id.to_string()
 }
 
 fn format_col_lineage_table(paths: &[Vec<crate::graph::traverse::ColumnLineageStep>]) -> String {
