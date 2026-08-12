@@ -52,10 +52,30 @@ pub struct ColumnLineageExtractor {
     column_edges: Vec<ColumnEdge>,
     group_by_columns: Vec<String>,
     current_output: Option<OutputContext>,
+    cursor_sources: std::collections::HashMap<String, Vec<CursorColumn>>,
+    fetch_vars: std::collections::HashMap<String, Vec<String>>,
+    pending_insert: Option<(String, Vec<String>, Vec<Expr>)>,
 }
 
 struct OutputContext {
     owner_table: String,
+}
+
+/// A cursor SELECT output column: its output name and resolved source.
+#[derive(Debug, Clone)]
+pub struct CursorColumn {
+    pub output_name: String,
+    pub source_table: Option<String>,
+    pub source_col: String,
+}
+
+fn make_cursor_flow(table: &str, target_col: &str, c: &CursorColumn) -> ColumnEdge {
+    ColumnEdge::Flow {
+        target_col: format!("{}.{}", table, target_col),
+        source_table: c.source_table.clone(),
+        source_col: c.source_col.clone(),
+        location: None,
+    }
 }
 
 impl ColumnLineageExtractor {
@@ -65,6 +85,9 @@ impl ColumnLineageExtractor {
             column_edges: Vec::new(),
             group_by_columns: Vec::new(),
             current_output: None,
+            cursor_sources: std::collections::HashMap::new(),
+            fetch_vars: std::collections::HashMap::new(),
+            pending_insert: None,
         }
     }
 
@@ -97,6 +120,21 @@ impl ColumnLineageExtractor {
         self.base.set_alias_map(aliases);
     }
 
+    /// Record a cursor declaration's SELECT output columns (name → source).
+    pub fn record_cursor(&mut self, name: &str, source_cols: Vec<CursorColumn>) {
+        self.cursor_sources.insert(name.to_lowercase(), source_cols);
+    }
+
+    /// Record a FETCH statement's INTO variable list for a cursor.
+    pub fn record_fetch(&mut self, cursor_name: &str, vars: Vec<String>) {
+        self.fetch_vars.insert(cursor_name.to_lowercase(), vars);
+    }
+
+    /// Record an INSERT ... VALUES target table, column list, and value exprs.
+    pub fn record_insert_values(&mut self, table: &str, columns: Vec<String>, values: Vec<Expr>) {
+        self.pending_insert = Some((table.to_string(), columns, values));
+    }
+
     /// Extract table aliases from a SELECT's FROM clause.
     /// Returns a fresh alias_map scoped to this SELECT only,
     /// avoiding alias shadowing across sub-selects.
@@ -117,8 +155,65 @@ impl ColumnLineageExtractor {
         self.analyze_select_targets(&select.targets);
     }
 
-    pub fn finish(self) -> Vec<ColumnEdge> {
+    pub fn finish(mut self) -> Vec<ColumnEdge> {
+        // Resolve cursor → FETCH → INSERT VALUES data flow.
+        self.resolve_cursor_insert_flow();
         self.column_edges
+    }
+
+    /// Connect cursor SELECT sources to INSERT VALUES targets via FETCH variables.
+    ///
+    /// Pattern: `CURSOR c IS SELECT a, b FROM t; FETCH c INTO v1, v2;
+    /// INSERT INTO target VALUES(v1, v2);`
+    /// Produces Flow edges: t.a → target.col1, t.b → target.col2.
+    fn resolve_cursor_insert_flow(&mut self) {
+        let Some((table, columns, values)) = self.pending_insert.take() else {
+            return;
+        };
+        let mut new_edges: Vec<ColumnEdge> = Vec::new();
+        for (i, value) in values.iter().enumerate() {
+            let target_col = columns
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{}", i));
+
+            // Match value against cursor output columns.
+            // Two cases:
+            //   1. Bare variable (v1) — match by FETCH position
+            //   2. Record field (r.accrual) — match by cursor output column NAME
+            let var_name = match value {
+                Expr::ColumnRef(parts) if parts.len() == 1 => Some(parts[0].value.to_lowercase()),
+                Expr::FieldAccess { field, .. } => Some(field.to_lowercase()),
+                _ => None,
+            };
+
+            let Some(var_name) = var_name else { continue };
+
+            // First try position-based matching via FETCH vars.
+            let mut found = false;
+            for (cursor, vars) in &self.fetch_vars {
+                if let Some(pos) = vars.iter().position(|v| v.to_lowercase() == var_name) {
+                    if let Some(src_cols) = self.cursor_sources.get(cursor) {
+                        if let Some(c) = src_cols.get(pos) {
+                            new_edges.push(make_cursor_flow(&table, &target_col, c));
+                            found = true;
+                        }
+                    }
+                }
+            }
+            // Fall back to name-based matching against cursor output column names.
+            if !found {
+                for src_cols in self.cursor_sources.values() {
+                    if let Some(c) = src_cols
+                        .iter()
+                        .find(|c| c.output_name.to_lowercase() == var_name)
+                    {
+                        new_edges.push(make_cursor_flow(&table, &target_col, c));
+                    }
+                }
+            }
+        }
+        self.column_edges.extend(new_edges);
     }
 
     /// Analyze the SELECT target list.
@@ -229,7 +324,7 @@ impl ColumnLineageExtractor {
     }
 
     /// Resolve all table aliases in a list of `(table, column)` pairs.
-    fn resolve_all_aliases(&self, cols: &mut Vec<(Option<String>, String)>) {
+    fn resolve_all_aliases(&self, cols: &mut [(Option<String>, String)]) {
         for (table, _col) in cols.iter_mut() {
             self.resolve_alias(table);
         }
@@ -442,16 +537,16 @@ fn extract_aliases_recursive(
             extract_aliases_recursive(left, aliases);
             extract_aliases_recursive(right, aliases);
         }
-        ogsql_parser::ast::TableRef::Subquery { alias, .. } => {
-            if let Some(ref a) = alias {
-                aliases.insert(
-                    a.value.to_lowercase(),
-                    crate::parser::TableAlias {
-                        schema: None,
-                        table: format!("<subquery:{}>", a.value),
-                    },
-                );
-            }
+        ogsql_parser::ast::TableRef::Subquery {
+            alias: Some(a), ..
+        } => {
+            aliases.insert(
+                a.value.to_lowercase(),
+                crate::parser::TableAlias {
+                    schema: None,
+                    table: format!("<subquery:{}>", a.value),
+                },
+            );
         }
         _ => {}
     }

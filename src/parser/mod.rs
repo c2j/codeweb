@@ -15,7 +15,7 @@ pub mod scanner;
 pub mod snippet;
 
 #[allow(unused_imports)]
-pub use column_lineage::{ColumnEdge, ColumnLineageExtractor};
+pub use column_lineage::{ColumnEdge, ColumnLineageExtractor, CursorColumn};
 #[allow(unused_imports)]
 pub use extractor::{
     extract_body_sql, pl_type_decl_name, CallEdge, CallExtractor, ColumnAccessExtractor,

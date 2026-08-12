@@ -4072,9 +4072,25 @@ fn cmd_lineage(
     let graph = store.graph();
 
     if target.contains('.') {
-        cmd_column_lineage(graph, target, direction, depth, format, output, show_procedures)
+        cmd_column_lineage(
+            graph,
+            target,
+            direction,
+            depth,
+            format,
+            output,
+            show_procedures,
+        )
     } else {
-        cmd_table_lineage(graph, target, direction, depth, format, output, show_procedures)
+        cmd_table_lineage(
+            graph,
+            target,
+            direction,
+            depth,
+            format,
+            output,
+            show_procedures,
+        )
     }
 }
 
@@ -4171,7 +4187,7 @@ fn cmd_table_lineage(
     output: Option<&Path>,
     _show_procedures: bool,
 ) -> Result<()> {
-    use crate::graph::{node_display_name, Node};
+    use crate::graph::Node;
 
     let table_node = graph.node_indices().find(|&idx| match &graph[idx] {
         Node::Table { name, .. } => name.eq_ignore_ascii_case(table_target),
@@ -4224,7 +4240,7 @@ struct TableRef {
 fn trace_table_upstream(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
-    max_depth: usize,
+    _max_depth: usize,
 ) -> Vec<TableRef> {
     use crate::graph::node_display_name;
     let mut results = Vec::new();
@@ -4259,7 +4275,7 @@ fn trace_table_upstream(
 fn trace_table_downstream(
     graph: &crate::graph::CodeGraph,
     start: NodeIndex,
-    max_depth: usize,
+    _max_depth: usize,
 ) -> Vec<TableRef> {
     use crate::graph::node_display_name;
     let mut results = Vec::new();
@@ -4292,12 +4308,16 @@ fn trace_table_downstream(
 
 fn format_mode(m: &crate::graph::AccessMode) -> String {
     let mut flags = Vec::new();
-    if m.contains(crate::graph::AccessMode::Read) { flags.push("R"); }
-    if m.contains(crate::graph::AccessMode::Write) { flags.push("W"); }
+    if m.contains(crate::graph::AccessMode::Read) {
+        flags.push("R");
+    }
+    if m.contains(crate::graph::AccessMode::Write) {
+        flags.push("W");
+    }
     flags.join("/")
 }
 
-fn format_table_ref(graph: &crate::graph::CodeGraph, t: &TableRef) -> String {
+fn format_table_ref(_graph: &crate::graph::CodeGraph, t: &TableRef) -> String {
     format!("{} [{}:{}]", t.table_name, t.mode, t.via_proc)
 }
 
@@ -4347,10 +4367,7 @@ fn format_col_lineage_tree(
 
             // Show clean column names (strip proc:/func: prefixes for readability)
             let display_id = clean_display_id(&step.source_col_id);
-            let line = format!(
-                "{}{}{} [{}]\n",
-                indent, prefix, display_id, kind_label
-            );
+            let line = format!("{}{}{} [{}]\n", indent, prefix, display_id, kind_label);
             out.push_str(&line);
         }
     }
@@ -4416,7 +4433,7 @@ fn format_col_lineage_table(paths: &[Vec<crate::graph::traverse::ColumnLineageSt
 
 #[allow(clippy::too_many_arguments)]
 fn format_tbl_lineage_tree(
-    graph: &crate::graph::CodeGraph,
+    _graph: &crate::graph::CodeGraph,
     target: &str,
     upstream: &[TableRef],
     downstream: &[TableRef],
@@ -4453,7 +4470,9 @@ fn format_tbl_lineage_table(
     downstream: &[TableRef],
     direction: &str,
 ) -> String {
-    let mut out = String::from("DIRECTION  | SOURCE_TABLE            | TARGET_TABLE            | MODE | VIA\n");
+    let mut out = String::from(
+        "DIRECTION  | SOURCE_TABLE            | TARGET_TABLE            | MODE | VIA\n",
+    );
     out.push_str("-----------+-------------------------+-------------------------+------+----\n");
     if direction == "upstream" || direction == "both" {
         for t in upstream {

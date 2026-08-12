@@ -2772,8 +2772,8 @@ impl GraphBuilder {
             // For INSERT/SELECT INTO statements, use the target TABLE name
             // as the column owner (not the procedure name), so column lineage
             // shows table→table flow instead of procedure→table.
-            let column_owner = extract_insert_target(&info.statement)
-                .unwrap_or_else(|| lineage_owner.clone());
+            let column_owner =
+                extract_insert_target(&info.statement).unwrap_or_else(|| lineage_owner.clone());
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
 
@@ -4316,7 +4316,12 @@ fn clean_col_owner(col_ref: &str) -> String {
     if let Some(dot) = col_ref.rfind('.') {
         let owner = &col_ref[..dot];
         let col_name = &col_ref[dot + 1..];
-        if owner.starts_with("proc:") || owner.starts_with("func:") || owner.starts_with("prc_") || owner.starts_with("pkg_") || owner.starts_with("fnc_") {
+        if owner.starts_with("proc:")
+            || owner.starts_with("func:")
+            || owner.starts_with("prc_")
+            || owner.starts_with("pkg_")
+            || owner.starts_with("fnc_")
+        {
             return col_name.to_string();
         }
     }
@@ -4354,8 +4359,10 @@ fn extract_insert_target(stmt: &ogsql_parser::Statement) -> Option<String> {
 /// Forwards `visit_select` to [`ColumnLineageExtractor::analyze_select_statement`]
 /// so that `walk_statement` analyzes SELECTs nested anywhere in a statement
 /// (e.g. inside a procedure body or an INSERT ... SELECT source).
+/// Also captures cursor/FETCH/INSERT VALUES for cursor-based column lineage.
 struct ColumnLineageWalker<'a> {
     extractor: &'a mut crate::parser::ColumnLineageExtractor,
+    current_cursor: Option<String>,
 }
 
 impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
@@ -4363,14 +4370,24 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
         &mut self,
         insert: &ogsql_parser::ast::InsertStatement,
     ) -> ogsql_parser::VisitorResult {
-        // Use the INSERT target TABLE as the column owner, not the procedure name.
-        // This makes column lineage show table→table flow.
         let target_table = insert
             .table
             .last()
             .map(|i| i.value.clone())
             .unwrap_or_default();
         self.extractor.set_output(&target_table);
+
+        // For INSERT ... VALUES, record target table + columns + value exprs
+        // for cursor variable tracking.
+        if let ogsql_parser::ast::InsertSource::Values(rows) = &insert.source {
+            if let Some(first_row) = rows.first() {
+                self.extractor.record_insert_values(
+                    &target_table,
+                    insert.columns.clone(),
+                    first_row.clone(),
+                );
+            }
+        }
         ogsql_parser::VisitorResult::Continue
     }
 
@@ -4378,14 +4395,155 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
         &mut self,
         select: &ogsql_parser::ast::SelectStatement,
     ) -> ogsql_parser::VisitorResult {
-        // Extract per-SELECT alias map from the FROM clause to avoid
-        // alias shadowing across different sub-selects in the same procedure.
-        self.extractor
-            .set_alias_map(crate::parser::ColumnLineageExtractor::extract_aliases_from_from(
-                &select.from,
-            ));
+        self.extractor.set_alias_map(
+            crate::parser::ColumnLineageExtractor::extract_aliases_from_from(&select.from),
+        );
+
+        // If inside a cursor declaration, record the SELECT's source columns.
+        if let Some(ref cursor_name) = self.current_cursor.clone() {
+            let sources = collect_select_sources(select, self.extractor);
+            self.extractor.record_cursor(cursor_name, sources);
+        }
+
         self.extractor.analyze_select_statement(select);
         ogsql_parser::VisitorResult::Continue
+    }
+
+    fn visit_pl_declaration(
+        &mut self,
+        decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
+    ) -> ogsql_parser::VisitorResult {
+        if let ogsql_parser::ast::plpgsql::PlDeclaration::Cursor(cursor) = decl {
+            self.current_cursor = Some(cursor.name.clone());
+        }
+        ogsql_parser::VisitorResult::Continue
+    }
+
+    fn visit_pl_statement(
+        &mut self,
+        stmt: &ogsql_parser::ast::plpgsql::PlStatement,
+    ) -> ogsql_parser::VisitorResult {
+        if let ogsql_parser::ast::plpgsql::PlStatement::Fetch(fetch) = stmt {
+            let cursor_name = match &fetch.node.cursor {
+                ogsql_parser::ast::Expr::ColumnRef(parts) => {
+                    parts.last().map(|i| i.value.clone()).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
+            self.extractor.record_fetch(&cursor_name, vars);
+        }
+        ogsql_parser::VisitorResult::Continue
+    }
+}
+
+/// Extract a bare variable name from an expression (single-part column ref).
+fn expr_var_name(expr: &ogsql_parser::ast::Expr) -> String {
+    match expr {
+        ogsql_parser::ast::Expr::ColumnRef(parts) => {
+            parts.last().map(|i| i.value.clone()).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Collect the source columns (resolved to table.column) of a cursor SELECT,
+/// with their output column names (aliases).
+fn collect_select_sources(
+    select: &ogsql_parser::ast::SelectStatement,
+    extractor: &crate::parser::ColumnLineageExtractor,
+) -> Vec<crate::parser::CursorColumn> {
+    let mut sources = Vec::new();
+    for target in &select.targets {
+        if let ogsql_parser::ast::SelectTarget::Expr(expr, alias) = target {
+            let output_name = alias
+                .as_ref()
+                .map(|a| a.value.clone())
+                .unwrap_or_else(|| derive_output_name(expr));
+            let mut cols = collect_columns_from_expr(expr);
+            // Resolve aliases using the extractor's alias map.
+            for (table, _col) in cols.iter_mut() {
+                if let Some(ref alias) = table {
+                    if let Some(resolved) = extractor.base().resolve_alias(alias) {
+                        *table = Some(resolved.table.clone());
+                    }
+                }
+            }
+            // If single source column, use it; otherwise mark as expression-derived.
+            if cols.len() == 1 {
+                let (table, col) = cols.into_iter().next().unwrap();
+                sources.push(crate::parser::CursorColumn {
+                    output_name,
+                    source_table: table,
+                    source_col: col,
+                });
+            } else if !cols.is_empty() {
+                // Multi-column expression: keep the first as approximate source.
+                let (table, col) = cols.into_iter().next().unwrap();
+                sources.push(crate::parser::CursorColumn {
+                    output_name,
+                    source_table: table,
+                    source_col: col,
+                });
+            }
+        }
+    }
+    sources
+}
+
+/// Derive an output column name from an expression (for SELECT without alias).
+fn derive_output_name(expr: &ogsql_parser::ast::Expr) -> String {
+    match expr {
+        ogsql_parser::ast::Expr::ColumnRef(parts)
+        | ogsql_parser::ast::Expr::ColumnRefOuterJoin(parts) => {
+            parts.last().map(|i| i.value.clone()).unwrap_or_default()
+        }
+        ogsql_parser::ast::Expr::FieldAccess { field, .. } => field.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Recursively collect column references from an expression.
+fn collect_columns_from_expr(expr: &ogsql_parser::ast::Expr) -> Vec<(Option<String>, String)> {
+    use ogsql_parser::ast::Expr;
+    match expr {
+        Expr::ColumnRef(parts) | Expr::ColumnRefOuterJoin(parts) => {
+            let col = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+            let table = if parts.len() >= 2 {
+                Some(parts[parts.len() - 2].value.clone())
+            } else {
+                None
+            };
+            vec![(table, col)]
+        }
+        Expr::FunctionCall { args, .. } => {
+            args.iter().flat_map(collect_columns_from_expr).collect()
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            let mut cols = collect_columns_from_expr(left);
+            cols.extend(collect_columns_from_expr(right));
+            cols
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Parenthesized(inner) => {
+            collect_columns_from_expr(inner)
+        }
+        Expr::Case {
+            whens, else_expr, ..
+        } => {
+            let mut cols: Vec<_> = whens
+                .iter()
+                .flat_map(|w| {
+                    let mut c = collect_columns_from_expr(&w.condition);
+                    c.extend(collect_columns_from_expr(&w.result));
+                    c
+                })
+                .collect();
+            if let Some(ref e) = else_expr {
+                cols.extend(collect_columns_from_expr(e));
+            }
+            cols
+        }
+        _ => vec![],
     }
 }
 
@@ -4407,6 +4565,7 @@ fn add_column_lineage_edges(
     for info in statements {
         let mut walker = ColumnLineageWalker {
             extractor: &mut extractor,
+            current_cursor: None,
         };
         walk_statement(&mut walker, &info.statement);
     }
