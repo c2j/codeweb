@@ -231,6 +231,10 @@ enum Commands {
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         project: PathBuf,
+
+        /// Enable column-level lineage analysis
+        #[arg(long)]
+        column_lineage: bool,
     },
 
     /// Show changes since last analysis
@@ -846,7 +850,10 @@ fn run() -> Result<()> {
             cmd_legacy(cli)
         }
         Some(Commands::Init { name, dir }) => cmd_init(&name, &dir),
-        Some(Commands::Analyze { project }) => cmd_analyze(&project),
+        Some(Commands::Analyze {
+            project,
+            column_lineage,
+        }) => cmd_analyze(&project, column_lineage),
         Some(Commands::Diff { project }) => cmd_diff(&project),
         Some(Commands::Export {
             format,
@@ -1073,14 +1080,14 @@ fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {
         proj.name(),
         proj.root().display()
     );
-    let report = proj.analyze()?;
+    let report = proj.analyze(false)?;
     print_analyze_report(&report);
     Ok(())
 }
 
-fn cmd_analyze(project: &Path) -> Result<()> {
+fn cmd_analyze(project: &Path, column_lineage: bool) -> Result<()> {
     let mut proj = project::Project::find(project)?;
-    let report = proj.analyze()?;
+    let report = proj.analyze(column_lineage)?;
     print_analyze_report(&report);
     Ok(())
 }
@@ -1426,7 +1433,7 @@ fn cmd_files(project: &Path) -> Result<()> {
         println_stdout!();
         println_stdout!("{} files total", entries.len());
     } else {
-        let report = proj.analyze()?;
+        let report = proj.analyze(false)?;
         print_analyze_report(&report);
     }
 
@@ -4080,13 +4087,25 @@ fn cmd_column_lineage(
         eprintln!("Invalid column target format. Use 'table.column'");
         return Ok(());
     }
-    let table = parts[0];
     let column = parts[1];
 
-    let col_ids = [
-        format!("col:{}.{}", table, column),
-        format!("col:public.{}.{}", table, column),
-    ];
+    // Search all column nodes whose ID ends with ".<column>"
+    // Column IDs are "col:<owner>.<name>" where owner may be proc:, table:, etc.
+    let col_ids: Vec<String> = graph
+        .node_indices()
+        .filter(|&idx| matches!(&graph[idx], crate::graph::Node::Column { .. }))
+        .filter_map(|idx| {
+            if let crate::graph::Node::Column { id, name, .. } = &graph[idx] {
+                if name == column {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let mut all_paths = vec![];
     for col_id in &col_ids {
@@ -4260,21 +4279,19 @@ fn format_col_lineage_tree(
                 "  ├── "
             };
 
-            let kind_label = match step.edge_kind.as_str() {
-                "dataflow" => "DataFlow",
+            let kind_label: String = match step.edge_kind.as_str() {
+                "dataflow" => "DataFlow".to_string(),
                 "derived" => match &step.expression {
                     Some(e) if !e.is_empty() => {
-                        return format!("{}Derived: {}", "", &e[..e.len().min(60)]);
+                        format!("Derived: {}", truncate_str(e, 50))
                     }
-                    _ => "Derived",
+                    _ => "Derived".to_string(),
                 },
                 "aggregated" => match &step.aggregation {
-                    Some(a) => {
-                        return format!("{}Aggregated: {}", "", a);
-                    }
-                    _ => "Aggregated",
+                    Some(a) => format!("Aggregated: {}", a),
+                    _ => "Aggregated".to_string(),
                 },
-                _ => &step.edge_kind,
+                _ => step.edge_kind.clone(),
             };
 
             let line = format!(

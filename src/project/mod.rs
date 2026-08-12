@@ -111,7 +111,7 @@ impl Project {
         })
     }
 
-    pub fn analyze(&mut self) -> Result<AnalyzeReport> {
+    pub fn analyze(&mut self, column_lineage: bool) -> Result<AnalyzeReport> {
         let start = std::time::Instant::now();
 
         let codeweb_dir = self.root.join(".codeweb");
@@ -230,7 +230,7 @@ impl Project {
                 all_hashes.push((pf.path.clone(), pf.content_hash.clone(), FileType::Sql));
             }
 
-            GraphBuilder::build_sql_chunk(&mut ctx, &parsed, false);
+            GraphBuilder::build_sql_chunk(&mut ctx, &parsed, column_lineage);
             // parsed dropped here — AST memory freed
         }
 

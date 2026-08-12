@@ -8,7 +8,7 @@ pub fn run(project_path: &std::path::Path) -> Result<()> {
 
     if proj.load_store().is_err() {
         eprintln!("No store found. Running initial analysis...");
-        proj.analyze()?;
+        proj.analyze(false)?;
     }
 
     let mut terminal = ratatui::init();

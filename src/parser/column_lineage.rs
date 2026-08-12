@@ -306,7 +306,67 @@ fn extract_all_columns(expr: &Expr) -> Vec<(Option<String>, String)> {
 
 /// Reconstruct the raw SQL text of an expression (MVP: uses the AST `Debug` format).
 fn expr_to_source_text(expr: &Expr) -> String {
-    format!("{:?}", expr)
+    match expr {
+        Expr::ColumnRef(parts) => parts
+            .iter()
+            .map(|i| i.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "{} {} {}",
+                expr_to_source_text(left),
+                op,
+                expr_to_source_text(right)
+            )
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            format!("({}{})", op, expr_to_source_text(inner))
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let func_name = name
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let args_str: Vec<String> = args.iter().map(expr_to_source_text).collect();
+            format!("{}({})", func_name, args_str.join(", "))
+        }
+        Expr::Parenthesized(inner) => {
+            format!("({})", expr_to_source_text(inner))
+        }
+        Expr::Literal(lit) => format!("{:?}", lit),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut s = String::from("CASE");
+            if let Some(ref op) = operand {
+                s.push_str(&format!(" {}", expr_to_source_text(op)));
+            }
+            for w in whens {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    expr_to_source_text(&w.condition),
+                    expr_to_source_text(&w.result)
+                ));
+            }
+            if let Some(ref e) = else_expr {
+                s.push_str(&format!(" ELSE {}", expr_to_source_text(e)));
+            }
+            s.push_str(" END");
+            s
+        }
+        _ => {
+            let dbg = format!("{:?}", expr);
+            if dbg.len() > 40 {
+                format!("{}...", &dbg[..37])
+            } else {
+                dbg
+            }
+        }
+    }
 }
 
 /// Collect GROUP BY column names (only simple `GROUP BY col` items; complex

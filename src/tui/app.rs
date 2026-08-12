@@ -366,7 +366,7 @@ impl App {
                 self.info_scroll = 0;
             }
             KeyCode::Char('a') => {
-                let _ = self.project.analyze();
+                let _ = self.project.analyze(false);
                 self.refresh_node_list();
             }
             KeyCode::Char('s') => {
