@@ -1145,6 +1145,19 @@ impl Visitor for TableAccessExtractor {
 
         self.push_cte_scope(local_cte_names);
 
+        // Every path below returns SkipChildren, so walk_select never reaches the
+        // set_operation branches. Pick up the UNION/INTERSECT/EXCEPT right-hand sides
+        // here — inside the CTE scope, which stays visible to all branches. The
+        // recursive call follows the rest of the right-nested chain.
+        if let Some(ref set_op) = select.set_operation {
+            let right = match set_op {
+                ogsql_parser::ast::SetOperation::Union { right, .. }
+                | ogsql_parser::ast::SetOperation::Intersect { right, .. }
+                | ogsql_parser::ast::SetOperation::Except { right, .. } => right.as_ref(),
+            };
+            self.visit_select(right);
+        }
+
         if let Some(ref into) = select.into_table {
             self.add_access(
                 &into.table_name,

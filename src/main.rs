@@ -1391,7 +1391,7 @@ fn cmd_lineage(
     // Format and output
     match format.to_lowercase().as_str() {
         "tree" => {
-            let tree_str = graph::lineage::format_lineage_tree(&lineage_node, graph, 0);
+            let tree_str = graph::lineage::format_lineage_tree(&lineage_node, graph, lineage_dir, 0);
             println_stdout!("{}", tree_str);
         }
         "json" => {

@@ -100,26 +100,27 @@ pub fn lineage_table(
                     }
                 }
 
-                // Also follow DependsOn edges (view dependencies)
-                for edge_ref in graph.edges_directed(current_idx, Direction::Incoming) {
+                // Follow DependsOn edges: view → base table. When the current node is a
+                // view, its base tables are upstream, so walk outgoing edges.
+                for edge_ref in graph.edges_directed(current_idx, Direction::Outgoing) {
                     if matches!(edge_ref.weight(), Edge::DependsOn { .. }) {
-                        let source_view = edge_ref.source();
-                        if !visited.contains(&source_view) {
-                            visited.insert(source_view);
-                            queue.push_back((source_view, current_depth + 1));
+                        let base_table = edge_ref.target();
+                        if !visited.contains(&base_table) {
+                            visited.insert(base_table);
+                            queue.push_back((base_table, current_depth + 1));
 
                             children_map
                                 .entry(current_idx)
                                 .or_insert_with(Vec::new)
                                 .push((
                                     LineageNode {
-                                        idx: source_view,
+                                        idx: base_table,
                                         _depth: current_depth + 1,
                                         steps: vec![],
                                         children: Vec::new(),
                                     },
                                     LineageStep {
-                                        routine_idx: source_view,  // View itself as "step"
+                                        routine_idx: current_idx, // the view's own definition
                                         modes: AccessMode::Read,
                                     },
                                 ));
@@ -171,27 +172,28 @@ pub fn lineage_table(
                     }
                 }
 
-                // Also follow DependsOn edges reverse (tables that depend on this view)
-                for edge_ref in graph.edges_directed(current_idx, Direction::Outgoing) {
+                // Follow DependsOn edges: view → base table. Views that select from the
+                // current table are downstream consumers, so walk incoming edges.
+                for edge_ref in graph.edges_directed(current_idx, Direction::Incoming) {
                     if matches!(edge_ref.weight(), Edge::DependsOn { .. }) {
-                        let target_view = edge_ref.target();
-                        if !visited.contains(&target_view) {
-                            visited.insert(target_view);
-                            queue.push_back((target_view, current_depth + 1));
+                        let consuming_view = edge_ref.source();
+                        if !visited.contains(&consuming_view) {
+                            visited.insert(consuming_view);
+                            queue.push_back((consuming_view, current_depth + 1));
 
                             children_map
                                 .entry(current_idx)
                                 .or_insert_with(Vec::new)
                                 .push((
                                     LineageNode {
-                                        idx: target_view,
+                                        idx: consuming_view,
                                         _depth: current_depth + 1,
                                         steps: vec![],
                                         children: Vec::new(),
                                     },
                                     LineageStep {
-                                        routine_idx: target_view,  // View itself
-                                        modes: AccessMode::Write,
+                                        routine_idx: consuming_view, // the view's own definition
+                                        modes: AccessMode::Read,
                                     },
                                 ));
                         }
@@ -246,6 +248,7 @@ pub fn lineage_table(
 pub fn format_lineage_tree(
     node: &LineageNode,
     graph: &CodeGraph,
+    direction: LineageDirection,
     indent: usize,
 ) -> String {
     let mut result = String::new();
@@ -254,35 +257,36 @@ pub fn format_lineage_tree(
     let node_key = crate::graph::key::NodeKey::from_node(&graph[node.idx]);
     result.push_str(&format!("{}{}", indent_str, node_key));
 
-    // Show incoming steps as edge labels
-    if !node.steps.is_empty() {
-        let step_labels: Vec<String> = node
-            .steps
-            .iter()
-            .map(|step| {
-                let routine_key = crate::graph::key::NodeKey::from_node(&graph[step.routine_idx]);
-                format!("{}", routine_key)
-            })
-            .collect();
-        result.push_str(&format!("  [← {}]", step_labels.join(", ")));
+    // Label the routines/views connecting this node to the children listed below it.
+    // A view reaching its own base tables lists itself; that adds no information.
+    let step_labels = step_labels(node, graph);
+    if !step_labels.is_empty() {
+        let arrow = match direction {
+            LineageDirection::Upstream => "written by",
+            LineageDirection::Downstream => "read by",
+        };
+        result.push_str(&format!("  [{} {}]", arrow, step_labels.join(", ")));
     }
     result.push('\n');
 
     for child in &node.children {
-        result.push_str(&format_lineage_tree(child, graph, indent + 1));
+        result.push_str(&format_lineage_tree(child, graph, direction, indent + 1));
     }
 
     result
 }
 
+fn step_labels(node: &LineageNode, graph: &CodeGraph) -> Vec<String> {
+    node.steps
+        .iter()
+        .filter(|step| step.routine_idx != node.idx)
+        .map(|step| crate::graph::key::NodeKey::from_node(&graph[step.routine_idx]).to_string())
+        .collect()
+}
+
 /// Format lineage node as JSON.
 pub fn format_lineage_json(node: &LineageNode, graph: &CodeGraph) -> serde_json::Value {
     let node_key = crate::graph::key::NodeKey::from_node(&graph[node.idx]);
-    let step_labels: Vec<String> = node
-        .steps
-        .iter()
-        .map(|step| crate::graph::key::NodeKey::from_node(&graph[step.routine_idx]).to_string())
-        .collect();
 
     let children_json: Vec<serde_json::Value> = node
         .children
@@ -292,7 +296,7 @@ pub fn format_lineage_json(node: &LineageNode, graph: &CodeGraph) -> serde_json:
 
     serde_json::json!({
         "node": node_key.to_string(),
-        "via": step_labels,
+        "via": step_labels(node, graph),
         "children": children_json,
     })
 }

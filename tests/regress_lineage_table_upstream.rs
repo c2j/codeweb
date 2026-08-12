@@ -1,210 +1,208 @@
+//! Table-level lineage traversal (#115).
+//!
+//! `codeweb lineage <table> --direction upstream|downstream` answers "who writes this
+//! table" / "where does this table flow to" in one step.
+
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use tempfile::TempDir;
 
-fn run_codeweb(args: &[&str]) -> std::process::Output {
+fn codeweb_bin() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
     let bin_name = if cfg!(windows) {
         "codeweb.exe"
     } else {
         "codeweb"
     };
-    let entries = std::fs::read_dir(&base).unwrap_or_else(|_| panic!("no target dir"));
-    for entry in entries.flatten() {
-        let p = entry.path().join("debug").join(bin_name);
-        if p.exists() {
-            return std::process::Command::new(p)
-                .args(args)
-                .output()
-                .expect("failed to run codeweb");
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("debug").join(bin_name);
+            if p.exists() {
+                return p;
+            }
         }
     }
-    let bin = base.join("debug").join(bin_name);
-    std::process::Command::new(bin)
+    base.join("debug").join(bin_name)
+}
+
+fn run_codeweb_in(cwd: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(codeweb_bin())
         .args(args)
+        .current_dir(cwd)
         .output()
         .expect("failed to run codeweb")
 }
 
-fn write_sql(dir: &TempDir, filename: &str, sql: &str) -> PathBuf {
-    let path = dir.path().join(filename);
-    fs::write(&path, sql).unwrap();
-    path
-}
+/// Lay out a project directory with `src/t.sql`, then `init` it (which also runs the
+/// first full analysis). Returns the project root.
+fn project_with_sql(dir: &TempDir, sql: &str) -> std::path::PathBuf {
+    let root = dir.path().to_path_buf();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("t.sql"), sql).unwrap();
 
-fn init_and_analyze_project(dir: &TempDir) {
-    // First create the .codeweb directory and codeweb.toml
-    let codeweb_dir = dir.path().join(".codeweb");
-    fs::create_dir_all(&codeweb_dir).unwrap();
-
-    let config_path = codeweb_dir.join("codeweb.toml");
-    fs::write(
-        &config_path,
-        "[project]\nname = \"test-project\"\nversion = \"0.0.1\"\n",
-    )
-    .unwrap();
-
-    // Use the legacy codeweb API to analyze the directory
-    // This will create a .codeweb/store.bincode file
-    let output = run_codeweb(&[
-        dir.path().to_str().unwrap(),
-        "--format",
-        "json",
-    ]);
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("legacy analyze stderr: {}", stderr);
-
+    let out = run_codeweb_in(&root, &["init", "lineage-test", "--dir", src.to_str().unwrap()]);
     assert!(
-        output.status.success(),
-        "initial analysis failed: {}",
-        stderr
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    root
 }
 
-#[test]
-fn test_lineage_table_upstream_simple() {
-    let dir = TempDir::new().unwrap();
-    write_sql(
-        &dir,
-        "test.sql",
-        r#"
-CREATE TABLE jsmx_temp(fund_code VARCHAR2(10), qsje NUMBER);
-CREATE TABLE dat_trd_qfii_chinaclear(fund_code VARCHAR2(10), cjje NUMBER);
-CREATE PROCEDURE prc_copy AS BEGIN
-  INSERT INTO dat_trd_qfii_chinaclear(fund_code, cjje)
-  SELECT fund_code, qsje FROM jsmx_temp;
-END;
-"#,
+fn lineage(root: &Path, target: &str, direction: &str, format: &str) -> String {
+    let out = run_codeweb_in(
+        root,
+        &[
+            "lineage",
+            target,
+            "--direction",
+            direction,
+            "--format",
+            format,
+            "-p",
+            root.to_str().unwrap(),
+        ],
     );
-
-    init_and_analyze_project(&dir);
-
-    // Run lineage command
-    let output = run_codeweb(&[
-        "lineage",
-        "dat_trd_qfii_chinaclear",
-        "--direction",
-        "upstream",
-        "--project",
-        dir.path().to_str().unwrap(),
-        "--format",
-        "tree",
-    ]);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("stdout: {}", stdout);
-    eprintln!("stderr: {}", stderr);
-
     assert!(
-        output.status.success(),
-        "lineage command failed: {}",
-        stderr
+        out.status.success(),
+        "lineage failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-
-    // Verify the output contains key table names
-    assert!(stdout.contains("dat_trd_qfii_chinaclear") || stdout.contains("DAT_TRD_QFII_CHINACLEAR"));
-    assert!(stdout.contains("jsmx_temp") || stdout.contains("JSMX_TEMP"));
+    String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-#[test]
-fn test_lineage_table_downstream_simple() {
-    let dir = TempDir::new().unwrap();
-    write_sql(
-        &dir,
-        "test.sql",
-        r#"
+/// Three-stage pipeline: source_tbl -> mid_tbl -> final_tbl.
+const PIPELINE_SQL: &str = r#"
 CREATE TABLE source_tbl(id NUMBER, amount NUMBER);
-CREATE TABLE mid_tbl(id NUMBER, sum_amount NUMBER);
-CREATE TABLE dest_tbl(id NUMBER, equity_amount NUMBER);
+CREATE TABLE mid_tbl(id NUMBER, total NUMBER);
+CREATE TABLE final_tbl(id NUMBER, result NUMBER);
 
-CREATE PROCEDURE prc_step2 AS BEGIN
-  INSERT INTO mid_tbl(id, sum_amount)
+CREATE PROCEDURE prc_step1 AS BEGIN
+  INSERT INTO mid_tbl(id, total)
   SELECT id, SUM(amount) FROM source_tbl GROUP BY id;
 END;
 
-CREATE PROCEDURE prc_step3 AS BEGIN
-  INSERT INTO dest_tbl(id, equity_amount)
-  SELECT id, sum_amount FROM mid_tbl;
+CREATE PROCEDURE prc_step2 AS BEGIN
+  INSERT INTO final_tbl(id, result)
+  SELECT id, total FROM mid_tbl;
 END;
-"#,
-    );
+"#;
 
-    init_and_analyze_project(&dir);
+#[test]
+fn upstream_walks_back_through_writing_routines() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, PIPELINE_SQL);
 
-    // Run lineage command with downstream
-    let output = run_codeweb(&[
-        "lineage",
-        "source_tbl",
-        "--direction",
-        "downstream",
-        "--project",
-        dir.path().to_str().unwrap(),
-        "--format",
-        "tree",
-    ]);
+    let out = lineage(&root, "final_tbl", "upstream", "tree");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("stdout: {}", stdout);
-    eprintln!("stderr: {}", stderr);
-
-    assert!(
-        output.status.success(),
-        "lineage command failed: {}",
-        stderr
-    );
-
-    // Verify the output contains table names
-    assert!(stdout.contains("source_tbl") || stdout.contains("SOURCE_TBL"));
+    // final_tbl is written by prc_step2, which reads mid_tbl; mid_tbl is written by
+    // prc_step1, which reads source_tbl.
+    assert!(out.contains("final_tbl"), "missing root node:\n{out}");
+    assert!(out.contains("prc_step2"), "missing writer of final_tbl:\n{out}");
+    assert!(out.contains("mid_tbl"), "missing 1-hop upstream table:\n{out}");
+    assert!(out.contains("prc_step1"), "missing writer of mid_tbl:\n{out}");
+    assert!(out.contains("source_tbl"), "missing 2-hop upstream table:\n{out}");
 }
 
 #[test]
-fn test_lineage_table_json_format() {
+fn downstream_walks_forward_through_reading_routines() {
     let dir = TempDir::new().unwrap();
-    write_sql(
+    let root = project_with_sql(&dir, PIPELINE_SQL);
+
+    let out = lineage(&root, "source_tbl", "downstream", "tree");
+
+    assert!(out.contains("source_tbl"), "missing root node:\n{out}");
+    assert!(out.contains("prc_step1"), "missing reader of source_tbl:\n{out}");
+    assert!(out.contains("mid_tbl"), "missing 1-hop downstream table:\n{out}");
+    assert!(out.contains("final_tbl"), "missing 2-hop downstream table:\n{out}");
+}
+
+#[test]
+fn upstream_and_downstream_label_the_direction_differently() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, PIPELINE_SQL);
+
+    assert!(
+        lineage(&root, "final_tbl", "upstream", "tree").contains("written by"),
+        "upstream should label steps as writers"
+    );
+    assert!(
+        lineage(&root, "source_tbl", "downstream", "tree").contains("read by"),
+        "downstream should label steps as readers"
+    );
+}
+
+#[test]
+fn json_output_is_a_nested_node_via_children_tree() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, PIPELINE_SQL);
+
+    let out = lineage(&root, "final_tbl", "upstream", "json");
+    let json: serde_json::Value = serde_json::from_str(&out).expect("lineage --format json must emit valid JSON");
+
+    assert!(json["node"].as_str().unwrap().contains("final_tbl"));
+    assert!(json["via"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("prc_step2")));
+
+    let child = &json["children"][0];
+    assert!(child["node"].as_str().unwrap().contains("mid_tbl"));
+    assert!(child["children"][0]["node"]
+        .as_str()
+        .unwrap()
+        .contains("source_tbl"));
+}
+
+/// A view's base tables are upstream of it; the view is downstream of its base tables.
+/// Getting this backwards was the first bug found against the real exam codebase.
+#[test]
+fn view_dependencies_point_from_base_table_to_view() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
         &dir,
-        "test.sql",
         r#"
-CREATE TABLE tbl_a(id NUMBER);
-CREATE TABLE tbl_b(id NUMBER);
-CREATE PROCEDURE prc_ab AS BEGIN
-  INSERT INTO tbl_b SELECT * FROM tbl_a;
-END;
+CREATE TABLE base_tbl(id NUMBER, raw NUMBER);
+CREATE VIEW v_derived AS SELECT id, raw * 2 AS doubled FROM base_tbl;
 "#,
     );
 
-    init_and_analyze_project(&dir);
-
-    // Run lineage command with JSON format
-    let output = run_codeweb(&[
-        "lineage",
-        "tbl_b",
-        "--direction",
-        "upstream",
-        "--project",
-        dir.path().to_str().unwrap(),
-        "--format",
-        "json",
-    ]);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("stdout: {}", stdout);
-    eprintln!("stderr: {}", stderr);
-
+    let up = lineage(&root, "v_derived", "upstream", "tree");
     assert!(
-        output.status.success(),
-        "lineage command failed: {}",
-        stderr
+        up.contains("base_tbl"),
+        "a view's base table is upstream of it:\n{up}"
     );
 
-    // Verify JSON is valid and contains expected fields
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-    assert!(parsed.is_ok(), "invalid JSON output");
-    let json = parsed.unwrap();
-    assert!(json["node"].is_string());
-    assert!(json["via"].is_array());
-    assert!(json["children"].is_array());
+    let down = lineage(&root, "base_tbl", "downstream", "tree");
+    assert!(
+        down.contains("v_derived"),
+        "a view that selects from a table is downstream of it:\n{down}"
+    );
+}
+
+/// The traversal must not label a node as its own step (a view reaching its own base
+/// tables would otherwise print `v_x [written by v_x]`).
+#[test]
+fn a_node_is_never_listed_as_its_own_step() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE base_tbl(id NUMBER);
+CREATE VIEW v_derived AS SELECT id FROM base_tbl;
+"#,
+    );
+
+    let out = lineage(&root, "v_derived", "upstream", "tree");
+    for line in out.lines() {
+        if let Some((node, label)) = line.split_once("  [") {
+            let node = node.trim();
+            assert!(
+                !label.contains(node),
+                "node listed as its own step: {line}"
+            );
+        }
+    }
 }
