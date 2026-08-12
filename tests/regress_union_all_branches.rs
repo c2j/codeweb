@@ -98,14 +98,12 @@ END;
     assert!(out.contains("table:dst"), "insert target missing:\n{out}");
 }
 
-/// Blocked upstream: `ogsql-parser`'s `parse_set_operations` (src/parser/select.rs)
-/// overwrites `stmt.set_operation` on each loop iteration instead of chaining, so a
-/// query with N>2 branches keeps only the first and the last. Branches 2..N-1 are
-/// discarded before codeweb sees the AST, and no fix here can recover them.
-///
-/// Un-ignore once the parser nests (or collects) set operations.
+/// Regression for the pair of bugs that hid each other: codeweb's extractor returned
+/// `SkipChildren` before reaching `set_operation`, and `ogsql-parser` overwrote
+/// `stmt.set_operation` each loop iteration instead of appending to the chain tail
+/// (c2j/ogsql-parser#318, fixed by PR #317). With only one fixed, an N-branch union
+/// still lost branches.
 #[test]
-#[ignore = "blocked on ogsql-parser: parse_set_operations drops middle branches"]
 fn view_over_four_way_union_depends_on_all_branches() {
     let dir = TempDir::new().unwrap();
     let root = project_with_sql(
@@ -125,6 +123,50 @@ CREATE VIEW v_four AS
 
     let out = detail(&root, "v_four");
     for t in ["table:ta", "table:tb", "table:tc", "table:td"] {
+        assert!(out.contains(t), "{t} missing from view dependencies:\n{out}");
+    }
+}
+
+/// Eight branches with per-branch column renaming, mirroring `V_PAR_BOND` in the
+/// clearing-split codebase that first exposed the branch loss.
+#[test]
+fn view_over_eight_way_union_depends_on_all_branches() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE par_sys_bond(security_id VARCHAR2(10), bond_kind VARCHAR2(4));
+CREATE TABLE par_sys_asset_security(security_id VARCHAR2(10), bond_kind VARCHAR2(4));
+CREATE TABLE par_sys_entrust(security_id VARCHAR2(10), entrust_type VARCHAR2(4));
+CREATE TABLE par_sys_bond_right(security_id VARCHAR2(10), debt_loan_type VARCHAR2(4));
+CREATE TABLE par_sys_financial_product(security_id VARCHAR2(10), financial_kind VARCHAR2(4));
+CREATE TABLE par_sys_annuity_fund(security_id VARCHAR2(10), fund_type VARCHAR2(4));
+CREATE TABLE par_sys_assurance(security_id VARCHAR2(10), security_kind VARCHAR2(4));
+CREATE TABLE par_sys_debt_loan(security_id VARCHAR2(10), debt_loan_type VARCHAR2(4));
+
+CREATE VIEW v_par_bond AS
+  SELECT security_id, bond_kind FROM par_sys_bond
+  UNION ALL SELECT security_id, bond_kind AS bond_kind FROM par_sys_asset_security
+  UNION ALL SELECT security_id, entrust_type AS bond_kind FROM par_sys_entrust
+  UNION ALL SELECT security_id, debt_loan_type AS bond_kind FROM par_sys_bond_right
+  UNION ALL SELECT security_id, financial_kind AS bond_kind FROM par_sys_financial_product
+  UNION ALL SELECT security_id, fund_type AS bond_kind FROM par_sys_annuity_fund
+  UNION ALL SELECT security_id, security_kind AS bond_kind FROM par_sys_assurance
+  UNION ALL SELECT security_id, debt_loan_type AS bond_kind FROM par_sys_debt_loan;
+"#,
+    );
+
+    let out = detail(&root, "v_par_bond");
+    for t in [
+        "table:par_sys_bond",
+        "table:par_sys_asset_security",
+        "table:par_sys_entrust",
+        "table:par_sys_bond_right",
+        "table:par_sys_financial_product",
+        "table:par_sys_annuity_fund",
+        "table:par_sys_assurance",
+        "table:par_sys_debt_loan",
+    ] {
         assert!(out.contains(t), "{t} missing from view dependencies:\n{out}");
     }
 }

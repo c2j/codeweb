@@ -1339,6 +1339,56 @@ pub struct ColumnAnalysis {
     pub insert_columns: Vec<InsertColumnInfo>,
     /// UPDATE statement SET columns.
     pub update_columns: Vec<UpdateColumnInfo>,
+    /// Per-column data flow: which sources feed each written column.
+    #[serde(default)]
+    pub column_mappings: Vec<ColumnMapping>,
+}
+
+/// One written column and the sources its value is built from.
+///
+/// `INSERT INTO t (a) SELECT b FROM s` yields one mapping: target `t.a`, source `s.b`,
+/// kind `Direct`. A bare `SELECT b AS a FROM s` (a view body, or a subquery) yields the
+/// same mapping with `target_table: None` — the enclosing object names the table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnMapping {
+    /// Table written to. None when the statement itself does not name one.
+    pub target_table: Option<String>,
+    pub target_column: String,
+    pub sources: Vec<ColumnSource>,
+    pub kind: MappingKind,
+    /// Source expression text, when the value is not a plain column reference.
+    pub expression: Option<String>,
+}
+
+/// Where one input of a [`ColumnMapping`] comes from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ColumnSource {
+    Column {
+        /// Resolved via `alias_map`. None when the reference is unqualified and the
+        /// statement reads more than one table, so the owner is ambiguous.
+        table: Option<String>,
+        column: String,
+    },
+    Literal {
+        value: String,
+    },
+    /// A PL/SQL variable or cursor field that could not be traced back to a column.
+    Variable {
+        name: String,
+    },
+    /// Assembled by dynamic SQL — the value is not statically knowable.
+    Dynamic,
+}
+
+/// How a target column's value relates to its sources.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MappingKind {
+    /// Plain copy of a single column, with no transformation.
+    Direct,
+    /// Computed — arithmetic, `decode`/`nvl`/`CASE`, a function call, a cast.
+    Derived,
+    /// Produced by an aggregate function.
+    Aggregated { function: String, distinct: bool },
 }
 
 /// Table alias definition.
@@ -1482,6 +1532,7 @@ pub struct ColumnAccessExtractor {
     select_into: Vec<SelectIntoMapping>,
     insert_columns: Vec<InsertColumnInfo>,
     update_columns: Vec<UpdateColumnInfo>,
+    column_mappings: Vec<ColumnMapping>,
     clause_stack: Vec<ColumnContext>,
 }
 
@@ -1496,6 +1547,7 @@ impl ColumnAccessExtractor {
             select_into: Vec::new(),
             insert_columns: Vec::new(),
             update_columns: Vec::new(),
+            column_mappings: Vec::new(),
             clause_stack: Vec::new(),
         }
     }
@@ -1510,6 +1562,7 @@ impl ColumnAccessExtractor {
             select_into: self.select_into,
             insert_columns: self.insert_columns,
             update_columns: self.update_columns,
+            column_mappings: self.column_mappings,
         }
     }
 
@@ -2025,6 +2078,187 @@ impl Visitor for ColumnAccessExtractor {
 // ── Column analysis helpers ────────────────────────────────
 
 impl ColumnAccessExtractor {
+    /// Resolve a column reference's owning table through `alias_map`.
+    fn column_source(&self, names: &[ogsql_parser::Ident]) -> ColumnSource {
+        let (alias_prefix, column) = split_alias_column(names);
+        let table = alias_prefix
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone());
+        ColumnSource::Column { table, column }
+    }
+
+    /// Describe how `expr` produces a value: which inputs feed it, and whether it is a
+    /// plain copy, a computation, or an aggregate.
+    fn classify_value_expr(&self, expr: &Expr) -> (Vec<ColumnSource>, MappingKind, Option<String>) {
+        let expr = peel_parenthesized(expr);
+
+        match expr {
+            Expr::ColumnRef(names) if !names.is_empty() => {
+                (vec![self.column_source(names)], MappingKind::Direct, None)
+            }
+            Expr::PlVariable(names) if !names.is_empty() => (
+                vec![ColumnSource::Variable {
+                    name: names.join("."),
+                }],
+                MappingKind::Direct,
+                None,
+            ),
+            Expr::Literal(lit) => (
+                vec![ColumnSource::Literal {
+                    value: format_literal_short(lit),
+                }],
+                MappingKind::Direct,
+                None,
+            ),
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                ..
+            } if is_aggregate_function(&name.last().cloned().unwrap_or_default()) => {
+                let mut sources = Vec::new();
+                for arg in args {
+                    self.collect_value_sources(arg, &mut sources);
+                }
+                let function = name
+                    .last()
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_string()
+                    .to_uppercase();
+                (
+                    sources,
+                    MappingKind::Aggregated {
+                        function,
+                        distinct: *distinct,
+                    },
+                    Some(format_expr_short(expr)),
+                )
+            }
+            _ => {
+                let mut sources = Vec::new();
+                self.collect_value_sources(expr, &mut sources);
+                (sources, MappingKind::Derived, Some(format_expr_short(expr)))
+            }
+        }
+    }
+
+    /// Collect the column and variable leaves that feed a computed expression.
+    ///
+    /// Literals are deliberately skipped here. Inside `decode(kind, '1', 'A', kind)` the
+    /// quoted values are outputs of the branch, not upstream data — recording them would
+    /// bury the one input that lineage cares about. A value that is *entirely* a literal
+    /// is handled by [`Self::classify_value_expr`] instead, where "this column is a
+    /// constant" is the useful answer.
+    fn collect_value_sources(&self, expr: &Expr, out: &mut Vec<ColumnSource>) {
+        match expr {
+            Expr::ColumnRef(names) | Expr::ColumnRefOuterJoin(names) if !names.is_empty() => {
+                push_unique_source(out, self.column_source(names));
+            }
+            Expr::PlVariable(names) if !names.is_empty() => {
+                push_unique_source(
+                    out,
+                    ColumnSource::Variable {
+                        name: names.join("."),
+                    },
+                );
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.collect_value_sources(left, out);
+                self.collect_value_sources(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::Like { expr, pattern, .. } => {
+                self.collect_value_sources(expr, out);
+                self.collect_value_sources(pattern, out);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_value_sources(expr, out);
+                self.collect_value_sources(low, out);
+                self.collect_value_sources(high, out);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.collect_value_sources(expr, out);
+                for item in list {
+                    self.collect_value_sources(item, out);
+                }
+            }
+            Expr::IsNull { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.collect_value_sources(arg, out);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(ref op) = operand {
+                    self.collect_value_sources(op, out);
+                }
+                for wc in whens {
+                    self.collect_value_sources(&wc.condition, out);
+                    self.collect_value_sources(&wc.result, out);
+                }
+                if let Some(ref e) = else_expr {
+                    self.collect_value_sources(e, out);
+                }
+            }
+            Expr::InSubquery { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::TypeCast { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::Parenthesized(inner) => self.collect_value_sources(inner, out),
+            Expr::FieldAccess { object, .. } => self.collect_value_sources(object, out),
+            // Subqueries carry their own scope; walking them here would resolve their
+            // columns against this statement's aliases.
+            Expr::Exists(_) | Expr::Subquery(_) => {}
+            _ => {}
+        }
+    }
+
+    fn push_column_mapping(
+        &mut self,
+        target_table: Option<String>,
+        target_column: String,
+        value: &Expr,
+    ) {
+        let (sources, kind, expression) = self.classify_value_expr(value);
+        self.column_mappings.push(ColumnMapping {
+            target_table,
+            target_column,
+            sources,
+            kind,
+            expression,
+        });
+    }
+
+    /// Pair a written column list against the expressions that fill it, by position.
+    ///
+    /// A `SELECT *` target cannot be aligned without a schema, so the whole statement is
+    /// skipped rather than emitting mappings shifted by one.
+    fn map_columns_positionally(
+        &mut self,
+        target_table: Option<&str>,
+        columns: &[String],
+        values: &[SelectTarget],
+    ) {
+        if values.iter().any(|t| matches!(t, SelectTarget::Star(_))) {
+            return;
+        }
+        for (column, target) in columns.iter().zip(values.iter()) {
+            if let SelectTarget::Expr(expr, _) = target {
+                self.push_column_mapping(
+                    target_table.map(|s| s.to_string()),
+                    column.clone(),
+                    expr,
+                );
+            }
+        }
+    }
+
     fn walk_expr_for_column_refs(&mut self, expr: &Expr) {
         match expr {
             Expr::ColumnRef(names) if !names.is_empty() => {
@@ -2140,14 +2374,91 @@ fn peel_parenthesized(mut expr: &Expr) -> &Expr {
 fn format_expr_short(expr: &Expr) -> String {
     match expr {
         Expr::ColumnRef(names) => names.join("."),
+        Expr::ColumnRefOuterJoin(names) => format!("{}(+)", names.join(".")),
         Expr::PlVariable(names) => names.join("."),
         Expr::Literal(lit) => format_literal_short(lit),
-        Expr::FunctionCall { name, args, .. } => {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            ..
+        } => {
             let fname = name.last().cloned().unwrap_or_default();
             let arg_strs: Vec<String> = args.iter().map(format_expr_short).collect();
-            format!("{}({})", fname, arg_strs.join(", "))
+            let prefix = if *distinct { "DISTINCT " } else { "" };
+            format!("{}({}{})", fname, prefix, arg_strs.join(", "))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "{} {} {}",
+                format_expr_short(left),
+                op,
+                format_expr_short(right)
+            )
+        }
+        Expr::UnaryOp { op, expr } => format!("{}{}", op, format_expr_short(expr)),
+        Expr::Parenthesized(inner) => format!("({})", format_expr_short(inner)),
+        Expr::TypeCast { expr, .. } => format_expr_short(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut out = String::from("CASE");
+            if let Some(op) = operand {
+                out.push(' ');
+                out.push_str(&format_expr_short(op));
+            }
+            for wc in whens {
+                out.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    format_expr_short(&wc.condition),
+                    format_expr_short(&wc.result)
+                ));
+            }
+            if let Some(e) = else_expr {
+                out.push_str(&format!(" ELSE {}", format_expr_short(e)));
+            }
+            out.push_str(" END");
+            out
         }
         _ => format!("{:?}", expr),
+    }
+}
+
+/// Aggregate functions whose output summarises many rows of their input.
+///
+/// Kept to the set that appears in GaussDB/Oracle analytics code; an unlisted function
+/// falls through to `Derived`, which is the safer default — it still records the same
+/// source columns, only without labelling the aggregation.
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "SUM"
+            | "COUNT"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "MEDIAN"
+            | "LISTAGG"
+            | "STRING_AGG"
+            | "ARRAY_AGG"
+            | "GROUP_CONCAT"
+            | "WM_CONCAT"
+            | "BOOL_AND"
+            | "BOOL_OR"
+    )
+}
+
+fn push_unique_source(out: &mut Vec<ColumnSource>, source: ColumnSource) {
+    if !out.contains(&source) {
+        out.push(source);
     }
 }
 
