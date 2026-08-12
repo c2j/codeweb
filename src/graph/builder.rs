@@ -7961,6 +7961,10 @@ ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products");
             matches!(e, crate::parser::ColumnEdge::Flow { target_col, .. }
                 if target_col.contains("dat_fund_cjqs"))
         });
-        assert!(has_dat_fund, "expected cursor flow into dat_fund_cjqs, got {:?}", edges);
+        assert!(
+            has_dat_fund,
+            "expected cursor flow into dat_fund_cjqs, got {:?}",
+            edges
+        );
     }
 }
