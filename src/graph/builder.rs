@@ -4399,10 +4399,12 @@ impl<'a> ogsql_parser::Visitor for ColumnLineageWalker<'a> {
             crate::parser::ColumnLineageExtractor::extract_aliases_from_from(&select.from),
         );
 
-        // If inside a cursor declaration, record the SELECT's source columns.
-        if let Some(ref cursor_name) = self.current_cursor.clone() {
+        // If inside a cursor declaration, record the SELECT's source columns
+        // and reset so nested sub-queries don't overwrite the top-level columns.
+        if let Some(cursor_name) = self.current_cursor.clone() {
             let sources = collect_select_sources(select, self.extractor);
-            self.extractor.record_cursor(cursor_name, sources);
+            self.extractor.record_cursor(&cursor_name, sources);
+            self.current_cursor = None;
         }
 
         self.extractor.analyze_select_statement(select);
