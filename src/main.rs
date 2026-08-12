@@ -4338,30 +4338,38 @@ fn format_col_lineage_tree(
 /// Check if a column ID belongs to a procedure (not a table).
 fn is_proc_col(col_id: &str) -> bool {
     let id = col_id.strip_prefix("col:").unwrap_or(col_id);
-    id.starts_with("proc:")
-        || id.starts_with("func:")
-        || id.starts_with("prc_")
-        || id.starts_with("pkg_")
-        || id.starts_with("fnc_")
+    if let Some(dot) = id.rfind('.') {
+        is_proc_owner(&id[..dot])
+    } else {
+        is_proc_owner(id)
+    }
 }
 
-/// Clean column ID for display: strip col: prefix and proc:/func: prefixes.
+/// Clean column ID for display: strip col: prefix, keep table.column,
+/// strip only procedure-owned prefixes to just column name.
 fn clean_display_id(col_id: &str) -> String {
     let id = col_id.strip_prefix("col:").unwrap_or(col_id);
-    // Strip procedure indicators, keep just column name
+    if id.is_empty() {
+        return id.to_string();
+    }
     if let Some(dot) = id.rfind('.') {
         let owner = &id[..dot];
         let col = &id[dot + 1..];
-        if owner.starts_with("proc:")
-            || owner.starts_with("func:")
-            || owner.starts_with("prc_")
-            || owner.starts_with("pkg_")
-            || owner.starts_with("fnc_")
-        {
+        if is_proc_owner(owner) {
+            // Procedure-owned: show just column name
             return col.to_string();
         }
+        // Table-owned: show table.column
     }
     id.to_string()
+}
+
+fn is_proc_owner(owner: &str) -> bool {
+    owner.starts_with("proc:")
+        || owner.starts_with("func:")
+        || owner.starts_with("prc_")
+        || owner.starts_with("pkg_")
+        || owner.starts_with("fnc_")
 }
 
 fn format_col_lineage_table(paths: &[Vec<crate::graph::traverse::ColumnLineageStep>]) -> String {
