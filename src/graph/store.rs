@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 6;
+const STORE_VERSION: u32 = 7;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]

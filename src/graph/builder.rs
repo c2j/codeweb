@@ -2,8 +2,8 @@
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
 use crate::graph::{
-    determine_call_scope, extract_routine_id, CallScope, CodeGraph, DataFlowKind, Edge, Node,
-    RoutineId, RoutineKind, SourceLocation,
+    determine_call_scope, extract_routine_id, AccessMode, CallScope, CodeGraph, DataFlowKind, Edge,
+    Node, RoutineId, RoutineKind, SourceLocation,
 };
 use crate::graph::{ColumnSummary, DistributeInfo, IndexConstraint, PartitionInfo};
 use crate::parser::{
@@ -565,6 +565,19 @@ impl GraphBuilder {
                         });
                         walk_statement(&mut extractor, &wrapped);
 
+                        let mut column_extractor = crate::parser::ColumnAccessExtractor::new();
+                        column_extractor.extract_view_column_mappings(
+                            &view_name,
+                            &v.columns,
+                            v.query.as_ref(),
+                        );
+                        let view_analysis = column_extractor.finish();
+                        let view_column_analysis = if view_analysis.column_mappings.is_empty() {
+                            None
+                        } else {
+                            Some(Box::new(view_analysis))
+                        };
+
                         for access in &extractor.accesses {
                             let key = normalize_table_key(access.schema.as_deref(), &access.name);
                             let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
@@ -597,6 +610,7 @@ impl GraphBuilder {
                                         file: file_arc.clone(),
                                         line: info.start_line,
                                     },
+                                    column_analysis: view_column_analysis.clone(),
                                 },
                             );
                         }
@@ -1237,6 +1251,19 @@ impl GraphBuilder {
                         });
                         walk_statement(&mut extractor, &wrapped);
 
+                        let mut column_extractor = crate::parser::ColumnAccessExtractor::new();
+                        column_extractor.extract_view_column_mappings(
+                            &name,
+                            &v.columns,
+                            v.query.as_ref(),
+                        );
+                        let view_analysis = column_extractor.finish();
+                        let view_column_analysis = if view_analysis.column_mappings.is_empty() {
+                            None
+                        } else {
+                            Some(Box::new(view_analysis))
+                        };
+
                         for access in &extractor.accesses {
                             let key = normalize_table_key(access.schema.as_deref(), &access.name);
                             let table_idx = *table_index.entry(key.clone()).or_insert_with(|| {
@@ -1269,6 +1296,7 @@ impl GraphBuilder {
                                         file: file_arc.clone(),
                                         line: info.start_line,
                                     },
+                                    column_analysis: view_column_analysis.clone(),
                                 },
                             );
                         }
@@ -2744,7 +2772,8 @@ impl GraphBuilder {
                 || !column_analysis.enum_mappings.is_empty()
                 || !column_analysis.insert_columns.is_empty()
                 || !column_analysis.update_columns.is_empty()
-                || !column_analysis.select_into.is_empty();
+                || !column_analysis.select_into.is_empty()
+                || !column_analysis.column_mappings.is_empty();
 
             for access in &extractor.accesses {
                 let key = if access.schema.is_none() && owner_schema.is_some() {
@@ -2791,7 +2820,16 @@ impl GraphBuilder {
                             line: info.start_line,
                         },
                         column_analysis: if has_column_data {
-                            Some(Box::new(column_analysis.clone()))
+                            // Column mappings describe how the *written* table's
+                            // columns are produced. Attaching them to every read edge
+                            // of the statement duplicates them (one per source table)
+                            // and bloats the store for no benefit; the lineage walk
+                            // only needs them on the write edge.
+                            let mut ca = column_analysis.clone();
+                            if !access.modes.contains(AccessMode::Write) {
+                                ca.column_mappings.clear();
+                            }
+                            Some(Box::new(ca))
                         } else {
                             None
                         },

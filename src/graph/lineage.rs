@@ -1,7 +1,7 @@
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 
 use crate::graph::{AccessMode, CodeGraph, Edge};
 
@@ -30,218 +30,151 @@ pub struct LineageNode {
     pub children: Vec<LineageNode>,
 }
 
-/// Compute table-level lineage using breadth-first search.
+/// Compute table-level lineage using depth-first traversal with per-path ancestors.
 ///
 /// Algorithm:
 /// - UPSTREAM: table → (Incoming Write TableAccess) → routine → (Outgoing Read TableAccess) → table → recurse
 /// - DOWNSTREAM: table → (Incoming Read TableAccess) → routine → (Outgoing Write TableAccess) → table → recurse
 /// - Views: follow DependsOn edges as if they were transparent
+///
+/// A per-path ancestor set (rather than one global `visited` set) keeps a table reached
+/// through two different routines visible under both parents, while still cutting off a
+/// cycle that returns to an ancestor.
 pub fn lineage_table(
     graph: &CodeGraph,
     start_idx: NodeIndex,
     direction: LineageDirection,
     depth: usize,
 ) -> LineageNode {
-    let mut visited: HashSet<NodeIndex> = HashSet::new();
-    let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+    let mut ancestors: HashSet<NodeIndex> = HashSet::new();
+    ancestors.insert(start_idx);
+    build_table_lineage(graph, start_idx, direction, depth, &mut ancestors)
+}
 
-    queue.push_back((start_idx, 0));
-    visited.insert(start_idx);
+fn build_table_lineage(
+    graph: &CodeGraph,
+    idx: NodeIndex,
+    direction: LineageDirection,
+    depth: usize,
+    ancestors: &mut HashSet<NodeIndex>,
+) -> LineageNode {
+    let mut steps: Vec<LineageStep> = Vec::new();
+    let mut children: Vec<LineageNode> = Vec::new();
+    let mut child_seen: HashSet<NodeIndex> = HashSet::new();
 
-    let mut children_map: HashMap<NodeIndex, Vec<(LineageNode, LineageStep)>> = HashMap::new();
-
-    while let Some((current_idx, current_depth)) = queue.pop_front() {
-        if current_depth >= depth {
-            continue;
-        }
-
-        match direction {
-            LineageDirection::Upstream => {
-                // Get all incoming Write edges (who writes this table)
-                let mut routine_accesses: Vec<(NodeIndex, AccessMode)> = Vec::new();
-                for edge_ref in graph.edges_directed(current_idx, Direction::Incoming) {
-                    if let Edge::TableAccess { modes, .. } = edge_ref.weight() {
-                        if modes.contains(AccessMode::Write) {
-                            routine_accesses.push((edge_ref.source(), *modes));
-                        }
-                    }
-                }
-
-                // From each writing routine, get all tables it reads
-                for (routine_idx, routine_modes) in routine_accesses {
-                    for edge_ref in graph.edges_directed(routine_idx, Direction::Outgoing) {
-                        match edge_ref.weight() {
-                            Edge::TableAccess { modes, .. } if modes.contains(AccessMode::Read) => {
-                                let target_table = edge_ref.target();
-                                if !visited.contains(&target_table) {
-                                    visited.insert(target_table);
-                                    queue.push_back((target_table, current_depth + 1));
-
-                                    let step = LineageStep {
-                                        routine_idx,
-                                        modes: routine_modes,
-                                    };
-                                    children_map
-                                        .entry(current_idx)
-                                        .or_insert_with(Vec::new)
-                                        .push((
-                                            LineageNode {
-                                                idx: target_table,
-                                                _depth: current_depth + 1,
-                                                steps: vec![],
-                                                children: Vec::new(),
-                                            },
-                                            step,
-                                        ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Follow DependsOn edges: view → base table. When the current node is a
-                // view, its base tables are upstream, so walk outgoing edges.
-                for edge_ref in graph.edges_directed(current_idx, Direction::Outgoing) {
-                    if matches!(edge_ref.weight(), Edge::DependsOn { .. }) {
-                        let base_table = edge_ref.target();
-                        if !visited.contains(&base_table) {
-                            visited.insert(base_table);
-                            queue.push_back((base_table, current_depth + 1));
-
-                            children_map
-                                .entry(current_idx)
-                                .or_insert_with(Vec::new)
-                                .push((
-                                    LineageNode {
-                                        idx: base_table,
-                                        _depth: current_depth + 1,
-                                        steps: vec![],
-                                        children: Vec::new(),
-                                    },
-                                    LineageStep {
-                                        routine_idx: current_idx, // the view's own definition
-                                        modes: AccessMode::Read,
-                                    },
-                                ));
-                        }
-                    }
-                }
-            }
-            LineageDirection::Downstream => {
-                // Get all incoming Read edges (who reads this table)
-                let mut routine_accesses: Vec<(NodeIndex, AccessMode)> = Vec::new();
-                for edge_ref in graph.edges_directed(current_idx, Direction::Incoming) {
-                    if let Edge::TableAccess { modes, .. } = edge_ref.weight() {
-                        if modes.contains(AccessMode::Read) {
-                            routine_accesses.push((edge_ref.source(), *modes));
-                        }
-                    }
-                }
-
-                // From each reading routine, get all tables it writes
-                for (routine_idx, routine_modes) in routine_accesses {
-                    for edge_ref in graph.edges_directed(routine_idx, Direction::Outgoing) {
-                        match edge_ref.weight() {
-                            Edge::TableAccess { modes, .. }
-                                if modes.contains(AccessMode::Write) =>
-                            {
-                                let target_table = edge_ref.target();
-                                if !visited.contains(&target_table) {
-                                    visited.insert(target_table);
-                                    queue.push_back((target_table, current_depth + 1));
-
-                                    let step = LineageStep {
-                                        routine_idx,
-                                        modes: routine_modes,
-                                    };
-                                    children_map
-                                        .entry(current_idx)
-                                        .or_insert_with(Vec::new)
-                                        .push((
-                                            LineageNode {
-                                                idx: target_table,
-                                                _depth: current_depth + 1,
-                                                steps: vec![],
-                                                children: Vec::new(),
-                                            },
-                                            step,
-                                        ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Follow DependsOn edges: view → base table. Views that select from the
-                // current table are downstream consumers, so walk incoming edges.
-                for edge_ref in graph.edges_directed(current_idx, Direction::Incoming) {
-                    if matches!(edge_ref.weight(), Edge::DependsOn { .. }) {
-                        let consuming_view = edge_ref.source();
-                        if !visited.contains(&consuming_view) {
-                            visited.insert(consuming_view);
-                            queue.push_back((consuming_view, current_depth + 1));
-
-                            children_map
-                                .entry(current_idx)
-                                .or_insert_with(Vec::new)
-                                .push((
-                                    LineageNode {
-                                        idx: consuming_view,
-                                        _depth: current_depth + 1,
-                                        steps: vec![],
-                                        children: Vec::new(),
-                                    },
-                                    LineageStep {
-                                        routine_idx: consuming_view, // the view's own definition
-                                        modes: AccessMode::Read,
-                                    },
-                                ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Reconstruct tree: build root node
-    fn build_node(
-        idx: NodeIndex,
-        children_map: &HashMap<NodeIndex, Vec<(LineageNode, LineageStep)>>,
-    ) -> LineageNode {
-        let (mut immediate_children, mut steps) = if let Some(entries) = children_map.get(&idx) {
-            let mut stps: Vec<LineageStep> = entries.iter().map(|(_, s)| s.clone()).collect();
-            stps.sort_by_key(|a| a.routine_idx.index());
-            let children: Vec<LineageNode> = entries
-                .iter()
-                .map(|(child_template, _)| build_node(child_template.idx, children_map))
-                .collect();
-            (children, stps)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        // Deduplicate: group by (routine_idx, modes) and keep unique
-        let mut seen: HashSet<(usize, u8)> = HashSet::new();
-        steps.retain(|s| {
-            let key = (s.routine_idx.index(), s.modes.bits());
-            seen.insert(key)
-        });
-
-        // De-duplicate children
-        immediate_children.sort_by_key(|a| a.idx.index());
-        immediate_children.dedup_by(|a, b| a.idx == b.idx);
-
-        LineageNode {
+    if depth == 0 {
+        return LineageNode {
             idx,
             _depth: 0,
             steps,
-            children: immediate_children,
+            children,
+        };
+    }
+
+    let wanted = match direction {
+        LineageDirection::Upstream => AccessMode::Write,
+        LineageDirection::Downstream => AccessMode::Read,
+    };
+    let hop = match direction {
+        LineageDirection::Upstream => AccessMode::Read,
+        LineageDirection::Downstream => AccessMode::Write,
+    };
+
+    let mut routines: Vec<(NodeIndex, AccessMode)> = Vec::new();
+    for edge_ref in graph.edges_directed(idx, Direction::Incoming) {
+        if let Edge::TableAccess { modes, .. } = edge_ref.weight() {
+            if modes.contains(wanted) {
+                routines.push((edge_ref.source(), *modes));
+            }
+        }
+    }
+    routines.sort_by_key(|(r, _)| r.index());
+    routines.dedup_by_key(|(r, _)| *r);
+
+    for (routine_idx, routine_modes) in routines {
+        let mut hop_targets: Vec<NodeIndex> = Vec::new();
+        for edge_ref in graph.edges_directed(routine_idx, Direction::Outgoing) {
+            if let Edge::TableAccess { modes, .. } = edge_ref.weight() {
+                if modes.contains(hop) {
+                    hop_targets.push(edge_ref.target());
+                }
+            }
+        }
+        if hop_targets.is_empty() {
+            // The routine writes (upstream) or reads (downstream) this table but touches
+            // no counterpart table — INSERT ... VALUES, a bare DELETE, or a SELECT-only
+            // read. Record it so the write/read is not silently invisible.
+            steps.push(LineageStep {
+                routine_idx,
+                modes: routine_modes,
+            });
+        } else {
+            for target in hop_targets {
+                steps.push(LineageStep {
+                    routine_idx,
+                    modes: routine_modes,
+                });
+                if child_seen.insert(target) && !ancestors.contains(&target) {
+                    ancestors.insert(target);
+                    children.push(build_table_lineage(
+                        graph,
+                        target,
+                        direction,
+                        depth - 1,
+                        ancestors,
+                    ));
+                    ancestors.remove(&target);
+                }
+            }
         }
     }
 
-    build_node(start_idx, &children_map)
+    let depends_dir = match direction {
+        LineageDirection::Upstream => Direction::Outgoing,
+        LineageDirection::Downstream => Direction::Incoming,
+    };
+    for edge_ref in graph.edges_directed(idx, depends_dir) {
+        if matches!(edge_ref.weight(), Edge::DependsOn { .. }) {
+            let other = match direction {
+                LineageDirection::Upstream => edge_ref.target(),
+                LineageDirection::Downstream => edge_ref.source(),
+            };
+            let step_routine = match direction {
+                LineageDirection::Upstream => idx,
+                LineageDirection::Downstream => other,
+            };
+            steps.push(LineageStep {
+                routine_idx: step_routine,
+                modes: AccessMode::Read,
+            });
+            if child_seen.insert(other) && !ancestors.contains(&other) {
+                ancestors.insert(other);
+                children.push(build_table_lineage(
+                    graph,
+                    other,
+                    direction,
+                    depth - 1,
+                    ancestors,
+                ));
+                ancestors.remove(&other);
+            }
+        }
+    }
+
+    // Deduplicate steps by (routine, modes): a routine that both writes and reads a
+    // table, or a diamond reaching the same child twice, would otherwise repeat it.
+    let mut seen: HashSet<(usize, u8)> = HashSet::new();
+    steps.retain(|s| {
+        let key = (s.routine_idx.index(), s.modes.bits());
+        seen.insert(key)
+    });
+
+    LineageNode {
+        idx,
+        _depth: 0,
+        steps,
+        children,
+    }
 }
 
 /// Format lineage node as tree string.
@@ -337,6 +270,7 @@ pub struct ColumnLineageStep {
 /// twice.
 fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMapping> {
     let mut out: Vec<ColumnMapping> = Vec::new();
+    let mut seen: HashSet<ColumnMapping> = HashSet::new();
     for dir in [Direction::Outgoing, Direction::Incoming] {
         for edge_ref in graph.edges_directed(routine, dir) {
             if let Edge::TableAccess {
@@ -345,7 +279,7 @@ fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMappi
             } = edge_ref.weight()
             {
                 for m in &analysis.column_mappings {
-                    if !out.contains(m) {
+                    if seen.insert(m.clone()) {
                         out.push(m.clone());
                     }
                 }
@@ -355,15 +289,36 @@ fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMappi
     out
 }
 
-/// Find the Table or View node named `name`, case-insensitively.
+/// Find the Table or View node named `name`.
+///
+/// A schema-qualified name (`schema.table`) matches schema and table together. A bare
+/// name resolves only when a single node carries it — with two schemas each holding a
+/// table of the same name, returning the first would report one schema's pipeline as the
+/// other's, so an ambiguous bare name resolves to `None`.
 fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
-    graph.node_indices().find(|idx| {
-        let node_name = match &graph[*idx] {
-            crate::graph::Node::Table { name, .. } | crate::graph::Node::View { name, .. } => name,
-            _ => return false,
-        };
-        node_name.eq_ignore_ascii_case(name)
-    })
+    let name_of = |idx: &NodeIndex| match &graph[*idx] {
+        crate::graph::Node::Table { schema, name, .. }
+        | crate::graph::Node::View { schema, name, .. } => Some((schema.as_deref(), name.as_str())),
+        _ => None,
+    };
+
+    if let Some((schema, table)) = name.rsplit_once('.') {
+        if !schema.is_empty() {
+            return graph.node_indices().find(|idx| {
+                name_of(idx)
+                    .is_some_and(|(s, n)| n.eq_ignore_ascii_case(table) && s == Some(schema))
+            });
+        }
+    }
+
+    let mut matches = graph
+        .node_indices()
+        .filter(|idx| name_of(idx).is_some_and(|(_, n)| n.eq_ignore_ascii_case(name)));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn eq(a: &str, b: &str) -> bool {
@@ -494,6 +449,99 @@ fn lineage_column_inner(
                         },
                         next: Some(next),
                     });
+                }
+            }
+        }
+    }
+
+    // Views define their columns through a body, not a routine: the mappings live on
+    // DependsOn edges (view → base table). Upstream reads the view's own outgoing edges,
+    // downstream reads the incoming edges of a base table the view selects from.
+    match direction {
+        LineageDirection::Upstream => {
+            for edge_ref in graph.edges_directed(table_idx, Direction::Outgoing) {
+                if let Edge::DependsOn {
+                    column_analysis: Some(analysis),
+                    ..
+                } = edge_ref.weight()
+                {
+                    for mapping in &analysis.column_mappings {
+                        let targets_this = mapping
+                            .target_table
+                            .as_deref()
+                            .is_some_and(|t| eq(t, table))
+                            && eq(&mapping.target_column, column);
+                        if !targets_this {
+                            continue;
+                        }
+                        for source in &mapping.sources {
+                            let next = match source {
+                                ColumnSource::Column {
+                                    table: Some(src_table),
+                                    column: src_column,
+                                } => Some(lineage_column_inner(
+                                    graph,
+                                    src_table,
+                                    src_column,
+                                    direction,
+                                    depth - 1,
+                                    seen,
+                                )),
+                                _ => None,
+                            };
+                            node.steps.push(ColumnLineageStep {
+                                via: table_idx,
+                                kind: mapping.kind.clone(),
+                                expression: mapping.expression.clone(),
+                                source: source.clone(),
+                                next,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        LineageDirection::Downstream => {
+            for edge_ref in graph.edges_directed(table_idx, Direction::Incoming) {
+                if let Edge::DependsOn {
+                    column_analysis: Some(analysis),
+                    ..
+                } = edge_ref.weight()
+                {
+                    let view_idx = edge_ref.source();
+                    for mapping in &analysis.column_mappings {
+                        let consumes_this = mapping.sources.iter().any(|s| match s {
+                            ColumnSource::Column {
+                                table: Some(t),
+                                column: c,
+                            } => eq(t, table) && eq(c, column),
+                            _ => false,
+                        });
+                        if !consumes_this {
+                            continue;
+                        }
+                        let Some(target_table) = mapping.target_table.as_deref() else {
+                            continue;
+                        };
+                        let next = lineage_column_inner(
+                            graph,
+                            target_table,
+                            &mapping.target_column,
+                            direction,
+                            depth - 1,
+                            seen,
+                        );
+                        node.steps.push(ColumnLineageStep {
+                            via: view_idx,
+                            kind: mapping.kind.clone(),
+                            expression: mapping.expression.clone(),
+                            source: ColumnSource::Column {
+                                table: Some(target_table.to_string()),
+                                column: mapping.target_column.clone(),
+                            },
+                            next: Some(next),
+                        });
+                    }
                 }
             }
         }

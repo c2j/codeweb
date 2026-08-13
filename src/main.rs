@@ -1334,8 +1334,10 @@ fn cmd_lineage(
     let store = proj.load_store()?;
     let graph = store.graph();
 
-    // `table` traces the table; `table.column` traces one column through it.
-    let (table_name, column_name) = match target.split_once('.') {
+    // `table` traces the table; `table.column` traces one column through it. Split on the
+    // last `.` so a schema-qualified `schema.table.column` keeps `schema.table` as the
+    // table part and only the final component as the column.
+    let (table_name, column_name) = match target.rsplit_once('.') {
         Some((table, column)) if !table.is_empty() && !column.is_empty() => (table, Some(column)),
         Some(_) => {
             eprintln!(

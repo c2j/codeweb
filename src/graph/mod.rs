@@ -635,6 +635,8 @@ pub enum Edge {
     },
     DependsOn {
         location: SourceLocation,
+        #[serde(default)]
+        column_analysis: Option<Box<ColumnAnalysis>>,
     },
     ContainsRoutine,
     TriggersRoutine {

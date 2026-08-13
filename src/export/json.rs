@@ -292,7 +292,7 @@ enum EdgeKindJson {
         file: String,
         line: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        column_analysis: Option<ColumnAnalysis>,
+        column_analysis: Option<Box<ColumnAnalysis>>,
     },
     #[serde(rename = "depends_on")]
     DependsOn { file: String, line: usize },
@@ -808,11 +808,11 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                         write_kinds: wk_strs,
                         file: location.file.to_string_lossy().to_string(),
                         line: location.line,
-                        column_analysis: column_analysis.as_deref().cloned(),
+                        column_analysis: column_analysis.clone(),
                     },
                 }
             }
-            Edge::DependsOn { location } => EdgeJson {
+            Edge::DependsOn { location, .. } => EdgeJson {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::DependsOn {

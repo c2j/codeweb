@@ -321,3 +321,110 @@ END;
         assert!(out.contains(expected), "{expected} missing:\n{out}");
     }
 }
+
+/// A cursor's SELECT feeds its FETCH variables, which feed `INSERT ... VALUES` — the
+/// whole chain must resolve back to the cursor's source columns.
+#[test]
+fn cursor_fetch_insert_values_resolves_to_source_columns() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE src_cursor(id NUMBER, amount NUMBER);
+CREATE TABLE dst_cursor(id NUMBER, total NUMBER);
+CREATE PROCEDURE prc_cursor AS
+  CURSOR c IS SELECT id, amount FROM src_cursor;
+  v_id NUMBER;
+  v_amount NUMBER;
+BEGIN
+  OPEN c;
+  LOOP
+    FETCH c INTO v_id, v_amount;
+    EXIT WHEN c%NOTFOUND;
+    INSERT INTO dst_cursor(id, total) VALUES (v_id, v_amount);
+  END LOOP;
+  CLOSE c;
+END;
+"#,
+    );
+
+    let out = lineage(&root, "dst_cursor.total", "upstream", "tree");
+    assert!(
+        out.contains("src_cursor.amount"),
+        "cursor source column missing:\n{out}"
+    );
+}
+
+/// A view's body is the definition of its columns, so column lineage must resolve
+/// through the view to its base table.
+#[test]
+fn view_column_lineage_resolves_through_the_view() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE base_v(a NUMBER, b NUMBER);
+CREATE VIEW v_dbl AS SELECT a * 2 AS x, b AS y FROM base_v;
+CREATE TABLE dst_view(x NUMBER, y NUMBER);
+CREATE PROCEDURE prc_view AS BEGIN
+  INSERT INTO dst_view(x, y) SELECT x, y FROM v_dbl;
+END;
+"#,
+    );
+
+    let out = lineage(&root, "dst_view.x", "upstream", "tree");
+    assert!(out.contains("base_v.a"), "view base column missing:\n{out}");
+    assert!(
+        out.contains("a * 2"),
+        "view expression text missing:\n{out}"
+    );
+}
+
+/// A MERGE statement's WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT clauses both
+/// produce column mappings.
+#[test]
+fn merge_produces_column_mappings() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE m_src(id NUMBER, val NUMBER);
+CREATE TABLE m_tgt(id NUMBER, val NUMBER);
+CREATE PROCEDURE prc_merge AS BEGIN
+  MERGE INTO m_tgt t
+  USING m_src s ON (t.id = s.id)
+  WHEN MATCHED THEN UPDATE SET val = s.val
+  WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);
+END;
+"#,
+    );
+
+    let out = lineage(&root, "m_tgt.val", "upstream", "tree");
+    assert!(
+        out.contains("m_src.val"),
+        "merge source column missing:\n{out}"
+    );
+}
+
+/// `UPDATE ... FROM` source columns must be attributed to the FROM table, not the
+/// UPDATE target table.
+#[test]
+fn update_from_attributes_source_columns() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE u_tgt(id NUMBER, v NUMBER);
+CREATE TABLE u_src(id NUMBER, v NUMBER);
+CREATE PROCEDURE prc_upd AS BEGIN
+  UPDATE u_tgt t SET v = s.v FROM u_src s WHERE t.id = s.id;
+END;
+"#,
+    );
+
+    let out = lineage(&root, "u_tgt.v", "upstream", "tree");
+    assert!(
+        out.contains("u_src.v"),
+        "UPDATE ... FROM source column missing:\n{out}"
+    );
+}
