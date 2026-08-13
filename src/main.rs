@@ -355,6 +355,28 @@ enum Commands {
         fail_on_multiple: bool,
     },
 
+    /// Table-level and column-level lineage analysis
+    Lineage {
+        /// Target table name (e.g., "my_table") for table-level, or "table.column" for column-level
+        target: String,
+
+        /// Lineage direction: upstream (who writes/defines) or downstream (who consumes)
+        #[arg(long, default_value = "upstream", value_parser = ["upstream", "downstream"])]
+        direction: String,
+
+        /// Recursion depth
+        #[arg(long, default_value = "5")]
+        depth: usize,
+
+        /// Output format: tree, json
+        #[arg(long, default_value = "tree", value_parser = ["tree", "json"])]
+        format: String,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
     /// Show project statistics
     Stats {
         /// Project directory (default: current directory)
@@ -855,6 +877,13 @@ fn run() -> Result<()> {
             all_matches,
             fail_on_multiple,
         ),
+        Some(Commands::Lineage {
+            target,
+            direction,
+            depth,
+            format,
+            project,
+        }) => cmd_lineage(&target, &direction, depth, &format, &project),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -1291,6 +1320,127 @@ fn cmd_trace(
         "{}",
         graph::traverse::format_chain(&chain, graph, chain_style)
     );
+    Ok(())
+}
+
+fn cmd_lineage(
+    target: &str,
+    direction: &str,
+    depth: usize,
+    format: &str,
+    project: &Path,
+) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    // `table` traces the table; `table.column` traces one column through it. Split on the
+    // last `.` so a schema-qualified `schema.table.column` keeps `schema.table` as the
+    // table part and only the final component as the column.
+    let (table_name, column_name) = match target.rsplit_once('.') {
+        Some((table, column)) if !table.is_empty() && !column.is_empty() => (table, Some(column)),
+        Some(_) => {
+            eprintln!(
+                "Invalid target format: {}. Use 'table' or 'table.column'",
+                target
+            );
+            return Ok(());
+        }
+        None => (target, None),
+    };
+
+    // Parse direction up front — both the table and column paths need it.
+    let lineage_dir = match direction.to_lowercase().as_str() {
+        "upstream" => graph::lineage::LineageDirection::Upstream,
+        "downstream" => graph::lineage::LineageDirection::Downstream,
+        _ => {
+            eprintln!(
+                "Unknown direction: {}. Use 'upstream' or 'downstream'",
+                direction
+            );
+            return Ok(());
+        }
+    };
+
+    if let Some(column) = column_name {
+        let node = graph::lineage::lineage_column(graph, table_name, column, lineage_dir, depth);
+        if node.steps.is_empty() {
+            eprintln!(
+                "No column lineage for {}.{} — the column may be unknown, or its writers \
+                 may not have been analyzed with column mappings.",
+                table_name, column
+            );
+        }
+        match format.to_lowercase().as_str() {
+            "tree" => {
+                println_stdout!(
+                    "{}",
+                    graph::lineage::format_column_lineage_tree(&node, graph, lineage_dir, 0)
+                );
+            }
+            "json" => {
+                let json = graph::lineage::format_column_lineage_json(&node, graph);
+                match serde_json::to_string_pretty(&json) {
+                    Ok(s) => println_stdout!("{}", s),
+                    Err(e) => eprintln!("Failed to format JSON: {}", e),
+                }
+            }
+            _ => eprintln!("Unknown format: {}. Use 'tree' or 'json'", format),
+        }
+        return Ok(());
+    }
+
+    // Find the table node (use substring matching for flexibility)
+    let result = store.resolve_single_node(
+        table_name,
+        crate::graph::search::MatchMode::Substring,
+        false,
+        false,
+    );
+
+    let table_idx = match result {
+        crate::graph::search::ResolveResult::Single(idx, _) => idx,
+        crate::graph::search::ResolveResult::Empty => {
+            eprintln!("No table found matching '{}'", table_name);
+            return Ok(());
+        }
+        _ => {
+            eprintln!("Ambiguous match for '{}'", table_name);
+            return Ok(());
+        }
+    };
+
+    // Verify it's a table or view node
+    if !matches!(
+        &graph[table_idx],
+        graph::Node::Table { .. } | graph::Node::View { .. }
+    ) {
+        eprintln!("'{}' is not a table or view", table_name);
+        return Ok(());
+    }
+
+    // Compute lineage
+    let lineage_node = graph::lineage::lineage_table(graph, table_idx, lineage_dir, depth);
+
+    // Format and output
+    match format.to_lowercase().as_str() {
+        "tree" => {
+            let tree_str =
+                graph::lineage::format_lineage_tree(&lineage_node, graph, lineage_dir, 0);
+            println_stdout!("{}", tree_str);
+        }
+        "json" => {
+            let json = graph::lineage::format_lineage_json(&lineage_node, graph);
+            match serde_json::to_string_pretty(&json) {
+                Ok(json_str) => println_stdout!("{}", json_str),
+                Err(e) => eprintln!("Failed to format JSON: {}", e),
+            }
+        }
+        _ => {
+            eprintln!("Unknown format: {}. Use 'tree' or 'json'", format);
+        }
+    }
+
     Ok(())
 }
 

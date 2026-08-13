@@ -637,6 +637,7 @@ impl CgefParser {
             }
             "depends_on" => Ok(Edge::DependsOn {
                 location: location.unwrap_or_else(dummy_location),
+                column_analysis: None,
             }),
             "contains_routine" => Ok(Edge::ContainsRoutine),
             "triggers_routine" => Ok(Edge::TriggersRoutine {

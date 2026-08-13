@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(codeweb detail:*)",
+      "Bash(codeweb lineage:*)",
+      "Bash(cargo clippy:*)"
+    ]
+  }
+}

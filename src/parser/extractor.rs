@@ -1145,6 +1145,19 @@ impl Visitor for TableAccessExtractor {
 
         self.push_cte_scope(local_cte_names);
 
+        // Every path below returns SkipChildren, so walk_select never reaches the
+        // set_operation branches. Pick up the UNION/INTERSECT/EXCEPT right-hand sides
+        // here — inside the CTE scope, which stays visible to all branches. The
+        // recursive call follows the rest of the right-nested chain.
+        if let Some(ref set_op) = select.set_operation {
+            let right = match set_op {
+                ogsql_parser::ast::SetOperation::Union { right, .. }
+                | ogsql_parser::ast::SetOperation::Intersect { right, .. }
+                | ogsql_parser::ast::SetOperation::Except { right, .. } => right.as_ref(),
+            };
+            self.visit_select(right);
+        }
+
         if let Some(ref into) = select.into_table {
             self.add_access(
                 &into.table_name,
@@ -1326,6 +1339,68 @@ pub struct ColumnAnalysis {
     pub insert_columns: Vec<InsertColumnInfo>,
     /// UPDATE statement SET columns.
     pub update_columns: Vec<UpdateColumnInfo>,
+    /// Per-column data flow: which sources feed each written column.
+    #[serde(default)]
+    pub column_mappings: Vec<ColumnMapping>,
+}
+
+/// One written column and the sources its value is built from.
+///
+/// `INSERT INTO t (a) SELECT b FROM s` yields one mapping: target `t.a`, source `s.b`,
+/// kind `Direct`. A bare `SELECT b AS a FROM s` (a view body, or a union branch) yields
+/// the same mapping with `target_table: None` — the enclosing object names the table.
+///
+/// A union contributes one mapping per branch, all sharing a target. Merging them is left
+/// to the consumer so that each branch keeps its own [`MappingKind`] and expression text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ColumnMapping {
+    /// Table written to. None when the statement itself does not name one.
+    pub target_table: Option<String>,
+    pub target_column: String,
+    /// 0-based position in the producing SELECT list.
+    ///
+    /// Authoritative for a bare SELECT, where `target_column` is only that branch's own
+    /// alias or column name: in `SELECT a FROM t1 UNION ALL SELECT b FROM t2` the output
+    /// column is named by the first branch, so the second branch's `target_column` of
+    /// `b` is a local name, not the result's. Aligning by position is what identifies
+    /// them as the same output column.
+    #[serde(default)]
+    pub position: Option<usize>,
+    pub sources: Vec<ColumnSource>,
+    pub kind: MappingKind,
+    /// Source expression text, when the value is not a plain column reference.
+    pub expression: Option<String>,
+}
+
+/// Where one input of a [`ColumnMapping`] comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ColumnSource {
+    Column {
+        /// Resolved via `alias_map`. None when the reference is unqualified and the
+        /// statement reads more than one table, so the owner is ambiguous.
+        table: Option<String>,
+        column: String,
+    },
+    Literal {
+        value: String,
+    },
+    /// A PL/SQL variable or cursor field that could not be traced back to a column.
+    Variable {
+        name: String,
+    },
+    /// Assembled by dynamic SQL — the value is not statically knowable.
+    Dynamic,
+}
+
+/// How a target column's value relates to its sources.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MappingKind {
+    /// Plain copy of a single column, with no transformation.
+    Direct,
+    /// Computed — arithmetic, `decode`/`nvl`/`CASE`, a function call, a cast.
+    Derived,
+    /// Produced by an aggregate function.
+    Aggregated { function: String, distinct: bool },
 }
 
 /// Table alias definition.
@@ -1333,6 +1408,14 @@ pub struct ColumnAnalysis {
 pub struct TableAlias {
     pub schema: Option<String>,
     pub table: String,
+}
+
+/// One output column of a cursor's SELECT, with its resolved source.
+#[derive(Debug, Clone)]
+pub struct CursorColumn {
+    pub output_name: String,
+    pub source_table: Option<String>,
+    pub source_col: String,
 }
 
 /// Column reference.
@@ -1469,7 +1552,20 @@ pub struct ColumnAccessExtractor {
     select_into: Vec<SelectIntoMapping>,
     insert_columns: Vec<InsertColumnInfo>,
     update_columns: Vec<UpdateColumnInfo>,
+    column_mappings: Vec<ColumnMapping>,
+    /// The one table a bare column reference belongs to, for the select currently being
+    /// mapped. Scoped per union branch: without that, branch 2 would see branch 1's table
+    /// too and treat its unqualified columns as ambiguous.
+    scope_sole_table: Option<String>,
     clause_stack: Vec<ColumnContext>,
+    /// CTE names in scope, so a WITH reference is not reported as a real source table.
+    cte_scope: Vec<HashSet<String>>,
+    /// Cursor name → the columns its SELECT produces (resolved to table.column).
+    cursor_sources: HashMap<String, Vec<CursorColumn>>,
+    /// Cursor name → the variables its FETCH reads into, in order.
+    fetch_vars: HashMap<String, Vec<String>>,
+    /// The cursor whose SELECT is currently being walked.
+    current_cursor: Option<String>,
 }
 
 impl ColumnAccessExtractor {
@@ -1483,11 +1579,18 @@ impl ColumnAccessExtractor {
             select_into: Vec::new(),
             insert_columns: Vec::new(),
             update_columns: Vec::new(),
+            column_mappings: Vec::new(),
+            scope_sole_table: None,
             clause_stack: Vec::new(),
+            cte_scope: Vec::new(),
+            cursor_sources: HashMap::new(),
+            fetch_vars: HashMap::new(),
+            current_cursor: None,
         }
     }
 
-    pub fn finish(self) -> ColumnAnalysis {
+    pub fn finish(mut self) -> ColumnAnalysis {
+        self.resolve_cursor_flows();
         ColumnAnalysis {
             column_refs: dedup_column_refs(self.column_refs),
             alias_map: self.alias_map,
@@ -1497,6 +1600,7 @@ impl ColumnAccessExtractor {
             select_into: self.select_into,
             insert_columns: self.insert_columns,
             update_columns: self.update_columns,
+            column_mappings: self.column_mappings,
         }
     }
 
@@ -1506,6 +1610,117 @@ impl ColumnAccessExtractor {
 
     fn resolve_alias(&self, prefix: &str) -> Option<&TableAlias> {
         self.alias_map.get(&prefix.to_lowercase())
+    }
+
+    fn is_cte_reference(&self, name: &ogsql_parser::ast::ObjectName) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let table_name = name[name.len() - 1].to_lowercase();
+        self.cte_scope
+            .iter()
+            .any(|scope| scope.contains(&table_name))
+    }
+
+    fn push_cte_scope(&mut self, names: HashSet<String>) {
+        self.cte_scope.push(names);
+    }
+
+    fn pop_cte_scope(&mut self) {
+        self.cte_scope.pop();
+    }
+
+    fn record_cursor(&mut self, name: &str, cols: Vec<CursorColumn>) {
+        self.cursor_sources.insert(name.to_lowercase(), cols);
+    }
+
+    fn record_fetch(&mut self, cursor_name: &str, vars: Vec<String>) {
+        self.fetch_vars.insert(
+            cursor_name.to_lowercase(),
+            vars.into_iter().map(|v| v.to_lowercase()).collect(),
+        );
+    }
+
+    /// Resolve `INSERT ... VALUES(v1, v2)` variables back to the columns the cursor
+    /// SELECT produced, by FETCH variable position.
+    fn resolve_cursor_flows(&mut self) {
+        let mut var_to_source: HashMap<String, ColumnSource> = HashMap::new();
+        for (cursor, vars) in &self.fetch_vars {
+            if let Some(cols) = self.cursor_sources.get(cursor) {
+                for (i, var) in vars.iter().enumerate() {
+                    if let Some(col) = cols.get(i) {
+                        if !col.source_col.is_empty() {
+                            var_to_source.insert(
+                                var.clone(),
+                                ColumnSource::Column {
+                                    table: col.source_table.clone(),
+                                    column: col.source_col.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if var_to_source.is_empty() {
+            return;
+        }
+        for mapping in &mut self.column_mappings {
+            for source in &mut mapping.sources {
+                if let ColumnSource::Variable { name } = source {
+                    if let Some(col) = var_to_source.get(&name.to_lowercase()) {
+                        *source = col.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect the source columns (resolved to table.column) of a cursor SELECT.
+    fn collect_cursor_select_sources(&self, select: &SelectStatement) -> Vec<CursorColumn> {
+        let default_table = single_table_name_of(&select.from);
+        let mut sources = Vec::new();
+        for target in &select.targets {
+            if let SelectTarget::Expr(expr, alias) = target {
+                let output_name = alias
+                    .as_ref()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| derive_cursor_output_name(expr));
+                let mut cols = collect_expr_columns(expr);
+                for (table, _col) in cols.iter_mut() {
+                    if let Some(ref alias) = table {
+                        if let Some(resolved) = self.resolve_alias(alias) {
+                            *table = Some(resolved.table.clone());
+                        }
+                    } else if let Some(ref dt) = default_table {
+                        *table = Some(dt.clone());
+                    }
+                }
+                if let Some((table, col)) = cols.into_iter().next() {
+                    sources.push(CursorColumn {
+                        output_name,
+                        source_table: table,
+                        source_col: col,
+                    });
+                }
+            }
+        }
+        sources
+    }
+
+    /// The sole non-CTE table of a FROM list, or None when zero or several are in scope.
+    fn scope_sole_table_of(&self, refs: &[AstTableRef]) -> Option<String> {
+        let mut tables = refs.iter().filter_map(|tr| match tr {
+            AstTableRef::Table { name, .. } if !self.is_cte_reference(name) => {
+                Some(split_schema_table(name).1)
+            }
+            _ => None,
+        });
+        let first = tables.next()?;
+        if tables.any(|t| !t.eq_ignore_ascii_case(&first)) {
+            return None;
+        }
+        Some(first)
     }
 
     fn add_column_ref(
@@ -1537,7 +1752,7 @@ impl ColumnAccessExtractor {
     fn collect_aliases_from_table_refs(&mut self, refs: &[AstTableRef]) {
         for tr in refs {
             match tr {
-                AstTableRef::Table { name, alias, .. } => {
+                AstTableRef::Table { name, alias, .. } if !self.is_cte_reference(name) => {
                     let (schema, table) = split_schema_table(name);
                     if let Some(a) = alias {
                         self.alias_map
@@ -1867,9 +2082,50 @@ impl ColumnAccessExtractor {
 }
 
 impl Visitor for ColumnAccessExtractor {
+    fn visit_statement(&mut self, stmt: &Statement) -> VisitorResult {
+        if let Statement::Merge(merge) = stmt {
+            self.visit_merge_statement(&merge.node);
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        if let PlDeclaration::Cursor(PlCursorDecl { name, .. }) = decl {
+            self.current_cursor = Some(name.clone());
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
+        if let PlStatement::Fetch(fetch) = stmt {
+            let cursor_name = match &fetch.node.cursor {
+                Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+                    parts.last().map(|i| i.to_string()).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
+            self.record_fetch(&cursor_name, vars);
+        }
+        VisitorResult::Continue
+    }
+
     fn visit_select(&mut self, select: &SelectStatement) -> VisitorResult {
+        let local_cte_names: HashSet<String> = select
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+        self.push_cte_scope(local_cte_names);
+
         // Collect aliases from FROM clause
         self.collect_aliases_from_table_refs(&select.from);
+
+        if let Some(cursor_name) = self.current_cursor.clone() {
+            let sources = self.collect_cursor_select_sources(select);
+            self.record_cursor(&cursor_name, sources);
+            self.current_cursor = None;
+        }
 
         // Handle SELECT INTO (PL/pgSQL SELECT col INTO var FROM ...)
         if let Some(ref into_targets) = select.into_targets {
@@ -1919,30 +2175,113 @@ impl Visitor for ColumnAccessExtractor {
             self.clause_stack.pop();
         }
 
+        self.pop_cte_scope();
+
         VisitorResult::Continue
     }
 
     fn visit_insert(&mut self, insert: &InsertStatement) -> VisitorResult {
+        let local_cte_names: HashSet<String> = insert
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+        self.push_cte_scope(local_cte_names);
+
         let table_name = insert.table.last().cloned().unwrap_or_default().to_string();
         self.insert_columns.push(InsertColumnInfo {
-            table: table_name,
+            table: table_name.clone(),
             columns: insert.columns.clone(),
         });
+
+        if !insert.columns.is_empty() {
+            match &insert.source {
+                ogsql_parser::ast::InsertSource::Select(select) => {
+                    // Each union branch fills the same target columns, so align the
+                    // column list against every branch. Aliases must be collected per
+                    // branch first: `visit_select` runs later, and until it does the
+                    // FROM aliases are unknown, leaving every source table as None.
+                    for branch in Self::set_operation_branches(select) {
+                        self.collect_aliases_from_table_refs(&branch.from);
+                        self.map_columns_positionally(
+                            Some(&table_name),
+                            &insert.columns,
+                            &branch.targets,
+                            &branch.from,
+                        );
+                    }
+                }
+                ogsql_parser::ast::InsertSource::Values(rows) => {
+                    for row in rows {
+                        for (position, (column, value)) in
+                            insert.columns.iter().zip(row.iter()).enumerate()
+                        {
+                            self.push_column_mapping(
+                                Some(table_name.clone()),
+                                column.clone(),
+                                Some(position),
+                                value,
+                            );
+                        }
+                    }
+                }
+                // DEFAULT VALUES has no sources; `SET` is handled as assignments; a
+                // record variable needs the variable's own type to expand.
+                ogsql_parser::ast::InsertSource::DefaultValues
+                | ogsql_parser::ast::InsertSource::Set(_)
+                | ogsql_parser::ast::InsertSource::RecordVariable(_) => {}
+            }
+        } else if let ogsql_parser::ast::InsertSource::Select(select) = &insert.source {
+            // No column list: name the target columns from the SELECT output (the first
+            // branch), then align every branch by position.
+            let names = output_column_names(select);
+            if !names.is_empty() {
+                for branch in Self::set_operation_branches(select) {
+                    self.collect_aliases_from_table_refs(&branch.from);
+                    self.map_columns_positionally(
+                        Some(&table_name),
+                        &names,
+                        &branch.targets,
+                        &branch.from,
+                    );
+                }
+            }
+        }
+
+        self.pop_cte_scope();
+
         VisitorResult::Continue
     }
 
     fn visit_update(&mut self, update: &UpdateStatement) -> VisitorResult {
-        // Collect aliases from update tables
-        for tr in &update.tables {
-            if let AstTableRef::Table {
-                name,
-                alias: Some(a),
-                ..
-            } = tr
-            {
+        let local_cte_names: HashSet<String> = update
+            .with
+            .as_ref()
+            .map(|w| w.ctes.iter().map(|c| c.name.to_lowercase()).collect())
+            .unwrap_or_default();
+        self.push_cte_scope(local_cte_names);
+
+        // Collect aliases from the target table(s) and any FROM clause. `UPDATE ... FROM`
+        // source tables must be in the alias map or their qualified columns would resolve
+        // to the target table.
+        for tr in update.tables.iter().chain(update.from.iter()) {
+            if let AstTableRef::Table { name, alias, .. } = tr {
+                if self.is_cte_reference(name) {
+                    continue;
+                }
                 let (schema, table) = split_schema_table(name);
-                self.alias_map
-                    .insert(a.to_lowercase(), TableAlias { schema, table });
+                match alias {
+                    Some(a) => {
+                        self.alias_map
+                            .insert(a.to_lowercase(), TableAlias { schema, table });
+                    }
+                    None => {
+                        let table_lower = table.to_lowercase();
+                        self.alias_map
+                            .entry(table_lower)
+                            .or_insert(TableAlias { schema, table });
+                    }
+                }
             }
         }
 
@@ -1966,10 +2305,34 @@ impl Visitor for ColumnAccessExtractor {
 
         if !table_name.is_empty() {
             self.update_columns.push(UpdateColumnInfo {
-                table: table_name,
+                table: table_name.clone(),
                 set_columns,
             });
         }
+
+        // SET col = expr. A multi-column form, `SET (a, b) = (SELECT x, y ...)`, has one
+        // assignment holding several targets but a single value expression; pairing them
+        // by position would need the subquery's select list, so those targets share the
+        // whole expression rather than being split.
+        let new_scope = if update.from.is_empty() {
+            self.scope_sole_table_of(&update.tables)
+        } else {
+            None
+        };
+        let previous_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+        for assignment in &update.assignments {
+            for (position, target) in assignment.columns.iter().enumerate() {
+                if let Some(column) = target.last() {
+                    self.push_column_mapping(
+                        Some(table_name.clone()),
+                        column.to_string(),
+                        Some(position),
+                        &assignment.value,
+                    );
+                }
+            }
+        }
+        self.scope_sole_table = previous_scope;
 
         // Walk WHERE clause for column refs and filters
         if let Some(ref where_clause) = update.where_clause {
@@ -1978,6 +2341,8 @@ impl Visitor for ColumnAccessExtractor {
             self.walk_expr_for_column_refs(where_clause);
             self.clause_stack.pop();
         }
+
+        self.pop_cte_scope();
 
         VisitorResult::Continue
     }
@@ -2012,6 +2377,305 @@ impl Visitor for ColumnAccessExtractor {
 // ── Column analysis helpers ────────────────────────────────
 
 impl ColumnAccessExtractor {
+    /// Resolve a column reference's owning table through `alias_map`.
+    ///
+    /// An unqualified column falls back to the sole table of the select being mapped: in
+    /// `SELECT qsje FROM jsmx_temp` the owner is unambiguous even without a prefix. With
+    /// two or more tables in scope it stays unattributed rather than guessed.
+    fn column_source(&self, names: &[ogsql_parser::Ident]) -> ColumnSource {
+        let (alias_prefix, column) = split_alias_column(names);
+        let table = match alias_prefix.as_ref() {
+            Some(a) => self.resolve_alias(a).map(|ta| ta.table.clone()),
+            None => self.scope_sole_table.clone(),
+        };
+        ColumnSource::Column { table, column }
+    }
+
+    /// Describe how `expr` produces a value: which inputs feed it, and whether it is a
+    /// plain copy, a computation, or an aggregate.
+    fn classify_value_expr(&self, expr: &Expr) -> (Vec<ColumnSource>, MappingKind, Option<String>) {
+        let expr = peel_parenthesized(expr);
+
+        match expr {
+            Expr::ColumnRef(names) if !names.is_empty() => {
+                (vec![self.column_source(names)], MappingKind::Direct, None)
+            }
+            Expr::PlVariable(names) if !names.is_empty() => (
+                vec![ColumnSource::Variable {
+                    name: names.join("."),
+                }],
+                MappingKind::Direct,
+                None,
+            ),
+            Expr::Literal(lit) => (
+                vec![ColumnSource::Literal {
+                    value: format_literal_short(lit),
+                }],
+                MappingKind::Direct,
+                None,
+            ),
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                ..
+            } if is_aggregate_function(&name.last().cloned().unwrap_or_default()) => {
+                let mut sources = Vec::new();
+                for arg in args {
+                    self.collect_value_sources(arg, &mut sources);
+                }
+                let function = name
+                    .last()
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_string()
+                    .to_uppercase();
+                (
+                    sources,
+                    MappingKind::Aggregated {
+                        function,
+                        distinct: *distinct,
+                    },
+                    Some(format_expr_short(expr)),
+                )
+            }
+            _ => {
+                let mut sources = Vec::new();
+                self.collect_value_sources(expr, &mut sources);
+                (sources, MappingKind::Derived, Some(format_expr_short(expr)))
+            }
+        }
+    }
+
+    /// Collect the column and variable leaves that feed a computed expression.
+    ///
+    /// Literals are deliberately skipped here. Inside `decode(kind, '1', 'A', kind)` the
+    /// quoted values are outputs of the branch, not upstream data — recording them would
+    /// bury the one input that lineage cares about. A value that is *entirely* a literal
+    /// is handled by [`Self::classify_value_expr`] instead, where "this column is a
+    /// constant" is the useful answer.
+    fn collect_value_sources(&self, expr: &Expr, out: &mut Vec<ColumnSource>) {
+        match expr {
+            Expr::ColumnRef(names) | Expr::ColumnRefOuterJoin(names) if !names.is_empty() => {
+                push_unique_source(out, self.column_source(names));
+            }
+            Expr::PlVariable(names) if !names.is_empty() => {
+                push_unique_source(
+                    out,
+                    ColumnSource::Variable {
+                        name: names.join("."),
+                    },
+                );
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.collect_value_sources(left, out);
+                self.collect_value_sources(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::Like { expr, pattern, .. } => {
+                self.collect_value_sources(expr, out);
+                self.collect_value_sources(pattern, out);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.collect_value_sources(expr, out);
+                self.collect_value_sources(low, out);
+                self.collect_value_sources(high, out);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.collect_value_sources(expr, out);
+                for item in list {
+                    self.collect_value_sources(item, out);
+                }
+            }
+            Expr::IsNull { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.collect_value_sources(arg, out);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(ref op) = operand {
+                    self.collect_value_sources(op, out);
+                }
+                for wc in whens {
+                    self.collect_value_sources(&wc.condition, out);
+                    self.collect_value_sources(&wc.result, out);
+                }
+                if let Some(ref e) = else_expr {
+                    self.collect_value_sources(e, out);
+                }
+            }
+            Expr::InSubquery { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::TypeCast { expr, .. } => self.collect_value_sources(expr, out),
+            Expr::Parenthesized(inner) => self.collect_value_sources(inner, out),
+            Expr::FieldAccess { object, .. } => self.collect_value_sources(object, out),
+            // Subqueries carry their own scope; walking them here would resolve their
+            // columns against this statement's aliases.
+            Expr::Exists(_) | Expr::Subquery(_) => {}
+            _ => {}
+        }
+    }
+
+    /// Extract the column mappings of a view body.
+    ///
+    /// Called explicitly for `CREATE VIEW` rather than from `visit_select`, so the
+    /// `INSERT ... SELECT` path — which already emits table-qualified mappings — does not
+    /// also produce a second, table-less set for the same select list.
+    ///
+    /// `declared_columns` is the view's explicit column list when it has one. Otherwise
+    /// the first branch's aliases name the output columns and later union branches align
+    /// to them by position, which is the only thing that identifies
+    /// `SELECT entrust_type AS bond_kind` in one branch and a bare `bond_kind` in another
+    /// as the same output column.
+    pub fn extract_view_column_mappings(
+        &mut self,
+        view_name: &str,
+        declared_columns: &[String],
+        select: &SelectStatement,
+    ) {
+        let branches = Self::set_operation_branches(select);
+
+        let names: Vec<String> = if !declared_columns.is_empty() {
+            declared_columns.to_vec()
+        } else {
+            branches
+                .first()
+                .map(|b| output_column_names(b))
+                .unwrap_or_default()
+        };
+        if names.is_empty() {
+            return;
+        }
+
+        for branch in branches {
+            self.collect_aliases_from_table_refs(&branch.from);
+            self.map_columns_positionally(Some(view_name), &names, &branch.targets, &branch.from);
+        }
+    }
+
+    fn push_column_mapping(
+        &mut self,
+        target_table: Option<String>,
+        target_column: String,
+        position: Option<usize>,
+        value: &Expr,
+    ) {
+        let (sources, kind, expression) = self.classify_value_expr(value);
+        self.column_mappings.push(ColumnMapping {
+            target_table,
+            target_column,
+            position,
+            sources,
+            kind,
+            expression,
+        });
+    }
+
+    /// Extract column mappings from a MERGE statement's WHEN clauses.
+    fn visit_merge_statement(&mut self, merge: &ogsql_parser::ast::MergeStatement) {
+        let target_name = match &merge.target {
+            AstTableRef::Table { name, .. } => name.last().cloned().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        if target_name.is_empty() {
+            return;
+        }
+
+        self.collect_aliases_from_table_refs(std::slice::from_ref(&merge.target));
+        self.collect_aliases_from_table_refs(std::slice::from_ref(&merge.source));
+
+        let new_scope = self.scope_sole_table_of(std::slice::from_ref(&merge.source));
+        let previous_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+
+        for clause in &merge.when_clauses {
+            match &clause.action {
+                ogsql_parser::ast::MergeAction::Update(assignments) => {
+                    for (position, assignment) in assignments.iter().enumerate() {
+                        if let Some(column) = assignment.columns.first().and_then(|c| c.last()) {
+                            self.push_column_mapping(
+                                Some(target_name.clone()),
+                                column.to_string(),
+                                Some(position),
+                                &assignment.value,
+                            );
+                        }
+                    }
+                }
+                ogsql_parser::ast::MergeAction::Insert { columns, values } => {
+                    for (position, (column, value)) in columns.iter().zip(values.iter()).enumerate()
+                    {
+                        if let Some(col) = column.last() {
+                            self.push_column_mapping(
+                                Some(target_name.clone()),
+                                col.to_string(),
+                                Some(position),
+                                value,
+                            );
+                        }
+                    }
+                }
+                ogsql_parser::ast::MergeAction::Delete => {}
+            }
+        }
+
+        self.scope_sole_table = previous_scope;
+    }
+
+    /// Pair a written column list against the expressions that fill it, by position.
+    ///
+    /// A `SELECT *` target cannot be aligned without a schema, so the whole statement is
+    /// skipped rather than emitting mappings shifted by one.
+    fn map_columns_positionally(
+        &mut self,
+        target_table: Option<&str>,
+        columns: &[String],
+        values: &[SelectTarget],
+        from: &[AstTableRef],
+    ) {
+        if values.iter().any(|t| matches!(t, SelectTarget::Star(_))) {
+            return;
+        }
+        let new_scope = self.scope_sole_table_of(from);
+        let previous_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+        for (position, (column, target)) in columns.iter().zip(values.iter()).enumerate() {
+            if column.is_empty() {
+                continue;
+            }
+            if let SelectTarget::Expr(expr, _) = target {
+                self.push_column_mapping(
+                    target_table.map(|s| s.to_string()),
+                    column.clone(),
+                    Some(position),
+                    expr,
+                );
+            }
+        }
+        self.scope_sole_table = previous_scope;
+    }
+
+    /// Follow a set-operation chain, yielding each branch in source order (the head
+    /// select included).
+    fn set_operation_branches(select: &SelectStatement) -> Vec<&SelectStatement> {
+        let mut branches = vec![select];
+        let mut cur = select;
+        while let Some(op) = cur.set_operation.as_ref() {
+            let right = match op {
+                ogsql_parser::ast::SetOperation::Union { right, .. }
+                | ogsql_parser::ast::SetOperation::Intersect { right, .. }
+                | ogsql_parser::ast::SetOperation::Except { right, .. } => right.as_ref(),
+            };
+            branches.push(right);
+            cur = right;
+        }
+        branches
+    }
+
     fn walk_expr_for_column_refs(&mut self, expr: &Expr) {
         match expr {
             Expr::ColumnRef(names) if !names.is_empty() => {
@@ -2127,14 +2791,184 @@ fn peel_parenthesized(mut expr: &Expr) -> &Expr {
 fn format_expr_short(expr: &Expr) -> String {
     match expr {
         Expr::ColumnRef(names) => names.join("."),
+        Expr::ColumnRefOuterJoin(names) => format!("{}(+)", names.join(".")),
         Expr::PlVariable(names) => names.join("."),
         Expr::Literal(lit) => format_literal_short(lit),
-        Expr::FunctionCall { name, args, .. } => {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            ..
+        } => {
             let fname = name.last().cloned().unwrap_or_default();
             let arg_strs: Vec<String> = args.iter().map(format_expr_short).collect();
-            format!("{}({})", fname, arg_strs.join(", "))
+            let prefix = if *distinct { "DISTINCT " } else { "" };
+            format!("{}({}{})", fname, prefix, arg_strs.join(", "))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "{} {} {}",
+                format_expr_short(left),
+                op,
+                format_expr_short(right)
+            )
+        }
+        Expr::UnaryOp { op, expr } => format!("{}{}", op, format_expr_short(expr)),
+        Expr::Parenthesized(inner) => format!("({})", format_expr_short(inner)),
+        Expr::TypeCast { expr, .. } => format_expr_short(expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut out = String::from("CASE");
+            if let Some(op) = operand {
+                out.push(' ');
+                out.push_str(&format_expr_short(op));
+            }
+            for wc in whens {
+                out.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    format_expr_short(&wc.condition),
+                    format_expr_short(&wc.result)
+                ));
+            }
+            if let Some(e) = else_expr {
+                out.push_str(&format!(" ELSE {}", format_expr_short(e)));
+            }
+            out.push_str(" END");
+            out
         }
         _ => format!("{:?}", expr),
+    }
+}
+
+/// Names a select list produces, in order.
+///
+/// An explicit alias wins; a bare column reference names itself. Anything else — an
+/// unaliased `decode(...)`, a literal — yields an empty placeholder so that later entries
+/// keep their positions, and [`ColumnAccessExtractor::map_columns_positionally`] skips it.
+fn output_column_names(select: &SelectStatement) -> Vec<String> {
+    select
+        .targets
+        .iter()
+        .map(|target| match target {
+            SelectTarget::Expr(expr, Some(alias)) => {
+                let _ = expr;
+                alias.to_string()
+            }
+            SelectTarget::Expr(expr, None) => match peel_parenthesized(expr) {
+                Expr::ColumnRef(names) | Expr::ColumnRefOuterJoin(names) => {
+                    names.last().map(|n| n.to_string()).unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            SelectTarget::Star(_) => String::new(),
+        })
+        .collect()
+}
+
+/// Aggregate functions whose output summarises many rows of their input.
+///
+/// Kept to the set that appears in GaussDB/Oracle analytics code; an unlisted function
+/// falls through to `Derived`, which is the safer default — it still records the same
+/// source columns, only without labelling the aggregation.
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "SUM"
+            | "COUNT"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "MEDIAN"
+            | "LISTAGG"
+            | "STRING_AGG"
+            | "ARRAY_AGG"
+            | "GROUP_CONCAT"
+            | "WM_CONCAT"
+            | "BOOL_AND"
+            | "BOOL_OR"
+    )
+}
+
+fn push_unique_source(out: &mut Vec<ColumnSource>, source: ColumnSource) {
+    if !out.contains(&source) {
+        out.push(source);
+    }
+}
+
+fn single_table_name_of(from: &[AstTableRef]) -> Option<String> {
+    if from.len() == 1 {
+        if let AstTableRef::Table { name, .. } = &from[0] {
+            return name.last().map(|i| i.to_string());
+        }
+    }
+    None
+}
+
+fn derive_cursor_output_name(expr: &Expr) -> String {
+    match expr {
+        Expr::ColumnRef(parts) | Expr::ColumnRefOuterJoin(parts) => {
+            parts.last().map(|i| i.to_string()).unwrap_or_default()
+        }
+        Expr::FieldAccess { field, .. } => field.clone(),
+        _ => String::new(),
+    }
+}
+
+fn collect_expr_columns(expr: &Expr) -> Vec<(Option<String>, String)> {
+    match expr {
+        Expr::ColumnRef(parts) | Expr::ColumnRefOuterJoin(parts) => {
+            let col = parts.last().map(|i| i.to_string()).unwrap_or_default();
+            let table = if parts.len() >= 2 {
+                Some(parts[parts.len() - 2].to_string())
+            } else {
+                None
+            };
+            vec![(table, col)]
+        }
+        Expr::FunctionCall { args, .. } => args.iter().flat_map(collect_expr_columns).collect(),
+        Expr::BinaryOp { left, right, .. } => {
+            let mut cols = collect_expr_columns(left);
+            cols.extend(collect_expr_columns(right));
+            cols
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Parenthesized(inner) => {
+            collect_expr_columns(inner)
+        }
+        Expr::Case {
+            whens, else_expr, ..
+        } => {
+            let mut cols: Vec<_> = whens
+                .iter()
+                .flat_map(|w| {
+                    let mut c = collect_expr_columns(&w.condition);
+                    c.extend(collect_expr_columns(&w.result));
+                    c
+                })
+                .collect();
+            if let Some(ref e) = else_expr {
+                cols.extend(collect_expr_columns(e));
+            }
+            cols
+        }
+        _ => vec![],
+    }
+}
+
+fn expr_var_name(expr: &Expr) -> String {
+    match expr {
+        Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+            parts.last().map(|i| i.to_string()).unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 
@@ -3082,6 +3916,276 @@ mod column_tests {
         assert!(
             id_refs[0].contexts.contains(&ColumnContext::OrderBy),
             "should have OrderBy context"
+        );
+    }
+
+    // ── Column mappings (#136) ────────────────────────────────────────────────
+
+    fn column_mappings_of(sql: &str) -> Vec<ColumnMapping> {
+        extract_column_analysis(sql)
+            .into_iter()
+            .flat_map(|a| a.column_mappings)
+            .collect()
+    }
+
+    /// Column mappings of a view body, via the explicit `CREATE VIEW` entry point.
+    fn view_column_mappings(view: &str, declared: &[&str], select_sql: &str) -> Vec<ColumnMapping> {
+        let tokens = Tokenizer::new(select_sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, select_sql.to_string());
+        let stmts = parser.parse_with_text();
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+
+        let mut extractor = ColumnAccessExtractor::new();
+        for info in &stmts {
+            if let Statement::Select(select) = &info.statement {
+                extractor.extract_view_column_mappings(view, &declared, select);
+            }
+        }
+        extractor.finish().column_mappings
+    }
+
+    fn find_mapping<'a>(maps: &'a [ColumnMapping], column: &str) -> &'a ColumnMapping {
+        maps.iter()
+            .find(|m| m.target_column.eq_ignore_ascii_case(column))
+            .unwrap_or_else(|| panic!("no mapping for {column} in {maps:#?}"))
+    }
+
+    fn sources_for<'a>(maps: &'a [ColumnMapping], column: &str) -> Vec<&'a ColumnSource> {
+        maps.iter()
+            .filter(|m| m.target_column.eq_ignore_ascii_case(column))
+            .flat_map(|m| m.sources.iter())
+            .collect()
+    }
+
+    fn col(table: Option<&str>, column: &str) -> ColumnSource {
+        ColumnSource::Column {
+            table: table.map(|s| s.to_string()),
+            column: column.to_string(),
+        }
+    }
+
+    #[test]
+    fn insert_select_maps_columns_by_position() {
+        let maps = column_mappings_of(
+            "INSERT INTO dst (fund_code, cjje) SELECT fund_code, qsje FROM jsmx_temp",
+        );
+
+        let cjje = find_mapping(&maps, "cjje");
+        assert_eq!(cjje.target_table.as_deref(), Some("dst"));
+        assert_eq!(cjje.kind, MappingKind::Direct);
+        assert_eq!(cjje.sources, vec![col(Some("jsmx_temp"), "qsje")]);
+        assert_eq!(
+            cjje.expression, None,
+            "a plain copy needs no expression text"
+        );
+    }
+
+    #[test]
+    fn insert_select_resolves_source_table_through_alias() {
+        let maps = column_mappings_of(
+            "INSERT INTO dst (v) SELECT t.qsje FROM jsmx_temp t WHERE t.bcrq = '20260101'",
+        );
+        assert_eq!(
+            find_mapping(&maps, "v").sources,
+            vec![col(Some("jsmx_temp"), "qsje")]
+        );
+    }
+
+    #[test]
+    fn aggregate_is_labelled_with_its_function() {
+        let maps = column_mappings_of(
+            "INSERT INTO dat_fund_cjqs (fund_code, total) \
+             SELECT fund_code, SUM(cjje) FROM mid_yjqs_detail GROUP BY fund_code",
+        );
+
+        let total = find_mapping(&maps, "total");
+        assert_eq!(
+            total.kind,
+            MappingKind::Aggregated {
+                function: "SUM".to_string(),
+                distinct: false
+            }
+        );
+        assert_eq!(total.sources, vec![col(Some("mid_yjqs_detail"), "cjje")]);
+    }
+
+    #[test]
+    fn count_distinct_records_the_distinct_flag() {
+        let maps = column_mappings_of("INSERT INTO d (n) SELECT COUNT(DISTINCT gddm) FROM t");
+        assert_eq!(
+            find_mapping(&maps, "n").kind,
+            MappingKind::Aggregated {
+                function: "COUNT".to_string(),
+                distinct: true
+            }
+        );
+    }
+
+    #[test]
+    fn arithmetic_over_two_columns_is_derived_from_both() {
+        let maps = column_mappings_of(
+            "INSERT INTO dat_fund_cjqs (accural_tax) SELECT abs(accrual - accrual2) FROM mid_yjqs_detail",
+        );
+
+        let m = find_mapping(&maps, "accural_tax");
+        assert_eq!(m.kind, MappingKind::Derived);
+        assert_eq!(
+            m.sources,
+            vec![
+                col(Some("mid_yjqs_detail"), "accrual"),
+                col(Some("mid_yjqs_detail"), "accrual2"),
+            ]
+        );
+        assert!(
+            m.expression.as_deref().unwrap_or("").contains("abs"),
+            "expression text should survive: {:?}",
+            m.expression
+        );
+    }
+
+    #[test]
+    fn decode_records_its_input_column_but_not_its_branch_literals() {
+        let maps = view_column_mappings(
+            "v_bond",
+            &[],
+            "SELECT decode(bond_accrual_type, '1', '3', '2', '13', bond_accrual_type) AS accrual_mapped FROM par_sys_bond",
+        );
+
+        let m = find_mapping(&maps, "accrual_mapped");
+        assert_eq!(m.kind, MappingKind::Derived);
+        assert_eq!(
+            m.sources,
+            vec![col(Some("par_sys_bond"), "bond_accrual_type")],
+            "branch literals are outputs, not upstream data"
+        );
+    }
+
+    #[test]
+    fn a_constant_column_records_the_literal() {
+        let maps = view_column_mappings("v_x", &[], "SELECT '1500' AS bond_kind FROM par_sys_bond");
+        let m = find_mapping(&maps, "bond_kind");
+        assert_eq!(
+            m.sources,
+            vec![ColumnSource::Literal {
+                value: "'1500'".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn update_set_maps_each_assignment() {
+        let maps = column_mappings_of(
+            "UPDATE dat_trd t SET t.net_amount = decode(t.bs, 'B', t.cjje + t.fee, t.cjje - t.fee)",
+        );
+
+        let m = find_mapping(&maps, "net_amount");
+        assert_eq!(m.target_table.as_deref(), Some("dat_trd"));
+        assert_eq!(m.kind, MappingKind::Derived);
+        assert_eq!(
+            m.sources,
+            vec![
+                col(Some("dat_trd"), "bs"),
+                col(Some("dat_trd"), "cjje"),
+                col(Some("dat_trd"), "fee"),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_maps_literals_and_columns() {
+        let maps = column_mappings_of("INSERT INTO t (a, b) VALUES ('0', 42)");
+        assert_eq!(
+            find_mapping(&maps, "a").sources,
+            vec![ColumnSource::Literal {
+                value: "'0'".to_string()
+            }]
+        );
+        assert_eq!(
+            find_mapping(&maps, "b").sources,
+            vec![ColumnSource::Literal {
+                value: "42".to_string()
+            }]
+        );
+    }
+
+    /// Every union branch feeds the same target column. This needs both the extractor's
+    /// set-operation walk and the parser's chain fix (c2j/ogsql-parser#318).
+    #[test]
+    fn every_union_branch_contributes_to_the_same_target() {
+        let maps = column_mappings_of(
+            "INSERT INTO dst (v) \
+             SELECT a FROM t1 UNION ALL SELECT b FROM t2 UNION ALL SELECT c FROM t3",
+        );
+
+        assert_eq!(
+            sources_for(&maps, "v"),
+            vec![
+                &col(Some("t1"), "a"),
+                &col(Some("t2"), "b"),
+                &col(Some("t3"), "c"),
+            ]
+        );
+    }
+
+    /// A view over a union names its output columns from the first branch; later branches
+    /// select differently-named columns into the same position.
+    #[test]
+    fn union_view_aligns_renamed_branches_by_position() {
+        let maps = view_column_mappings(
+            "v_par_bond",
+            &[],
+            "SELECT security_id, bond_kind FROM par_sys_bond \
+             UNION ALL SELECT security_id, entrust_type AS bond_kind FROM par_sys_entrust \
+             UNION ALL SELECT security_id, fund_type FROM par_sys_annuity_fund",
+        );
+
+        assert_eq!(
+            sources_for(&maps, "bond_kind"),
+            vec![
+                &col(Some("par_sys_bond"), "bond_kind"),
+                &col(Some("par_sys_entrust"), "entrust_type"),
+                &col(Some("par_sys_annuity_fund"), "fund_type"),
+            ],
+            "the third branch has no alias, so only its position identifies it"
+        );
+        for m in maps.iter().filter(|m| m.target_column == "bond_kind") {
+            assert_eq!(m.position, Some(1), "all three sit in select position 1");
+        }
+    }
+
+    #[test]
+    fn declared_view_columns_win_over_branch_aliases() {
+        let maps = view_column_mappings("v_named", &["out_a", "out_b"], "SELECT x, y FROM t");
+        assert_eq!(
+            find_mapping(&maps, "out_a").sources,
+            vec![col(Some("t"), "x")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "out_b").sources,
+            vec![col(Some("t"), "y")]
+        );
+    }
+
+    /// `SELECT *` cannot be aligned against a column list without a schema. Emitting
+    /// mappings anyway would shift every column by one, which is worse than emitting none.
+    #[test]
+    fn select_star_yields_no_mappings_rather_than_shifted_ones() {
+        let maps = column_mappings_of("INSERT INTO dst (a, b) SELECT * FROM src");
+        assert!(
+            maps.is_empty(),
+            "star select should not be aligned positionally: {maps:#?}"
+        );
+    }
+
+    #[test]
+    fn unqualified_column_over_a_join_leaves_the_owner_unresolved() {
+        let maps = column_mappings_of(
+            "INSERT INTO dst (v) SELECT amount FROM t1 JOIN t2 ON t1.id = t2.id",
+        );
+        assert_eq!(
+            find_mapping(&maps, "v").sources,
+            vec![col(None, "amount")],
+            "an unqualified column over two tables has no single owner"
         );
     }
 }

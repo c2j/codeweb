@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod format;
 pub mod inspect;
 pub mod key;
+pub mod lineage;
 pub mod query;
 pub mod search;
 pub mod store;
@@ -634,6 +635,8 @@ pub enum Edge {
     },
     DependsOn {
         location: SourceLocation,
+        #[serde(default)]
+        column_analysis: Option<Box<ColumnAnalysis>>,
     },
     ContainsRoutine,
     TriggersRoutine {
