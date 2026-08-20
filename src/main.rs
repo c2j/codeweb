@@ -222,7 +222,7 @@ enum Commands {
         name: String,
 
         /// Source directories to analyze (can specify multiple)
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long)]
         dir: Vec<PathBuf>,
     },
 
