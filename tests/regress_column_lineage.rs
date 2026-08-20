@@ -355,6 +355,49 @@ END;
     );
 }
 
+/// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
+/// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
+/// its argument eagerly, indexing `&cols[0]` on the empty list
+/// ("index out of bounds: the len is 0 but the index is 0"). The chain must survive and
+/// the cursor's source table must still flow upstream.
+#[test]
+fn star_cursor_fetch_does_not_panic_on_empty_sources() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE src_star(id NUMBER, amount NUMBER);
+CREATE TABLE dst_star(id NUMBER, total NUMBER);
+CREATE PROCEDURE prc_star AS
+  CURSOR c IS SELECT * FROM src_star;
+  v_id NUMBER;
+  v_amount NUMBER;
+BEGIN
+  OPEN c;
+  LOOP
+    FETCH c INTO v_id, v_amount;
+    EXIT WHEN c%NOTFOUND;
+    INSERT INTO dst_star(id, total) VALUES (v_id, v_amount);
+  END LOOP;
+  CLOSE c;
+END;
+"#,
+    );
+
+    let out = run_codeweb_in(&root, &["analyze"]);
+    assert!(
+        out.status.success(),
+        "analyze must not panic on a SELECT * cursor:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let tbl = lineage(&root, "dst_star", "upstream", "tree");
+    assert!(
+        tbl.contains("table:src_star"),
+        "cursor source table must be upstream:\n{tbl}"
+    );
+}
+
 /// A view's body is the definition of its columns, so column lineage must resolve
 /// through the view to its base table.
 #[test]

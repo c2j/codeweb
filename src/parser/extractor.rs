@@ -2060,9 +2060,13 @@ impl ColumnAccessExtractor {
             if let Some(cols) = self.cursor_sources.get(cursor) {
                 for (i, var) in vars.iter().enumerate() {
                     // A single catch-all source (empty output name, table attributed from
-                    // dynamic-SQL fragments) covers every FETCH position.
-                    let col = cols.get(i).or_else(|| {
-                        (cols.len() == 1 && cols[0].output_name.is_empty()).then_some(&cols[0])
+                    // dynamic-SQL fragments) covers every FETCH position. Match on the
+                    // slice rather than indexing: `bool::then_some(&cols[0])` evaluates
+                    // its argument eagerly, so `&cols[0]` would panic on an empty list
+                    // (e.g. a `SELECT *` cursor with no catch-all entry).
+                    let col = cols.get(i).or(match cols.as_slice() {
+                        [single] if single.output_name.is_empty() => Some(single),
+                        _ => None,
                     });
                     if let Some(col) = col {
                         if !col.source_col.is_empty() {
@@ -2119,27 +2123,43 @@ impl ColumnAccessExtractor {
         });
         let mut sources = Vec::new();
         for target in &select.targets {
-            if let SelectTarget::Expr(expr, alias) = target {
-                let output_name = alias
-                    .as_ref()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| derive_cursor_output_name(expr));
-                let mut cols = collect_expr_columns(expr);
-                for (table, _col) in cols.iter_mut() {
-                    if let Some(ref alias) = table {
-                        if let Some(resolved) = self.resolve_alias(alias) {
-                            *table = Some(resolved.table.clone());
+            match target {
+                SelectTarget::Expr(expr, alias) => {
+                    let output_name = alias
+                        .as_ref()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| derive_cursor_output_name(expr));
+                    let mut cols = collect_expr_columns(expr);
+                    for (table, _col) in cols.iter_mut() {
+                        if let Some(ref alias) = table {
+                            if let Some(resolved) = self.resolve_alias(alias) {
+                                *table = Some(resolved.table.clone());
+                            }
+                        } else if let Some(ref dt) = default_table {
+                            *table = Some(dt.clone());
                         }
-                    } else if let Some(ref dt) = default_table {
-                        *table = Some(dt.clone());
+                    }
+                    if let Some((table, col)) = cols.into_iter().next() {
+                        sources.push(CursorColumn {
+                            output_name,
+                            source_table: table,
+                            source_col: col,
+                        });
                     }
                 }
-                if let Some((table, col)) = cols.into_iter().next() {
-                    sources.push(CursorColumn {
-                        output_name,
-                        source_table: table,
-                        source_col: col,
-                    });
+                // `SELECT *` / `t.*`: the exact columns are unknown, but when the FROM
+                // resolves to a single table the table itself is known. Emit the catch-all
+                // entry (empty output name, table attributed, exact column unknown) so
+                // FETCH variables still resolve at table level — same shape as the
+                // dynamic-SQL fallback in the OPEN handler.
+                SelectTarget::Star(_prefix) => {
+                    if let Some(ref dt) = default_table {
+                        sources.push(CursorColumn {
+                            output_name: String::new(),
+                            source_table: Some(dt.clone()),
+                            source_col: String::new(),
+                        });
+                    }
                 }
             }
         }
