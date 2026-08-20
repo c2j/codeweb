@@ -506,6 +506,10 @@ impl Project {
         &self.config.project.name
     }
 
+    pub fn config(&self) -> &ProjectConfig {
+        &self.config
+    }
+
     pub fn store_path(&self) -> PathBuf {
         self.root.join(&self.config.store.path)
     }

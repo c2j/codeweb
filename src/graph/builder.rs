@@ -12,7 +12,8 @@ use crate::parser::{
 use ogsql_parser::ast::{
     AlterTableAction, ColumnConstraint, PackageItem, Statement, TableConstraint,
 };
-use ogsql_parser::{walk_pl_block, walk_statement};
+use ogsql_parser::{walk_pl_block, walk_statement, Tokenizer};
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1657,26 +1658,32 @@ impl GraphBuilder {
                     Statement::CreateProcedure(p) => {
                         let proc_id = RoutineId::from_object_name(&p.name, RoutineKind::Procedure);
                         if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
+                            let (infos, cursor_ctx) =
+                                Self::procedure_body_infos_with_fallback(p.block.as_ref(), info);
                             Self::collect_table_access_from_statements(
-                                std::slice::from_ref(info),
+                                &infos,
                                 &file_arc,
                                 proc_idx,
                                 proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
+                                cursor_ctx,
                             );
                         }
                     }
                     Statement::CreateFunction(f) => {
                         let proc_id = RoutineId::from_object_name(&f.name, RoutineKind::Function);
                         if let Some(&proc_idx) = proc_index.get(&proc_id.normalized()) {
+                            let (infos, cursor_ctx) =
+                                Self::procedure_body_infos_with_fallback(f.block.as_ref(), info);
                             Self::collect_table_access_from_statements(
-                                std::slice::from_ref(info),
+                                &infos,
                                 &file_arc,
                                 proc_idx,
                                 proc_id.schema.as_deref(),
                                 graph,
                                 table_index,
+                                cursor_ctx,
                             );
                         }
                     }
@@ -2441,6 +2448,7 @@ impl GraphBuilder {
                         None,
                         graph,
                         table_index,
+                        None,
                     );
                 }
             }
@@ -2649,6 +2657,7 @@ impl GraphBuilder {
                         None,
                         graph,
                         table_index,
+                        None,
                     );
                 }
 
@@ -2738,19 +2747,86 @@ impl GraphBuilder {
                             span: None,
                         }),
                     };
+                    let (infos, cursor_ctx) =
+                        Self::procedure_body_infos_with_fallback(Some(block), &block_stmt);
                     Self::collect_table_access_from_statements(
-                        std::slice::from_ref(&block_stmt),
+                        &infos,
                         file_path,
                         proc_idx,
                         schema_part.as_deref(),
                         graph,
                         table_index,
+                        cursor_ctx,
                     );
                 }
             }
         }
     }
 
+    /// Split a procedure/function body into one StatementInfo per SQL statement so table
+    /// access and column analysis are statement-scoped (issue #147) instead of being
+    /// aggregated over the whole block. Falls back to the whole-body statement when no
+    /// per-statement SQL could be extracted from the block.
+    fn procedure_body_infos_with_fallback(
+        block: Option<&ogsql_parser::ast::plpgsql::PlBlock>,
+        whole: &ogsql_parser::StatementInfo,
+    ) -> (
+        Vec<ogsql_parser::StatementInfo>,
+        Option<crate::parser::ProcedureVarContext>,
+    ) {
+        let Some(block) = block else {
+            return (vec![whole.clone()], None);
+        };
+        let mut out = Vec::new();
+        for body in crate::parser::extract_body_sql(block) {
+            // Prefer the statement AST from the original procedure-body parse: it keeps
+            // procedure context (declared variables classify as PL variables, not bare
+            // columns). Only raw text fragments (dynamic SQL, RETURN QUERY) are re-parsed.
+            let statement = match body.statement {
+                Some(stmt) => stmt,
+                None => {
+                    let Ok(tokens) = Tokenizer::new(&body.sql_text).tokenize() else {
+                        continue;
+                    };
+                    let mut parser =
+                        ogsql_parser::Parser::with_source(tokens, body.sql_text.clone());
+                    match parser.parse_with_text().into_iter().next() {
+                        Some(info) => info.statement,
+                        None => continue,
+                    }
+                }
+            };
+            out.push(ogsql_parser::StatementInfo {
+                sql_text: body.sql_text.clone(),
+                start_line: body.line.unwrap_or(whole.start_line),
+                start_col: 0,
+                end_line: whole.end_line,
+                end_col: 0,
+                statement,
+            });
+        }
+        if out.is_empty() {
+            return (vec![whole.clone()], None);
+        }
+        // Procedure-level cursor pre-pass (issue #147): cursor declarations live outside
+        // any SQL statement, so per-statement walks would lose the cursor → FETCH →
+        // INSERT chain. Collect the context once here and seed each statement walk.
+        let mut ctx = crate::parser::ColumnAccessExtractor::new();
+        walk_pl_block(&mut ctx, block);
+        let procedure_ctx = ctx.procedure_context();
+        let context = if procedure_ctx.cursor_sources.is_empty()
+            && procedure_ctx.fetch_vars.is_empty()
+            && procedure_ctx.record_cursors.is_empty()
+            && procedure_ctx.var_values.is_empty()
+        {
+            None
+        } else {
+            Some(procedure_ctx)
+        };
+        (out, context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn collect_table_access_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
@@ -2758,12 +2834,19 @@ impl GraphBuilder {
         owner_schema: Option<&str>,
         graph: &mut CodeGraph,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        cursor_context: Option<crate::parser::ProcedureVarContext>,
     ) {
         for info in statements {
             let mut extractor = crate::parser::TableAccessExtractor::new();
             walk_statement(&mut extractor, &info.statement);
 
-            let mut column_extractor = crate::parser::ColumnAccessExtractor::new();
+            // Seed the per-statement column extractor with the procedure-level variable
+            // context (issue #147) so FETCH-variable / %ROWTYPE record / %TYPE anchor
+            // sources still resolve across statement boundaries.
+            let mut column_extractor = match &cursor_context {
+                Some(ctx) => crate::parser::ColumnAccessExtractor::new_with_context(ctx),
+                None => crate::parser::ColumnAccessExtractor::new(),
+            };
             walk_statement(&mut column_extractor, &info.statement);
             let column_analysis = column_extractor.finish();
             let has_column_data = !column_analysis.column_refs.is_empty()
@@ -2774,6 +2857,26 @@ impl GraphBuilder {
                 || !column_analysis.update_columns.is_empty()
                 || !column_analysis.select_into.is_empty()
                 || !column_analysis.column_mappings.is_empty();
+
+            // Tables the statement's column analysis resolves to (issue #147): the
+            // cursor/FETCH chain and record variables feed this statement's values from
+            // tables the statement does not name directly. Adding them to read_tables
+            // restores the cursor-mediated hop (`INSERT INTO dst VALUES (v_id)` reads
+            // src_cursor through the cursor) without re-aggregating other statements.
+            let mut resolved_tables: Vec<String> = Vec::new();
+            for mapping in &column_analysis.column_mappings {
+                for source in &mapping.sources {
+                    if let crate::parser::ColumnSource::Column {
+                        table: Some(table), ..
+                    } = source
+                    {
+                        let table = table.to_lowercase();
+                        if !resolved_tables.contains(&table) {
+                            resolved_tables.push(table);
+                        }
+                    }
+                }
+            }
 
             for access in &extractor.accesses {
                 let key = if access.schema.is_none() && owner_schema.is_some() {
@@ -2808,6 +2911,22 @@ impl GraphBuilder {
                         .entry(access.name.to_lowercase())
                         .or_insert(table_idx);
                 }
+                // Statement-scoped hop basis (issue #147): the OTHER tables this statement
+                // touches (lowercased), excluding the edge's own target, plus any tables
+                // its column analysis resolves to via cursors/records. The lineage walk
+                // uses it to connect only same-statement reads to a write.
+                let self_name = access.name.to_lowercase();
+                let mut read_tables: Vec<String> = extractor
+                    .accesses
+                    .iter()
+                    .map(|a| a.name.to_lowercase())
+                    .filter(|t| *t != self_name)
+                    .collect();
+                for t in &resolved_tables {
+                    if t != &self_name && !read_tables.contains(t) {
+                        read_tables.push(t.clone());
+                    }
+                }
                 graph.add_edge(
                     source_idx,
                     table_idx,
@@ -2819,7 +2938,7 @@ impl GraphBuilder {
                             file: file_path.clone(),
                             line: info.start_line,
                         },
-                        column_analysis: if has_column_data {
+                        column_analysis: if has_column_data || !read_tables.is_empty() {
                             // Column mappings describe how the *written* table's
                             // columns are produced. Attaching them to every read edge
                             // of the statement duplicates them (one per source table)
@@ -2829,6 +2948,7 @@ impl GraphBuilder {
                             if !access.modes.contains(AccessMode::Write) {
                                 ca.column_mappings.clear();
                             }
+                            ca.read_tables = Some(read_tables);
                             Some(Box::new(ca))
                         } else {
                             None
@@ -2965,6 +3085,7 @@ impl GraphBuilder {
                         None,
                         &mut ctx.graph,
                         &mut ctx.table_index,
+                        None,
                     );
                 }
             }
@@ -3173,8 +3294,31 @@ impl GraphBuilder {
                     for wk in write_kinds {
                         merged_kinds.insert(*wk);
                     }
-                    if merged_col.is_none() && column_analysis.is_some() {
-                        merged_col = column_analysis.clone();
+                    // Union the per-statement analyses: mappings and same-statement
+                    // read tables accumulate across the statements merged into this edge
+                    // (issue #147); the remaining diagnostic fields keep the first.
+                    if let Some(ca) = column_analysis {
+                        match &mut merged_col {
+                            Some(m) => {
+                                for mp in &ca.column_mappings {
+                                    if !m.column_mappings.contains(mp) {
+                                        m.column_mappings.push(mp.clone());
+                                    }
+                                }
+                                match (&ca.read_tables, &mut m.read_tables) {
+                                    (Some(rt), Some(m_rt)) => {
+                                        for t in rt {
+                                            if !m_rt.contains(t) {
+                                                m_rt.push(t.clone());
+                                            }
+                                        }
+                                    }
+                                    (Some(rt), None) => m.read_tables = Some(rt.clone()),
+                                    _ => {}
+                                }
+                            }
+                            None => merged_col = Some(ca.clone()),
+                        }
                     }
                 }
             }

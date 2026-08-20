@@ -1,5 +1,5 @@
 use crate::graph::cluster::ClusterResult;
-use crate::graph::{AccessMode, CodeGraph, Edge, Node, WriteKind};
+use crate::graph::{AccessMode, CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
 use std::collections::HashMap;
 
@@ -336,20 +336,11 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
             let label = if write_kinds.is_empty() {
                 String::new()
             } else {
-                let parts: Vec<&str> = write_kinds
+                let mut parts: Vec<&str> = write_kinds
                     .iter()
-                    .map(|wk| match wk {
-                        WriteKind::Insert => "insert",
-                        WriteKind::InsertSelect => "insert_select",
-                        WriteKind::Update => "update",
-                        WriteKind::Delete => "delete",
-                        WriteKind::MergeInsert => "merge_insert",
-                        WriteKind::MergeUpdate => "merge_update",
-                        WriteKind::MergeDelete => "merge_delete",
-                        WriteKind::SelectInto => "select_into",
-                        WriteKind::Truncate => "truncate",
-                    })
+                    .map(crate::graph::write_kind_label)
                     .collect();
+                parts.sort_unstable();
                 format!("label=\"{}\"", parts.join(","))
             };
             (label, format!("color={color},"))

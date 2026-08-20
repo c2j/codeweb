@@ -360,17 +360,27 @@ enum Commands {
         /// Target table name (e.g., "my_table") for table-level, or "table.column" for column-level
         target: String,
 
-        /// Lineage direction: upstream (who writes/defines) or downstream (who consumes)
-        #[arg(long, default_value = "upstream", value_parser = ["upstream", "downstream"])]
+        /// Lineage direction: upstream (who writes/defines), downstream (who consumes),
+        /// or both (default: show both)
+        #[arg(long, default_value = "both", value_parser = ["upstream", "downstream", "both"])]
         direction: String,
 
         /// Recursion depth
         #[arg(long, default_value = "5")]
         depth: usize,
 
-        /// Output format: tree, json
-        #[arg(long, default_value = "tree", value_parser = ["tree", "json"])]
+        /// Output format: tree, json, dot, mermaid (dot/mermaid export the entity subgraph)
+        #[arg(long, default_value = "tree", value_parser = ["tree", "json", "dot", "mermaid"])]
         format: String,
+
+        /// Lineage tree rendering: tree (default), entity (no processes), relation
+        /// (explicit source──process──▶target lines), grouped (by connecting process)
+        #[arg(long, default_value = "tree", value_parser = ["tree", "entity", "relation", "grouped"])]
+        view: String,
+
+        /// Show only flow sources, hiding reference sources (config: [lineage] thresholds)
+        #[arg(long)]
+        flow_only: bool,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -882,8 +892,12 @@ fn run() -> Result<()> {
             direction,
             depth,
             format,
+            view,
+            flow_only,
             project,
-        }) => cmd_lineage(&target, &direction, depth, &format, &project),
+        }) => cmd_lineage(
+            &target, &direction, depth, &format, &view, flow_only, &project,
+        ),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -1328,11 +1342,34 @@ fn cmd_lineage(
     direction: &str,
     depth: usize,
     format: &str,
+    view: &str,
+    flow_only: bool,
     project: &Path,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
+    let cfg = graph::lineage::LineageConfig {
+        flow_min_overlap: proj.config().lineage.flow_min_overlap,
+        flow_min_ratio: proj.config().lineage.flow_min_ratio,
+        ignore_columns: proj.config().lineage.ignore_columns.clone(),
+    };
+    let view_enum = match view.parse::<graph::lineage::LineageView>() {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            return Ok(());
+        }
+    };
     let store = proj.load_store()?;
     let graph = store.graph();
+
+    // Stores built before the lineage column analysis landed (STORE_VERSION 7, #139)
+    // carry no column mappings — flow/reference classification (issue #146) needs them.
+    if store.version < 7 {
+        eprintln!(
+            "note: store version {} predates lineage column analysis (v7) — run `codeweb analyze` to rebuild it; flow/reference classification will be unavailable.",
+            store.version
+        );
+    }
 
     // `table` traces the table; `table.column` traces one column through it. Split on the
     // last `.` so a schema-qualified `schema.table.column` keeps `schema.table` as the
@@ -1349,13 +1386,15 @@ fn cmd_lineage(
         None => (target, None),
     };
 
-    // Parse direction up front — both the table and column paths need it.
-    let lineage_dir = match direction.to_lowercase().as_str() {
-        "upstream" => graph::lineage::LineageDirection::Upstream,
-        "downstream" => graph::lineage::LineageDirection::Downstream,
+    // Parse direction up front — both the table and column paths need it. `None` means
+    // "both" (the default): the output shows upstream and downstream sections.
+    let dir_spec = match direction.to_lowercase().as_str() {
+        "upstream" => Some(graph::lineage::LineageDirection::Upstream),
+        "downstream" => Some(graph::lineage::LineageDirection::Downstream),
+        "both" => None,
         _ => {
             eprintln!(
-                "Unknown direction: {}. Use 'upstream' or 'downstream'",
+                "Unknown direction: {}. Use 'upstream', 'downstream' or 'both'",
                 direction
             );
             return Ok(());
@@ -1363,29 +1402,43 @@ fn cmd_lineage(
     };
 
     if let Some(column) = column_name {
-        let node = graph::lineage::lineage_column(graph, table_name, column, lineage_dir, depth);
-        if node.steps.is_empty() {
-            eprintln!(
-                "No column lineage for {}.{} — the column may be unknown, or its writers \
-                 may not have been analyzed with column mappings.",
-                table_name, column
-            );
-        }
-        match format.to_lowercase().as_str() {
-            "tree" => {
-                println_stdout!(
-                    "{}",
-                    graph::lineage::format_column_lineage_tree(&node, graph, lineage_dir, 0)
+        let render = |dir: graph::lineage::LineageDirection| {
+            let node = graph::lineage::lineage_column(graph, table_name, column, dir, depth);
+            if node.steps.is_empty() {
+                eprintln!(
+                    "No column lineage for {}.{} — the column may be unknown, or its writers \
+                     may not have been analyzed with column mappings.",
+                    table_name, column
                 );
             }
-            "json" => {
-                let json = graph::lineage::format_column_lineage_json(&node, graph);
-                match serde_json::to_string_pretty(&json) {
-                    Ok(s) => println_stdout!("{}", s),
-                    Err(e) => eprintln!("Failed to format JSON: {}", e),
+            match format.to_lowercase().as_str() {
+                "tree" => {
+                    println_stdout!(
+                        "{}",
+                        graph::lineage::format_column_lineage_tree(&node, graph, dir, 0)
+                    );
+                }
+                "json" => {
+                    let json = graph::lineage::format_column_lineage_json(&node, graph);
+                    match serde_json::to_string_pretty(&json) {
+                        Ok(s) => println_stdout!("{}", s),
+                        Err(e) => eprintln!("Failed to format JSON: {}", e),
+                    }
+                }
+                _ => eprintln!("Unknown format: {}. Use 'tree' or 'json'", format),
+            }
+        };
+        match dir_spec {
+            Some(dir) => render(dir),
+            None => {
+                for (dir, label) in [
+                    (graph::lineage::LineageDirection::Upstream, "upstream"),
+                    (graph::lineage::LineageDirection::Downstream, "downstream"),
+                ] {
+                    println_stdout!("── {} ──", label);
+                    render(dir);
                 }
             }
-            _ => eprintln!("Unknown format: {}. Use 'tree' or 'json'", format),
         }
         return Ok(());
     }
@@ -1419,25 +1472,107 @@ fn cmd_lineage(
         return Ok(());
     }
 
-    // Compute lineage
-    let lineage_node = graph::lineage::lineage_table(graph, table_idx, lineage_dir, depth);
+    // Compute lineage (one or both directions). The nodes are declared here so `roots`
+    // can borrow them for the whole render phase.
+    let opts = graph::lineage::DisplayOptions::new(view_enum, flow_only);
+    let up_node;
+    let down_node;
+    let mut roots: Vec<(
+        &graph::lineage::LineageNode,
+        graph::lineage::LineageDirection,
+    )> = Vec::new();
+    match dir_spec {
+        Some(dir) => {
+            up_node = graph::lineage::lineage_table(graph, table_idx, dir, depth, &cfg);
+            roots.push((&up_node, dir));
+        }
+        None => {
+            up_node = graph::lineage::lineage_table(
+                graph,
+                table_idx,
+                graph::lineage::LineageDirection::Upstream,
+                depth,
+                &cfg,
+            );
+            down_node = graph::lineage::lineage_table(
+                graph,
+                table_idx,
+                graph::lineage::LineageDirection::Downstream,
+                depth,
+                &cfg,
+            );
+            roots.push((&up_node, graph::lineage::LineageDirection::Upstream));
+            roots.push((&down_node, graph::lineage::LineageDirection::Downstream));
+        }
+    }
+
+    // A table with neither steps nor children on a side has nothing in the analyzed code
+    // there (e.g. a parameter table with no writers). Print a hint instead of a lone,
+    // uninterpretable table name.
+    for (node, dir) in &roots {
+        if node.steps.is_empty() && node.children.is_empty() {
+            match dir {
+                graph::lineage::LineageDirection::Upstream => eprintln!(
+                    "No writers found for '{}' in the analyzed code — the table may be loaded externally.",
+                    table_name
+                ),
+                graph::lineage::LineageDirection::Downstream => eprintln!(
+                    "No readers found for '{}' in the analyzed code.",
+                    table_name
+                ),
+            }
+        }
+    }
 
     // Format and output
     match format.to_lowercase().as_str() {
         "tree" => {
-            let tree_str =
-                graph::lineage::format_lineage_tree(&lineage_node, graph, lineage_dir, 0);
-            println_stdout!("{}", tree_str);
+            let mut out = String::new();
+            for (node, dir) in &roots {
+                let label = match dir {
+                    graph::lineage::LineageDirection::Upstream => "upstream",
+                    graph::lineage::LineageDirection::Downstream => "downstream",
+                };
+                if roots.len() > 1 {
+                    out.push_str(&format!("── {} ──\n", label));
+                }
+                out.push_str(&graph::lineage::format_lineage_tree(
+                    node, graph, *dir, 0, &opts,
+                ));
+            }
+            println_stdout!("{}", out);
         }
         "json" => {
-            let json = graph::lineage::format_lineage_json(&lineage_node, graph);
+            let json = if roots.len() == 1 {
+                graph::lineage::format_lineage_json(roots[0].0, graph, &opts)
+            } else {
+                serde_json::json!({
+                    "upstream": graph::lineage::format_lineage_json(roots[0].0, graph, &opts),
+                    "downstream": graph::lineage::format_lineage_json(roots[1].0, graph, &opts),
+                })
+            };
             match serde_json::to_string_pretty(&json) {
                 Ok(json_str) => println_stdout!("{}", json_str),
                 Err(e) => eprintln!("Failed to format JSON: {}", e),
             }
         }
+        "dot" => {
+            println_stdout!(
+                "{}",
+                graph::lineage::format_lineage_dot(&roots, graph, &opts)
+            );
+        }
+        "mermaid" => {
+            println_stdout!(
+                "{}",
+                graph::lineage::format_lineage_mermaid(&roots, graph, &opts)
+            );
+        }
         _ => {
-            eprintln!("Unknown format: {}. Use 'tree' or 'json'", format);
+            eprintln!(
+                "Unknown format: {}. Use 'tree', 'json', 'dot' or 'mermaid'",
+                format
+            );
         }
     }
 
@@ -1906,20 +2041,8 @@ fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph
         } else if is_read {
             reads.push(tbl);
         } else if is_write {
-            let wk_labels: Vec<&str> = wk
-                .iter()
-                .map(|w| match w {
-                    WriteKind::Insert => "insert",
-                    WriteKind::InsertSelect => "insert_select",
-                    WriteKind::Update => "update",
-                    WriteKind::Delete => "delete",
-                    WriteKind::MergeInsert => "merge_insert",
-                    WriteKind::MergeUpdate => "merge_update",
-                    WriteKind::MergeDelete => "merge_delete",
-                    WriteKind::SelectInto => "select_into",
-                    WriteKind::Truncate => "truncate",
-                })
-                .collect();
+            let mut wk_labels: Vec<&str> = wk.iter().map(crate::graph::write_kind_label).collect();
+            wk_labels.sort_unstable();
             writes.push((tbl, wk_labels));
         }
     }

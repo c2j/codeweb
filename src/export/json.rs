@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::graph::{
-    AccessMode, CodeGraph, ColumnSummary, DistributeInfo, Edge, Node, PartitionInfo, WriteKind,
+    AccessMode, CodeGraph, ColumnSummary, DistributeInfo, Edge, Node, PartitionInfo,
 };
 use crate::parser::ColumnAnalysis;
 use serde::Serialize;
@@ -780,17 +780,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
 
                 let wk_strs: Vec<String> = write_kinds
                     .iter()
-                    .map(|wk| match wk {
-                        WriteKind::Insert => "insert",
-                        WriteKind::InsertSelect => "insert_select",
-                        WriteKind::Update => "update",
-                        WriteKind::Delete => "delete",
-                        WriteKind::MergeInsert => "merge_insert",
-                        WriteKind::MergeUpdate => "merge_update",
-                        WriteKind::MergeDelete => "merge_delete",
-                        WriteKind::SelectInto => "select_into",
-                        WriteKind::Truncate => "truncate",
-                    })
+                    .map(crate::graph::write_kind_label)
                     .map(String::from)
                     .collect();
 

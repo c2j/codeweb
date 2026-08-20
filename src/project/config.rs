@@ -8,6 +8,8 @@ pub struct ProjectConfig {
     pub analysis: AnalysisConfig,
     #[serde(default)]
     pub store: StoreConfig,
+    #[serde(default)]
+    pub lineage: LineageConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +91,48 @@ pub enum StoreFormat {
     Json,
 }
 
+/// Lineage display tuning (flow/reference classification, issue #146).
+///
+/// ```toml
+/// [lineage]
+/// flow_min_overlap = 8      # absolute minimum column overlap for a flow source
+/// flow_min_ratio = 0.15     # minimum overlap ratio of the target's written columns
+/// ignore_columns = ["id", "curr_date"]
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct LineageConfig {
+    /// Absolute minimum column overlap for a source edge to count as a flow source.
+    /// Effective threshold is `min(target_cols, max(flow_min_overlap, ceil(target_cols × ratio)))`
+    /// so narrow tables are not excluded by the absolute floor alone.
+    #[serde(default = "default_flow_min_overlap")]
+    pub flow_min_overlap: usize,
+    /// Minimum overlap ratio of the target's written columns for a flow source.
+    #[serde(default = "default_flow_min_ratio")]
+    pub flow_min_ratio: f64,
+    /// Column names excluded from overlap computation (project-wide same-name noise,
+    /// e.g. `id`/`curr_date` present in nearly every table).
+    #[serde(default)]
+    pub ignore_columns: Vec<String>,
+}
+
+fn default_flow_min_overlap() -> usize {
+    8
+}
+
+fn default_flow_min_ratio() -> f64 {
+    0.15
+}
+
+impl Default for LineageConfig {
+    fn default() -> Self {
+        Self {
+            flow_min_overlap: default_flow_min_overlap(),
+            flow_min_ratio: default_flow_min_ratio(),
+            ignore_columns: Vec::new(),
+        }
+    }
+}
+
 impl ProjectConfig {
     pub fn load(toml_content: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(toml_content)
@@ -123,6 +167,11 @@ paths = [{}]
 [store]
 path = ".codeweb/store.bincode"
 format = "bincode"
+
+# [lineage]
+# flow_min_overlap = 8
+# flow_min_ratio = 0.15
+# ignore_columns = []
 "#,
             name, paths_toml
         )

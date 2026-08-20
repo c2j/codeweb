@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 7;
+const STORE_VERSION: u32 = 8;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2315,6 +2315,31 @@ mod tests {
             loaded.err()
         );
         assert_eq!(loaded.unwrap().version, STORE_VERSION);
+    }
+
+    /// A store written by the previous layout (version 7, before `ColumnAnalysis.read_tables`,
+    /// issue #147) must be rejected by the version gate with the friendly message, not fail
+    /// with a raw bincode deserialize error after passing the check.
+    #[test]
+    fn load_bincode_rejects_previous_layout_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v7.bincode");
+        // Simulate a store file written by the previous version: magic + version=7 header.
+        // The version gate must reject it before any deserialization of the payload.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "previous-version cache must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "error should mention the version gate: {}",
+            err_msg
+        );
     }
 
     #[test]
