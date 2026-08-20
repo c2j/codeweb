@@ -769,17 +769,37 @@ fn summary_line(
             EntityRole::Unknown => unknown += 1,
         }
     }
-    let what = match direction {
-        LineageDirection::Upstream => "upstream entities",
-        LineageDirection::Downstream => "downstream entities",
+    let entity_word = |n: usize| match direction {
+        LineageDirection::Upstream => format!(
+            "{} upstream {}",
+            n,
+            if n == 1 { "entity" } else { "entities" }
+        ),
+        LineageDirection::Downstream => format!(
+            "{} downstream {}",
+            n,
+            if n == 1 { "entity" } else { "entities" }
+        ),
     };
     let mut parts = vec![
-        format!("{} {}", flow + reference + unknown, what),
+        entity_word(flow + reference + unknown),
         format!("flow {}", flow),
         format!("reference {}", reference),
     ];
     if unknown > 0 {
         parts.push(format!("unknown {}", unknown));
+    }
+    // Under --flow-only the hidden reference/unknown sources are still counted, so the
+    // reader can tell "no reference sources" from "reference sources filtered out".
+    if opts.flow_only {
+        let hidden = node
+            .children
+            .iter()
+            .filter(|c| child_role(c) != EntityRole::Flow)
+            .count();
+        if hidden > 0 {
+            parts.push(format!("{} reference filtered", hidden));
+        }
     }
     if node.edges_without_column_data > 0 {
         parts.push(format!(
@@ -1383,10 +1403,16 @@ pub fn format_lineage_json(
     graph: &CodeGraph,
     opts: &DisplayOptions,
 ) -> serde_json::Value {
-    let children_json: Vec<serde_json::Value> = node
+    // Match the tree view's ordering: flow first (by coverage), then reference, then
+    // unknown — so JSON consumers see the same role ordering without re-sorting.
+    let mut children: Vec<&LineageChild> = node
         .children
         .iter()
         .filter(|c| !opts.flow_only || child_role(c) == EntityRole::Flow)
+        .collect();
+    sort_children(&mut children);
+    let children_json: Vec<serde_json::Value> = children
+        .into_iter()
         .map(|child| {
             let mut child_json = format_lineage_json(&child.node, graph, opts);
             // Edge attribution: routines connecting parent → this child.

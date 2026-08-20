@@ -158,7 +158,7 @@ fn upstream_and_downstream_label_the_direction_differently() {
 
     let up = lineage(&root, "final_tbl", "upstream", "tree");
     assert!(
-        up.contains("upstream entities"),
+        up.contains("upstream entit"),
         "upstream should label the traversal direction:\n{up}"
     );
     // Upstream children feed the parent: `← proc`; downstream children are fed by it: `→ proc`.
@@ -168,7 +168,7 @@ fn upstream_and_downstream_label_the_direction_differently() {
     );
     let down = lineage(&root, "source_tbl", "downstream", "tree");
     assert!(
-        down.contains("downstream entities"),
+        down.contains("downstream entit"),
         "downstream should label the traversal direction:\n{down}"
     );
     assert!(
