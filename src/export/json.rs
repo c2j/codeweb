@@ -771,7 +771,11 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     (AccessMode::Read, "read"),
                     (AccessMode::Write, "write"),
                     (AccessMode::LockRead, "lock_read"),
-                    (AccessMode::Truncate, "truncate"),
+                    (AccessMode::AccessExclusive, "access_exclusive"),
+                    (AccessMode::ShareUpdateExclusive, "share_update_exclusive"),
+                    (AccessMode::Share, "share"),
+                    (AccessMode::ShareRowExclusive, "share_row_exclusive"),
+                    (AccessMode::Exclusive, "exclusive"),
                 ]
                 .iter()
                 .filter(|(flag, _)| modes.contains(*flag))

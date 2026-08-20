@@ -763,7 +763,11 @@ fn parse_access_modes(props: Option<&serde_json::Value>) -> AccessMode {
                     "read" => modes |= AccessMode::Read,
                     "write" => modes |= AccessMode::Write,
                     "lock_read" => modes |= AccessMode::LockRead,
-                    "truncate" => modes |= AccessMode::Truncate,
+                    "truncate" | "access_exclusive" => modes |= AccessMode::AccessExclusive,
+                    "share_update_exclusive" => modes |= AccessMode::ShareUpdateExclusive,
+                    "share" => modes |= AccessMode::Share,
+                    "share_row_exclusive" => modes |= AccessMode::ShareRowExclusive,
+                    "exclusive" => modes |= AccessMode::Exclusive,
                     _ => {}
                 }
             }

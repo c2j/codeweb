@@ -1433,7 +1433,7 @@ impl Visitor for TableAccessExtractor {
         match stmt {
             Statement::Truncate(truncate) => {
                 for table in &truncate.tables {
-                    self.add_access(table, AccessMode::Truncate, Some(WriteKind::Truncate));
+                    self.add_access(table, AccessMode::AccessExclusive, Some(WriteKind::Truncate));
                 }
             }
             Statement::Merge(merge) => {
@@ -3893,8 +3893,8 @@ mod tests {
         assert_eq!(accesses.len(), 1, "expected 1 access, got: {:?}", accesses);
         let t1 = find_access(&accesses, "t1").expect("t1 not found");
         assert!(
-            t1.modes.contains(AccessMode::Truncate),
-            "t1 should be Truncate"
+            t1.modes.contains(AccessMode::AccessExclusive),
+            "t1 should be AccessExclusive"
         );
         assert!(
             t1.write_kinds.contains(&WriteKind::Truncate),

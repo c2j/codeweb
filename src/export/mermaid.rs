@@ -158,7 +158,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::Implements { .. } => "-->",
             Edge::DirectCall { .. } => "-->",
             Edge::TableAccess { modes, .. } => {
-                if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate) {
+                if modes.contains(AccessMode::Write) || modes.contains(AccessMode::AccessExclusive) {
                     "==>"
                 } else {
                     "-.->"

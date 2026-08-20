@@ -60,13 +60,18 @@ impl<'de> Deserialize<'de> for JsonMap {
 }
 
 bitflags! {
-    /// Access mode for table references (read/write/lock/truncate).
+    /// Access mode for table references. Bits map 1:1 onto openGauss
+    /// table-lock levels L1–L8 (see `graph::conflict`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct AccessMode: u8 {
-        const Read     = 0b0001;
-        const Write    = 0b0010;
-        const LockRead = 0b0100;
-        const Truncate = 0b1000;
+        const Read                   = 0b0000_0001; // L1 AccessShare
+        const Write                  = 0b0000_0010; // L3 RowExclusive
+        const LockRead               = 0b0000_0100; // L2 RowShare
+        const AccessExclusive        = 0b0000_1000; // L8
+        const ShareUpdateExclusive   = 0b0001_0000; // L4
+        const Share                  = 0b0010_0000; // L5
+        const ShareRowExclusive      = 0b0100_0000; // L6
+        const Exclusive              = 0b1000_0000; // L7
     }
 }
 
@@ -177,7 +182,7 @@ pub fn access_mode_label(
     if modes.contains(AccessMode::LockRead) {
         parts.push("lock".to_string());
     }
-    if modes.contains(AccessMode::Truncate) {
+    if modes.contains(AccessMode::AccessExclusive) {
         parts.push("truncate".to_string());
     }
     if parts.is_empty() {
@@ -804,7 +809,43 @@ mod tests {
         assert!(rw.contains(AccessMode::Read));
         assert!(rw.contains(AccessMode::Write));
         assert!(!rw.contains(AccessMode::LockRead));
-        assert!(!rw.contains(AccessMode::Truncate));
+        assert!(!rw.contains(AccessMode::AccessExclusive));
+    }
+
+    #[test]
+    fn access_mode_eight_lock_levels_are_distinct() {
+        let bits = [
+            AccessMode::Read,
+            AccessMode::LockRead,
+            AccessMode::Write,
+            AccessMode::ShareUpdateExclusive,
+            AccessMode::Share,
+            AccessMode::ShareRowExclusive,
+            AccessMode::Exclusive,
+            AccessMode::AccessExclusive,
+        ];
+        for (i, a) in bits.iter().enumerate() {
+            for (j, b) in bits.iter().enumerate() {
+                if i == j {
+                    assert_eq!(*a, *b);
+                } else {
+                    assert!(!a.intersects(*b), "{i} must not overlap {j}");
+                }
+            }
+        }
+        assert_eq!(AccessMode::AccessExclusive.bits(), 0b1000);
+        assert_eq!(AccessMode::ShareUpdateExclusive.bits(), 0b0001_0000);
+        assert_eq!(AccessMode::Share.bits(), 0b0010_0000);
+        assert_eq!(AccessMode::ShareRowExclusive.bits(), 0b0100_0000);
+        assert_eq!(AccessMode::Exclusive.bits(), 0b1000_0000);
+    }
+
+    #[test]
+    fn access_exclusive_u8_roundtrip_preserves_high_bits() {
+        let modes = AccessMode::Read | AccessMode::Share | AccessMode::AccessExclusive;
+        let json = serde_json::to_string(&modes).unwrap();
+        let back: AccessMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(modes, back);
     }
 
     #[test]

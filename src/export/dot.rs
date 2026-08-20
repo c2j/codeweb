@@ -328,7 +328,7 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
                 "purple"
             } else if modes.contains(AccessMode::LockRead) {
                 "orange"
-            } else if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate) {
+            } else if modes.contains(AccessMode::Write) || modes.contains(AccessMode::AccessExclusive) {
                 "red"
             } else {
                 "blue"
