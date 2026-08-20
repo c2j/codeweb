@@ -16,7 +16,8 @@ pub enum ConflictSeverity {
 
 const CONFLICT: [[bool; 8]; 8] = [
     //        L1     L2     L3     L4     L5     L6     L7     L8
-    /* L1 */ [false, false, false, false, false, false, false, true],
+    /* L1 */
+    [false, false, false, false, false, false, false, true],
     /* L2 */ [false, false, false, false, false, false, true, true],
     /* L3 */ [false, false, false, false, true, true, true, true],
     /* L4 */ [false, false, false, true, true, true, true, true],

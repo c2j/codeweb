@@ -1452,7 +1452,11 @@ impl Visitor for TableAccessExtractor {
         match stmt {
             Statement::Truncate(truncate) => {
                 for table in &truncate.tables {
-                    self.add_access(table, AccessMode::AccessExclusive, Some(WriteKind::Truncate));
+                    self.add_access(
+                        table,
+                        AccessMode::AccessExclusive,
+                        Some(WriteKind::Truncate),
+                    );
                 }
             }
             Statement::AlterTable(alter) => {

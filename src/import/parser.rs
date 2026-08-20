@@ -797,9 +797,7 @@ fn parse_write_kinds(props: Option<&serde_json::Value>) -> std::collections::Has
                     "alter" => _ = kinds.insert(WriteKind::AlterTable),
                     "drop" => _ = kinds.insert(WriteKind::DropTable),
                     "create_index" => _ = kinds.insert(WriteKind::CreateIndex),
-                    "create_index_concurrent" => {
-                        _ = kinds.insert(WriteKind::CreateIndexConcurrent)
-                    }
+                    "create_index_concurrent" => _ = kinds.insert(WriteKind::CreateIndexConcurrent),
                     "lock_table" => _ = kinds.insert(WriteKind::LockTable),
                     "reindex" => _ = kinds.insert(WriteKind::Reindex),
                     "vacuum" => _ = kinds.insert(WriteKind::Vacuum),

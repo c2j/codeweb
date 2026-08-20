@@ -1185,7 +1185,11 @@ fn cmd_conflicts(
         .filter(|c| c.severity >= min)
         .filter(|c| {
             table_filter
-                .map(|f| node_name(c.table).to_lowercase().contains(&f.to_lowercase()))
+                .map(|f| {
+                    node_name(c.table)
+                        .to_lowercase()
+                        .contains(&f.to_lowercase())
+                })
                 .unwrap_or(true)
         })
         .map(|c| ConflictEntry {
@@ -1234,11 +1238,10 @@ fn cmd_conflicts(
         severity_filter: severity.to_string(),
         conflicts: entries,
     };
-    let json = serde_json::to_string_pretty(&result).map_err(|e| {
-        error::CodeWebError::ExportError {
+    let json =
+        serde_json::to_string_pretty(&result).map_err(|e| error::CodeWebError::ExportError {
             message: e.to_string(),
-        }
-    })?;
+        })?;
     println!("{json}");
     Ok(())
 }

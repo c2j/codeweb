@@ -175,14 +175,12 @@ fn conflicts_reports_truncate_vs_select_not_two_inserts() {
     assert_eq!(json["schema_version"], 1);
     let conflicts = json["conflicts"].as_array().unwrap();
     let has_high = conflicts.iter().any(|c| {
-        c["severity"].as_str() == Some("high")
-            && c["table"].as_str() == Some("t_log")
-            && {
-                let a = c["proc_a"].as_str().unwrap_or("");
-                let b = c["proc_b"].as_str().unwrap_or("");
-                (a.contains("p_clean") && b.contains("p_read"))
-                    || (a.contains("p_read") && b.contains("p_clean"))
-            }
+        c["severity"].as_str() == Some("high") && c["table"].as_str() == Some("t_log") && {
+            let a = c["proc_a"].as_str().unwrap_or("");
+            let b = c["proc_b"].as_str().unwrap_or("");
+            (a.contains("p_clean") && b.contains("p_read"))
+                || (a.contains("p_read") && b.contains("p_clean"))
+        }
     });
     assert!(
         has_high,
