@@ -2,6 +2,7 @@ use crate::parser::ColumnAnalysis;
 
 pub mod builder;
 pub mod cluster;
+pub mod conflict;
 pub mod format;
 pub mod inspect;
 pub mod key;
