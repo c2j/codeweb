@@ -15,6 +15,14 @@ fn run_codeweb(args: &[&str]) -> std::process::Output {
         .expect("failed to run codeweb")
 }
 
+fn run_in_dir(dir: &TempDir, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(codeweb_bin())
+        .args(args)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run codeweb")
+}
+
 fn codeweb_bin() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
     let bin_name = if cfg!(windows) {
@@ -115,5 +123,98 @@ fn execute_immediate_truncate_literal_still_works() {
         has_truncate_table_access(&json, "p_clean2", "t_log"),
         "EXECUTE IMMEDIATE truncate path regressed, edges: {:?}",
         json["edges"]
+    );
+}
+
+#[test]
+fn conflicts_reports_truncate_vs_select_not_two_inserts() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("t.sql"),
+        r#"
+        CREATE TABLE t_log (id int);
+        CREATE OR REPLACE PROCEDURE p_clean IS
+        BEGIN
+            TRUNCATE TABLE t_log;
+        END;
+        /
+        CREATE OR REPLACE PROCEDURE p_read IS
+            v int;
+        BEGIN
+            SELECT COUNT(*) INTO v FROM t_log;
+        END;
+        /
+        CREATE OR REPLACE PROCEDURE p_ins1 IS
+        BEGIN
+            INSERT INTO t_log VALUES (1);
+        END;
+        /
+        CREATE OR REPLACE PROCEDURE p_ins2 IS
+        BEGIN
+            INSERT INTO t_log VALUES (2);
+        END;
+        /
+        "#,
+    )
+    .unwrap();
+    let init = run_in_dir(&dir, &["init", "t", "-d", "."]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let output = run_in_dir(&dir, &["conflicts", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "conflicts failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    let conflicts = json["conflicts"].as_array().unwrap();
+    let has_high = conflicts.iter().any(|c| {
+        c["severity"].as_str() == Some("high")
+            && c["table"].as_str() == Some("t_log")
+            && {
+                let a = c["proc_a"].as_str().unwrap_or("");
+                let b = c["proc_b"].as_str().unwrap_or("");
+                (a.contains("p_clean") && b.contains("p_read"))
+                    || (a.contains("p_read") && b.contains("p_clean"))
+            }
+    });
+    assert!(
+        has_high,
+        "expected HIGH p_clean vs p_read on t_log, got: {conflicts:?}"
+    );
+    let has_insert_pair = conflicts.iter().any(|c| {
+        let a = c["proc_a"].as_str().unwrap_or("");
+        let b = c["proc_b"].as_str().unwrap_or("");
+        (a.contains("p_ins1") && b.contains("p_ins2"))
+            || (a.contains("p_ins2") && b.contains("p_ins1"))
+    });
+    assert!(
+        !has_insert_pair,
+        "two INSERTs must not be reported: {conflicts:?}"
+    );
+
+    let medium = run_in_dir(
+        &dir,
+        &["conflicts", "--format", "json", "--severity", "medium"],
+    );
+    assert!(medium.status.success());
+    let med_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&medium.stdout)).unwrap();
+    let med = med_json["conflicts"].as_array().unwrap();
+    let has_insert_pair_med = med.iter().any(|c| {
+        let a = c["proc_a"].as_str().unwrap_or("");
+        let b = c["proc_b"].as_str().unwrap_or("");
+        (a.contains("p_ins1") && b.contains("p_ins2"))
+            || (a.contains("p_ins2") && b.contains("p_ins1"))
+    });
+    assert!(
+        !has_insert_pair_med,
+        "two INSERTs must not be reported at medium: {med:?}"
     );
 }
