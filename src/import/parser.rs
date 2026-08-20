@@ -794,6 +794,18 @@ fn parse_write_kinds(props: Option<&serde_json::Value>) -> std::collections::Has
                     "merge_delete" => _ = kinds.insert(WriteKind::MergeDelete),
                     "select_into" => _ = kinds.insert(WriteKind::SelectInto),
                     "truncate" => _ = kinds.insert(WriteKind::Truncate),
+                    "alter" => _ = kinds.insert(WriteKind::AlterTable),
+                    "drop" => _ = kinds.insert(WriteKind::DropTable),
+                    "create_index" => _ = kinds.insert(WriteKind::CreateIndex),
+                    "create_index_concurrent" => {
+                        _ = kinds.insert(WriteKind::CreateIndexConcurrent)
+                    }
+                    "lock_table" => _ = kinds.insert(WriteKind::LockTable),
+                    "reindex" => _ = kinds.insert(WriteKind::Reindex),
+                    "vacuum" => _ = kinds.insert(WriteKind::Vacuum),
+                    "vacuum_full" => _ = kinds.insert(WriteKind::VacuumFull),
+                    "analyze" => _ = kinds.insert(WriteKind::Analyze),
+                    "cluster" => _ = kinds.insert(WriteKind::Cluster),
                     _ => {}
                 }
             }
