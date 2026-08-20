@@ -2,8 +2,8 @@ use crate::graph::{AccessMode, RoutineId, RoutineKind, SourceLocation, WriteKind
 use ogsql_parser::ast::plpgsql::{PlCursorDecl, PlExecuteStmt, PlProcedureCall, PlStatement};
 use ogsql_parser::ast::plpgsql::{PlDeclaration, PlTypeDecl};
 use ogsql_parser::ast::{
-    CallFuncStatement, DataType, Expr, InsertStatement, JoinType as AstJoinType, Literal,
-    ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
+    CallFuncStatement, DataType, Expr, GroupByItem, InsertStatement, JoinType as AstJoinType,
+    Literal, ObjectName, RoutineParam, SelectStatement, SelectTarget, SequenceFunc, Statement,
     TableRef as AstTableRef, UpdateStatement, WhenClause, WithClause,
 };
 use ogsql_parser::{Visitor, VisitorResult};
@@ -1073,6 +1073,290 @@ impl TableAccessExtractor {
             ogsql_parser::walk_statement(self, &stmt);
         }
     }
+
+    /// Walk the expression-bearing fields of a `SELECT` (targets, WHERE,
+    /// HAVING, GROUP BY, ORDER BY, …) and extract reads from any subqueries
+    /// found inside them. This captures subquery table references regardless
+    /// of the outer statement kind (#140) — before this, only UPDATE/DELETE
+    /// contexts descended into WHERE expressions, so tables referenced in
+    /// SELECT/INSERT subqueries were silently dropped.
+    ///
+    /// Must be called while this select's CTE scope is still active, so that
+    /// CTE references inside those subqueries are filtered out.
+    fn walk_select_expr_subqueries(&mut self, select: &SelectStatement) {
+        for target in &select.targets {
+            if let SelectTarget::Expr(expr, _) = target {
+                self.walk_expr_subqueries(expr);
+            }
+        }
+        if let Some(ref where_clause) = select.where_clause {
+            self.walk_expr_subqueries(where_clause);
+        }
+        for expr in &select.distinct_on {
+            self.walk_expr_subqueries(expr);
+        }
+        if let Some(ref connect_by) = select.connect_by {
+            self.walk_expr_subqueries(&connect_by.condition);
+            if let Some(ref start_with) = connect_by.start_with {
+                self.walk_expr_subqueries(start_with);
+            }
+        }
+        for item in &select.group_by {
+            match item {
+                GroupByItem::Expr(expr) => self.walk_expr_subqueries(expr),
+                GroupByItem::GroupingSets(sets) => {
+                    for set in sets {
+                        for expr in set {
+                            self.walk_expr_subqueries(expr);
+                        }
+                    }
+                }
+                GroupByItem::Rollup(exprs) | GroupByItem::Cube(exprs) => {
+                    for expr in exprs {
+                        self.walk_expr_subqueries(expr);
+                    }
+                }
+            }
+        }
+        if let Some(ref having) = select.having {
+            self.walk_expr_subqueries(having);
+        }
+        for ob in &select.order_by {
+            self.walk_expr_subqueries(&ob.expr);
+        }
+        if let Some(ref limit) = select.limit {
+            self.walk_expr_subqueries(limit);
+        }
+        if let Some(ref offset) = select.offset {
+            self.walk_expr_subqueries(offset);
+        }
+        if let Some(ref fetch) = select.fetch {
+            if let Some(ref count) = fetch.count {
+                self.walk_expr_subqueries(count);
+            }
+        }
+        for named_window in &select.window_clause {
+            for expr in &named_window.spec.partition_by {
+                self.walk_expr_subqueries(expr);
+            }
+            for item in &named_window.spec.order_by {
+                self.walk_expr_subqueries(&item.expr);
+            }
+        }
+    }
+
+    /// Recursively descend an expression and walk every subquery it contains
+    /// (`Expr::Subquery`, `Expr::InSubquery`, `Expr::Exists`,
+    /// `Expr::ScalarSublink`) as a nested statement, so the tables referenced
+    /// inside those subqueries produce read edges. The container variants
+    /// mirrored here follow ogsql-parser's `walk_expr`; leaf variants are
+    /// ignored.
+    fn walk_expr_subqueries(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Subquery(select) | Expr::Exists(select) => {
+                self.walk_nested_select(select);
+            }
+            Expr::InSubquery { expr, subquery, .. }
+            | Expr::ScalarSublink { expr, subquery, .. } => {
+                self.walk_expr_subqueries(expr);
+                self.walk_nested_select(subquery);
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.walk_expr_subqueries(left);
+                self.walk_expr_subqueries(right);
+            }
+            Expr::UnaryOp { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::AtTimeZone { expr, zone } => {
+                self.walk_expr_subqueries(expr);
+                self.walk_expr_subqueries(zone);
+            }
+            Expr::FunctionCall {
+                args,
+                over,
+                filter,
+                within_group,
+                separator,
+                default,
+                conversion_format,
+                ..
+            } => {
+                for arg in args {
+                    self.walk_expr_subqueries(arg);
+                }
+                if let Some(ref over) = over {
+                    for expr in &over.partition_by {
+                        self.walk_expr_subqueries(expr);
+                    }
+                    for item in &over.order_by {
+                        self.walk_expr_subqueries(&item.expr);
+                    }
+                }
+                if let Some(ref filter) = filter {
+                    self.walk_expr_subqueries(filter);
+                }
+                for item in within_group {
+                    self.walk_expr_subqueries(&item.expr);
+                }
+                if let Some(ref separator) = separator {
+                    self.walk_expr_subqueries(separator);
+                }
+                if let Some(ref default) = default {
+                    self.walk_expr_subqueries(default);
+                }
+                if let Some(ref conversion_format) = conversion_format {
+                    self.walk_expr_subqueries(conversion_format);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(ref op) = operand {
+                    self.walk_expr_subqueries(op);
+                }
+                for wc in whens {
+                    self.walk_expr_subqueries(&wc.condition);
+                    self.walk_expr_subqueries(&wc.result);
+                }
+                if let Some(ref e) = else_expr {
+                    self.walk_expr_subqueries(e);
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.walk_expr_subqueries(expr);
+                self.walk_expr_subqueries(pattern);
+                if let Some(ref escape) = escape {
+                    self.walk_expr_subqueries(escape);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.walk_expr_subqueries(expr);
+                self.walk_expr_subqueries(low);
+                self.walk_expr_subqueries(high);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.walk_expr_subqueries(expr);
+                for item in list {
+                    self.walk_expr_subqueries(item);
+                }
+            }
+            Expr::IsNull { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::IsBoolean { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::TypeCast {
+                expr,
+                default,
+                format,
+                ..
+            } => {
+                self.walk_expr_subqueries(expr);
+                if let Some(ref default) = default {
+                    self.walk_expr_subqueries(default);
+                }
+                if let Some(ref format) = format {
+                    self.walk_expr_subqueries(format);
+                }
+            }
+            Expr::Treat { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::Array(elems) => {
+                for elem in elems {
+                    self.walk_expr_subqueries(elem);
+                }
+            }
+            Expr::Subscript {
+                object,
+                lower,
+                upper,
+                ..
+            } => {
+                self.walk_expr_subqueries(object);
+                if let Some(ref lower) = lower {
+                    self.walk_expr_subqueries(lower);
+                }
+                if let Some(ref upper) = upper {
+                    self.walk_expr_subqueries(upper);
+                }
+            }
+            Expr::FieldAccess { object, .. } => self.walk_expr_subqueries(object),
+            Expr::Parenthesized(inner) => self.walk_expr_subqueries(inner),
+            Expr::RowConstructor(exprs) => {
+                for expr in exprs {
+                    self.walk_expr_subqueries(expr);
+                }
+            }
+            Expr::CollationFor { expr } => self.walk_expr_subqueries(expr),
+            Expr::Prior(expr) => self.walk_expr_subqueries(expr),
+            Expr::SpecialFunction { args, .. } => {
+                for arg in args {
+                    self.walk_expr_subqueries(arg);
+                }
+            }
+            Expr::CursorAttribute { cursor, .. } => self.walk_expr_subqueries(cursor),
+            Expr::XmlElement {
+                evalname,
+                attributes,
+                content,
+                ..
+            } => {
+                if let Some(ref expr) = evalname {
+                    self.walk_expr_subqueries(expr);
+                }
+                if let Some(ref attributes) = attributes {
+                    for item in &attributes.items {
+                        self.walk_expr_subqueries(&item.value);
+                    }
+                }
+                for item in content {
+                    self.walk_expr_subqueries(&item.expr);
+                }
+            }
+            Expr::XmlConcat(exprs) => {
+                for expr in exprs {
+                    self.walk_expr_subqueries(expr);
+                }
+            }
+            Expr::XmlForest(items) => {
+                for item in items {
+                    self.walk_expr_subqueries(&item.expr);
+                }
+            }
+            Expr::XmlParse { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::XmlPi {
+                content: Some(c), ..
+            } => self.walk_expr_subqueries(c),
+            Expr::XmlPi { .. } => {}
+            Expr::XmlRoot { expr, version, .. } => {
+                self.walk_expr_subqueries(expr);
+                if let Some(ref version) = version {
+                    self.walk_expr_subqueries(version);
+                }
+            }
+            Expr::XmlSerialize { expr, .. } => self.walk_expr_subqueries(expr),
+            Expr::PredictBy { features, .. } => {
+                for f in features {
+                    self.walk_expr_subqueries(f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a subquery select as a nested statement while the enclosing
+    /// statement's CTE scope is still active.
+    fn walk_nested_select(&mut self, select: &SelectStatement) {
+        let stmt = Statement::Select(ogsql_parser::ast::Spanned {
+            node: select.clone(),
+            span: None,
+        });
+        ogsql_parser::walk_statement(self, &stmt);
+    }
 }
 
 impl Visitor for TableAccessExtractor {
@@ -1166,75 +1450,45 @@ impl Visitor for TableAccessExtractor {
             );
         }
 
+        // FOR UPDATE / FOR SHARE locking reads. Locked tables are read for
+        // locking purposes in addition to the plain FROM reads.
+        let mut lock_clause_read_from = false;
         if let Some(ref lock) = select.lock_clause {
-            match lock {
-                ogsql_parser::ast::LockClause::Update { tables, .. } if tables.is_empty() => {
-                    self.extract_reads_from_table_refs(&select.from);
-                    for tr in &select.from {
-                        if let AstTableRef::Table { name, .. } = tr {
-                            if !self.is_cte_reference(name) {
-                                self.extract_lock_read_from_object_name(name);
-                            }
+            let tables: &[ObjectName] = match lock {
+                ogsql_parser::ast::LockClause::Update { tables, .. }
+                | ogsql_parser::ast::LockClause::Share { tables, .. }
+                | ogsql_parser::ast::LockClause::NoKeyUpdate { tables, .. }
+                | ogsql_parser::ast::LockClause::KeyShare { tables, .. } => tables,
+            };
+            self.extract_reads_from_table_refs(&select.from);
+            lock_clause_read_from = true;
+            if tables.is_empty() {
+                for tr in &select.from {
+                    if let AstTableRef::Table { name, .. } = tr {
+                        if !self.is_cte_reference(name) {
+                            self.extract_lock_read_from_object_name(name);
                         }
                     }
-                    if let Some(ref w) = select.with {
-                        self.walk_cte_bodies(w);
-                    }
-                    self.pop_cte_scope();
-                    return VisitorResult::SkipChildren;
                 }
-                ogsql_parser::ast::LockClause::Update { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
-                    for name in tables {
-                        self.extract_lock_read_from_object_name(name);
-                    }
-                    if let Some(ref w) = select.with {
-                        self.walk_cte_bodies(w);
-                    }
-                    self.pop_cte_scope();
-                    return VisitorResult::SkipChildren;
-                }
-                ogsql_parser::ast::LockClause::Share { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
-                    for name in tables {
-                        self.extract_lock_read_from_object_name(name);
-                    }
-                    if let Some(ref w) = select.with {
-                        self.walk_cte_bodies(w);
-                    }
-                    self.pop_cte_scope();
-                    return VisitorResult::SkipChildren;
-                }
-                ogsql_parser::ast::LockClause::NoKeyUpdate { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
-                    for name in tables {
-                        self.extract_lock_read_from_object_name(name);
-                    }
-                    if let Some(ref w) = select.with {
-                        self.walk_cte_bodies(w);
-                    }
-                    self.pop_cte_scope();
-                    return VisitorResult::SkipChildren;
-                }
-                ogsql_parser::ast::LockClause::KeyShare { tables, .. } => {
-                    self.extract_reads_from_table_refs(&select.from);
-                    for name in tables {
-                        self.extract_lock_read_from_object_name(name);
-                    }
-                    if let Some(ref w) = select.with {
-                        self.walk_cte_bodies(w);
-                    }
-                    self.pop_cte_scope();
-                    return VisitorResult::SkipChildren;
+            } else {
+                for name in tables {
+                    self.extract_lock_read_from_object_name(name);
                 }
             }
         }
 
-        self.extract_reads_from_table_refs(&select.from);
+        if !lock_clause_read_from {
+            self.extract_reads_from_table_refs(&select.from);
+        }
 
         if let Some(ref w) = select.with {
             self.walk_cte_bodies(w);
         }
+
+        // Subqueries in expression positions (WHERE / HAVING / SELECT list /
+        // GROUP BY / ORDER BY / …) must be walked while this select's CTE scope
+        // is still active, or their table references are silently dropped (#140).
+        self.walk_select_expr_subqueries(select);
 
         self.pop_cte_scope();
         VisitorResult::SkipChildren
@@ -1265,6 +1519,29 @@ impl Visitor for TableAccessExtractor {
                 span: None,
             });
             ogsql_parser::walk_statement(self, &stmt);
+        }
+
+        // Non-SELECT sources can still carry subqueries in their expressions
+        // (e.g. `INSERT INTO t VALUES ((SELECT …))`); walk them while this
+        // insert's CTE scope is active (#140).
+        match &insert.source {
+            ogsql_parser::ast::InsertSource::Values(rows) => {
+                for row in rows {
+                    for expr in row {
+                        self.walk_expr_subqueries(expr);
+                    }
+                }
+            }
+            ogsql_parser::ast::InsertSource::Set(assignments) => {
+                for a in assignments {
+                    self.walk_expr_subqueries(&a.value);
+                }
+            }
+            ogsql_parser::ast::InsertSource::RecordVariable(expr) => {
+                self.walk_expr_subqueries(expr);
+            }
+            ogsql_parser::ast::InsertSource::Select(_)
+            | ogsql_parser::ast::InsertSource::DefaultValues => {}
         }
 
         self.pop_cte_scope();
@@ -3339,6 +3616,172 @@ mod tests {
         assert!(
             t_src.modes.contains(AccessMode::Read),
             "t_src should be Read"
+        );
+    }
+
+    // ── #140: subquery table references must be extracted regardless of the
+    // outer statement kind (SELECT / INSERT), not just UPDATE / DELETE. ──
+
+    #[test]
+    fn select_where_in_subquery_reads() {
+        let sql = "SELECT COUNT(1) FROM t_main m WHERE m.id IN (SELECT p.id FROM t_parent p)";
+        let accesses = extract_accesses(sql);
+        assert_eq!(
+            accesses.len(),
+            2,
+            "expected 2 accesses, got: {:?}",
+            accesses
+        );
+        let t_main = find_access(&accesses, "t_main").expect("t_main not found");
+        let t_parent = find_access(&accesses, "t_parent").expect("t_parent not found");
+        assert!(
+            t_main.modes.contains(AccessMode::Read),
+            "t_main should be Read"
+        );
+        assert!(
+            t_parent.modes.contains(AccessMode::Read),
+            "t_parent (IN subquery) should be Read"
+        );
+    }
+
+    #[test]
+    fn select_where_not_exists_subquery_reads() {
+        let sql = "SELECT COUNT(1) FROM t_main m WHERE NOT EXISTS (SELECT 1 FROM t_excl e WHERE e.id = m.id)";
+        let accesses = extract_accesses(sql);
+        assert_eq!(
+            accesses.len(),
+            2,
+            "expected 2 accesses, got: {:?}",
+            accesses
+        );
+        let t_excl = find_access(&accesses, "t_excl").expect("t_excl not found");
+        assert!(
+            t_excl.modes.contains(AccessMode::Read),
+            "t_excl (NOT EXISTS subquery) should be Read"
+        );
+    }
+
+    #[test]
+    fn select_target_scalar_subquery_reads() {
+        let sql = "SELECT m.id, (SELECT MAX(x) FROM t_agg) AS mx FROM t_main m";
+        let accesses = extract_accesses(sql);
+        assert_eq!(
+            accesses.len(),
+            2,
+            "expected 2 accesses, got: {:?}",
+            accesses
+        );
+        let t_agg = find_access(&accesses, "t_agg").expect("t_agg not found");
+        assert!(
+            t_agg.modes.contains(AccessMode::Read),
+            "t_agg (scalar subquery in target list) should be Read"
+        );
+    }
+
+    #[test]
+    fn select_having_subquery_reads() {
+        let sql = "SELECT m.dept, COUNT(1) FROM t_main m GROUP BY m.dept HAVING COUNT(1) > (SELECT AVG(c) FROM t_stats s)";
+        let accesses = extract_accesses(sql);
+        let t_stats = find_access(&accesses, "t_stats").expect("t_stats not found");
+        assert!(
+            t_stats.modes.contains(AccessMode::Read),
+            "t_stats (HAVING subquery) should be Read"
+        );
+    }
+
+    #[test]
+    fn insert_select_where_not_exists_subquery_reads() {
+        let sql = "INSERT INTO t_out SELECT m.id FROM t_main m WHERE NOT EXISTS (SELECT 1 FROM t_excl e WHERE e.id = m.id)";
+        let accesses = extract_accesses(sql);
+        assert_eq!(
+            accesses.len(),
+            3,
+            "expected 3 accesses, got: {:?}",
+            accesses
+        );
+        let t_out = find_access(&accesses, "t_out").expect("t_out not found");
+        let t_excl = find_access(&accesses, "t_excl").expect("t_excl not found");
+        assert!(
+            t_out.modes.contains(AccessMode::Write),
+            "t_out should be Write"
+        );
+        assert!(
+            t_excl.modes.contains(AccessMode::Read),
+            "t_excl (NOT EXISTS in INSERT..SELECT WHERE) should be Read"
+        );
+    }
+
+    #[test]
+    fn insert_values_scalar_subquery_reads() {
+        let sql = "INSERT INTO t_out VALUES ((SELECT MAX(x) FROM t_src))";
+        let accesses = extract_accesses(sql);
+        assert_eq!(
+            accesses.len(),
+            2,
+            "expected 2 accesses, got: {:?}",
+            accesses
+        );
+        let t_out = find_access(&accesses, "t_out").expect("t_out not found");
+        let t_src = find_access(&accesses, "t_src").expect("t_src not found");
+        assert!(
+            t_out.modes.contains(AccessMode::Write),
+            "t_out should be Write"
+        );
+        assert!(
+            t_src.modes.contains(AccessMode::Read),
+            "t_src (scalar subquery in VALUES) should be Read"
+        );
+    }
+
+    #[test]
+    fn nested_subquery_inside_binary_op_reads() {
+        let sql = "SELECT COUNT(1) FROM t_main m WHERE m.flag = '1' AND m.id IN (SELECT p.id FROM t_parent p WHERE p.id IN (SELECT s.id FROM t_grand s))";
+        let accesses = extract_accesses(sql);
+        let t_parent = find_access(&accesses, "t_parent").expect("t_parent not found");
+        let t_grand = find_access(&accesses, "t_grand").expect("t_grand not found");
+        assert!(
+            t_parent.modes.contains(AccessMode::Read),
+            "t_parent should be Read"
+        );
+        assert!(
+            t_grand.modes.contains(AccessMode::Read),
+            "t_grand (subquery nested inside subquery) should be Read"
+        );
+    }
+
+    #[test]
+    fn cursor_query_subquery_reads() {
+        let sql = "CREATE PROCEDURE p() AS $$ DECLARE CURSOR cur IS SELECT m.id FROM t_main m WHERE m.id IN (SELECT p.id FROM t_parent p); BEGIN NULL; END; $$;";
+        let accesses = extract_accesses(sql);
+        let t_parent = find_access(&accesses, "t_parent").expect("t_parent not found");
+        assert!(
+            t_parent.modes.contains(AccessMode::Read),
+            "t_parent (subquery inside cursor declaration) should be Read"
+        );
+    }
+
+    /// The CTE scope must stay active while expression subqueries are walked:
+    /// a subquery referencing the statement's own CTE must not produce a
+    /// spurious table edge (#140 regression guard).
+    #[test]
+    fn subquery_referencing_cte_is_filtered() {
+        let sql = "WITH cte AS (SELECT id FROM t_parent) SELECT COUNT(1) FROM t_main m WHERE m.id IN (SELECT id FROM cte)";
+        let accesses = extract_accesses(sql);
+        let names: Vec<&str> = accesses.iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains(&"t_main"),
+            "t_main should be Read: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"t_parent"),
+            "CTE body table t_parent should be Read: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"cte"),
+            "CTE name must not be added as a table access: {:?}",
+            names
         );
     }
 
