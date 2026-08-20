@@ -54,7 +54,7 @@ pub(crate) fn edge_label_for(
     from: NodeIndex,
     to: NodeIndex,
 ) -> Option<String> {
-    use crate::graph::{AccessMode, CallScope, DataFlowKind, Edge, WriteKind};
+    use crate::graph::{CallScope, DataFlowKind, Edge};
     let edge = graph.edges_connecting(from, to).next()?;
     match edge.weight() {
         Edge::DirectCall { scope, .. } => Some(match scope {
@@ -72,35 +72,8 @@ pub(crate) fn edge_label_for(
             if matches!(flow_kind, DataFlowKind::DefinitionDependency) {
                 parts.push("dep".to_string());
             }
-            if modes.contains(AccessMode::Read) {
-                parts.push("R".to_string());
-            }
-            if modes.contains(AccessMode::Write) {
-                let wk: Vec<&str> = write_kinds
-                    .iter()
-                    .map(|wk| match wk {
-                        WriteKind::Insert => "insert",
-                        WriteKind::InsertSelect => "insert_select",
-                        WriteKind::Update => "update",
-                        WriteKind::Delete => "delete",
-                        WriteKind::MergeInsert => "merge_insert",
-                        WriteKind::MergeUpdate => "merge_update",
-                        WriteKind::MergeDelete => "merge_delete",
-                        WriteKind::SelectInto => "select_into",
-                        WriteKind::Truncate => "truncate",
-                    })
-                    .collect();
-                if wk.is_empty() {
-                    parts.push("W".to_string());
-                } else {
-                    parts.push(format!("W:{}", wk.join(",")));
-                }
-            }
-            if modes.contains(AccessMode::LockRead) {
-                parts.push("lock".to_string());
-            }
-            if modes.contains(AccessMode::Truncate) {
-                parts.push("truncate".to_string());
+            if let Some(mode_label) = crate::graph::access_mode_label(*modes, write_kinds) {
+                parts.push(mode_label);
             }
             if parts.is_empty() {
                 None

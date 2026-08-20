@@ -137,6 +137,56 @@ pub enum WriteKind {
     Truncate,
 }
 
+/// Stable display label for a [`WriteKind`], shared by detail/trace, exports, and lineage.
+/// The snake_case form (`insert_select`) is the canonical on-screen spelling.
+pub fn write_kind_label(kind: &WriteKind) -> &'static str {
+    match kind {
+        WriteKind::Insert => "insert",
+        WriteKind::InsertSelect => "insert_select",
+        WriteKind::Update => "update",
+        WriteKind::Delete => "delete",
+        WriteKind::MergeInsert => "merge_insert",
+        WriteKind::MergeUpdate => "merge_update",
+        WriteKind::MergeDelete => "merge_delete",
+        WriteKind::SelectInto => "select_into",
+        WriteKind::Truncate => "truncate",
+    }
+}
+
+/// Access-mode label content for a TableAccess edge, e.g. `R`, `W:insert_select,delete`
+/// or `R,W:update` — the style `detail` shows on CALLERS lines (wrapped in `[...]` by
+/// the caller). `None` when the edge carries no access mode at all.
+pub fn access_mode_label(
+    modes: AccessMode,
+    write_kinds: &std::collections::HashSet<WriteKind>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if modes.contains(AccessMode::Read) {
+        parts.push("R".to_string());
+    }
+    if modes.contains(AccessMode::Write) {
+        // Write kinds come from a HashSet, so sort for a stable, reproducible label.
+        let mut wk: Vec<&str> = write_kinds.iter().map(write_kind_label).collect();
+        wk.sort_unstable();
+        if wk.is_empty() {
+            parts.push("W".to_string());
+        } else {
+            parts.push(format!("W:{}", wk.join(",")));
+        }
+    }
+    if modes.contains(AccessMode::LockRead) {
+        parts.push("lock".to_string());
+    }
+    if modes.contains(AccessMode::Truncate) {
+        parts.push("truncate".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
 /// Whether a routine is a procedure or a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RoutineKind {

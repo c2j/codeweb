@@ -15,6 +15,10 @@ pub struct ProcedureBodySql {
     pub sql_text: String,
     pub kind: String,
     pub line: Option<usize>,
+    /// The parsed statement AST from the ORIGINAL procedure-body parse, when the source
+    /// was a typed SQL statement. Walking this (instead of re-parsing `sql_text`) keeps
+    /// procedure context such as declared-variable classification (issue #147).
+    pub statement: Option<Statement>,
 }
 
 pub struct ProcedureSqlExtractor {
@@ -55,6 +59,7 @@ impl Visitor for ProcedureSqlExtractor {
                 sql_text: query.clone(),
                 kind,
                 line: None,
+                statement: parsed_query.as_ref().map(|q| (**q).clone()),
             });
         }
         VisitorResult::Continue
@@ -74,6 +79,7 @@ impl Visitor for ProcedureSqlExtractor {
                     sql_text: sql_text.clone(),
                     kind,
                     line,
+                    statement: Some((**statement).clone()),
                 });
             }
             PlStatement::Sql(sql_text) => {
@@ -81,6 +87,7 @@ impl Visitor for ProcedureSqlExtractor {
                     sql_text: sql_text.clone(),
                     kind: "SQL".to_string(),
                     line: None,
+                    statement: None,
                 });
             }
             PlStatement::Perform {
@@ -103,6 +110,15 @@ impl Visitor for ProcedureSqlExtractor {
                     sql_text: query.clone(),
                     kind,
                     line: None,
+                    statement: parsed_query.as_ref().map(|q| (**q).clone()),
+                });
+            }
+            PlStatement::ReturnQuery(rq) => {
+                self.results.push(ProcedureBodySql {
+                    sql_text: rq.node.query.clone(),
+                    kind: "SQL".to_string(),
+                    line: rq.span.as_ref().map(|sp| sp.start.line),
+                    statement: None,
                 });
             }
             PlStatement::Execute(exec) => {
@@ -120,6 +136,7 @@ impl Visitor for ProcedureSqlExtractor {
                     sql_text,
                     kind,
                     line: None,
+                    statement: exec.node.parsed_query.as_ref().map(|q| (**q).clone()),
                 });
             }
             _ => {}
@@ -166,6 +183,105 @@ pub struct CallEdge {
 /// falls back to an opaque dynamic edge — a sound, lossy fallback that
 /// preserves call-graph correctness.
 pub const MAX_VALUE_SET: usize = 64;
+
+/// All literal strings `expr` can evaluate to (`||` concatenation, variable lookup via
+/// `var_values`, CASE branches), capped to avoid exponential blowup on long chains.
+/// Shared by call-edge and column-analysis dynamic-SQL tracking.
+fn literal_strings(expr: &Expr, var_values: &HashMap<String, HashSet<String>>) -> Vec<String> {
+    match expr {
+        Expr::Literal(Literal::String(s)) => vec![s.clone()],
+        Expr::BinaryOp {
+            left, op, right, ..
+        } if op.trim() == "||" => {
+            let left_vals = literal_strings(left, var_values);
+            let right_vals = literal_strings(right, var_values);
+            if left_vals.is_empty() || right_vals.is_empty() {
+                return vec![];
+            }
+            let product = left_vals.len().saturating_mul(right_vals.len());
+            if product > MAX_VALUE_SET {
+                return vec![];
+            }
+            let mut result = Vec::with_capacity(product);
+            for l in &left_vals {
+                for r in &right_vals {
+                    result.push(format!("{}{}", l, r));
+                }
+            }
+            result
+        }
+        Expr::PlVariable(names) => {
+            let var_name = names.join(".").to_lowercase();
+            var_values
+                .get(&var_name)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+        Expr::Case {
+            whens, else_expr, ..
+        } => {
+            let mut result = Vec::new();
+            for wc in whens {
+                result.extend(literal_strings(&wc.result, var_values));
+            }
+            if let Some(else_expr) = else_expr {
+                result.extend(literal_strings(else_expr, var_values));
+            }
+            result
+        }
+        _ => vec![],
+    }
+}
+
+/// Collect every string literal leaf in `expr` regardless of `||` concatenation success —
+/// used to scan partially-dynamic SQL for its static table references.
+fn literal_leaves(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Literal(Literal::String(s)) => out.push(s.clone()),
+        Expr::BinaryOp { left, right, .. } => {
+            literal_leaves(left, out);
+            literal_leaves(right, out);
+        }
+        Expr::UnaryOp { expr, .. } => literal_leaves(expr, out),
+        Expr::Case {
+            whens, else_expr, ..
+        } => {
+            for wc in whens {
+                literal_leaves(&wc.result, out);
+            }
+            if let Some(else_expr) = else_expr {
+                literal_leaves(else_expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Tables named in a (possibly partial) dynamic-SQL text: whitespace-split and take the
+/// word after each FROM. Tolerant of fragments ending in an unterminated quote (a
+/// tokenizer would reject them). Static fragments like `... from mid_yjqs_detail ...`
+/// are resolvable even when the full dynamic statement is built from runtime values.
+fn tables_in_sql_fragment(sql: &str) -> HashSet<String> {
+    let mut tables = HashSet::new();
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if word.eq_ignore_ascii_case("from") {
+            let Some(raw) = words.get(i + 1) else {
+                continue;
+            };
+            let cleaned: String = raw
+                .trim_matches(|c: char| c.is_ascii_punctuation() && c != '_')
+                .chars()
+                .take_while(|c| !c.is_ascii_punctuation() || *c == '_' || *c == '.')
+                .collect();
+            let name = cleaned.rsplit('.').next().unwrap_or("").to_lowercase();
+            if !name.is_empty() && !raw.contains('(') {
+                tables.insert(name);
+            }
+        }
+    }
+    tables
+}
 
 pub struct CallExtractor {
     pub current_procedure: Option<RoutineId>,
@@ -308,54 +424,7 @@ impl CallExtractor {
     /// A Vec with multiple entries means the value is non-deterministic
     /// (e.g. different IF/ELSE branches, CASE with different WHEN values).
     fn extract_all_literal_strings(&mut self, expr: &Expr) -> Vec<String> {
-        match expr {
-            Expr::Literal(Literal::String(s)) => vec![s.clone()],
-            Expr::BinaryOp {
-                left, op, right, ..
-            } if op.trim() == "||" => {
-                let left_vals = self.extract_all_literal_strings(left);
-                let right_vals = self.extract_all_literal_strings(right);
-                if left_vals.is_empty() || right_vals.is_empty() {
-                    return vec![];
-                }
-                // Cap the cartesian product to prevent exponential blowup on
-                // long `||` chains whose operands each carry multiple values.
-                // Abandoning expansion degrades EXECUTE IMMEDIATE resolution to
-                // an opaque dynamic call — a sound, lossy fallback.
-                let product = left_vals.len().saturating_mul(right_vals.len());
-                if product > MAX_VALUE_SET {
-                    self.warn_value_overflow();
-                    return vec![];
-                }
-                let mut result = Vec::with_capacity(product);
-                for l in &left_vals {
-                    for r in &right_vals {
-                        result.push(format!("{}{}", l, r));
-                    }
-                }
-                result
-            }
-            Expr::PlVariable(names) => {
-                let var_name = names.join(".").to_lowercase();
-                self.var_values
-                    .get(&var_name)
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default()
-            }
-            Expr::Case {
-                whens, else_expr, ..
-            } => {
-                let mut result = Vec::new();
-                for wc in whens {
-                    result.extend(self.extract_all_literal_strings(&wc.result));
-                }
-                if let Some(else_expr) = else_expr {
-                    result.extend(self.extract_all_literal_strings(else_expr));
-                }
-                result
-            }
-            _ => vec![],
-        }
+        literal_strings(expr, &self.var_values)
     }
 }
 
@@ -1342,6 +1411,17 @@ pub struct ColumnAnalysis {
     /// Per-column data flow: which sources feed each written column.
     #[serde(default)]
     pub column_mappings: Vec<ColumnMapping>,
+    /// Names of the OTHER tables touched by the same statement as this edge (issue #147).
+    /// Populated by the builder on every TableAccess edge of a statement; it is what lets
+    /// lineage restrict hops to tables read in the same statement as a write, instead of
+    /// connecting all of a routine's reads to all of its writes.
+    ///
+    /// `None` = not populated (store built before #147) — lineage falls back to
+    /// connecting all of a routine's reads/writes. `Some(vec![])` = populated and the
+    /// statement genuinely touches no other table (e.g. a bare `UPDATE t SET ...`) — a
+    /// legitimate empty hop set, NOT a reason to fall back.
+    #[serde(default)]
+    pub read_tables: Option<Vec<String>>,
 }
 
 /// One written column and the sources its value is built from.
@@ -1537,6 +1617,25 @@ pub struct UpdateColumnInfo {
     pub set_columns: Vec<String>,
 }
 
+/// Procedure-level variable context collected by a pre-pass and seeded into per-statement
+/// walks (issue #147): cursor sources, FETCH chains, `%ROWTYPE` records and `%TYPE`
+/// anchors. Per-statement walks would otherwise lose these cross-statement bindings
+/// (a cursor is declared in DECLARE, fetched in one statement, consumed in another).
+#[derive(Debug, Clone, Default)]
+pub struct ProcedureVarContext {
+    /// Cursor name → the columns its SELECT produces (resolved to table.column).
+    pub cursor_sources: HashMap<String, Vec<CursorColumn>>,
+    /// Cursor name → the variables its FETCH reads into, in order.
+    pub fetch_vars: HashMap<String, Vec<String>>,
+    /// `%ROWTYPE` record variable → its cursor name.
+    pub record_cursors: HashMap<String, String>,
+    /// Variable → literal string values (for dynamic-SQL cursor resolution).
+    pub var_values: HashMap<String, HashSet<String>>,
+    /// Variable → the single distinct table found in its literal SQL fragments (partial
+    /// dynamic-SQL resolution when the full statement cannot be statically built).
+    pub dynamic_table_vars: HashMap<String, String>,
+}
+
 /// Column-level SQL dependency extractor.
 ///
 /// Usage (same pattern as TableAccessExtractor):
@@ -1564,6 +1663,12 @@ pub struct ColumnAccessExtractor {
     cursor_sources: HashMap<String, Vec<CursorColumn>>,
     /// Cursor name → the variables its FETCH reads into, in order.
     fetch_vars: HashMap<String, Vec<String>>,
+    /// `%ROWTYPE` record variable → its cursor name.
+    record_cursors: HashMap<String, String>,
+    /// Variable → literal string values (dynamic-SQL cursor resolution).
+    var_values: HashMap<String, HashSet<String>>,
+    /// Variable → single distinct table in its literal SQL fragments.
+    dynamic_table_vars: HashMap<String, String>,
     /// The cursor whose SELECT is currently being walked.
     current_cursor: Option<String>,
 }
@@ -1585,7 +1690,35 @@ impl ColumnAccessExtractor {
             cte_scope: Vec::new(),
             cursor_sources: HashMap::new(),
             fetch_vars: HashMap::new(),
+            record_cursors: HashMap::new(),
+            var_values: HashMap::new(),
+            dynamic_table_vars: HashMap::new(),
             current_cursor: None,
+        }
+    }
+
+    /// Build an extractor pre-seeded with procedure variable context collected by a
+    /// procedure-level pass (issue #147): a per-statement walk would otherwise lose the
+    /// cross-statement cursor → FETCH → INSERT chain and `%ROWTYPE`/`%TYPE` anchors.
+    pub fn new_with_context(ctx: &ProcedureVarContext) -> Self {
+        let mut ext = Self::new();
+        ext.cursor_sources = ctx.cursor_sources.clone();
+        ext.fetch_vars = ctx.fetch_vars.clone();
+        ext.record_cursors = ctx.record_cursors.clone();
+        ext.var_values = ctx.var_values.clone();
+        ext.dynamic_table_vars = ctx.dynamic_table_vars.clone();
+        ext
+    }
+
+    /// The collected procedure variable context (cloned), for seeding per-statement
+    /// walks from a procedure-level pass.
+    pub fn procedure_context(&self) -> ProcedureVarContext {
+        ProcedureVarContext {
+            cursor_sources: self.cursor_sources.clone(),
+            fetch_vars: self.fetch_vars.clone(),
+            record_cursors: self.record_cursors.clone(),
+            var_values: self.var_values.clone(),
+            dynamic_table_vars: self.dynamic_table_vars.clone(),
         }
     }
 
@@ -1601,6 +1734,7 @@ impl ColumnAccessExtractor {
             insert_columns: self.insert_columns,
             update_columns: self.update_columns,
             column_mappings: self.column_mappings,
+            read_tables: None,
         }
     }
 
@@ -1648,13 +1782,29 @@ impl ColumnAccessExtractor {
         for (cursor, vars) in &self.fetch_vars {
             if let Some(cols) = self.cursor_sources.get(cursor) {
                 for (i, var) in vars.iter().enumerate() {
-                    if let Some(col) = cols.get(i) {
+                    // A single catch-all source (empty output name, table attributed from
+                    // dynamic-SQL fragments) covers every FETCH position.
+                    let col = cols.get(i).or_else(|| {
+                        (cols.len() == 1 && cols[0].output_name.is_empty()).then_some(&cols[0])
+                    });
+                    if let Some(col) = col {
                         if !col.source_col.is_empty() {
                             var_to_source.insert(
                                 var.clone(),
                                 ColumnSource::Column {
                                     table: col.source_table.clone(),
                                     column: col.source_col.clone(),
+                                },
+                            );
+                        } else if col.source_table.is_some() && col.output_name.is_empty() {
+                            // Catch-all from partial dynamic-SQL resolution: the exact
+                            // source column is unknown, attribute to the table under the
+                            // variable's own name (table-level flow remains accurate).
+                            var_to_source.insert(
+                                var.clone(),
+                                ColumnSource::Column {
+                                    table: col.source_table.clone(),
+                                    column: var.clone(),
                                 },
                             );
                         }
@@ -1678,7 +1828,18 @@ impl ColumnAccessExtractor {
 
     /// Collect the source columns (resolved to table.column) of a cursor SELECT.
     fn collect_cursor_select_sources(&self, select: &SelectStatement) -> Vec<CursorColumn> {
-        let default_table = single_table_name_of(&select.from);
+        // A direct single FROM table, or — when the driving table lives inside a derived
+        // table (dynamic SQL `SELECT ... FROM (SELECT ... FROM t ...)`) — the single
+        // distinct table anywhere in the FROM tree.
+        let default_table = single_table_name_of(&select.from).or_else(|| {
+            let mut tables: HashSet<String> = HashSet::new();
+            collect_from_tables(&select.from, &mut tables);
+            if tables.len() == 1 {
+                tables.into_iter().next()
+            } else {
+                None
+            }
+        });
         let mut sources = Vec::new();
         for target in &select.targets {
             if let SelectTarget::Expr(expr, alias) = target {
@@ -2090,22 +2251,166 @@ impl Visitor for ColumnAccessExtractor {
     }
 
     fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
-        if let PlDeclaration::Cursor(PlCursorDecl { name, .. }) = decl {
-            self.current_cursor = Some(name.clone());
+        match decl {
+            PlDeclaration::Cursor(PlCursorDecl { name, .. }) => {
+                self.current_cursor = Some(name.clone());
+            }
+            PlDeclaration::Variable(v) => {
+                use ogsql_parser::ast::plpgsql::PlDataType;
+                // `rec cursor_name%ROWTYPE`: record fields resolve via the cursor's
+                // SELECT sources (issue #147 L2). `%TYPE` anchors are deliberately NOT
+                // resolved: typing a variable as `t.col%TYPE` says nothing about where
+                // its value comes from, so resolving it would fabricate data edges.
+                if let PlDataType::PercentRowType(cursor) = &v.data_type {
+                    self.record_cursors
+                        .insert(v.name.to_lowercase(), cursor.to_lowercase());
+                }
+            }
+            _ => {}
         }
         VisitorResult::Continue
     }
 
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
-        if let PlStatement::Fetch(fetch) = stmt {
-            let cursor_name = match &fetch.node.cursor {
-                Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
-                    parts.last().map(|i| i.to_string()).unwrap_or_default()
+        match stmt {
+            // Track literal-string assignments so `OPEN c FOR v_sql` can resolve the
+            // dynamic cursor's SELECT sources (issue #147).
+            PlStatement::Assignment {
+                target: Expr::PlVariable(names),
+                expression,
+            } => {
+                let var_name = names.join(".").to_lowercase();
+                let values = literal_strings(expression, &self.var_values);
+                if !values.is_empty() {
+                    self.var_values
+                        .insert(var_name, values.into_iter().collect());
+                } else {
+                    // Partial resolution: the concatenation may contain runtime values,
+                    // but its static fragments still name tables.
+                    let mut leaves = Vec::new();
+                    literal_leaves(expression, &mut leaves);
+                    let mut tables: HashSet<String> = HashSet::new();
+                    for frag in &leaves {
+                        tables.extend(tables_in_sql_fragment(frag));
+                    }
+                    if tables.len() == 1 {
+                        if let Some(t) = tables.into_iter().next() {
+                            self.dynamic_table_vars.insert(var_name, t);
+                        }
+                    }
                 }
-                _ => String::new(),
-            };
-            let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
-            self.record_fetch(&cursor_name, vars);
+            }
+            PlStatement::Assignment {
+                target: Expr::FieldAccess { object, field },
+                expression,
+            } => {
+                if let Expr::PlVariable(record_name) = object.as_ref() {
+                    let compound = format!("{}.{}", record_name.join("."), field).to_lowercase();
+                    let values = literal_strings(expression, &self.var_values);
+                    if !values.is_empty() {
+                        self.var_values
+                            .insert(compound, values.into_iter().collect());
+                    }
+                }
+            }
+            PlStatement::Fetch(fetch) => {
+                let cursor_name = match &fetch.node.cursor {
+                    Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+                        parts.last().map(|i| i.to_string()).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
+                self.record_fetch(&cursor_name, vars);
+            }
+            // `OPEN c_fxj FOR v_sql_txt` / `FOR EXECUTE expr`: resolve the dynamic SQL to
+            // the cursor's SELECT sources so FETCH-variable chains keep resolving.
+            PlStatement::Open(spanned) => {
+                use ogsql_parser::ast::plpgsql::PlOpenKind;
+                let open = &spanned.node;
+                let cursor_name = match &open.cursor {
+                    Expr::ColumnRef(parts) | Expr::PlVariable(parts) => {
+                        parts.last().map(|i| i.to_string()).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                if cursor_name.is_empty()
+                    || self
+                        .cursor_sources
+                        .contains_key(&cursor_name.to_lowercase())
+                {
+                    return VisitorResult::Continue;
+                }
+                let mut candidates: Vec<String> = Vec::new();
+                let mut dynamic_table: Option<String> = None;
+                match &open.kind {
+                    PlOpenKind::ForQuery {
+                        parsed_query,
+                        query,
+                        ..
+                    } => {
+                        if let Some(Statement::Select(select)) = parsed_query.as_deref() {
+                            let sources = self.collect_cursor_select_sources(&select.node);
+                            self.record_cursor(&cursor_name, sources);
+                            return VisitorResult::Continue;
+                        }
+                        // The query text may be a variable name holding the SQL literal.
+                        if let Some(vals) = self.var_values.get(&query.to_lowercase()) {
+                            candidates.extend(vals.iter().cloned());
+                        } else {
+                            candidates.push(query.clone());
+                        }
+                        if let Some(t) = self.dynamic_table_vars.get(&query.to_lowercase()) {
+                            dynamic_table = Some(t.clone());
+                        }
+                    }
+                    PlOpenKind::ForExecute { query, .. } => {
+                        candidates.extend(literal_strings(query, &self.var_values));
+                    }
+                    _ => {}
+                }
+                for sql in candidates {
+                    let (stmts, _) = ogsql_parser::Parser::parse_sql(&sql);
+                    for info in &stmts {
+                        if let Statement::Select(select) = &info.statement {
+                            let sources = self.collect_cursor_select_sources(&select.node);
+                            self.record_cursor(&cursor_name, sources);
+                            return VisitorResult::Continue;
+                        }
+                    }
+                }
+                // Last resort: the dynamic SQL is built from runtime values, but its
+                // literal fragments name a single static table — attribute every cursor
+                // output to it (empty output name marks the catch-all).
+                if let Some(table) = dynamic_table {
+                    self.record_cursor(
+                        &cursor_name,
+                        vec![CursorColumn {
+                            output_name: String::new(),
+                            source_table: Some(table),
+                            source_col: String::new(),
+                        }],
+                    );
+                }
+            }
+            // `FOR rec IN (SELECT ...)` — the loop variable is an implicit %ROWTYPE
+            // record over the inline query's sources (issue #147 L2).
+            PlStatement::For(spanned) => {
+                use ogsql_parser::ast::plpgsql::PlForKind;
+                if let PlForKind::Query {
+                    parsed_query: Some(parsed),
+                    ..
+                } = &spanned.node.kind
+                {
+                    if let Statement::Select(select) = &**parsed {
+                        let sources = self.collect_cursor_select_sources(&select.node);
+                        let loop_var = spanned.node.variable.to_lowercase();
+                        self.cursor_sources.insert(loop_var.clone(), sources);
+                        self.record_cursors.insert(loop_var.clone(), loop_var);
+                    }
+                }
+            }
+            _ => {}
         }
         VisitorResult::Continue
     }
@@ -2384,6 +2689,27 @@ impl ColumnAccessExtractor {
     /// two or more tables in scope it stays unattributed rather than guessed.
     fn column_source(&self, names: &[ogsql_parser::Ident]) -> ColumnSource {
         let (alias_prefix, column) = split_alias_column(names);
+
+        // `%ROWTYPE` record field (issue #147 L2): `rec.id` where rec is a record
+        // resolves to the cursor's source column by output name.
+        if let Some(record) = &alias_prefix {
+            if let Some(cursor) = self.record_cursors.get(&record.to_lowercase()) {
+                if let Some(cols) = self.cursor_sources.get(cursor) {
+                    if let Some(col) = cols
+                        .iter()
+                        .find(|c| c.output_name.eq_ignore_ascii_case(&column))
+                    {
+                        if !col.source_col.is_empty() {
+                            return ColumnSource::Column {
+                                table: col.source_table.clone(),
+                                column: col.source_col.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
         let table = match alias_prefix.as_ref() {
             Some(a) => self.resolve_alias(a).map(|ta| ta.table.clone()),
             None => self.scope_sole_table.clone(),
@@ -2901,6 +3227,22 @@ fn is_aggregate_function(name: &str) -> bool {
 fn push_unique_source(out: &mut Vec<ColumnSource>, source: ColumnSource) {
     if !out.contains(&source) {
         out.push(source);
+    }
+}
+
+/// Collect distinct table names referenced anywhere in a FROM list, descending into
+/// derived tables/subqueries (for dynamic-SQL cursor attribution).
+fn collect_from_tables(from: &[AstTableRef], out: &mut HashSet<String>) {
+    for tr in from {
+        match tr {
+            AstTableRef::Table { name, .. } => {
+                if let Some(t) = name.last() {
+                    out.insert(t.to_string().to_lowercase());
+                }
+            }
+            AstTableRef::Subquery { query, .. } => collect_from_tables(&query.from, out),
+            _ => {}
+        }
     }
 }
 
