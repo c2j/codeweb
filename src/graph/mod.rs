@@ -2,6 +2,7 @@ use crate::parser::ColumnAnalysis;
 
 pub mod builder;
 pub mod cluster;
+pub mod conflict;
 pub mod format;
 pub mod inspect;
 pub mod key;
@@ -60,13 +61,18 @@ impl<'de> Deserialize<'de> for JsonMap {
 }
 
 bitflags! {
-    /// Access mode for table references (read/write/lock/truncate).
+    /// Access mode for table references. Bits map 1:1 onto openGauss
+    /// table-lock levels L1–L8 (see `graph::conflict`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct AccessMode: u8 {
-        const Read     = 0b0001;
-        const Write    = 0b0010;
-        const LockRead = 0b0100;
-        const Truncate = 0b1000;
+        const Read                   = 0b0000_0001; // L1 AccessShare
+        const Write                  = 0b0000_0010; // L3 RowExclusive
+        const LockRead               = 0b0000_0100; // L2 RowShare
+        const AccessExclusive        = 0b0000_1000; // L8
+        const ShareUpdateExclusive   = 0b0001_0000; // L4
+        const Share                  = 0b0010_0000; // L5
+        const ShareRowExclusive      = 0b0100_0000; // L6
+        const Exclusive              = 0b1000_0000; // L7
     }
 }
 
@@ -135,6 +141,16 @@ pub enum WriteKind {
     MergeDelete,
     SelectInto,
     Truncate,
+    AlterTable,
+    DropTable,
+    CreateIndex,
+    CreateIndexConcurrent,
+    LockTable,
+    Reindex,
+    Vacuum,
+    VacuumFull,
+    Analyze,
+    Cluster,
 }
 
 /// Stable display label for a [`WriteKind`], shared by detail/trace, exports, and lineage.
@@ -150,6 +166,65 @@ pub fn write_kind_label(kind: &WriteKind) -> &'static str {
         WriteKind::MergeDelete => "merge_delete",
         WriteKind::SelectInto => "select_into",
         WriteKind::Truncate => "truncate",
+        WriteKind::AlterTable => "alter",
+        WriteKind::DropTable => "drop",
+        WriteKind::CreateIndex => "create_index",
+        WriteKind::CreateIndexConcurrent => "create_index_concurrent",
+        WriteKind::LockTable => "lock_table",
+        WriteKind::Reindex => "reindex",
+        WriteKind::Vacuum => "vacuum",
+        WriteKind::VacuumFull => "vacuum_full",
+        WriteKind::Analyze => "analyze",
+        WriteKind::Cluster => "cluster",
+    }
+}
+
+pub fn is_ddl_write_kind(kind: &WriteKind) -> bool {
+    matches!(
+        kind,
+        WriteKind::Truncate
+            | WriteKind::AlterTable
+            | WriteKind::DropTable
+            | WriteKind::CreateIndex
+            | WriteKind::CreateIndexConcurrent
+            | WriteKind::Reindex
+            | WriteKind::Cluster
+    )
+}
+
+fn is_ops_write_kind(kind: &WriteKind) -> bool {
+    matches!(
+        kind,
+        WriteKind::LockTable | WriteKind::Vacuum | WriteKind::VacuumFull | WriteKind::Analyze
+    )
+}
+
+fn ddl_display_label(kind: &WriteKind) -> &'static str {
+    match kind {
+        WriteKind::CreateIndex | WriteKind::CreateIndexConcurrent => "create_index",
+        other => write_kind_label(other),
+    }
+}
+
+pub fn highest_lock_level(modes: AccessMode) -> Option<u8> {
+    if modes.contains(AccessMode::AccessExclusive) {
+        Some(8)
+    } else if modes.contains(AccessMode::Exclusive) {
+        Some(7)
+    } else if modes.contains(AccessMode::ShareRowExclusive) {
+        Some(6)
+    } else if modes.contains(AccessMode::Share) {
+        Some(5)
+    } else if modes.contains(AccessMode::ShareUpdateExclusive) {
+        Some(4)
+    } else if modes.contains(AccessMode::Write) {
+        Some(3)
+    } else if modes.contains(AccessMode::LockRead) {
+        Some(2)
+    } else if modes.contains(AccessMode::Read) {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -165,8 +240,11 @@ pub fn access_mode_label(
         parts.push("R".to_string());
     }
     if modes.contains(AccessMode::Write) {
-        // Write kinds come from a HashSet, so sort for a stable, reproducible label.
-        let mut wk: Vec<&str> = write_kinds.iter().map(write_kind_label).collect();
+        let mut wk: Vec<&str> = write_kinds
+            .iter()
+            .filter(|k| !is_ddl_write_kind(k) && !is_ops_write_kind(k))
+            .map(write_kind_label)
+            .collect();
         wk.sort_unstable();
         if wk.is_empty() {
             parts.push("W".to_string());
@@ -177,8 +255,22 @@ pub fn access_mode_label(
     if modes.contains(AccessMode::LockRead) {
         parts.push("lock".to_string());
     }
-    if modes.contains(AccessMode::Truncate) {
-        parts.push("truncate".to_string());
+    let highest = highest_lock_level(modes);
+    let has_ddl = write_kinds.iter().any(is_ddl_write_kind);
+    if let Some(level) = highest {
+        if level >= 4 || has_ddl {
+            parts.push(format!("L{level}"));
+        }
+    }
+    if has_ddl {
+        let mut d: Vec<&str> = write_kinds
+            .iter()
+            .filter(|k| is_ddl_write_kind(k))
+            .map(ddl_display_label)
+            .collect();
+        d.sort_unstable();
+        d.dedup();
+        parts.push(format!("D:{}", d.join(",")));
     }
     if parts.is_empty() {
         None
@@ -804,7 +896,43 @@ mod tests {
         assert!(rw.contains(AccessMode::Read));
         assert!(rw.contains(AccessMode::Write));
         assert!(!rw.contains(AccessMode::LockRead));
-        assert!(!rw.contains(AccessMode::Truncate));
+        assert!(!rw.contains(AccessMode::AccessExclusive));
+    }
+
+    #[test]
+    fn access_mode_eight_lock_levels_are_distinct() {
+        let bits = [
+            AccessMode::Read,
+            AccessMode::LockRead,
+            AccessMode::Write,
+            AccessMode::ShareUpdateExclusive,
+            AccessMode::Share,
+            AccessMode::ShareRowExclusive,
+            AccessMode::Exclusive,
+            AccessMode::AccessExclusive,
+        ];
+        for (i, a) in bits.iter().enumerate() {
+            for (j, b) in bits.iter().enumerate() {
+                if i == j {
+                    assert_eq!(*a, *b);
+                } else {
+                    assert!(!a.intersects(*b), "{i} must not overlap {j}");
+                }
+            }
+        }
+        assert_eq!(AccessMode::AccessExclusive.bits(), 0b1000);
+        assert_eq!(AccessMode::ShareUpdateExclusive.bits(), 0b0001_0000);
+        assert_eq!(AccessMode::Share.bits(), 0b0010_0000);
+        assert_eq!(AccessMode::ShareRowExclusive.bits(), 0b0100_0000);
+        assert_eq!(AccessMode::Exclusive.bits(), 0b1000_0000);
+    }
+
+    #[test]
+    fn access_exclusive_u8_roundtrip_preserves_high_bits() {
+        let modes = AccessMode::Read | AccessMode::Share | AccessMode::AccessExclusive;
+        let json = serde_json::to_string(&modes).unwrap();
+        let back: AccessMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(modes, back);
     }
 
     #[test]
@@ -823,6 +951,95 @@ mod tests {
         let json = serde_json::to_string(&kinds).unwrap();
         let deserialized: HashSet<WriteKind> = serde_json::from_str(&json).unwrap();
         assert_eq!(kinds, deserialized);
+    }
+
+    #[test]
+    fn write_kind_label_covers_ddl_and_ops() {
+        assert_eq!(write_kind_label(&WriteKind::AlterTable), "alter");
+        assert_eq!(write_kind_label(&WriteKind::DropTable), "drop");
+        assert_eq!(write_kind_label(&WriteKind::CreateIndex), "create_index");
+        assert_eq!(
+            write_kind_label(&WriteKind::CreateIndexConcurrent),
+            "create_index_concurrent"
+        );
+        assert_eq!(write_kind_label(&WriteKind::LockTable), "lock_table");
+        assert_eq!(write_kind_label(&WriteKind::Reindex), "reindex");
+        assert_eq!(write_kind_label(&WriteKind::Vacuum), "vacuum");
+        assert_eq!(write_kind_label(&WriteKind::VacuumFull), "vacuum_full");
+        assert_eq!(write_kind_label(&WriteKind::Analyze), "analyze");
+        assert_eq!(write_kind_label(&WriteKind::Cluster), "cluster");
+        assert_eq!(write_kind_label(&WriteKind::Truncate), "truncate");
+    }
+
+    #[test]
+    fn ddl_write_kind_predicate() {
+        assert!(is_ddl_write_kind(&WriteKind::Truncate));
+        assert!(is_ddl_write_kind(&WriteKind::AlterTable));
+        assert!(is_ddl_write_kind(&WriteKind::DropTable));
+        assert!(is_ddl_write_kind(&WriteKind::CreateIndex));
+        assert!(is_ddl_write_kind(&WriteKind::CreateIndexConcurrent));
+        assert!(is_ddl_write_kind(&WriteKind::Reindex));
+        assert!(is_ddl_write_kind(&WriteKind::Cluster));
+        assert!(!is_ddl_write_kind(&WriteKind::LockTable));
+        assert!(!is_ddl_write_kind(&WriteKind::Vacuum));
+        assert!(!is_ddl_write_kind(&WriteKind::Analyze));
+        assert!(!is_ddl_write_kind(&WriteKind::VacuumFull));
+        assert!(!is_ddl_write_kind(&WriteKind::Insert));
+    }
+
+    #[test]
+    fn access_mode_label_keeps_rw_hides_l1_l2_l3() {
+        let empty = HashSet::new();
+        assert_eq!(
+            access_mode_label(AccessMode::Read, &empty).as_deref(),
+            Some("R")
+        );
+        let mut wk = HashSet::new();
+        wk.insert(WriteKind::Insert);
+        assert_eq!(
+            access_mode_label(AccessMode::Write, &wk).as_deref(),
+            Some("W:insert")
+        );
+    }
+
+    #[test]
+    fn access_mode_label_emits_l8_and_d_for_truncate() {
+        let mut wk = HashSet::new();
+        wk.insert(WriteKind::Truncate);
+        assert_eq!(
+            access_mode_label(AccessMode::AccessExclusive, &wk).as_deref(),
+            Some("L8,D:truncate")
+        );
+    }
+
+    #[test]
+    fn access_mode_label_lock_table_l6_has_no_d() {
+        let mut wk = HashSet::new();
+        wk.insert(WriteKind::LockTable);
+        assert_eq!(
+            access_mode_label(AccessMode::ShareRowExclusive, &wk).as_deref(),
+            Some("L6")
+        );
+    }
+
+    #[test]
+    fn access_mode_label_mixed_dml_ddl_highest_only() {
+        let mut wk = HashSet::new();
+        wk.insert(WriteKind::Insert);
+        wk.insert(WriteKind::AlterTable);
+        let modes = AccessMode::Read | AccessMode::Write | AccessMode::AccessExclusive;
+        assert_eq!(
+            access_mode_label(modes, &wk).as_deref(),
+            Some("R,W:insert,L8,D:alter")
+        );
+    }
+
+    #[test]
+    fn highest_lock_level_prefers_l8_over_l1() {
+        let modes = AccessMode::Read | AccessMode::AccessExclusive;
+        assert_eq!(highest_lock_level(modes), Some(8));
+        assert_eq!(highest_lock_level(AccessMode::Write), Some(3));
+        assert_eq!(highest_lock_level(AccessMode::empty()), None);
     }
 
     #[test]

@@ -143,6 +143,27 @@ struct ImpactEntry {
     line: Option<usize>,
 }
 
+/// `conflicts` JSON output schema (schema_version=1).
+/// Static analysis: "would conflict IF executed concurrently". No transaction model.
+#[derive(Serialize)]
+struct ConflictsResult {
+    schema_version: u32,
+    severity_filter: String,
+    conflicts: Vec<ConflictEntry>,
+}
+
+#[derive(Serialize)]
+struct ConflictEntry {
+    severity: String,
+    table: String,
+    proc_a: String,
+    proc_b: String,
+    lock_a: String,
+    lock_b: String,
+    modes_a: Vec<String>,
+    modes_b: Vec<String>,
+}
+
 /// `impact --file` / `impact --node` JSON output schema (schema_version=2)
 #[derive(Serialize)]
 struct ImpactResult {
@@ -731,6 +752,25 @@ enum Commands {
         #[arg(long)]
         fail_on_multiple: bool,
     },
+
+    /// Report cross-procedure table-lock conflicts (static analysis)
+    Conflicts {
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+
+        /// Minimum severity to report
+        #[arg(long, default_value = "high", value_parser = ["high", "medium"])]
+        severity: String,
+
+        /// Output format
+        #[arg(short, long, default_value = "json", value_parser = ["json", "text"])]
+        format: String,
+
+        /// Filter by table name (substring)
+        #[arg(long)]
+        table: Option<String>,
+    },
 }
 
 fn match_mode_from_flags(exact: bool, regex: bool) -> crate::graph::search::MatchMode {
@@ -1058,7 +1098,152 @@ fn run() -> Result<()> {
                 fail_on_multiple,
             )
         }
+        Some(Commands::Conflicts {
+            project,
+            severity,
+            format,
+            table,
+        }) => cmd_conflicts(&project, &severity, &format, table.as_deref()),
     }
+}
+
+fn cmd_conflicts(
+    project: &Path,
+    severity: &str,
+    format: &str,
+    table_filter: Option<&str>,
+) -> Result<()> {
+    use crate::graph::conflict::{find_conflicts, ConflictSeverity};
+    use crate::graph::{highest_lock_level, AccessMode, Node};
+
+    let mut proj = project::Project::find(project)?;
+    let store = match proj.load_store() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Project not analyzed. Run `codeweb analyze` first.");
+            return Ok(());
+        }
+    };
+    let graph = store.graph();
+
+    let min = match severity {
+        "medium" => ConflictSeverity::Medium,
+        _ => ConflictSeverity::High,
+    };
+
+    let node_name = |idx: petgraph::graph::NodeIndex| -> String {
+        match &graph[idx] {
+            Node::Procedure { id, .. } | Node::Function { id, .. } => id.to_string(),
+            Node::Table {
+                schema: Some(s),
+                name,
+                ..
+            }
+            | Node::View {
+                schema: Some(s),
+                name,
+                ..
+            }
+            | Node::MaterializedView {
+                schema: Some(s),
+                name,
+                ..
+            } => format!("{s}.{name}"),
+            Node::Table { name, .. }
+            | Node::View { name, .. }
+            | Node::MaterializedView { name, .. } => name.clone(),
+            other => format!("{other:?}"),
+        }
+    };
+
+    let mode_strs = |modes: AccessMode| -> Vec<String> {
+        [
+            (AccessMode::Read, "read"),
+            (AccessMode::Write, "write"),
+            (AccessMode::LockRead, "lock_read"),
+            (AccessMode::AccessExclusive, "access_exclusive"),
+            (AccessMode::ShareUpdateExclusive, "share_update_exclusive"),
+            (AccessMode::Share, "share"),
+            (AccessMode::ShareRowExclusive, "share_row_exclusive"),
+            (AccessMode::Exclusive, "exclusive"),
+        ]
+        .iter()
+        .filter(|(flag, _)| modes.contains(*flag))
+        .map(|(_, s)| (*s).to_string())
+        .collect()
+    };
+
+    let lock_label = |modes: AccessMode| -> String {
+        match highest_lock_level(modes) {
+            Some(n) => format!("L{n}"),
+            None => "-".to_string(),
+        }
+    };
+
+    let mut entries: Vec<ConflictEntry> = find_conflicts(graph)
+        .into_iter()
+        .filter(|c| c.severity >= min)
+        .filter(|c| {
+            table_filter
+                .map(|f| {
+                    node_name(c.table)
+                        .to_lowercase()
+                        .contains(&f.to_lowercase())
+                })
+                .unwrap_or(true)
+        })
+        .map(|c| ConflictEntry {
+            severity: match c.severity {
+                ConflictSeverity::High => "high".to_string(),
+                ConflictSeverity::Medium => "medium".to_string(),
+            },
+            table: node_name(c.table),
+            proc_a: node_name(c.proc_a),
+            proc_b: node_name(c.proc_b),
+            lock_a: lock_label(c.modes_a),
+            lock_b: lock_label(c.modes_b),
+            modes_a: mode_strs(c.modes_a),
+            modes_b: mode_strs(c.modes_b),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(a.table.cmp(&b.table))
+            .then(a.proc_a.cmp(&b.proc_a))
+            .then(a.proc_b.cmp(&b.proc_b))
+    });
+
+    if format == "text" {
+        if entries.is_empty() {
+            println!("No lock conflicts.");
+        } else {
+            for e in &entries {
+                println!(
+                    "{}  table {}: {} [{}] vs {} [{}]",
+                    e.severity.to_uppercase(),
+                    e.table,
+                    e.proc_a,
+                    e.lock_a,
+                    e.proc_b,
+                    e.lock_b
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let result = ConflictsResult {
+        schema_version: 1,
+        severity_filter: severity.to_string(),
+        conflicts: entries,
+    };
+    let json =
+        serde_json::to_string_pretty(&result).map_err(|e| error::CodeWebError::ExportError {
+            message: e.to_string(),
+        })?;
+    println!("{json}");
+    Ok(())
 }
 
 fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {

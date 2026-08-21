@@ -1,4 +1,4 @@
-use crate::graph::{AccessMode, CodeGraph, Edge, Node};
+use crate::graph::{highest_lock_level, AccessMode, CodeGraph, Edge, Node};
 
 pub fn to_mermaid(graph: &CodeGraph) -> String {
     let mut out = String::from("graph LR\n");
@@ -158,7 +158,8 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::Implements { .. } => "-->",
             Edge::DirectCall { .. } => "-->",
             Edge::TableAccess { modes, .. } => {
-                if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate) {
+                let high = highest_lock_level(*modes);
+                if high.is_some_and(|l| l >= 4) || modes.contains(AccessMode::Write) {
                     "==>"
                 } else {
                     "-.->"

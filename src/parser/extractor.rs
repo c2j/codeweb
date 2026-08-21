@@ -1428,12 +1428,110 @@ impl TableAccessExtractor {
     }
 }
 
+fn lock_mode_from_lock_table(mode: &str) -> AccessMode {
+    let n: String = mode
+        .split_whitespace()
+        .map(|w| w.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match n.as_str() {
+        "" | "ACCESS EXCLUSIVE" => AccessMode::AccessExclusive,
+        "ACCESS SHARE" => AccessMode::Read,
+        "ROW SHARE" => AccessMode::LockRead,
+        "ROW EXCLUSIVE" => AccessMode::Write,
+        "SHARE UPDATE EXCLUSIVE" => AccessMode::ShareUpdateExclusive,
+        "SHARE" => AccessMode::Share,
+        "SHARE ROW EXCLUSIVE" => AccessMode::ShareRowExclusive,
+        "EXCLUSIVE" => AccessMode::Exclusive,
+        _ => AccessMode::AccessExclusive,
+    }
+}
+
 impl Visitor for TableAccessExtractor {
     fn visit_statement(&mut self, stmt: &Statement) -> VisitorResult {
         match stmt {
             Statement::Truncate(truncate) => {
                 for table in &truncate.tables {
-                    self.add_access(table, AccessMode::Truncate, Some(WriteKind::Truncate));
+                    self.add_access(
+                        table,
+                        AccessMode::AccessExclusive,
+                        Some(WriteKind::Truncate),
+                    );
+                }
+            }
+            Statement::AlterTable(alter) => {
+                self.add_access(
+                    &alter.name,
+                    AccessMode::AccessExclusive,
+                    Some(WriteKind::AlterTable),
+                );
+            }
+            Statement::Drop(drop) => {
+                if matches!(drop.object_type, ogsql_parser::ast::ObjectType::Table) {
+                    for name in &drop.names {
+                        self.add_access(
+                            name,
+                            AccessMode::AccessExclusive,
+                            Some(WriteKind::DropTable),
+                        );
+                    }
+                }
+            }
+            Statement::CreateIndex(idx) => {
+                let (mode, wk) = if idx.concurrent {
+                    (
+                        AccessMode::ShareUpdateExclusive,
+                        WriteKind::CreateIndexConcurrent,
+                    )
+                } else {
+                    (AccessMode::Share, WriteKind::CreateIndex)
+                };
+                self.add_access(&idx.table, mode, Some(wk));
+            }
+            Statement::CreateGlobalIndex(idx) => {
+                let (mode, wk) = if idx.concurrent {
+                    (
+                        AccessMode::ShareUpdateExclusive,
+                        WriteKind::CreateIndexConcurrent,
+                    )
+                } else {
+                    (AccessMode::Share, WriteKind::CreateIndex)
+                };
+                self.add_access(&idx.table, mode, Some(wk));
+            }
+            Statement::Lock(lock) => {
+                let mode = lock_mode_from_lock_table(&lock.mode);
+                for table in &lock.tables {
+                    self.add_access(table, mode, Some(WriteKind::LockTable));
+                }
+            }
+            Statement::Vacuum(vac) => {
+                let (mode, wk) = if vac.full {
+                    (AccessMode::AccessExclusive, WriteKind::VacuumFull)
+                } else {
+                    (AccessMode::ShareUpdateExclusive, WriteKind::Vacuum)
+                };
+                for t in &vac.tables {
+                    self.add_access(&t.name, mode, Some(wk));
+                }
+            }
+            Statement::Analyze(an) => {
+                for t in &an.tables {
+                    self.add_access(
+                        &t.name,
+                        AccessMode::ShareUpdateExclusive,
+                        Some(WriteKind::Analyze),
+                    );
+                }
+            }
+            Statement::Cluster(cl) => {
+                if let Some(table) = &cl.table {
+                    self.add_access(table, AccessMode::AccessExclusive, Some(WriteKind::Cluster));
+                }
+            }
+            Statement::Reindex(ri) => {
+                if let ogsql_parser::ast::ReindexTarget::Table(name) = &ri.target {
+                    self.add_access(name, AccessMode::AccessExclusive, Some(WriteKind::Reindex));
                 }
             }
             Statement::Merge(merge) => {
@@ -3893,13 +3991,110 @@ mod tests {
         assert_eq!(accesses.len(), 1, "expected 1 access, got: {:?}", accesses);
         let t1 = find_access(&accesses, "t1").expect("t1 not found");
         assert!(
-            t1.modes.contains(AccessMode::Truncate),
-            "t1 should be Truncate"
+            t1.modes.contains(AccessMode::AccessExclusive),
+            "t1 should be AccessExclusive"
         );
         assert!(
             t1.write_kinds.contains(&WriteKind::Truncate),
             "t1 should have Truncate write_kind"
         );
+    }
+
+    #[test]
+    fn ddl_lock_alter_table_rename_is_l8() {
+        let accesses = extract_accesses("ALTER TABLE t_stage RENAME TO t_old");
+        let a = find_access(&accesses, "t_stage").unwrap();
+        assert!(a.modes.contains(AccessMode::AccessExclusive));
+        assert!(a.write_kinds.contains(&WriteKind::AlterTable));
+    }
+
+    #[test]
+    fn ddl_lock_drop_table_is_l8() {
+        let accesses = extract_accesses("DROP TABLE t_log");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::AccessExclusive));
+        assert!(a.write_kinds.contains(&WriteKind::DropTable));
+    }
+
+    #[test]
+    fn ddl_lock_drop_index_is_ignored() {
+        let accesses = extract_accesses("DROP INDEX idx_t_log");
+        assert!(
+            accesses.is_empty(),
+            "DROP INDEX is not a table access: {accesses:?}"
+        );
+    }
+
+    #[test]
+    fn ddl_lock_create_index_is_l5() {
+        let accesses = extract_accesses("CREATE INDEX idx ON t_log (id)");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::Share));
+        assert!(a.write_kinds.contains(&WriteKind::CreateIndex));
+    }
+
+    #[test]
+    fn ddl_lock_create_index_concurrently_is_l4() {
+        let accesses = extract_accesses("CREATE INDEX CONCURRENTLY idx ON t_log (id)");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::ShareUpdateExclusive));
+        assert!(a.write_kinds.contains(&WriteKind::CreateIndexConcurrent));
+    }
+
+    #[test]
+    fn ddl_lock_lock_table_share_row_exclusive_is_l6() {
+        let accesses = extract_accesses("LOCK TABLE t_log IN SHARE ROW EXCLUSIVE MODE");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::ShareRowExclusive));
+        assert!(a.write_kinds.contains(&WriteKind::LockTable));
+        assert!(!a.write_kinds.iter().any(crate::graph::is_ddl_write_kind));
+    }
+
+    #[test]
+    fn ddl_lock_lock_table_default_is_l8() {
+        let accesses = extract_accesses("LOCK TABLE t_log");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::AccessExclusive));
+    }
+
+    #[test]
+    fn ddl_lock_vacuum_full_is_l8_vacuum_is_l4() {
+        let full_acc = extract_accesses("VACUUM FULL t_log");
+        let full = find_access(&full_acc, "t_log").unwrap();
+        assert!(full.modes.contains(AccessMode::AccessExclusive));
+        assert!(full.write_kinds.contains(&WriteKind::VacuumFull));
+        let vac_acc = extract_accesses("VACUUM t_log");
+        let v = find_access(&vac_acc, "t_log").unwrap();
+        assert!(v.modes.contains(AccessMode::ShareUpdateExclusive));
+        assert!(v.write_kinds.contains(&WriteKind::Vacuum));
+    }
+
+    #[test]
+    fn ddl_lock_analyze_is_l4() {
+        let accesses = extract_accesses("ANALYZE t_log");
+        let a = find_access(&accesses, "t_log").unwrap();
+        assert!(a.modes.contains(AccessMode::ShareUpdateExclusive));
+        assert!(a.write_kinds.contains(&WriteKind::Analyze));
+    }
+
+    #[test]
+    fn ddl_lock_cluster_and_reindex_table_are_l8() {
+        let cluster_acc = extract_accesses("CLUSTER t_log");
+        let c = find_access(&cluster_acc, "t_log").unwrap();
+        assert!(c.modes.contains(AccessMode::AccessExclusive));
+        assert!(c.write_kinds.contains(&WriteKind::Cluster));
+        let reindex_acc = extract_accesses("REINDEX TABLE t_log");
+        let r = find_access(&reindex_acc, "t_log").unwrap();
+        assert!(r.modes.contains(AccessMode::AccessExclusive));
+        assert!(r.write_kinds.contains(&WriteKind::Reindex));
+    }
+
+    #[test]
+    fn ddl_lock_truncate_uses_access_exclusive_bit() {
+        let accesses = extract_accesses("TRUNCATE TABLE t1");
+        let t1 = find_access(&accesses, "t1").unwrap();
+        assert!(t1.modes.contains(AccessMode::AccessExclusive));
+        assert!(t1.write_kinds.contains(&WriteKind::Truncate));
     }
 
     #[test]

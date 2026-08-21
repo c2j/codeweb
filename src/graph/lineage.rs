@@ -2212,4 +2212,20 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn ddl_write_kinds_do_not_produce_columns() {
+        for k in [
+            WriteKind::Truncate,
+            WriteKind::AlterTable,
+            WriteKind::DropTable,
+            WriteKind::CreateIndex,
+            WriteKind::LockTable,
+            WriteKind::Vacuum,
+        ] {
+            let mut s = HashSet::new();
+            s.insert(k);
+            assert!(!produces_columns(&s), "{k:?}");
+        }
+    }
 }

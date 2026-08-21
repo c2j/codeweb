@@ -1,5 +1,5 @@
 use crate::graph::cluster::ClusterResult;
-use crate::graph::{AccessMode, CodeGraph, Edge, Node};
+use crate::graph::{highest_lock_level, AccessMode, CodeGraph, Edge, Node};
 use petgraph::graph::NodeIndex;
 use std::collections::HashMap;
 
@@ -324,11 +324,14 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
         Edge::TableAccess {
             modes, write_kinds, ..
         } => {
-            let color = if modes.contains(AccessMode::Read) && modes.contains(AccessMode::Write) {
+            let high = highest_lock_level(*modes);
+            let color = if high.is_some_and(|l| l >= 4) {
+                "red"
+            } else if modes.contains(AccessMode::Read) && modes.contains(AccessMode::Write) {
                 "purple"
             } else if modes.contains(AccessMode::LockRead) {
                 "orange"
-            } else if modes.contains(AccessMode::Write) || modes.contains(AccessMode::Truncate) {
+            } else if modes.contains(AccessMode::Write) {
                 "red"
             } else {
                 "blue"
