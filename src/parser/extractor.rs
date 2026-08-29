@@ -2925,11 +2925,59 @@ impl Visitor for ColumnAccessExtractor {
                         }
                     }
                 }
-                // DEFAULT VALUES has no sources; `SET` is handled as assignments; a
-                // record variable needs the variable's own type to expand.
+                // DEFAULT VALUES has no sources; `SET` is handled as assignments.
                 ogsql_parser::ast::InsertSource::DefaultValues
-                | ogsql_parser::ast::InsertSource::Set(_)
-                | ogsql_parser::ast::InsertSource::RecordVariable(_) => {}
+                | ogsql_parser::ast::InsertSource::Set(_) => {}
+                // #142: `INSERT INTO t (a, b) VALUES r` — expand the record's
+                // fields through its `%ROWTYPE` anchor. Cursor-anchored records
+                // resolve positionally through the cursor's SELECT sources; a
+                // table-anchored record needs the table's column order (DDL),
+                // which is unavailable here, so it is left unresolved (documented
+                // limitation).
+                ogsql_parser::ast::InsertSource::RecordVariable(expr) => {
+                    if let Expr::ColumnRef(names) | Expr::PlVariable(names) =
+                        peel_parenthesized(expr)
+                    {
+                        let rec = names.join(".").to_lowercase();
+                        if let Some(anchor) = self.record_cursors.get(&rec) {
+                            if let Some(cols) = self.cursor_sources.get(anchor) {
+                                for (position, column) in insert.columns.iter().enumerate() {
+                                    let col = cols.get(position).or(match cols.as_slice() {
+                                        [single] if single.output_name.is_empty() => Some(single),
+                                        _ => None,
+                                    });
+                                    let source = col.and_then(|c| {
+                                        if !c.source_col.is_empty() {
+                                            Some(ColumnSource::Column {
+                                                table: c.source_table.clone(),
+                                                column: c.source_col.clone(),
+                                            })
+                                        } else if c.source_table.is_some() {
+                                            // Catch-all (`SELECT *` cursor): attribute
+                                            // under the target column's own name.
+                                            Some(ColumnSource::Column {
+                                                table: c.source_table.clone(),
+                                                column: column.clone(),
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(source) = source {
+                                        self.column_mappings.push(ColumnMapping {
+                                            target_table: Some(table_name.clone()),
+                                            target_column: column.clone(),
+                                            position: Some(position),
+                                            sources: vec![source],
+                                            kind: MappingKind::Direct,
+                                            expression: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if let ogsql_parser::ast::InsertSource::Select(select) = &insert.source {
             // No column list: name the target columns from the SELECT output (the first
@@ -3101,6 +3149,31 @@ impl ColumnAccessExtractor {
                             };
                         }
                     }
+                    // #142: a single catch-all cursor source (empty output name —
+                    // `SELECT *` cursor, or dynamic-SQL attribution) covers every
+                    // record field: the exact column is unknown, attribute to the
+                    // cursor's table under the field's own name (same philosophy as
+                    // `resolve_cursor_flows`).
+                    if let [single] = cols.as_slice() {
+                        if single.output_name.is_empty() {
+                            if let Some(ref t) = single.source_table {
+                                return ColumnSource::Column {
+                                    table: Some(t.clone()),
+                                    column: column.clone(),
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    // #142: the `%ROWTYPE` anchor is a TABLE, not a registered
+                    // cursor (`rec t_src%ROWTYPE`): the record's fields are that
+                    // table's columns. (A custom record TYPE anchor is rare; it
+                    // would attribute the type name as a table — the field is
+                    // still attributable, unlike the old `?.field`.)
+                    return ColumnSource::Column {
+                        table: Some(cursor.clone()),
+                        column: column.clone(),
+                    };
                 }
             }
         }
@@ -3287,6 +3360,14 @@ impl ColumnAccessExtractor {
         position: Option<usize>,
         value: &Expr,
     ) {
+        // #142: a scalar subquery as a value (`INSERT .. SELECT (SELECT ...)`,
+        // `VALUES ((SELECT ...))`, `SET x = (SELECT ...)`, MERGE values) contributes
+        // the inner select's FIRST output expression as the source, resolved in the
+        // subquery's own FROM scope.
+        if let Expr::Subquery(select) = peel_parenthesized(value) {
+            self.push_subquery_column_mapping(target_table, target_column, position, select);
+            return;
+        }
         let (sources, kind, expression) = self.classify_value_expr(value);
         self.column_mappings.push(ColumnMapping {
             target_table,
@@ -3295,6 +3376,61 @@ impl ColumnAccessExtractor {
             sources,
             kind,
             expression,
+        });
+    }
+
+    /// Column mapping for `target = (SELECT first_expr FROM ...)`: resolve the
+    /// subquery's first select-list expression against the subquery's own FROM
+    /// aliases, then restore the enclosing statement's scope. Correlated
+    /// references (`s.id` in the subquery's WHERE) are not value sources and are
+    /// intentionally not collected — only the first select-list expression feeds
+    /// the written column.
+    fn push_subquery_column_mapping(
+        &mut self,
+        target_table: Option<String>,
+        target_column: String,
+        position: Option<usize>,
+        select: &SelectStatement,
+    ) {
+        let saved_alias_map = self.alias_map.clone();
+        self.collect_aliases_from_table_refs(&select.from);
+        let new_scope = self.scope_sole_table_of(&select.from);
+        let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+
+        let mut sources = Vec::new();
+        let mut kind = MappingKind::Derived;
+        let mut expression: Option<String> = None;
+        if let Some(SelectTarget::Expr(first, _)) = select.targets.first() {
+            let first = peel_parenthesized(first);
+            self.collect_value_sources(first, &mut sources);
+            // An entirely-literal first target (`(SELECT 'x' FROM dual)`) is a
+            // constant; collect_value_sources skips literals by design, so record
+            // it here as a Literal source rather than leaving the mapping empty.
+            if sources.is_empty() {
+                if let Expr::Literal(lit) = first {
+                    sources.push(ColumnSource::Literal {
+                        value: format_literal_short(lit),
+                    });
+                }
+            }
+            if matches!(sources.as_slice(), [ColumnSource::Column { .. }]) {
+                kind = MappingKind::Direct;
+            }
+            expression = Some(format_expr_short(first));
+        }
+
+        self.scope_sole_table = saved_scope;
+        self.alias_map = saved_alias_map;
+
+        // A plain copy needs no expression text (mirrors `insert_select_maps_columns_by_position`).
+        let is_direct = matches!(kind, MappingKind::Direct);
+        self.column_mappings.push(ColumnMapping {
+            target_table,
+            target_column,
+            position,
+            sources,
+            kind,
+            expression: if is_direct { None } else { expression },
         });
     }
 
@@ -4928,6 +5064,22 @@ mod column_tests {
             .collect()
     }
 
+    /// Column mappings with a seeded procedure variable context (#142): lets a
+    /// standalone INSERT walk see cursor/record bindings that in real procedures
+    /// come from the DECLARE block.
+    fn column_mappings_of_with_context(sql: &str, ctx: &ProcedureVarContext) -> Vec<ColumnMapping> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut result = Vec::new();
+        for info in &stmts {
+            let mut extractor = ColumnAccessExtractor::new_with_context(ctx);
+            walk_statement(&mut extractor, &info.statement);
+            result.extend(extractor.finish().column_mappings);
+        }
+        result
+    }
+
     /// Column mappings of a view body, via the explicit `CREATE VIEW` entry point.
     fn view_column_mappings(view: &str, declared: &[&str], select_sql: &str) -> Vec<ColumnMapping> {
         let tokens = Tokenizer::new(select_sql).tokenize().unwrap();
@@ -5105,6 +5257,117 @@ mod column_tests {
             vec![ColumnSource::Literal {
                 value: "42".to_string()
             }]
+        );
+    }
+
+    /// #142: a scalar subquery as an INSERT..SELECT target contributes the inner
+    /// select's FIRST expression as the source, resolved in the subquery's own FROM
+    /// scope. Correlated refs (`s.id` in WHERE) must NOT leak as sources.
+    #[test]
+    fn scalar_subquery_target_resolves_its_first_column() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (id, code) \
+             SELECT s.id, (SELECT r.code FROM t_ref r WHERE r.id = s.id) FROM t_src s",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Direct);
+        assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
+    }
+
+    /// #142: the choke point is push_column_mapping, so INSERT..VALUES subqueries
+    /// resolve too.
+    #[test]
+    fn scalar_subquery_in_insert_values_resolves() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) VALUES ((SELECT r.code FROM t_ref r WHERE r.id = 1))",
+        );
+        assert_eq!(
+            find_mapping(&maps, "code").sources,
+            vec![col(Some("t_ref"), "code")]
+        );
+    }
+
+    /// #142: a `rec t%ROWTYPE` record (anchor is a TABLE, not a registered cursor)
+    /// resolves its fields to that table's columns.
+    #[test]
+    fn table_rowtype_record_field_resolves_to_table_column() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.record_cursors
+            .insert("r".to_string(), "t_src".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: a `SELECT *` cursor produces a single catch-all cursor source (empty
+    /// output name, table attributed). Record fields over it attribute to the
+    /// cursor's table under the field's own name.
+    #[test]
+    fn star_cursor_rowtype_record_field_attributes_to_cursor_table() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: `INSERT INTO t (a, b) VALUES r` with a cursor-anchored %ROWTYPE record
+    /// expands the record's fields positionally through the cursor's SELECT sources.
+    #[test]
+    fn whole_record_insert_expands_cursor_rowtype_fields() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![
+                CursorColumn {
+                    output_name: "id".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "id".to_string(),
+                },
+                CursorColumn {
+                    output_name: "amt".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "amt".to_string(),
+                },
+            ],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context("INSERT INTO t_dst (id, amt) VALUES r", &ctx);
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
         );
     }
 
