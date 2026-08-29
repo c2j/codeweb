@@ -383,6 +383,41 @@ END;
     );
 }
 
+/// #142: a table-anchored %ROWTYPE record (`r t_src%ROWTYPE`) written via
+/// `VALUES (r.id, r.amt)` must resolve to t_src columns, not "?.id".
+#[test]
+fn table_rowtype_record_insert_values_resolves_to_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_table_rowtype AS
+  r t_src%ROWTYPE;
+  CURSOR cur IS SELECT id, amt FROM t_src;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_src.id"),
+        "table-anchored record field must resolve:\n{out}"
+    );
+    assert!(
+        !out.contains("?.id"),
+        "table-anchored record field must not stay unattributed:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list

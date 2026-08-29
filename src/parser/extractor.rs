@@ -3101,6 +3101,16 @@ impl ColumnAccessExtractor {
                             };
                         }
                     }
+                } else {
+                    // #142: the `%ROWTYPE` anchor is a TABLE, not a registered
+                    // cursor (`rec t_src%ROWTYPE`): the record's fields are that
+                    // table's columns. (A custom record TYPE anchor is rare; it
+                    // would attribute the type name as a table — the field is
+                    // still attributable, unlike the old `?.field`.)
+                    return ColumnSource::Column {
+                        table: Some(cursor.clone()),
+                        column: column.clone(),
+                    };
                 }
             }
         }
@@ -4991,6 +5001,22 @@ mod column_tests {
             .collect()
     }
 
+    /// Column mappings with a seeded procedure variable context (#142): lets a
+    /// standalone INSERT walk see cursor/record bindings that in real procedures
+    /// come from the DECLARE block.
+    fn column_mappings_of_with_context(sql: &str, ctx: &ProcedureVarContext) -> Vec<ColumnMapping> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut result = Vec::new();
+        for info in &stmts {
+            let mut extractor = ColumnAccessExtractor::new_with_context(ctx);
+            walk_statement(&mut extractor, &info.statement);
+            result.extend(extractor.finish().column_mappings);
+        }
+        result
+    }
+
     /// Column mappings of a view body, via the explicit `CREATE VIEW` entry point.
     fn view_column_mappings(view: &str, declared: &[&str], select_sql: &str) -> Vec<ColumnMapping> {
         let tokens = Tokenizer::new(select_sql).tokenize().unwrap();
@@ -5195,6 +5221,27 @@ mod column_tests {
         assert_eq!(
             find_mapping(&maps, "code").sources,
             vec![col(Some("t_ref"), "code")]
+        );
+    }
+
+    /// #142: a `rec t%ROWTYPE` record (anchor is a TABLE, not a registered cursor)
+    /// resolves its fields to that table's columns.
+    #[test]
+    fn table_rowtype_record_field_resolves_to_table_column() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.record_cursors
+            .insert("r".to_string(), "t_src".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
         );
     }
 
