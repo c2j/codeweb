@@ -2925,11 +2925,59 @@ impl Visitor for ColumnAccessExtractor {
                         }
                     }
                 }
-                // DEFAULT VALUES has no sources; `SET` is handled as assignments; a
-                // record variable needs the variable's own type to expand.
+                // DEFAULT VALUES has no sources; `SET` is handled as assignments.
                 ogsql_parser::ast::InsertSource::DefaultValues
-                | ogsql_parser::ast::InsertSource::Set(_)
-                | ogsql_parser::ast::InsertSource::RecordVariable(_) => {}
+                | ogsql_parser::ast::InsertSource::Set(_) => {}
+                // #142: `INSERT INTO t (a, b) VALUES r` — expand the record's
+                // fields through its `%ROWTYPE` anchor. Cursor-anchored records
+                // resolve positionally through the cursor's SELECT sources; a
+                // table-anchored record needs the table's column order (DDL),
+                // which is unavailable here, so it is left unresolved (documented
+                // limitation).
+                ogsql_parser::ast::InsertSource::RecordVariable(expr) => {
+                    if let Expr::ColumnRef(names) | Expr::PlVariable(names) =
+                        peel_parenthesized(expr)
+                    {
+                        let rec = names.join(".").to_lowercase();
+                        if let Some(anchor) = self.record_cursors.get(&rec) {
+                            if let Some(cols) = self.cursor_sources.get(anchor) {
+                                for (position, column) in insert.columns.iter().enumerate() {
+                                    let col = cols.get(position).or(match cols.as_slice() {
+                                        [single] if single.output_name.is_empty() => Some(single),
+                                        _ => None,
+                                    });
+                                    let source = col.and_then(|c| {
+                                        if !c.source_col.is_empty() {
+                                            Some(ColumnSource::Column {
+                                                table: c.source_table.clone(),
+                                                column: c.source_col.clone(),
+                                            })
+                                        } else if c.source_table.is_some() {
+                                            // Catch-all (`SELECT *` cursor): attribute
+                                            // under the target column's own name.
+                                            Some(ColumnSource::Column {
+                                                table: c.source_table.clone(),
+                                                column: column.clone(),
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(source) = source {
+                                        self.column_mappings.push(ColumnMapping {
+                                            target_table: Some(table_name.clone()),
+                                            target_column: column.clone(),
+                                            position: Some(position),
+                                            sources: vec![source],
+                                            kind: MappingKind::Direct,
+                                            expression: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if let ogsql_parser::ast::InsertSource::Select(select) = &insert.source {
             // No column list: name the target columns from the SELECT output (the first
@@ -5280,6 +5328,39 @@ mod column_tests {
             "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
             &ctx,
         );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: `INSERT INTO t (a, b) VALUES r` with a cursor-anchored %ROWTYPE record
+    /// expands the record's fields positionally through the cursor's SELECT sources.
+    #[test]
+    fn whole_record_insert_expands_cursor_rowtype_fields() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![
+                CursorColumn {
+                    output_name: "id".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "id".to_string(),
+                },
+                CursorColumn {
+                    output_name: "amt".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "amt".to_string(),
+                },
+            ],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context("INSERT INTO t_dst (id, amt) VALUES r", &ctx);
         assert_eq!(
             find_mapping(&maps, "id").sources,
             vec![col(Some("t_src"), "id")]

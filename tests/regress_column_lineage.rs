@@ -453,6 +453,37 @@ END;
     );
 }
 
+/// #142: whole-record insert `INSERT INTO t_dst (id, amt) VALUES r` (cursor-anchored
+/// %ROWTYPE) must resolve positionally through the cursor's sources.
+#[test]
+fn whole_record_insert_values_r_resolves_through_cursor() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_rec_insert AS
+  CURSOR cur IS SELECT id, amt FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES r;
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        out.contains("t_src.amt"),
+        "whole-record insert must resolve through the cursor:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list
