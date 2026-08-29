@@ -484,6 +484,38 @@ END;
     );
 }
 
+/// #142 characteristic test: cursor-anchored %ROWTYPE record written via
+/// `VALUES (r.id, r.amt)` resolves to the cursor's source columns (fixed by #148;
+/// this locks the behavior so later extraction changes cannot regress it).
+#[test]
+fn cursor_rowtype_record_insert_values_resolves_to_cursor_source() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_copy_cursor AS
+  CURSOR cur IS SELECT id, amt FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        out.contains("t_src.amt"),
+        "cursor %ROWTYPE record field must resolve:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list
