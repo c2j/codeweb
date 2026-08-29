@@ -3287,6 +3287,14 @@ impl ColumnAccessExtractor {
         position: Option<usize>,
         value: &Expr,
     ) {
+        // #142: a scalar subquery as a value (`INSERT .. SELECT (SELECT ...)`,
+        // `VALUES ((SELECT ...))`, `SET x = (SELECT ...)`, MERGE values) contributes
+        // the inner select's FIRST output expression as the source, resolved in the
+        // subquery's own FROM scope.
+        if let Expr::Subquery(select) = peel_parenthesized(value) {
+            self.push_subquery_column_mapping(target_table, target_column, position, select);
+            return;
+        }
         let (sources, kind, expression) = self.classify_value_expr(value);
         self.column_mappings.push(ColumnMapping {
             target_table,
@@ -3295,6 +3303,61 @@ impl ColumnAccessExtractor {
             sources,
             kind,
             expression,
+        });
+    }
+
+    /// Column mapping for `target = (SELECT first_expr FROM ...)`: resolve the
+    /// subquery's first select-list expression against the subquery's own FROM
+    /// aliases, then restore the enclosing statement's scope. Correlated
+    /// references (`s.id` in the subquery's WHERE) are not value sources and are
+    /// intentionally not collected — only the first select-list expression feeds
+    /// the written column.
+    fn push_subquery_column_mapping(
+        &mut self,
+        target_table: Option<String>,
+        target_column: String,
+        position: Option<usize>,
+        select: &SelectStatement,
+    ) {
+        let saved_alias_map = self.alias_map.clone();
+        self.collect_aliases_from_table_refs(&select.from);
+        let new_scope = self.scope_sole_table_of(&select.from);
+        let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+
+        let mut sources = Vec::new();
+        let mut kind = MappingKind::Derived;
+        let mut expression: Option<String> = None;
+        if let Some(SelectTarget::Expr(first, _)) = select.targets.first() {
+            let first = peel_parenthesized(first);
+            self.collect_value_sources(first, &mut sources);
+            // An entirely-literal first target (`(SELECT 'x' FROM dual)`) is a
+            // constant; collect_value_sources skips literals by design, so record
+            // it here as a Literal source rather than leaving the mapping empty.
+            if sources.is_empty() {
+                if let Expr::Literal(lit) = first {
+                    sources.push(ColumnSource::Literal {
+                        value: format_literal_short(lit),
+                    });
+                }
+            }
+            if matches!(sources.as_slice(), [ColumnSource::Column { .. }]) {
+                kind = MappingKind::Direct;
+            }
+            expression = Some(format_expr_short(first));
+        }
+
+        self.scope_sole_table = saved_scope;
+        self.alias_map = saved_alias_map;
+
+        // A plain copy needs no expression text (mirrors `insert_select_maps_columns_by_position`).
+        let is_direct = matches!(kind, MappingKind::Direct);
+        self.column_mappings.push(ColumnMapping {
+            target_table,
+            target_column,
+            position,
+            sources,
+            kind,
+            expression: if is_direct { None } else { expression },
         });
     }
 
@@ -5105,6 +5168,33 @@ mod column_tests {
             vec![ColumnSource::Literal {
                 value: "42".to_string()
             }]
+        );
+    }
+
+    /// #142: a scalar subquery as an INSERT..SELECT target contributes the inner
+    /// select's FIRST expression as the source, resolved in the subquery's own FROM
+    /// scope. Correlated refs (`s.id` in WHERE) must NOT leak as sources.
+    #[test]
+    fn scalar_subquery_target_resolves_its_first_column() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (id, code) \
+             SELECT s.id, (SELECT r.code FROM t_ref r WHERE r.id = s.id) FROM t_src s",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Direct);
+        assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
+    }
+
+    /// #142: the choke point is push_column_mapping, so INSERT..VALUES subqueries
+    /// resolve too.
+    #[test]
+    fn scalar_subquery_in_insert_values_resolves() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) VALUES ((SELECT r.code FROM t_ref r WHERE r.id = 1))",
+        );
+        assert_eq!(
+            find_mapping(&maps, "code").sources,
+            vec![col(Some("t_ref"), "code")]
         );
     }
 

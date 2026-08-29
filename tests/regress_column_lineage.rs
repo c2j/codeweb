@@ -355,6 +355,34 @@ END;
     );
 }
 
+/// #142: a scalar subquery in the INSERT..SELECT target list must resolve to the
+/// subquery's source column, not report "No column lineage".
+#[test]
+fn scalar_subquery_in_insert_select_target_resolves() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_ref(id NUMBER, code VARCHAR2(10));
+CREATE TABLE t_out(id NUMBER, code VARCHAR2(10));
+CREATE PROCEDURE p_copy_subquery AS BEGIN
+  INSERT INTO t_out (id, code)
+  SELECT s.id, (SELECT r.code FROM t_ref r WHERE r.id = s.id) FROM t_src s;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_out.code", "upstream", "tree");
+    assert!(
+        !out.contains("No column lineage"),
+        "scalar subquery target must resolve:\n{out}"
+    );
+    assert!(
+        out.contains("t_ref.code"),
+        "subquery source column missing:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list
