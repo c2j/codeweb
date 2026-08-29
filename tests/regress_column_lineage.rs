@@ -418,6 +418,41 @@ END;
     );
 }
 
+/// #142: `SELECT *` cursor + `%ROWTYPE` record fields must resolve to the
+/// cursor's table (columns attributed under the field names), not "?.id".
+#[test]
+fn star_cursor_rowtype_record_resolves_to_cursor_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_star_cursor AS
+  CURSOR cur IS SELECT * FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_src.id"),
+        "star-cursor record field must resolve:\n{out}"
+    );
+    assert!(
+        !out.contains("?.id"),
+        "star-cursor record field must not stay unattributed:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list

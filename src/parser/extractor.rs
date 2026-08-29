@@ -3101,6 +3101,21 @@ impl ColumnAccessExtractor {
                             };
                         }
                     }
+                    // #142: a single catch-all cursor source (empty output name —
+                    // `SELECT *` cursor, or dynamic-SQL attribution) covers every
+                    // record field: the exact column is unknown, attribute to the
+                    // cursor's table under the field's own name (same philosophy as
+                    // `resolve_cursor_flows`).
+                    if let [single] = cols.as_slice() {
+                        if single.output_name.is_empty() {
+                            if let Some(ref t) = single.source_table {
+                                return ColumnSource::Column {
+                                    table: Some(t.clone()),
+                                    column: column.clone(),
+                                };
+                            }
+                        }
+                    }
                 } else {
                     // #142: the `%ROWTYPE` anchor is a TABLE, not a registered
                     // cursor (`rec t_src%ROWTYPE`): the record's fields are that
@@ -5231,6 +5246,36 @@ mod column_tests {
         let mut ctx = ProcedureVarContext::default();
         ctx.record_cursors
             .insert("r".to_string(), "t_src".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: a `SELECT *` cursor produces a single catch-all cursor source (empty
+    /// output name, table attributed). Record fields over it attribute to the
+    /// cursor's table under the field's own name.
+    #[test]
+    fn star_cursor_rowtype_record_field_attributes_to_cursor_table() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
         let maps = column_mappings_of_with_context(
             "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
             &ctx,
