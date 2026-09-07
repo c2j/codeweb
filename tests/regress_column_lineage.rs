@@ -484,6 +484,42 @@ END;
     );
 }
 
+/// Review #3: FETCH fills the record, so `r t_type%ROWTYPE` + `FETCH cur INTO r`
+/// (cur reads t_other) must resolve to t_other, not the declared type table.
+#[test]
+fn fetch_rebinding_overrides_rowtype_type_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_other(id NUMBER, amt NUMBER);
+CREATE TABLE t_type(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_fetch_mismatch AS
+  r t_type%ROWTYPE;
+  CURSOR cur IS SELECT id, amt FROM t_other;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_other.id"),
+        "record filled by FETCH must resolve to the cursor's source:\n{out}"
+    );
+    assert!(
+        !out.contains("t_type.id"),
+        "declared %ROWTYPE type table must not be the data source:\n{out}"
+    );
+}
+
 /// #142 characteristic test: cursor-anchored %ROWTYPE record written via
 /// `VALUES (r.id, r.amt)` resolves to the cursor's source columns (fixed by #148;
 /// this locks the behavior so later extraction changes cannot regress it).

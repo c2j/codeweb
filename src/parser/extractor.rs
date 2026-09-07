@@ -2716,7 +2716,18 @@ impl Visitor for ColumnAccessExtractor {
                     _ => String::new(),
                 };
                 let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
-                self.record_fetch(&cursor_name, vars);
+                self.record_fetch(&cursor_name, vars.clone());
+                // Review #3: the record's data comes from the FETCHing cursor, not
+                // its declared %ROWTYPE type anchor — rebind so `column_source`
+                // resolves through the cursor's SELECT sources.
+                if !cursor_name.is_empty() && vars.len() == 1 {
+                    if let Some(var) = vars.first() {
+                        let key = var.to_lowercase();
+                        if self.record_cursors.contains_key(&key) {
+                            self.record_cursors.insert(key, cursor_name.to_lowercase());
+                        }
+                    }
+                }
             }
             // `OPEN c_fxj FOR v_sql_txt` / `FOR EXECUTE expr`: resolve the dynamic SQL to
             // the cursor's SELECT sources so FETCH-variable chains keep resolving.
@@ -5420,6 +5431,28 @@ mod column_tests {
         assert_eq!(
             find_mapping(&maps, "amt").sources,
             vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// Review #3: a `%ROWTYPE` record's data comes from the FETCH that fills it.
+    /// `r t_type%ROWTYPE` + `FETCH cur INTO r` (cur reads t_other) must resolve
+    /// `r.id` to t_other.id, not the declared type table.
+    #[test]
+    fn fetch_rebinds_rowtype_record_to_the_fetching_cursor() {
+        let maps = column_mappings_of(
+            "CREATE OR REPLACE PROCEDURE p AS\n\
+             \x20 r t_type%ROWTYPE;\n\
+             \x20 CURSOR cur IS SELECT id, amt FROM t_other;\n\
+             BEGIN\n\
+             \x20 OPEN cur;\n\
+             \x20 FETCH cur INTO r;\n\
+             \x20 INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);\n\
+             END",
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_other"), "id")],
+            "record field must resolve to the FETCHing cursor's source, not the type table"
         );
     }
 
