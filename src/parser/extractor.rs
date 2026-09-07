@@ -841,6 +841,80 @@ pub enum SequenceRefVia {
     DotCurrval,
 }
 
+/// Schema anchor kind for `AnchorsOn` edges (issue #158).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorKind {
+    PercentType,
+    PercentRowType,
+}
+
+/// Where in the routine the anchor appears.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorSite {
+    ReturnType,
+    Param,
+    Variable,
+    NestedType,
+}
+
+/// One `%TYPE` / `%ROWTYPE` anchor parsed from a declaration or signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRef {
+    pub object: String,
+    pub column: Option<String>,
+    pub kind: AnchorKind,
+    pub site: AnchorSite,
+}
+
+/// Parse a flat routine-signature type string (e.g. `par_sys_purchase.
+/// purchase_days% type`) into an anchor. Returns `None` for plain type
+/// names. Tolerates stray whitespace and case variation produced by
+/// ogsql-parser's token concatenation.
+pub fn parse_anchor_from_type_string(s: &str) -> Option<AnchorRef> {
+    let site = AnchorSite::Param; // 调用方按需覆盖 site
+    let lower = s.to_lowercase();
+    // '%' 与 "type"/"rowtype" 之间允许有杂散空格（ogsql-parser token 拼接产物）。
+    let pct_pos = lower.find('%')?;
+    let after_pct = lower[pct_pos + 1..].trim_start();
+    let kind = if after_pct.starts_with("rowtype") {
+        AnchorKind::PercentRowType
+    } else if after_pct.starts_with("type") {
+        AnchorKind::PercentType
+    } else {
+        return None;
+    };
+    let head = &s[..pct_pos];
+    let idents: Vec<&str> = head
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    match (kind, idents.len()) {
+        (AnchorKind::PercentType, n) if n >= 2 => {
+            let column = idents[n - 1].to_string();
+            let object = idents[..n - 1].join(".");
+            Some(AnchorRef {
+                object,
+                column: Some(column),
+                kind,
+                site,
+            })
+        }
+        (AnchorKind::PercentRowType, n) if n >= 1 => {
+            let object = idents.join(".");
+            Some(AnchorRef {
+                object,
+                column: None,
+                kind,
+                site,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub struct TypeSequenceRefExtractor {
     pub known_types: HashSet<String>,
     pub type_refs: Vec<TypeRef>,
@@ -3833,6 +3907,43 @@ mod tests {
 
     fn find_access<'a>(accesses: &'a [TableAccessInfo], name: &str) -> Option<&'a TableAccessInfo> {
         accesses.iter().find(|a| a.name == name)
+    }
+
+    #[test]
+    fn should_parse_flat_return_string_percent_type() {
+        // 真实 parse_type_name 输出：杂散空格 + 大小写混乱
+        let a = parse_anchor_from_type_string("par_sys_purchase. purchase_days% type")
+            .expect("should parse");
+        assert_eq!(a.object, "par_sys_purchase");
+        assert_eq!(a.column.as_deref(), Some("purchase_days"));
+        assert!(matches!(a.kind, AnchorKind::PercentType));
+        // 纯函数不区分调用点，统一默认 Param 占位；
+        // RETURN 场景由 builder 调用方覆盖为 ReturnType（后续 Task 6）
+        assert!(matches!(a.site, AnchorSite::Param));
+    }
+
+    #[test]
+    fn should_parse_flat_param_string_percent_rowtype() {
+        let a = parse_anchor_from_type_string("DAT_TRD_REPURCHASE%ROWTYPE").expect("should parse");
+        assert_eq!(a.object, "DAT_TRD_REPURCHASE");
+        assert_eq!(a.column, None);
+        assert!(matches!(a.kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_return_none_for_plain_type_names() {
+        assert!(parse_anchor_from_type_string("INTEGER").is_none());
+        assert!(parse_anchor_from_type_string("VARCHAR(100)").is_none());
+        assert!(parse_anchor_from_type_string("my_pkg.my_record").is_none());
+        assert!(parse_anchor_from_type_string("").is_none());
+    }
+
+    #[test]
+    fn should_parse_rowtype_not_mistaken_for_percent_type() {
+        let a = parse_anchor_from_type_string("t%ROWTYPE").expect("should parse");
+        assert_eq!(a.object, "t");
+        assert_eq!(a.column, None);
+        assert!(matches!(a.kind, AnchorKind::PercentRowType));
     }
 
     #[test]
