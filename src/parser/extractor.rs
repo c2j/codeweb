@@ -1101,6 +1101,30 @@ impl AnchorExtractor {
             site,
         });
     }
+
+    /// Visit a nested `PlDataType` (e.g. inside `TYPE ... IS TABLE OF` /
+    /// `RECORD (...)` field) and push an anchor if it is `%TYPE` / `%ROWTYPE`.
+    fn visit_pl_data_type(
+        &mut self,
+        dt: &ogsql_parser::ast::plpgsql::PlDataType,
+        site: AnchorSite,
+    ) {
+        use ogsql_parser::ast::plpgsql::PlDataType;
+        match dt {
+            PlDataType::PercentType { table, column } => {
+                self.push_anchor(
+                    table.clone(),
+                    Some(column.clone()),
+                    AnchorKind::PercentType,
+                    site,
+                );
+            }
+            PlDataType::PercentRowType(name) => {
+                self.push_anchor(name.clone(), None, AnchorKind::PercentRowType, site);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Visitor for AnchorExtractor {
@@ -1108,7 +1132,7 @@ impl Visitor for AnchorExtractor {
         &mut self,
         decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
     ) -> VisitorResult {
-        use ogsql_parser::ast::plpgsql::PlDataType;
+        use ogsql_parser::ast::plpgsql::{PlDataType, PlTypeDecl};
         match decl {
             PlDeclaration::Cursor(c) => {
                 self.cursor_names.insert(c.name.to_lowercase());
@@ -1130,6 +1154,27 @@ impl Visitor for AnchorExtractor {
                     );
                 }
             }
+            PlDeclaration::Type(t) => match t {
+                PlTypeDecl::TableOf {
+                    elem_type,
+                    index_by,
+                    ..
+                } => {
+                    self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
+                    if let Some(ib) = index_by {
+                        self.visit_pl_data_type(ib, AnchorSite::NestedType);
+                    }
+                }
+                PlTypeDecl::VarrayOf { elem_type, .. } => {
+                    self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
+                }
+                PlTypeDecl::Record { fields, .. } => {
+                    for f in fields {
+                        self.visit_pl_data_type(&f.data_type, AnchorSite::NestedType);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         VisitorResult::Continue
@@ -4630,6 +4675,31 @@ mod tests {
             "cursor%ROWTYPE must not produce a table anchor: {:?}",
             anchors
         );
+    }
+
+    #[test]
+    fn should_collect_nested_table_of_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_list IS TABLE OF par_sys_purchase.purchase_days%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+    }
+
+    #[test]
+    fn should_collect_record_field_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_rec IS RECORD (d dat_trd_repurchase.purchase_date%TYPE); \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_date"));
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentType));
     }
 
     #[test]
