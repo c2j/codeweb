@@ -1585,14 +1585,24 @@ fn cmd_lineage(
     // `schema.table`, split into table=`schema` + column=`table`) falls back to
     // treating the whole target as a table reference — with a transparent note.
     let (table_name, column_name) = match column_name {
-        Some(_) if graph::lineage::find_table_node(graph, table_name).is_none() => {
-            eprintln!(
-                "note: no table '{}' found — interpreting '{}' as a table reference",
-                table_name, target
-            );
-            (target, None)
-        }
-        other => (table_name, other),
+        Some(column) => match graph::lineage::lookup_table_node(graph, table_name) {
+            graph::lineage::TableLookup::Found(_) => (table_name, Some(column)),
+            graph::lineage::TableLookup::Ambiguous => {
+                eprintln!(
+                    "note: table '{}' is ambiguous across schemas — interpreting '{}' as a table reference",
+                    table_name, target
+                );
+                (target, None)
+            }
+            graph::lineage::TableLookup::Missing => {
+                eprintln!(
+                    "note: no table '{}' found — interpreting '{}' as a table reference",
+                    table_name, target
+                );
+                (target, None)
+            }
+        },
+        None => (table_name, None),
     };
 
     // Parse direction up front — both the table and column paths need it. `None` means

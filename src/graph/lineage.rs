@@ -1498,13 +1498,22 @@ fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMappi
     out
 }
 
-/// Find the Table or View node named `name`.
+/// Outcome of looking up a table/view node by `name` (`schema.table` or bare name).
+pub(crate) enum TableLookup {
+    Found(NodeIndex),
+    /// Bare name matches tables in 2+ schemas — deliberately unresolved to avoid
+    /// reporting one schema's pipeline as the other's.
+    Ambiguous,
+    Missing,
+}
+
+/// Look up the Table or View node named `name`.
 ///
 /// A schema-qualified name (`schema.table`) matches schema and table together. A bare
 /// name resolves only when a single node carries it — with two schemas each holding a
 /// table of the same name, returning the first would report one schema's pipeline as the
-/// other's, so an ambiguous bare name resolves to `None`.
-pub(crate) fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
+/// other's, so an ambiguous bare name is reported as [`TableLookup::Ambiguous`].
+pub(crate) fn lookup_table_node(graph: &CodeGraph, name: &str) -> TableLookup {
     let name_of = |idx: &NodeIndex| match &graph[*idx] {
         crate::graph::Node::Table { schema, name, .. }
         | crate::graph::Node::View { schema, name, .. } => Some((schema.as_deref(), name.as_str())),
@@ -1513,22 +1522,34 @@ pub(crate) fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex
 
     if let Some((schema, table)) = name.rsplit_once('.') {
         if !schema.is_empty() {
-            return graph.node_indices().find(|idx| {
+            return match graph.node_indices().find(|idx| {
                 name_of(idx).is_some_and(|(s, n)| {
                     n.eq_ignore_ascii_case(table) && s.is_some_and(|s| eq(s, schema))
                 })
-            });
+            }) {
+                Some(idx) => TableLookup::Found(idx),
+                None => TableLookup::Missing,
+            };
         }
     }
 
     let mut matches = graph
         .node_indices()
         .filter(|idx| name_of(idx).is_some_and(|(_, n)| n.eq_ignore_ascii_case(name)));
-    let first = matches.next()?;
+    let Some(first) = matches.next() else {
+        return TableLookup::Missing;
+    };
     if matches.next().is_some() {
-        return None;
+        return TableLookup::Ambiguous;
     }
-    Some(first)
+    TableLookup::Found(first)
+}
+
+pub(crate) fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
+    match lookup_table_node(graph, name) {
+        TableLookup::Found(idx) => Some(idx),
+        TableLookup::Ambiguous | TableLookup::Missing => None,
+    }
 }
 
 fn eq(a: &str, b: &str) -> bool {

@@ -205,3 +205,31 @@ fn should_report_clean_error_for_unknown_nodekey_target() {
         "expected table-resolution error, stderr:\n{stderr}"
     );
 }
+
+#[test]
+fn should_say_ambiguous_when_table_half_is_ambiguous() {
+    let tmp = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &tmp,
+        r#"
+CREATE SCHEMA bigfund;
+CREATE SCHEMA archive;
+CREATE TABLE bigfund.mid_yjqs_detail(id NUMBER);
+CREATE TABLE archive.mid_yjqs_detail(id NUMBER);
+"#,
+    );
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "lineage",
+            "mid_yjqs_detail.nonexistent_col",
+            "-p",
+            root.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous"),
+        "ambiguous table half must be identified accurately, stderr:\n{stderr}"
+    );
+}
