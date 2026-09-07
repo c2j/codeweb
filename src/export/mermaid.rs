@@ -172,7 +172,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::UsesSequence { .. } => "-->",
             Edge::IndexesTable { .. } => "-.->",
             Edge::AliasesObject { .. } => "-.->",
-            Edge::AnchorsOn { .. } => "-.->",
+            Edge::AnchorsOn { .. } => "-->",
             Edge::CustomEdge { .. } => "-.->",
         };
 

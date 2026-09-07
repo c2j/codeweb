@@ -323,6 +323,7 @@ enum EdgeKindJson {
         file: String,
         line: usize,
         kind: crate::parser::AnchorKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<String>,
         site: crate::parser::AnchorSite,
     },
