@@ -842,7 +842,7 @@ pub enum SequenceRefVia {
 }
 
 /// Schema anchor kind for `AnchorsOn` edges (issue #158).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorKind {
     PercentType,
@@ -850,7 +850,7 @@ pub enum AnchorKind {
 }
 
 /// Where in the routine the anchor appears.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorSite {
     ReturnType,
@@ -1062,12 +1062,43 @@ impl Visitor for TypeSequenceRefExtractor {
     }
 }
 
+/// Extract the raw `(object, column, kind)` triple from a `PlDataType` if it
+/// is `%TYPE` / `%ROWTYPE` anchored, with no cursor/variable guard applied.
+/// Shared by [`AnchorExtractor::visit_pl_data_type`] (routine-local walk,
+/// which does apply the guard) and package-level variable handling in
+/// `graph::builder`, which is declared outside any `PlBlock` and therefore
+/// cannot reuse the extractor's walk — it must apply its own (package-level)
+/// cursor guard against the returned object name.
+pub fn anchor_from_pl_data_type(
+    dt: &ogsql_parser::ast::plpgsql::PlDataType,
+) -> Option<(String, Option<String>, AnchorKind)> {
+    use ogsql_parser::ast::plpgsql::PlDataType;
+    match dt {
+        PlDataType::PercentType { table, column } => {
+            Some((table.clone(), Some(column.clone()), AnchorKind::PercentType))
+        }
+        PlDataType::PercentRowType(name) => Some((name.clone(), None, AnchorKind::PercentRowType)),
+        _ => None,
+    }
+}
+
 /// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
 /// `push_anchor` skips any anchor whose object name (lowercased) matches a
 /// known cursor name or a declared local variable name. This guards both
 /// `cursor%ROWTYPE` (issue #147/#142: record fields resolve via cursor
 /// SELECT sources, not table edges) and variable-to-variable anchoring
 /// (`v2 v1%TYPE`), neither of which are table references.
+///
+/// Caveats:
+/// - The cursor/variable guard assumes declare-before-use ordering (a
+///   `PlDeclaration::Cursor`/`Variable` must be visited before any anchor
+///   that shadows it is evaluated). This matches PL/SQL's own declaration
+///   order semantics, so out-of-order shadowing is not a real-world case.
+/// - When a local identifier (variable or cursor) shadows a same-named real
+///   table, anchors targeting that name are conservatively skipped rather
+///   than resolved to the table. This is intentional: PL/SQL identifier
+///   shadowing means the name resolves to the local declaration, not the
+///   table, at the point of use.
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
@@ -1080,6 +1111,16 @@ impl AnchorExtractor {
             anchors: Vec::new(),
             cursor_names: HashSet::new(),
             var_names: HashSet::new(),
+        }
+    }
+
+    /// Inject a cursor name declared outside this extractor's own walk (a
+    /// package-level `CURSOR` visible to every routine in the package) so
+    /// that `rec pkg_cursor%ROWTYPE` inside a routine body is guarded the
+    /// same way a routine-local cursor declaration would be (issue #158).
+    pub fn register_cursor_name(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.cursor_names.insert(name.to_lowercase());
         }
     }
 
@@ -1112,20 +1153,8 @@ impl AnchorExtractor {
         dt: &ogsql_parser::ast::plpgsql::PlDataType,
         site: AnchorSite,
     ) {
-        use ogsql_parser::ast::plpgsql::PlDataType;
-        match dt {
-            PlDataType::PercentType { table, column } => {
-                self.push_anchor(
-                    table.clone(),
-                    Some(column.clone()),
-                    AnchorKind::PercentType,
-                    site,
-                );
-            }
-            PlDataType::PercentRowType(name) => {
-                self.push_anchor(name.clone(), None, AnchorKind::PercentRowType, site);
-            }
-            _ => {}
+        if let Some((object, column, kind)) = anchor_from_pl_data_type(dt) {
+            self.push_anchor(object, column, kind, site);
         }
     }
 }

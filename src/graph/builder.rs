@@ -7,7 +7,7 @@ use crate::graph::{
 };
 use crate::graph::{ColumnSummary, DistributeInfo, IndexConstraint, PartitionInfo};
 use crate::parser::{
-    AllParsedFiles, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
+    AllParsedFiles, AnchorExtractor, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
 };
 use ogsql_parser::ast::{
     AlterTableAction, ColumnConstraint, PackageItem, Statement, TableConstraint,
@@ -303,6 +303,7 @@ impl GraphBuilder {
             &ctx.proc_index,
             &ctx.type_index,
             &ctx.sequence_index,
+            &ctx.package_index,
             &mut ctx.table_index,
         );
     }
@@ -1730,6 +1731,23 @@ impl GraphBuilder {
         Self::create_edges(&all_edges, graph, proc_index, builtin_index);
     }
 
+    /// Dedup key for `AnchorsOn` edges within a single routine/package-variable
+    /// scope: (lowercased object, column, kind, site). Signature anchors
+    /// (`Param`/`ReturnType`) and variable/nested-type anchors are collected
+    /// from different sources within the same routine and can collide on the
+    /// same column (e.g. a `RETURN t.c%TYPE` clause and a `RESULT t.c%TYPE`
+    /// local variable) — each distinct combination gets exactly one edge.
+    fn anchor_dedup_key(
+        a: &crate::parser::AnchorRef,
+    ) -> (
+        String,
+        Option<String>,
+        crate::parser::AnchorKind,
+        crate::parser::AnchorSite,
+    ) {
+        (a.object.to_lowercase(), a.column.clone(), a.kind, a.site)
+    }
+
     /// Resolve a flat `%TYPE`/`%ROWTYPE` signature anchor to its target table (creating
     /// an inferred `Node::Table` if no DDL-backed table exists yet) and add an
     /// `AnchorsOn` edge from `proc_idx` to it (issue #158).
@@ -1781,6 +1799,7 @@ impl GraphBuilder {
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        package_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for file in files {
@@ -1845,15 +1864,39 @@ impl GraphBuilder {
                                     );
                                 }
                             }
+                            let mut anchor_seen: HashSet<(
+                                String,
+                                Option<String>,
+                                crate::parser::AnchorKind,
+                                crate::parser::AnchorSite,
+                            )> = HashSet::new();
                             for param in &p.parameters {
                                 if let Some(a) = crate::parser::parse_anchor_from_type_string(
                                     &param.data_type,
                                     crate::parser::AnchorSite::Param,
                                 ) {
+                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                                        Self::add_anchor_edge(
+                                            graph,
+                                            proc_idx,
+                                            &a,
+                                            file_arc.clone(),
+                                            info.start_line,
+                                            table_index,
+                                        );
+                                    }
+                                }
+                            }
+                            let mut anchor_extractor = AnchorExtractor::new();
+                            if let Some(ref block) = p.block {
+                                walk_pl_block(&mut anchor_extractor, block);
+                            }
+                            for a in &anchor_extractor.anchors {
+                                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
                                     Self::add_anchor_edge(
                                         graph,
                                         proc_idx,
-                                        &a,
+                                        a,
                                         file_arc.clone(),
                                         info.start_line,
                                         table_index,
@@ -1931,19 +1974,27 @@ impl GraphBuilder {
                                     );
                                 }
                             }
+                            let mut anchor_seen: HashSet<(
+                                String,
+                                Option<String>,
+                                crate::parser::AnchorKind,
+                                crate::parser::AnchorSite,
+                            )> = HashSet::new();
                             for param in &f.parameters {
                                 if let Some(a) = crate::parser::parse_anchor_from_type_string(
                                     &param.data_type,
                                     crate::parser::AnchorSite::Param,
                                 ) {
-                                    Self::add_anchor_edge(
-                                        graph,
-                                        proc_idx,
-                                        &a,
-                                        file_arc.clone(),
-                                        info.start_line,
-                                        table_index,
-                                    );
+                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                                        Self::add_anchor_edge(
+                                            graph,
+                                            proc_idx,
+                                            &a,
+                                            file_arc.clone(),
+                                            info.start_line,
+                                            table_index,
+                                        );
+                                    }
                                 }
                             }
                             if let Some(rt) = &f.return_type {
@@ -1951,10 +2002,28 @@ impl GraphBuilder {
                                     rt,
                                     crate::parser::AnchorSite::ReturnType,
                                 ) {
+                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                                        Self::add_anchor_edge(
+                                            graph,
+                                            proc_idx,
+                                            &a,
+                                            file_arc.clone(),
+                                            info.start_line,
+                                            table_index,
+                                        );
+                                    }
+                                }
+                            }
+                            let mut anchor_extractor = AnchorExtractor::new();
+                            if let Some(ref block) = f.block {
+                                walk_pl_block(&mut anchor_extractor, block);
+                            }
+                            for a in &anchor_extractor.anchors {
+                                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
                                     Self::add_anchor_edge(
                                         graph,
                                         proc_idx,
-                                        &a,
+                                        a,
                                         file_arc.clone(),
                                         info.start_line,
                                         table_index,
@@ -1972,6 +2041,8 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
+                            package_index,
+                            table_index,
                             graph,
                         );
                     }
@@ -1984,6 +2055,8 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
+                            package_index,
+                            table_index,
                             graph,
                         );
                     }
@@ -2002,6 +2075,8 @@ impl GraphBuilder {
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        package_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
@@ -2012,10 +2087,67 @@ impl GraphBuilder {
         };
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
+        // Package-level cursor names guard %ROWTYPE anchors for package-level
+        // variables below, and are injected into every member routine's
+        // AnchorExtractor so `rec pkg_cursor%ROWTYPE` inside a routine body
+        // is guarded the same way a routine-local cursor would be (#158).
+        let pkg_cursor_names: Vec<String> = pkg_items
+            .iter()
+            .filter_map(|item| match item {
+                PackageItem::Cursor(c) => Some(c.name.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
         for item in pkg_items {
-            let (proc_name, block, kind) = match item {
-                PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
-                PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
+            if let PackageItem::Variable(v) = item {
+                if let Some((object, column, kind)) =
+                    crate::parser::anchor_from_pl_data_type(&v.data_type)
+                {
+                    let obj_lower = object.to_lowercase();
+                    if !pkg_cursor_names.contains(&obj_lower) {
+                        let qualified = match &schema_part {
+                            Some(s) => {
+                                format!("{}.{}", s.to_lowercase(), pkg_name_part.to_lowercase())
+                            }
+                            None => pkg_name_part.to_lowercase(),
+                        };
+                        if let Some(&pkg_idx) = package_index.get(&qualified) {
+                            let anchor = crate::parser::AnchorRef {
+                                object,
+                                column,
+                                kind,
+                                site: crate::parser::AnchorSite::Variable,
+                            };
+                            Self::add_anchor_edge(
+                                graph,
+                                pkg_idx,
+                                &anchor,
+                                file_path.clone(),
+                                info.start_line,
+                                table_index,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let (proc_name, parameters, return_type, block, kind) = match item {
+                PackageItem::Procedure(p) => (
+                    p.name.join("."),
+                    p.parameters.as_slice(),
+                    None,
+                    &p.block,
+                    RoutineKind::Procedure,
+                ),
+                PackageItem::Function(f) => (
+                    f.name.join("."),
+                    f.parameters.as_slice(),
+                    f.return_type.as_ref(),
+                    &f.block,
+                    RoutineKind::Function,
+                ),
                 PackageItem::Raw(_)
                 | PackageItem::Variable(_)
                 | PackageItem::Type(_)
@@ -2030,6 +2162,49 @@ impl GraphBuilder {
             let Some(proc_idx) = proc_index.get(&proc_id.normalized()).copied() else {
                 continue;
             };
+
+            let mut anchor_seen: HashSet<(
+                String,
+                Option<String>,
+                crate::parser::AnchorKind,
+                crate::parser::AnchorSite,
+            )> = HashSet::new();
+
+            for param in parameters {
+                if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                    &param.data_type,
+                    crate::parser::AnchorSite::Param,
+                ) {
+                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                        Self::add_anchor_edge(
+                            graph,
+                            proc_idx,
+                            &a,
+                            file_path.clone(),
+                            info.start_line,
+                            table_index,
+                        );
+                    }
+                }
+            }
+            if let Some(rt) = return_type {
+                if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                    rt,
+                    crate::parser::AnchorSite::ReturnType,
+                ) {
+                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                        Self::add_anchor_edge(
+                            graph,
+                            proc_idx,
+                            &a,
+                            file_path.clone(),
+                            info.start_line,
+                            table_index,
+                        );
+                    }
+                }
+            }
+
             let Some(ref block) = block else {
                 continue;
             };
@@ -2063,6 +2238,24 @@ impl GraphBuilder {
                                 line: info.start_line,
                             },
                         },
+                    );
+                }
+            }
+
+            let mut anchor_extractor = AnchorExtractor::new();
+            for cname in &pkg_cursor_names {
+                anchor_extractor.register_cursor_name(cname);
+            }
+            walk_pl_block(&mut anchor_extractor, block);
+            for a in &anchor_extractor.anchors {
+                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
+                    Self::add_anchor_edge(
+                        graph,
+                        proc_idx,
+                        a,
+                        file_path.clone(),
+                        info.start_line,
+                        table_index,
                     );
                 }
             }
@@ -4727,6 +4920,229 @@ mod tests {
             }
             other => panic!("expected Edge::AnchorsOn, got {:?}", other),
         }
+    }
+
+    /// issue #158: a routine body that both `SELECT`s from a table and
+    /// declares a `%TYPE` variable anchored to the same table must produce
+    /// two distinct edges — `TableAccess` (DML) and `AnchorsOn` (schema
+    /// anchor) — neither collapsing into or replacing the other.
+    #[test]
+    fn should_keep_table_access_and_anchor_edges_separate() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION fnc_test RETURN INT
+            IS
+                v par_sys_purchase.purchase_days%TYPE;
+            BEGIN
+                SELECT t.purchase_days INTO v FROM par_sys_purchase t;
+                RETURN v;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("fnc_test")))
+            .expect("function node should exist");
+        let table_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("par_sys_purchase")))
+            .expect("par_sys_purchase table node should exist");
+
+        let edges_between: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| graph.edge_endpoints(*e) == Some((func_idx, table_idx)))
+            .map(|e| &graph[e])
+            .collect();
+
+        let table_access_count = edges_between
+            .iter()
+            .filter(|e| matches!(e, Edge::TableAccess { .. }))
+            .count();
+        let anchor_count = edges_between
+            .iter()
+            .filter(|e| matches!(e, Edge::AnchorsOn { .. }))
+            .count();
+        assert_eq!(
+            table_access_count, 1,
+            "expected exactly 1 TableAccess edge, got {:?}",
+            edges_between
+        );
+        assert_eq!(
+            anchor_count, 1,
+            "expected exactly 1 AnchorsOn edge, got {:?}",
+            edges_between
+        );
+
+        let has_read = edges_between.iter().any(|e| {
+            matches!(e, Edge::TableAccess { modes, .. } if modes.contains(crate::graph::AccessMode::Read))
+        });
+        assert!(has_read, "TableAccess edge must carry Read mode");
+    }
+
+    /// issue #158 (D3 non-goal / #147 guard): a `cursor%ROWTYPE` record
+    /// variable must NOT produce an `AnchorsOn` edge — the cursor's query
+    /// source table only gets the normal `TableAccess` edge.
+    #[test]
+    fn should_not_create_anchor_edge_for_cursor_rowtype() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_test
+            IS
+                CURSOR c IS SELECT * FROM t_main;
+                rec c%ROWTYPE;
+            BEGIN
+                OPEN c;
+                CLOSE c;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_test")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "cursor%ROWTYPE must not produce any AnchorsOn edge, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let table_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("t_main")))
+            .expect("t_main table node should exist");
+        let has_table_access = graph.edge_indices().any(|e| {
+            graph.edge_endpoints(e) == Some((proc_idx, table_idx))
+                && matches!(&graph[e], Edge::TableAccess { .. })
+        });
+        assert!(
+            has_table_access,
+            "t_main must still get a TableAccess edge from the cursor's SELECT"
+        );
+    }
+
+    /// issue #158: a package-level variable's `%TYPE` anchors to the
+    /// **package** node (package-level variables belong to the package, not
+    /// to any single routine), while a package member function's
+    /// `RETURN ...%TYPE` signature anchors to that **routine's** node.
+    #[test]
+    fn should_anchor_package_level_variable_and_routine_signature() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_anchor AS
+                v_x some_table.some_col%TYPE;
+
+                FUNCTION f RETURN other_tbl.other_col%TYPE IS
+                BEGIN
+                    RETURN NULL;
+                END;
+            END pkg_anchor;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_anchor"))
+            .expect("package node should exist");
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("f")))
+            .expect("function node should exist");
+
+        // Package-level variable anchor: pkg -> some_table, site=Variable.
+        let pkg_anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            pkg_anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge from the package node"
+        );
+        let (_, pkg_anchor_target) = graph.edge_endpoints(pkg_anchor_edges[0]).unwrap();
+        match &graph[pkg_anchor_target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "some_table"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[pkg_anchor_edges[0]] {
+            Edge::AnchorsOn { column, site, .. } => {
+                assert_eq!(column.as_deref(), Some("some_col"));
+                assert!(matches!(site, crate::parser::AnchorSite::Variable));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+
+        // Routine signature anchor: f -> other_tbl, site=ReturnType.
+        let func_anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(func_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            func_anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge from the package function"
+        );
+        let (_, func_anchor_target) = graph.edge_endpoints(func_anchor_edges[0]).unwrap();
+        match &graph[func_anchor_target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "other_tbl"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[func_anchor_edges[0]] {
+            Edge::AnchorsOn { column, site, .. } => {
+                assert_eq!(column.as_deref(), Some("other_col"));
+                assert!(matches!(site, crate::parser::AnchorSite::ReturnType));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+    }
+
+    /// issue #158: a package-level `CURSOR` guards a package-level
+    /// `%ROWTYPE` variable anchored to it — no `AnchorsOn` (or table) edge
+    /// must be created for the cursor name itself.
+    #[test]
+    fn should_skip_package_level_cursor_rowtype() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_cur AS
+                CURSOR c IS SELECT * FROM t_pkg_main;
+                rec c%ROWTYPE;
+
+                PROCEDURE noop IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_cur;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package-level cursor%ROWTYPE must not produce any AnchorsOn edge, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let cursor_node = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("c")),
+        );
+        assert!(
+            cursor_node.is_none(),
+            "the cursor name 'c' must never become a table node"
+        );
     }
 
     #[test]
