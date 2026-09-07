@@ -530,13 +530,10 @@ impl Project {
         GraphStore::load_manifest_sidecar(&store_path).unwrap_or_default()
     }
 
-    /// True when the on-disk store exists and carries the current layout
-    /// version header. The manifest sidecar has no version header and survives
-    /// `STORE_VERSION` bumps, so fingerprints alone cannot detect a store
-    /// written by an older binary — without this check an upgraded binary would
-    /// keep a stale store that every read command then rejects. Bincode probes
-    /// only the 13-byte header; JSON relies on `load_json`'s own version gate,
-    /// so `is_ok()` means "current layout".
+    /// True when the on-disk store carries the current layout version. The
+    /// manifest sidecar has no version header, so fingerprints alone cannot
+    /// detect a store written by an older layout. Bincode probes only the
+    /// 13-byte header; JSON decodes only the `version` field.
     fn store_is_current(&self) -> bool {
         let store_path = self.store_path();
         if !store_path.exists() {
@@ -544,7 +541,7 @@ impl Project {
         }
         match self.config.store.format {
             config::StoreFormat::Bincode => GraphStore::file_is_current(&store_path),
-            config::StoreFormat::Json => GraphStore::load_json(&store_path).is_ok(),
+            config::StoreFormat::Json => GraphStore::json_file_is_current(&store_path),
         }
     }
 
