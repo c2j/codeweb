@@ -318,6 +318,14 @@ enum EdgeKindJson {
     #[cfg(feature = "jsp")]
     #[serde(rename = "contains_sql")]
     ContainsSql,
+    #[serde(rename = "anchors_on")]
+    AnchorsOn {
+        file: String,
+        line: usize,
+        kind: crate::parser::AnchorKind,
+        column: Option<String>,
+        site: crate::parser::AnchorSite,
+    },
 }
 
 pub fn to_json(graph: &CodeGraph) -> Result<String> {
@@ -880,6 +888,22 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 source: src.index(),
                 target: dst.index(),
                 kind: EdgeKindJson::ContainsSql,
+            },
+            Edge::AnchorsOn {
+                kind,
+                column,
+                site,
+                location,
+            } => EdgeJson {
+                source: src.index(),
+                target: dst.index(),
+                kind: EdgeKindJson::AnchorsOn {
+                    file: location.file.to_string_lossy().to_string(),
+                    line: location.line,
+                    kind: *kind,
+                    column: column.clone(),
+                    site: *site,
+                },
             },
         };
         edges.push(edge_json);

@@ -15,12 +15,12 @@ pub mod snippet;
 
 #[allow(unused_imports)]
 pub use extractor::{
-    extract_body_sql, pl_type_decl_name, CallEdge, CallExtractor, ColumnAccessExtractor,
-    ColumnAnalysis, ColumnContext, ColumnMapping, ColumnRef, ColumnSource, CursorColumn,
-    EnumMapping, FilterOperator, FilterValue, HardFilter, InsertColumnInfo, JoinCondition,
-    JoinConditionSource, JoinType, MappingKind, ProcedureBodySql, ProcedureSqlExtractor,
-    ProcedureVarContext, SelectIntoMapping, SequenceRef, SequenceRefVia, TableAccessExtractor,
-    TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
+    extract_body_sql, pl_type_decl_name, AnchorKind, AnchorRef, AnchorSite, CallEdge,
+    CallExtractor, ColumnAccessExtractor, ColumnAnalysis, ColumnContext, ColumnMapping, ColumnRef,
+    ColumnSource, CursorColumn, EnumMapping, FilterOperator, FilterValue, HardFilter,
+    InsertColumnInfo, JoinCondition, JoinConditionSource, JoinType, MappingKind, ProcedureBodySql,
+    ProcedureSqlExtractor, ProcedureVarContext, SelectIntoMapping, SequenceRef, SequenceRefVia,
+    TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
 };
 #[allow(unused_imports)]
 pub use ibatis_loader::{

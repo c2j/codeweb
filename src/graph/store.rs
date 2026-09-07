@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 8;
+const STORE_VERSION: u32 = 9;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1783,6 +1783,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::UsesSequence { .. } => "uses_sequence",
         crate::graph::Edge::IndexesTable { .. } => "indexes_table",
         crate::graph::Edge::AliasesObject { .. } => "aliases_object",
+        crate::graph::Edge::AnchorsOn { .. } => "anchors_on",
         crate::graph::Edge::CustomEdge { type_name, .. } => {
             return format!("custom:{}", type_name);
         }
@@ -2481,6 +2482,126 @@ mod tests {
         let path = dir.path().join("missing.bincode");
         assert_eq!(GraphStore::peek_version(&path), None);
         assert!(!GraphStore::file_is_current(&path));
+    }
+
+    /// A store with an `Edge::AnchorsOn` edge (issue #158, `%TYPE`/`%ROWTYPE` schema
+    /// anchors) must round-trip through bincode save/load with the variant fields and
+    /// `EdgeCategory::Reference` intact.
+    #[test]
+    fn should_roundtrip_anchors_on_edge_through_bincode_store() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("anchors_on.bincode");
+
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation {
+            file: file.clone(),
+            line: 7,
+        };
+
+        let proc = crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_purchase".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        };
+        let table = crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "par_sys_purchase".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+
+        let proc_idx = graph.add_node(proc);
+        let table_idx = graph.add_node(table);
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("purchase_days".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+
+        let store = GraphStore::from_graph("anchors-on-test", graph);
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path).expect("round-trip should succeed");
+
+        assert_eq!(loaded.graph.node_count(), 2);
+        assert_eq!(loaded.graph.edge_count(), 1);
+
+        let edge = loaded
+            .graph
+            .edge_weights()
+            .next()
+            .expect("one edge must be present");
+        assert_eq!(edge.category(), crate::graph::EdgeCategory::Reference);
+        match edge {
+            crate::graph::Edge::AnchorsOn {
+                kind,
+                column,
+                site,
+                location,
+            } => {
+                assert!(matches!(kind, AnchorKind::PercentType));
+                assert_eq!(column.as_deref(), Some("purchase_days"));
+                assert!(matches!(site, AnchorSite::Variable));
+                assert_eq!(location.line, 7);
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+    }
+
+    /// Mirrors `load_bincode_rejects_header_version_mismatch_with_friendly_error`: a
+    /// store saved under the current `STORE_VERSION` whose on-disk header byte is then
+    /// rewritten to `STORE_VERSION - 1` must be rejected by `load_bincode` with the
+    /// friendly "unsupported cache version" message, not a raw bincode error.
+    #[test]
+    fn should_reject_store_with_stale_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stale.bincode");
+
+        let store = GraphStore::from_graph("stale-version-test", CodeGraph::new());
+        store.save_bincode(&path).unwrap();
+
+        // Header layout (see save_bincode): 9-byte magic + 4-byte LE version at offset 9..13.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= 13, "file must have the magic+version header");
+        let stale_ver = STORE_VERSION - 1;
+        bytes[9..13].copy_from_slice(&stale_ver.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "stale-version store must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "error should mention the version gate: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains(&stale_ver.to_string()),
+            "error should report the stale version ({}): {}",
+            stale_ver,
+            err_msg
+        );
     }
 
     #[test]

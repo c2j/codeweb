@@ -139,6 +139,7 @@ pub fn edge_weight(edge: &Edge, config: &EdgeWeights) -> Option<f64> {
         Edge::ContainsMethod | Edge::ContainsRoutine => Some(config.composition),
         #[cfg(feature = "jsp")]
         Edge::ContainsSql => Some(config.composition),
+        Edge::AnchorsOn { .. } => None,
     }
 }
 

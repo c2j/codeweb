@@ -102,6 +102,7 @@ pub(crate) fn edge_label_for(
         Edge::UsesSequence { .. } => Some("[uses_seq]".into()),
         Edge::IndexesTable { .. } => Some("[indexes]".into()),
         Edge::AliasesObject { .. } => Some("[aliases]".into()),
+        Edge::AnchorsOn { .. } => Some("[T]".into()),
         Edge::ContainsRoutine | Edge::ContainsMethod => None,
         _ => None,
     }
