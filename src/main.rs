@@ -1558,8 +1558,8 @@ fn cmd_lineage(
         );
     }
 
-    // Issue #154: resolve `type:name` node keys whole so dots in qualified names are
-    // never mistaken for the legacy `table.column` separator.
+    // Node keys (`table:schema.table`) must not be last-dot-split — the final dot is
+    // part of the key, not a `table.column` separator.
     let (table_name, column_name) = if graph::key::split_type_prefix(target).is_some() {
         (target, None)
     } else {
@@ -1578,8 +1578,8 @@ fn cmd_lineage(
         }
     };
 
-    // Issue #154: missing table halves fall back to the whole table reference;
-    // ambiguous halves stop with a qualifier hint instead.
+    // A missing table half means the split was probably `schema.table`: reinterpret the
+    // whole target as a table reference. An ambiguous half stops with a qualifier hint.
     let (table_name, column_name) = match column_name {
         Some(column) => match graph::lineage::lookup_table_node(graph, table_name) {
             graph::lineage::TableLookup::Found(_) => (table_name, Some(column)),

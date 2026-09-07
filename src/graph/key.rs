@@ -104,7 +104,11 @@ const TYPE_TAG_PREFIXES: &[&str] = &[
 /// never mistaken for `table.column` targets (#154).
 pub fn split_type_prefix(target: &str) -> Option<(&str, &str)> {
     let (tag, rest) = target.split_once(':')?;
-    if rest.is_empty() || !TYPE_TAG_PREFIXES.contains(&tag) {
+    if rest.is_empty()
+        || !TYPE_TAG_PREFIXES
+            .iter()
+            .any(|t| tag.eq_ignore_ascii_case(t))
+    {
         return None;
     }
     Some((tag, rest))
@@ -405,6 +409,18 @@ mod tests {
         assert_eq!(split_type_prefix("table:"), None);
         assert_eq!(split_type_prefix("my_table"), None);
         assert_eq!(split_type_prefix("schema.table.column"), None);
+    }
+
+    #[test]
+    fn should_detect_type_prefix_case_insensitively() {
+        assert_eq!(
+            split_type_prefix("Table:bigfund.mid"),
+            Some(("Table", "bigfund.mid"))
+        );
+        assert_eq!(
+            split_type_prefix("VIEW:public.v1"),
+            Some(("VIEW", "public.v1"))
+        );
     }
 
     #[test]

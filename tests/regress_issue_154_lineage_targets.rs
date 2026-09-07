@@ -108,7 +108,7 @@ fn should_fall_back_to_table_level_for_bare_schema_qualified_target() {
         "bare schema.table should fall back to table-level lineage, got:\n{stdout}"
     );
     assert!(
-        stderr.contains("interpreting") || stderr.contains("treating"),
+        stderr.contains("interpreting") && stderr.contains("bigfund.mid_yjqs_detail"),
         "fallback must emit a transparent note, stderr:\n{stderr}"
     );
 }
