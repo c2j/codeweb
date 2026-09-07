@@ -1218,6 +1218,31 @@ impl GraphStore {
         Ok(store)
     }
 
+    /// Peek at the on-disk store's format version WITHOUT deserializing the
+    /// payload. Returns `None` when the file is missing, unreadable, or has no
+    /// recognizable header (legacy pre-#110 stores); callers treat `None` as
+    /// stale.
+    pub fn peek_version(path: &Path) -> Option<u32> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut header = [0u8; 13];
+        file.read_exact(&mut header).ok()?;
+        if header[..9] != STORE_MAGIC {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            header[9], header[10], header[11], header[12],
+        ]))
+    }
+
+    /// True when the on-disk bincode store is readable under the current
+    /// `STORE_VERSION`. Used by the analyze up-to-date fast path so a store
+    /// written by an older layout gets rebuilt instead of being left stale on
+    /// disk while every read command rejects it.
+    pub fn file_is_current(path: &Path) -> bool {
+        Self::peek_version(path).is_some_and(|v| v == STORE_VERSION)
+    }
+
     pub fn save_json(&self, path: &Path) -> crate::error::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| crate::error::CodeWebError::FileRead {
@@ -2404,6 +2429,39 @@ mod tests {
             "error should report the found version (99): {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn peek_version_returns_header_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("peek.bincode");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(GraphStore::peek_version(&path), Some(STORE_VERSION));
+        assert!(GraphStore::file_is_current(&path));
+    }
+
+    #[test]
+    fn peek_version_none_for_legacy_headerless_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bincode");
+        let store = GraphStore::from_graph("legacy", CodeGraph::new());
+        let raw = bincode::serialize(&store).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+
+        assert_eq!(GraphStore::peek_version(&path), None);
+        assert!(!GraphStore::file_is_current(&path));
+    }
+
+    #[test]
+    fn peek_version_none_for_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing.bincode");
+        assert_eq!(GraphStore::peek_version(&path), None);
+        assert!(!GraphStore::file_is_current(&path));
     }
 
     #[test]

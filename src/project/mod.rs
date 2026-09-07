@@ -145,7 +145,7 @@ impl Project {
 
         let changes = compute_changes(&current_files, &existing_manifest);
 
-        let is_up_to_date = changes.is_empty();
+        let is_up_to_date = changes.is_empty() && self.store_is_current();
         let is_full_build = existing_manifest.is_empty();
 
         if is_up_to_date && !is_full_build {
@@ -530,6 +530,24 @@ impl Project {
         GraphStore::load_manifest_sidecar(&store_path).unwrap_or_default()
     }
 
+    /// True when the on-disk store exists and carries the current layout
+    /// version header. The manifest sidecar has no version header and survives
+    /// `STORE_VERSION` bumps, so fingerprints alone cannot detect a store
+    /// written by an older binary — without this check an upgraded binary would
+    /// keep a stale store that every read command then rejects. Bincode probes
+    /// only the 13-byte header; JSON relies on `load_json`'s own version gate,
+    /// so `is_ok()` means "current layout".
+    fn store_is_current(&self) -> bool {
+        let store_path = self.store_path();
+        if !store_path.exists() {
+            return false;
+        }
+        match self.config.store.format {
+            config::StoreFormat::Bincode => GraphStore::file_is_current(&store_path),
+            config::StoreFormat::Json => GraphStore::load_json(&store_path).is_ok(),
+        }
+    }
+
     pub fn try_load_store(&mut self) -> Option<&GraphStore> {
         if self.store.is_none() {
             let store_path = self.store_path();
@@ -579,6 +597,57 @@ fn scan_with_fingerprints(paths: &[PathBuf], exclude: &[String]) -> Vec<(PathBuf
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn analyze_rebuilds_when_store_version_stale() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        fs::write(tmpdir.path().join("p1.sql"), "SELECT 1;").unwrap();
+        let config = ProjectConfig::load(
+            "[project]\nname = \"t\"\n\n[analysis]\npaths = [\".\"]\n\n[store]\npath = \".codeweb/store.bincode\"\nformat = \"bincode\"\n",
+        )
+        .unwrap();
+        let mut proj = Project {
+            root: tmpdir.path().to_path_buf(),
+            config,
+            store: None,
+        };
+
+        // Baseline: first analyze is a full build and writes a current store.
+        let first = proj.analyze().unwrap();
+        assert!(
+            first.is_full_build,
+            "first analyze on an empty cache must be a full build"
+        );
+
+        // Simulate a store written by an older binary (previous layout, e.g. v7
+        // from before the STORE_VERSION 7→8 bump): overwrite the store bytes with
+        // a stale-version header. The manifest sidecar is left untouched — file
+        // fingerprints are unchanged, so the up-to-date check must not trust the
+        // store version it never looked at.
+        let store_path = tmpdir.path().join(".codeweb").join("store.bincode");
+        let mut stale: Vec<u8> = Vec::new();
+        stale.extend_from_slice(b"CWEBSTORE");
+        stale.extend_from_slice(&7u32.to_le_bytes());
+        stale.extend_from_slice(&[0u8; 8]);
+        fs::write(&store_path, &stale).unwrap();
+
+        // Core behavior: fingerprints unchanged BUT store layout is stale →
+        // analyze must rebuild (self-heal), never report "Up to date".
+        let second = proj.analyze().unwrap();
+        assert!(
+            !second.is_up_to_date,
+            "a store whose version predates the current layout must NOT be reported up-to-date"
+        );
+
+        // Self-heal: after the rebuild the on-disk store must be loadable by the
+        // current binary (version gate passes) instead of trapping stats/trace.
+        let healed = GraphStore::load_bincode(&store_path);
+        assert!(
+            healed.is_ok(),
+            "re-analyze must rewrite the store in the current layout: {:?}",
+            healed.err().map(|e| e.to_string())
+        );
+    }
 
     #[test]
     fn scan_with_fingerprints_deduplicates_overlapping_paths() {
