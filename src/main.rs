@@ -378,7 +378,9 @@ enum Commands {
 
     /// Table-level and column-level lineage analysis
     Lineage {
-        /// Target table name (e.g., "my_table") for table-level, or "table.column" for column-level
+        /// Target for lineage: "my_table" (table-level), "table.column" or
+        /// "schema.table.column" (column-level), or a node key like
+        /// "table:schema.table" (table-level, same grammar as trace/detail)
         target: String,
 
         /// Lineage direction: upstream (who writes/defines), downstream (who consumes),
@@ -1556,19 +1558,49 @@ fn cmd_lineage(
         );
     }
 
-    // `table` traces the table; `table.column` traces one column through it. Split on the
-    // last `.` so a schema-qualified `schema.table.column` keeps `schema.table` as the
-    // table part and only the final component as the column.
-    let (table_name, column_name) = match target.rsplit_once('.') {
-        Some((table, column)) if !table.is_empty() && !column.is_empty() => (table, Some(column)),
-        Some(_) => {
-            eprintln!(
-                "Invalid target format: {}. Use 'table' or 'table.column'",
-                target
-            );
-            return Ok(());
+    // Node keys (`table:schema.table`) must not be last-dot-split — the final dot is
+    // part of the key, not a `table.column` separator.
+    let (table_name, column_name) = if graph::key::split_type_prefix(target).is_some() {
+        (target, None)
+    } else {
+        match target.rsplit_once('.') {
+            Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+                (table, Some(column))
+            }
+            Some(_) => {
+                eprintln!(
+                    "Invalid target format: {}. Use 'table', 'table.column', or a node key like 'table:schema.table'",
+                    target
+                );
+                return Ok(());
+            }
+            None => (target, None),
         }
-        None => (target, None),
+    };
+
+    // A missing table half means the split was probably `schema.table`: reinterpret the
+    // whole target as a table reference. An ambiguous half stops with a qualifier hint.
+    let (table_name, column_name) = match column_name {
+        Some(column) => match graph::lineage::lookup_table_node(graph, table_name) {
+            graph::lineage::TableLookup::Found(_) => (table_name, Some(column)),
+            graph::lineage::TableLookup::Ambiguous => {
+                eprintln!(
+                    "error: table '{}' is ambiguous across schemas — qualify it as \
+                     'schema.{table_name}' for table-level, or 'schema.{table_name}.{column}' \
+                     for column-level lineage",
+                    table_name
+                );
+                return Ok(());
+            }
+            graph::lineage::TableLookup::Missing => {
+                eprintln!(
+                    "note: no table '{}' found — interpreting '{}' as a table reference",
+                    table_name, target
+                );
+                (target, None)
+            }
+        },
+        None => (table_name, None),
     };
 
     // Parse direction up front — both the table and column paths need it. `None` means

@@ -90,6 +90,30 @@ pub enum NodeKey {
     },
 }
 
+/// Node-key type tags exactly as emitted by the [`fmt::Display`] implementation below.
+/// Keep in sync with its match arms; `should_detect_every_display_tag_roundtrip` pins
+/// the fixed tags (the custom and unresolved formats are intentionally excluded).
+const TYPE_TAG_PREFIXES: &[&str] = &[
+    "proc", "func", "mapper", "method", "class", "table", "view", "pkg", "trigger", "type", "seq",
+    "idx", "mview", "syn", "event", "builtin", "javasql", "jsp", "jspsql",
+];
+
+/// If `target` starts with `<known-tag>:`, return `(tag, rest)`.
+///
+/// CLI target parsing uses this so `type:name` node keys resolve as whole keys and are
+/// never mistaken for `table.column` targets (#154).
+pub fn split_type_prefix(target: &str) -> Option<(&str, &str)> {
+    let (tag, rest) = target.split_once(':')?;
+    if rest.is_empty()
+        || !TYPE_TAG_PREFIXES
+            .iter()
+            .any(|t| tag.eq_ignore_ascii_case(t))
+    {
+        return None;
+    }
+    Some((tag, rest))
+}
+
 impl fmt::Display for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -351,6 +375,159 @@ impl NodeKey {
                 name: name.clone(),
             }),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_detect_known_type_prefix() {
+        assert_eq!(
+            split_type_prefix("table:bigfund.mid_yjqs_detail"),
+            Some(("table", "bigfund.mid_yjqs_detail"))
+        );
+        assert_eq!(
+            split_type_prefix("table:my_table"),
+            Some(("table", "my_table"))
+        );
+        assert_eq!(
+            split_type_prefix("view:public.v1"),
+            Some(("view", "public.v1"))
+        );
+        assert_eq!(
+            split_type_prefix("idx:mid_yjqs_detail[pk_mid_yjqs_detail]"),
+            Some(("idx", "mid_yjqs_detail[pk_mid_yjqs_detail]"))
+        );
+    }
+
+    #[test]
+    fn should_reject_unknown_or_empty_prefix() {
+        assert_eq!(split_type_prefix("weird:stuff"), None);
+        assert_eq!(split_type_prefix("table:"), None);
+        assert_eq!(split_type_prefix("my_table"), None);
+        assert_eq!(split_type_prefix("schema.table.column"), None);
+    }
+
+    #[test]
+    fn should_detect_type_prefix_case_insensitively() {
+        assert_eq!(
+            split_type_prefix("Table:bigfund.mid"),
+            Some(("Table", "bigfund.mid"))
+        );
+        assert_eq!(
+            split_type_prefix("VIEW:public.v1"),
+            Some(("VIEW", "public.v1"))
+        );
+    }
+
+    #[test]
+    fn should_detect_every_display_tag_roundtrip() {
+        let cases = [
+            format!(
+                "{}",
+                NodeKey::Procedure {
+                    schema: Some("s".into()),
+                    package: None,
+                    name: "p".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Function {
+                    schema: Some("s".into()),
+                    package: None,
+                    name: "f".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Mapper {
+                    namespace: "n".into(),
+                    statement_id: "q".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::JavaMethod {
+                    fqn: "a.B.c".into()
+                }
+            ),
+            format!("{}", NodeKey::JavaClass { fqn: "a.B".into() }),
+            format!(
+                "{}",
+                NodeKey::Table {
+                    schema: Some("s".into()),
+                    name: "t".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::View {
+                    schema: Some("s".into()),
+                    name: "v".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Package {
+                    schema: Some("s".into()),
+                    name: "pk".into()
+                }
+            ),
+            format!("{}", NodeKey::Trigger { name: "tg".into() }),
+            format!(
+                "{}",
+                NodeKey::Type {
+                    schema: Some("s".into()),
+                    name: "ty".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Sequence {
+                    schema: Some("s".into()),
+                    name: "sq".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Index {
+                    table_name: "t".into(),
+                    name: Some("ix".into())
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::MaterializedView {
+                    schema: Some("s".into()),
+                    name: "mv".into()
+                }
+            ),
+            format!(
+                "{}",
+                NodeKey::Synonym {
+                    schema: Some("s".into()),
+                    name: "sy".into()
+                }
+            ),
+            format!("{}", NodeKey::Event { name: "ev".into() }),
+            format!("{}", NodeKey::BuiltinFunction { name: "bf".into() }),
+            format!(
+                "{}",
+                NodeKey::JavaSql {
+                    file: "a.java".into(),
+                    line: 1
+                }
+            ),
+        ];
+        for key in &cases {
+            assert!(
+                split_type_prefix(key).is_some(),
+                "tag not detected for Display key: {key}"
+            );
         }
     }
 }
