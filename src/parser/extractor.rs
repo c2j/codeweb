@@ -1062,6 +1062,82 @@ impl Visitor for TypeSequenceRefExtractor {
     }
 }
 
+/// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
+/// Cursor-anchored `%ROWTYPE` is deliberately skipped (issue #147/#142:
+/// record fields resolve via cursor SELECT sources, not table edges).
+pub struct AnchorExtractor {
+    pub anchors: Vec<AnchorRef>,
+    cursor_names: HashSet<String>,
+}
+
+impl AnchorExtractor {
+    pub fn new() -> Self {
+        Self {
+            anchors: Vec::new(),
+            cursor_names: HashSet::new(),
+        }
+    }
+
+    fn push_anchor(
+        &mut self,
+        object: String,
+        column: Option<String>,
+        kind: AnchorKind,
+        site: AnchorSite,
+    ) {
+        let obj_lower = object.to_lowercase();
+        // 守卫：锚定目标是 cursor → 不建表锚（Task 4 将扩展变量名守卫）
+        if self.cursor_names.contains(&obj_lower) {
+            return;
+        }
+        self.anchors.push(AnchorRef {
+            object,
+            column,
+            kind,
+            site,
+        });
+    }
+}
+
+impl Default for AnchorExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Visitor for AnchorExtractor {
+    fn visit_pl_declaration(
+        &mut self,
+        decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
+    ) -> VisitorResult {
+        use ogsql_parser::ast::plpgsql::PlDataType;
+        match decl {
+            PlDeclaration::Cursor(c) => {
+                self.cursor_names.insert(c.name.to_lowercase());
+            }
+            PlDeclaration::Variable(v) => {
+                if let PlDataType::PercentType { table, column } = &v.data_type {
+                    self.push_anchor(
+                        table.clone(),
+                        Some(column.clone()),
+                        AnchorKind::PercentType,
+                        AnchorSite::Variable,
+                    );
+                } else if let PlDataType::PercentRowType(name) = &v.data_type {
+                    self.push_anchor(
+                        name.clone(),
+                        None,
+                        AnchorKind::PercentRowType,
+                        AnchorSite::Variable,
+                    );
+                }
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableAccessInfo {
     pub name: String,
@@ -4505,6 +4581,41 @@ mod tests {
             walk_statement(&mut extractor, &info.statement);
         }
         (extractor.type_refs, extractor.sequence_refs)
+    }
+
+    fn extract_anchors(sql: &str) -> Vec<AnchorRef> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut out = Vec::new();
+        for info in &stmts {
+            let mut ex = AnchorExtractor::new();
+            walk_statement(&mut ex, &info.statement);
+            out.extend(ex.anchors);
+        }
+        out
+    }
+
+    #[test]
+    fn should_collect_variable_percent_type_anchor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            $$ DECLARE v_days par_sys_purchase.purchase_days%TYPE; BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
+    }
+
+    #[test]
+    fn should_collect_variable_table_rowtype_anchor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            $$ DECLARE r dat_trd_repurchase%ROWTYPE; BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].object.to_lowercase(), "dat_trd_repurchase");
+        assert_eq!(anchors[0].column, None);
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
     }
 
     #[test]
