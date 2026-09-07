@@ -1064,14 +1064,14 @@ impl Visitor for TypeSequenceRefExtractor {
 
 /// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
 /// `push_anchor` skips any anchor whose object name (lowercased) matches a
-/// known cursor name. This mainly guards `cursor%ROWTYPE` (issue #147/#142:
-/// record fields resolve via cursor SELECT sources, not table edges); a
-/// `%TYPE` table name colliding with a cursor name can't happen in practice,
-/// but the guard applies uniformly to both branches to keep a single
-/// enforcement point (Task 4 will extend it with a variable-name guard).
+/// known cursor name or a declared local variable name. This guards both
+/// `cursor%ROWTYPE` (issue #147/#142: record fields resolve via cursor
+/// SELECT sources, not table edges) and variable-to-variable anchoring
+/// (`v2 v1%TYPE`), neither of which are table references.
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
+    var_names: HashSet<String>,
 }
 
 impl AnchorExtractor {
@@ -1079,6 +1079,7 @@ impl AnchorExtractor {
         Self {
             anchors: Vec::new(),
             cursor_names: HashSet::new(),
+            var_names: HashSet::new(),
         }
     }
 
@@ -1090,8 +1091,8 @@ impl AnchorExtractor {
         site: AnchorSite,
     ) {
         let obj_lower = object.to_lowercase();
-        // 守卫：锚定目标是 cursor → 不建表锚（Task 4 将扩展变量名守卫）
-        if self.cursor_names.contains(&obj_lower) {
+        // 守卫：锚定目标是 cursor 或本 routine 已声明的局部变量 → 不建表锚
+        if self.cursor_names.contains(&obj_lower) || self.var_names.contains(&obj_lower) {
             return;
         }
         self.anchors.push(AnchorRef {
@@ -1140,6 +1141,7 @@ impl Visitor for AnchorExtractor {
                 self.cursor_names.insert(c.name.to_lowercase());
             }
             PlDeclaration::Variable(v) => {
+                self.var_names.insert(v.name.to_lowercase());
                 self.visit_pl_data_type(&v.data_type, AnchorSite::Variable);
             }
             PlDeclaration::Type(t) => match t {
@@ -4663,6 +4665,33 @@ mod tests {
             "cursor%ROWTYPE must not produce a table anchor: {:?}",
             anchors
         );
+    }
+
+    #[test]
+    fn should_skip_var_anchored_type_to_local_variable() {
+        // PL/SQL 允许变量锚定到另一变量：v2 v1%TYPE —— 不是表锚
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE v1 INTEGER; v2 v1%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "variable%TYPE must not become a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    #[test]
+    fn should_keep_table_rowtype_when_cursor_exists_elsewhere() {
+        // 同 routine 内：cursor c 的存在不影响真正的表锚 rec2
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE CURSOR c IS SELECT id FROM t_main; \
+            rec c%ROWTYPE; rec2 dat_trd_repurchase%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
     }
 
     #[test]
