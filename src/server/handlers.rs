@@ -663,6 +663,8 @@ fn tree_nodes_to_json(nodes: &[TreeNode], graph: &CodeGraph) -> Vec<Value> {
                 "key": key.to_string(),
                 "type": node_sub_type_tag(&graph[node.idx]),
                 "edge_label": node.edge_label,
+                "has_more": node.has_more,
+                "more_count": node.more_count,
                 "children": tree_nodes_to_json(&node.children, graph),
             })
         })
