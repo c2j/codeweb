@@ -1218,6 +1218,50 @@ impl GraphStore {
         Ok(store)
     }
 
+    /// Peek at the on-disk store's format version WITHOUT deserializing the
+    /// payload. Returns `None` when the file is missing, unreadable, or has no
+    /// recognizable header (legacy pre-#110 stores); callers treat `None` as
+    /// stale.
+    pub fn peek_version(path: &Path) -> Option<u32> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut header = [0u8; 13];
+        file.read_exact(&mut header).ok()?;
+        if header[..9] != STORE_MAGIC {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            header[9], header[10], header[11], header[12],
+        ]))
+    }
+
+    /// True when the on-disk bincode store's 13-byte header carries the
+    /// expected magic and `version == STORE_VERSION`. Missing, unreadable, or
+    /// headerless files are not current. Payload readability is NOT checked —
+    /// a truncated or corrupt payload behind a valid header still counts as
+    /// current (the analyze up-to-date fast path only needs the layout probe;
+    /// the manifest sidecar has no version header, so this is what lets it
+    /// detect a store written by an older layout).
+    pub fn file_is_current(path: &Path) -> bool {
+        Self::peek_version(path).is_some_and(|v| v == STORE_VERSION)
+    }
+
+    /// True when the on-disk JSON store's `version` field equals
+    /// `STORE_VERSION`. Decodes ONLY that field (serde ignores the rest of the
+    /// document), so the up-to-date fast path never constructs the full graph.
+    /// Missing, unreadable, malformed, or stale-versioned files are not
+    /// current — payload validity is not otherwise checked.
+    pub fn json_file_is_current(path: &Path) -> bool {
+        #[derive(serde::Deserialize)]
+        struct StoreVersionProbe {
+            version: u32,
+        }
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<StoreVersionProbe>(&text).ok())
+            .is_some_and(|probe| probe.version == STORE_VERSION)
+    }
+
     pub fn save_json(&self, path: &Path) -> crate::error::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| crate::error::CodeWebError::FileRead {
@@ -2404,6 +2448,69 @@ mod tests {
             "error should report the found version (99): {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn peek_version_returns_header_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("peek.bincode");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&STORE_VERSION.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(GraphStore::peek_version(&path), Some(STORE_VERSION));
+        assert!(GraphStore::file_is_current(&path));
+    }
+
+    #[test]
+    fn peek_version_none_for_legacy_headerless_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bincode");
+        let store = GraphStore::from_graph("legacy", CodeGraph::new());
+        let raw = bincode::serialize(&store).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+
+        assert_eq!(GraphStore::peek_version(&path), None);
+        assert!(!GraphStore::file_is_current(&path));
+    }
+
+    #[test]
+    fn peek_version_none_for_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing.bincode");
+        assert_eq!(GraphStore::peek_version(&path), None);
+        assert!(!GraphStore::file_is_current(&path));
+    }
+
+    #[test]
+    fn json_file_is_current_true_for_current_version_document() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("current.json");
+        let store = GraphStore::from_graph("probe", CodeGraph::new());
+        store.save_json(&path).unwrap();
+
+        assert!(GraphStore::json_file_is_current(&path));
+    }
+
+    #[test]
+    fn json_file_is_current_false_for_stale_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v7.json");
+        std::fs::write(&path, r#"{"version": 7, "project_name": "stale"}"#).unwrap();
+
+        assert!(!GraphStore::json_file_is_current(&path));
+    }
+
+    #[test]
+    fn json_file_is_current_false_for_corrupt_or_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "not json at all").unwrap();
+        assert!(!GraphStore::json_file_is_current(&corrupt));
+
+        let missing = dir.path().join("missing.json");
+        assert!(!GraphStore::json_file_is_current(&missing));
     }
 
     #[test]

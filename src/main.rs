@@ -3787,12 +3787,15 @@ fn print_cluster_analysis(report: &graph::cluster::PartitionReport) {
     }
 }
 
+/// The up-to-date fast path never loads the store, so `report.nodes`/`edges`
+/// are meaningless zeros there — printing them suggests an empty graph.
+fn format_up_to_date_line(report: &project::AnalyzeReport) -> String {
+    format!("Up to date. {} files.", report.files_scanned)
+}
+
 fn print_analyze_report(report: &project::AnalyzeReport) {
     if report.is_up_to_date {
-        eprintln!(
-            "Up to date. {} files, {} nodes, {} edges.",
-            report.files_scanned, report.nodes, report.edges
-        );
+        eprintln!("{}", format_up_to_date_line(report));
         return;
     }
     let build_type = if report.is_full_build {
@@ -4487,6 +4490,29 @@ mod tests {
             tag: tag.to_string(),
             name: name.to_string(),
         }
+    }
+
+    #[test]
+    fn up_to_date_line_reports_files_without_zero_counts() {
+        let report = project::AnalyzeReport {
+            files_scanned: 136,
+            files_unchanged: 136,
+            files_changed: 0,
+            files_added: 0,
+            files_deleted: 0,
+            nodes: 0,
+            edges: 0,
+            is_full_build: false,
+            is_up_to_date: true,
+            elapsed_ms: 12,
+        };
+        let line = format_up_to_date_line(&report);
+        assert_eq!(line, "Up to date. 136 files.");
+        assert!(
+            !line.contains("nodes"),
+            "up-to-date fast path never loads the store, so node/edge counts are \
+             meaningless zeros and must not be printed: {line}"
+        );
     }
 
     #[test]
