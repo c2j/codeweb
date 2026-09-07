@@ -2019,10 +2019,37 @@ impl GraphStore {
             // so interleaving access with removal can panic when a cached
             // EdgeIndex equals the swapped-out last slot.
             let mut to_remove: Vec<petgraph::graph::EdgeIndex> = Vec::new();
-            for ((_src, _dst, tag), mut group) in edge_groups {
+            for ((_src, _dst, tag), group) in edge_groups {
                 if group.len() <= 1 {
                     continue;
                 }
+                if tag == "anchors_on" {
+                    // `AnchorsOn` edges on the same (proc, table) pair are not
+                    // interchangeable duplicates: distinct params/vars can each
+                    // anchor a different column of the same table (issue #158).
+                    // Only collapse edges whose (kind, column, site) are all equal;
+                    // keep one representative per distinct combination.
+                    let mut seen: Vec<(
+                        crate::parser::AnchorKind,
+                        Option<String>,
+                        crate::parser::AnchorSite,
+                    )> = Vec::new();
+                    for &edge_idx in &group {
+                        if let crate::graph::Edge::AnchorsOn {
+                            kind, column, site, ..
+                        } = &self.graph[edge_idx]
+                        {
+                            let key = (*kind, column.clone(), *site);
+                            if seen.contains(&key) {
+                                to_remove.push(edge_idx);
+                            } else {
+                                seen.push(key);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut group = group;
                 let keep = group.remove(0);
                 if tag == "table_access" {
                     // Merge modes/write_kinds from all remove edges into keep.
@@ -2567,6 +2594,107 @@ mod tests {
             }
             other => panic!("expected Edge::AnchorsOn, got {:?}", other),
         }
+    }
+
+    /// issue #158 code review: `dedup()`'s generic same-(src,dst,tag) collapse
+    /// ("keep = group.remove(0)") must not apply to `AnchorsOn` edges wholesale —
+    /// two params anchoring the *same* table on *different* columns
+    /// (`p1 emp.id%TYPE`, `p2 emp.name%TYPE`) produce two distinct, both-correct
+    /// `AnchorsOn` edges on the same (proc, table) pair. Only an exact
+    /// `(kind, column, site)` duplicate should be removed.
+    #[test]
+    fn should_keep_distinct_anchor_edges_through_dedup() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let mut graph = CodeGraph::new();
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let proc_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        // p1 emp.id%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // p2 emp.name%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("name".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // Exact duplicate of p1 — this one must be removed.
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+
+        let mut store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.graph().edge_count(), 3);
+
+        let report = store.dedup();
+        assert_eq!(
+            report.edges_removed, 1,
+            "only the exact duplicate should be removed"
+        );
+        assert_eq!(store.graph().edge_count(), 2);
+
+        let mut columns: Vec<Option<String>> = store
+            .graph()
+            .edge_weights()
+            .map(|e| match e {
+                crate::graph::Edge::AnchorsOn { column, .. } => column.clone(),
+                other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+            })
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![Some("id".to_string()), Some("name".to_string())]
+        );
     }
 
     /// Mirrors `load_bincode_rejects_header_version_mismatch_with_friendly_error`: a

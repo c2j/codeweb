@@ -4622,14 +4622,15 @@ mod tests {
         }
     }
 
-    /// issue #158: a function's flat `RETURN par_sys_purchase.purchase_days%TYPE`
-    /// signature must produce an `AnchorsOn` edge from the function to the
-    /// (inferred, no-DDL) `par_sys_purchase` table, carrying the anchored column.
+    /// issue #158: a function's flat, schema-qualified
+    /// `RETURN bigfund.par_sys_purchase.purchase_days%TYPE` signature must produce an
+    /// `AnchorsOn` edge from the function to the (inferred, no-DDL)
+    /// `bigfund.par_sys_purchase` table, carrying the anchored column and schema.
     #[test]
     fn should_create_anchor_edge_from_function_return_type() {
         let sql = r#"
             CREATE OR REPLACE FUNCTION BIGFUND.FNC_GET_PURCHASE_JS_DAYS
-            RETURN par_sys_purchase.purchase_days%TYPE
+            RETURN bigfund.par_sys_purchase.purchase_days%TYPE
             IS
             BEGIN
                 RETURN NULL;
@@ -4668,7 +4669,13 @@ mod tests {
         }
 
         match &graph[target] {
-            Node::Table { name, explicit, .. } => {
+            Node::Table {
+                schema,
+                name,
+                explicit,
+                ..
+            } => {
+                assert_eq!(schema.as_deref(), Some("bigfund"));
                 assert_eq!(name.to_lowercase(), "par_sys_purchase");
                 assert!(
                     !explicit,
