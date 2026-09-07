@@ -651,10 +651,11 @@ impl GraphBuilder {
                             let seq_node = Node::Sequence {
                                 schema: schema.as_ref().map(|s| s.to_lowercase()),
                                 name: name.to_lowercase(),
-                                location: SourceLocation {
+                                explicit: true,
+                                location: Some(SourceLocation {
                                     file: file_arc.clone(),
                                     line: info.start_line,
-                                },
+                                }),
                             };
                             let idx = graph.add_node(seq_node);
                             sequence_index.entry(short_key).or_insert(idx);
@@ -1736,6 +1737,7 @@ impl GraphBuilder {
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
     ) {
+        let mut inferred_sequence_index = HashMap::new();
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
@@ -1783,20 +1785,22 @@ impl GraphBuilder {
                                 }
                             }
                             for seq_ref in &extractor.sequence_refs {
-                                if let Some(&seq_idx) =
-                                    sequence_index.get(&seq_ref.sequence_name.to_lowercase())
-                                {
-                                    graph.add_edge(
-                                        proc_idx,
-                                        seq_idx,
-                                        Edge::UsesSequence {
-                                            location: SourceLocation {
-                                                file: file_arc.clone(),
-                                                line: info.start_line,
-                                            },
+                                let seq_idx = Self::resolve_or_infer_sequence(
+                                    &seq_ref.sequence_name,
+                                    sequence_index,
+                                    &mut inferred_sequence_index,
+                                    graph,
+                                );
+                                graph.add_edge(
+                                    proc_idx,
+                                    seq_idx,
+                                    Edge::UsesSequence {
+                                        location: SourceLocation {
+                                            file: file_arc.clone(),
+                                            line: info.start_line,
                                         },
-                                    );
-                                }
+                                    },
+                                );
                             }
                         }
                     }
@@ -1854,20 +1858,22 @@ impl GraphBuilder {
                                 }
                             }
                             for seq_ref in &extractor.sequence_refs {
-                                if let Some(&seq_idx) =
-                                    sequence_index.get(&seq_ref.sequence_name.to_lowercase())
-                                {
-                                    graph.add_edge(
-                                        proc_idx,
-                                        seq_idx,
-                                        Edge::UsesSequence {
-                                            location: SourceLocation {
-                                                file: file_arc.clone(),
-                                                line: info.start_line,
-                                            },
+                                let seq_idx = Self::resolve_or_infer_sequence(
+                                    &seq_ref.sequence_name,
+                                    sequence_index,
+                                    &mut inferred_sequence_index,
+                                    graph,
+                                );
+                                graph.add_edge(
+                                    proc_idx,
+                                    seq_idx,
+                                    Edge::UsesSequence {
+                                        location: SourceLocation {
+                                            file: file_arc.clone(),
+                                            line: info.start_line,
                                         },
-                                    );
-                                }
+                                    },
+                                );
                             }
                         }
                     }
@@ -1880,6 +1886,7 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
+                            &mut inferred_sequence_index,
                             graph,
                         );
                     }
@@ -1892,6 +1899,7 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
+                            &mut inferred_sequence_index,
                             graph,
                         );
                     }
@@ -1910,6 +1918,7 @@ impl GraphBuilder {
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
@@ -1961,20 +1970,66 @@ impl GraphBuilder {
                 }
             }
             for seq_ref in &extractor.sequence_refs {
-                if let Some(&seq_idx) = sequence_index.get(&seq_ref.sequence_name.to_lowercase()) {
-                    graph.add_edge(
-                        proc_idx,
-                        seq_idx,
-                        Edge::UsesSequence {
-                            location: SourceLocation {
-                                file: file_path.clone(),
-                                line: info.start_line,
-                            },
+                let seq_idx = Self::resolve_or_infer_sequence(
+                    &seq_ref.sequence_name,
+                    sequence_index,
+                    inferred_sequence_index,
+                    graph,
+                );
+                graph.add_edge(
+                    proc_idx,
+                    seq_idx,
+                    Edge::UsesSequence {
+                        location: SourceLocation {
+                            file: file_path.clone(),
+                            line: info.start_line,
                         },
-                    );
-                }
+                    },
+                );
             }
         }
+    }
+
+    fn resolve_or_infer_sequence(
+        sequence_name: &str,
+        sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        graph: &mut CodeGraph,
+    ) -> petgraph::graph::NodeIndex {
+        let normalized = sequence_name.to_lowercase();
+        let (schema, name) = normalized
+            .rsplit_once('.')
+            .map_or((None, normalized.as_str()), |(schema, name)| {
+                (Some(schema), name)
+            });
+        let full_key = normalize_object_key(schema, name);
+        let short_key = normalize_object_key(None, name);
+
+        // Schema-qualified references must not fall back to the short-name
+        // alias: `hr.seq_id.nextval` is a different object from
+        // `finance.seq_id` even though both share the short name `seq_id`.
+        // Only unqualified references resolve through the short-name key
+        // (which equals `full_key` when `schema` is `None`).
+        let (lookup_key, insert_key) = if schema.is_some() {
+            (full_key.clone(), full_key)
+        } else {
+            (short_key.clone(), short_key)
+        };
+        if let Some(&idx) = sequence_index
+            .get(&lookup_key)
+            .or_else(|| inferred_sequence_index.get(&lookup_key))
+        {
+            return idx;
+        }
+
+        let idx = graph.add_node(Node::Sequence {
+            schema: schema.map(str::to_string),
+            name: name.to_string(),
+            explicit: false,
+            location: None,
+        });
+        inferred_sequence_index.insert(insert_key, idx);
+        idx
     }
 
     fn collect_package_call_edges(
@@ -4898,6 +4953,191 @@ mod tests {
             1,
             "Expected 1 UsesSequence edge from dot NEXTVAL"
         );
+    }
+
+    fn assert_single_inferred_sequence(graph: &crate::graph::CodeGraph, expected_name: &str) {
+        let seq_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::UsesSequence { .. }))
+            .collect();
+        assert_eq!(seq_edges.len(), 1, "Expected exactly 1 UsesSequence edge");
+        let (_, target) = graph.edge_endpoints(seq_edges[0]).unwrap();
+        assert!(
+            matches!(
+                &graph[target],
+                Node::Sequence {
+                    name,
+                    explicit: false,
+                    location: None,
+                    ..
+                } if name == expected_name
+            ),
+            "UsesSequence should target inferred sequence {expected_name}"
+        );
+    }
+
+    #[test]
+    fn procedure_using_nextval_without_ddl_creates_inferred_sequence_node() {
+        let graph = build_from_sql(
+            r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v BIGINT;
+            BEGIN
+                SELECT nextval('seq_batch_payment') INTO v FROM sys_dummy;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        assert_single_inferred_sequence(&graph, "seq_batch_payment");
+    }
+
+    #[test]
+    fn select_dot_nextval_into_from_sys_dummy_creates_edge_with_ddl() {
+        let graph = build_from_sql(
+            r#"
+            CREATE SEQUENCE seq_batch_payment;
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v BIGINT;
+            BEGIN
+                SELECT seq_batch_payment.nextval INTO v FROM sys_dummy;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        let seq_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::UsesSequence { .. }))
+            .collect();
+        assert_eq!(seq_edges.len(), 1, "Expected exactly 1 UsesSequence edge");
+        let (_, target) = graph.edge_endpoints(seq_edges[0]).unwrap();
+        assert!(matches!(
+            &graph[target],
+            Node::Sequence { explicit: true, .. }
+        ));
+    }
+
+    #[test]
+    fn qualified_sequence_ref_does_not_collapse_to_other_schemas_sequence() {
+        // `finance.seq_id` has DDL, the procedure references `hr.seq_id.nextval`.
+        // The hr-qualified reference must NOT bind through the short-name alias
+        // to finance's sequence: same short name, different schema, different node.
+        let graph = build_from_sql(
+            r#"
+            CREATE SEQUENCE finance.seq_id START 1;
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v_id BIGINT;
+            BEGIN
+                v_id := hr.seq_id.NEXTVAL;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        let seq_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::UsesSequence { .. }))
+            .collect();
+        assert_eq!(seq_edges.len(), 1, "Expected exactly 1 UsesSequence edge");
+        let (_, target) = graph.edge_endpoints(seq_edges[0]).unwrap();
+        assert!(
+            matches!(
+                &graph[target],
+                Node::Sequence {
+                    schema: Some(schema),
+                    name,
+                    explicit: false,
+                    ..
+                } if schema == "hr" && name == "seq_id"
+            ),
+            "qualified ref must target inferred hr.seq_id, got: {:?}",
+            &graph[target]
+        );
+    }
+
+    #[test]
+    fn two_schema_qualified_inferred_sequence_refs_create_distinct_nodes() {
+        let graph = build_from_sql(
+            r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v_a BIGINT; v_b BIGINT;
+            BEGIN
+                v_a := finance.seq_id.NEXTVAL;
+                v_b := hr.seq_id.NEXTVAL;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        let targets: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::UsesSequence { .. }))
+            .map(|e| graph.edge_endpoints(e).unwrap().1)
+            .collect();
+        assert_eq!(targets.len(), 2, "Expected 2 UsesSequence edges");
+        let mut schemas: Vec<&str> = targets
+            .iter()
+            .map(|&t| match &graph[t] {
+                Node::Sequence {
+                    schema: Some(s), ..
+                } => s.as_str(),
+                other => panic!("unexpected target node: {other:?}"),
+            })
+            .collect();
+        schemas.sort_unstable();
+        assert_eq!(
+            schemas,
+            vec!["finance", "hr"],
+            "distinct inferred nodes per schema"
+        );
+    }
+
+    #[test]
+    fn dot_nextval_assignment_without_ddl_creates_inferred_sequence_node() {
+        let graph = build_from_sql(
+            r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v_id BIGINT;
+            BEGIN
+                v_id := my_seq.NEXTVAL;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        assert_single_inferred_sequence(&graph, "my_seq");
+    }
+
+    #[test]
+    fn insert_values_nextval_without_ddl_creates_inferred_sequence_node() {
+        let graph = build_from_sql(
+            r#"
+            CREATE PROCEDURE test_proc() AS $$
+            BEGIN
+                INSERT INTO t(id) VALUES(my_seq.NEXTVAL);
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        assert_single_inferred_sequence(&graph, "my_seq");
+    }
+
+    #[test]
+    fn inferred_sequence_schema_qualified_ref_resolves() {
+        let graph = build_from_sql(
+            r#"
+            CREATE PROCEDURE test_proc() AS $$
+            DECLARE v BIGINT;
+            BEGIN
+                SELECT s1.my_seq.nextval INTO v FROM sys_dummy;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        );
+
+        assert_single_inferred_sequence(&graph, "my_seq");
     }
 
     #[test]

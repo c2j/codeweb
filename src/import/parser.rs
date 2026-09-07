@@ -420,7 +420,8 @@ impl CgefParser {
                 Ok(Node::Sequence {
                     schema: key_get_str(key, "schema").map(String::from),
                     name: name.to_string(),
-                    location: loc,
+                    explicit: true,
+                    location: Some(loc),
                 })
             }
             "index" => {

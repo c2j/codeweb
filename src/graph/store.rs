@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 8;
+const STORE_VERSION: u32 = 9;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1736,7 +1736,7 @@ pub fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::Package { location, .. } => Some(location.file.to_path_buf()),
         Node::Trigger { location, .. } => Some(location.file.to_path_buf()),
         Node::Type { location, .. } => Some(location.file.to_path_buf()),
-        Node::Sequence { location, .. } => Some(location.file.to_path_buf()),
+        Node::Sequence { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
         Node::Index { location, .. } => Some(location.file.to_path_buf()),
         Node::MaterializedView { location, .. } => Some(location.file.to_path_buf()),
         Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
@@ -2383,6 +2383,30 @@ mod tests {
             err_msg.contains("unsupported cache version"),
             "error should mention the version gate: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn load_bincode_rejects_pre_issue_159_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v8.bincode");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "pre-issue-159 cache must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "error should mention the version gate: {}",
+            err_msg
+        );
+        assert!(
+            !GraphStore::file_is_current(&path),
+            "pre-issue-159 cache must be treated as stale"
         );
     }
 
