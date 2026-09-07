@@ -4605,6 +4605,7 @@ mod tests {
         assert_eq!(anchors[0].object, "par_sys_purchase");
         assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
         assert!(matches!(anchors[0].site, AnchorSite::Variable));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentType));
     }
 
     #[test]
@@ -4616,6 +4617,7 @@ mod tests {
         assert_eq!(anchors[0].object.to_lowercase(), "dat_trd_repurchase");
         assert_eq!(anchors[0].column, None);
         assert!(matches!(anchors[0].site, AnchorSite::Variable));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentRowType));
     }
 
     #[test]
