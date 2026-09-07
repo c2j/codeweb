@@ -850,7 +850,7 @@ pub enum AnchorKind {
 }
 
 /// Where in the routine the anchor appears.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorSite {
     ReturnType,
@@ -868,16 +868,17 @@ pub struct AnchorRef {
     pub site: AnchorSite,
 }
 
-/// Parse a flat routine-signature type string (e.g. `par_sys_purchase.
-/// purchase_days% type`) into an anchor. Returns `None` for plain type
-/// names. Tolerates stray whitespace and case variation produced by
-/// ogsql-parser's token concatenation.
-pub fn parse_anchor_from_type_string(s: &str) -> Option<AnchorRef> {
-    let site = AnchorSite::Param; // 调用方按需覆盖 site
-    let lower = s.to_lowercase();
-    // '%' 与 "type"/"rowtype" 之间允许有杂散空格（ogsql-parser token 拼接产物）。
-    let pct_pos = lower.find('%')?;
-    let after_pct = lower[pct_pos + 1..].trim_start();
+/// Parse a flat routine-signature type string (e.g. `par_sys_purchase. purchase_days% type`)
+/// into an anchor. Returns `None` for plain type names. Tolerates stray whitespace and case
+/// variation produced by ogsql-parser's token concatenation. `site` is supplied by the caller
+/// (e.g. `AnchorSite::Param` for a parameter declaration, `AnchorSite::ReturnType` for a
+/// RETURN clause) and is carried through unchanged into the resulting `AnchorRef`.
+pub fn parse_anchor_from_type_string(s: &str, site: AnchorSite) -> Option<AnchorRef> {
+    // '%' 是大小写不变的单字节 ASCII 字符，必须在原始串 `s` 上直接定位，而不能先对整串
+    // `to_lowercase()` 再用该偏移切 `s`：某些 Unicode 字符（如 İ U+0130）大小写折叠后
+    // 字节长度会变化，导致偏移漂移、把 '%' 吞进 head。仅对 '%' 之后的关键字部分做大小写折叠。
+    let pct_pos = s.find('%')?;
+    let after_pct = s[pct_pos + 1..].trim_start().to_lowercase();
     let kind = if after_pct.starts_with("rowtype") {
         AnchorKind::PercentRowType
     } else if after_pct.starts_with("type") {
@@ -3912,19 +3913,23 @@ mod tests {
     #[test]
     fn should_parse_flat_return_string_percent_type() {
         // 真实 parse_type_name 输出：杂散空格 + 大小写混乱
-        let a = parse_anchor_from_type_string("par_sys_purchase. purchase_days% type")
-            .expect("should parse");
+        let a = parse_anchor_from_type_string(
+            "par_sys_purchase. purchase_days% type",
+            AnchorSite::Param,
+        )
+        .expect("should parse");
         assert_eq!(a.object, "par_sys_purchase");
         assert_eq!(a.column.as_deref(), Some("purchase_days"));
         assert!(matches!(a.kind, AnchorKind::PercentType));
-        // 纯函数不区分调用点，统一默认 Param 占位；
-        // RETURN 场景由 builder 调用方覆盖为 ReturnType（后续 Task 6）
+        // site 由调用方显式传入，此处验证原样传回（Param 占位）；
+        // RETURN 场景调用方传 AnchorSite::ReturnType（builder 侧，后续 Task 6）
         assert!(matches!(a.site, AnchorSite::Param));
     }
 
     #[test]
     fn should_parse_flat_param_string_percent_rowtype() {
-        let a = parse_anchor_from_type_string("DAT_TRD_REPURCHASE%ROWTYPE").expect("should parse");
+        let a = parse_anchor_from_type_string("DAT_TRD_REPURCHASE%ROWTYPE", AnchorSite::Param)
+            .expect("should parse");
         assert_eq!(a.object, "DAT_TRD_REPURCHASE");
         assert_eq!(a.column, None);
         assert!(matches!(a.kind, AnchorKind::PercentRowType));
@@ -3932,18 +3937,39 @@ mod tests {
 
     #[test]
     fn should_return_none_for_plain_type_names() {
-        assert!(parse_anchor_from_type_string("INTEGER").is_none());
-        assert!(parse_anchor_from_type_string("VARCHAR(100)").is_none());
-        assert!(parse_anchor_from_type_string("my_pkg.my_record").is_none());
-        assert!(parse_anchor_from_type_string("").is_none());
+        assert!(parse_anchor_from_type_string("INTEGER", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("VARCHAR(100)", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("my_pkg.my_record", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("", AnchorSite::Param).is_none());
     }
 
     #[test]
     fn should_parse_rowtype_not_mistaken_for_percent_type() {
-        let a = parse_anchor_from_type_string("t%ROWTYPE").expect("should parse");
+        // 混合大小写关键字 "RowType"：验证大小写折叠只作用于 %ROWTYPE/%TYPE 关键字判定，
+        // 不会误判成 %TYPE（区别于 should_parse_flat_param_string_percent_rowtype 的全大写场景）。
+        let a =
+            parse_anchor_from_type_string("t%RowType", AnchorSite::Param).expect("should parse");
         assert_eq!(a.object, "t");
         assert_eq!(a.column, None);
         assert!(matches!(a.kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_parse_three_part_schema_percent_type() {
+        let a = parse_anchor_from_type_string("a. b. c% TYPE", AnchorSite::Param)
+            .expect("should parse");
+        assert_eq!(a.object, "a.b");
+        assert_eq!(a.column.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn should_parse_unicode_ident_percent_type() {
+        // İ (U+0130) 的 to_lowercase() 结果字节长度与原字符不同（2 bytes -> 3 bytes: "i" +
+        // 组合点 U+0307）。若 '%' 位置误从 lowercased 串计算再切原始串会导致偏移漂移。
+        let a =
+            parse_anchor_from_type_string("İ.col%TYPE", AnchorSite::Param).expect("should parse");
+        assert_eq!(a.object, "İ");
+        assert_eq!(a.column.as_deref(), Some("col"));
     }
 
     #[test]
