@@ -1102,8 +1102,10 @@ impl AnchorExtractor {
         });
     }
 
-    /// Visit a nested `PlDataType` (e.g. inside `TYPE ... IS TABLE OF` /
-    /// `RECORD (...)` field) and push an anchor if it is `%TYPE` / `%ROWTYPE`.
+    /// Visit a `PlDataType` reached from any declaration site — a plain
+    /// variable, or nested inside a `TYPE ... IS TABLE OF` / `VARRAY OF` /
+    /// `RECORD (...)` field — and push an anchor if it is `%TYPE` /
+    /// `%ROWTYPE`.
     fn visit_pl_data_type(
         &mut self,
         dt: &ogsql_parser::ast::plpgsql::PlDataType,
@@ -1132,27 +1134,13 @@ impl Visitor for AnchorExtractor {
         &mut self,
         decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
     ) -> VisitorResult {
-        use ogsql_parser::ast::plpgsql::{PlDataType, PlTypeDecl};
+        use ogsql_parser::ast::plpgsql::PlTypeDecl;
         match decl {
             PlDeclaration::Cursor(c) => {
                 self.cursor_names.insert(c.name.to_lowercase());
             }
             PlDeclaration::Variable(v) => {
-                if let PlDataType::PercentType { table, column } = &v.data_type {
-                    self.push_anchor(
-                        table.clone(),
-                        Some(column.clone()),
-                        AnchorKind::PercentType,
-                        AnchorSite::Variable,
-                    );
-                } else if let PlDataType::PercentRowType(name) = &v.data_type {
-                    self.push_anchor(
-                        name.clone(),
-                        None,
-                        AnchorKind::PercentRowType,
-                        AnchorSite::Variable,
-                    );
-                }
+                self.visit_pl_data_type(&v.data_type, AnchorSite::Variable);
             }
             PlDeclaration::Type(t) => match t {
                 PlTypeDecl::TableOf {
@@ -4700,6 +4688,18 @@ mod tests {
         assert_eq!(anchors[0].column.as_deref(), Some("purchase_date"));
         assert!(matches!(anchors[0].site, AnchorSite::NestedType));
         assert!(matches!(anchors[0].kind, AnchorKind::PercentType));
+    }
+
+    #[test]
+    fn should_collect_varray_of_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_arr IS VARRAY(10) OF par_sys_purchase.purchase_days%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
     }
 
     #[test]
