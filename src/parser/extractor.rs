@@ -2939,12 +2939,9 @@ impl Visitor for ColumnAccessExtractor {
                 // DEFAULT VALUES has no sources; `SET` is handled as assignments.
                 ogsql_parser::ast::InsertSource::DefaultValues
                 | ogsql_parser::ast::InsertSource::Set(_) => {}
-                // #142: `INSERT INTO t (a, b) VALUES r` — expand the record's
-                // fields through its `%ROWTYPE` anchor. Cursor-anchored records
-                // resolve positionally through the cursor's SELECT sources; a
-                // table-anchored record needs the table's column order (DDL),
-                // which is unavailable here, so it is left unresolved (documented
-                // limitation).
+                // `INSERT INTO t (a, b) VALUES r` expands positionally through the
+                // record's %ROWTYPE cursor sources. Whole-record inserts cannot be
+                // aligned without the target DDL column order.
                 ogsql_parser::ast::InsertSource::RecordVariable(expr) => {
                     if let Expr::ColumnRef(names) | Expr::PlVariable(names) =
                         peel_parenthesized(expr)
@@ -3179,11 +3176,8 @@ impl ColumnAccessExtractor {
                         }
                     }
                 } else {
-                    // #142: the `%ROWTYPE` anchor is a TABLE, not a registered
-                    // cursor (`rec t_src%ROWTYPE`): the record's fields are that
-                    // table's columns. (A custom record TYPE anchor is rare; it
-                    // would attribute the type name as a table — the field is
-                    // still attributable, unlike the old `?.field`.)
+                    // A table-anchored %ROWTYPE record has no cursor_sources entry;
+                    // its fields are the anchor table's columns.
                     return ColumnSource::Column {
                         table: Some(cursor.clone()),
                         column: column.clone(),
@@ -5472,6 +5466,34 @@ mod column_tests {
             find_mapping(&maps, "id").sources,
             vec![col(Some("t_other"), "id")],
             "record field must resolve to the FETCHing cursor's source, not the type table"
+        );
+    }
+
+    /// Review #4: a %ROWTYPE record field as a scalar subquery's first expression
+    /// penetrates through record_cursors to the cursor's source column — ogsql-parser
+    /// parses `rec.field` as a dotted ColumnRef, which column_source already resolves.
+    #[test]
+    fn record_field_in_scalar_subquery_resolves_to_column() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: "CLIENT_ACNT_ID".to_string(),
+                source_table: Some("v_src".to_string()),
+                source_col: "CLIENT_ACNT_ID".to_string(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("v_fund_acnt_all".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO v_dst (acnt) \
+             SELECT (SELECT v_fund_acnt_all.CLIENT_ACNT_ID FROM dual) FROM dual",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "acnt").sources,
+            vec![col(Some("v_src"), "CLIENT_ACNT_ID")],
+            "record field in a scalar subquery must resolve to the cursor's column"
         );
     }
 

@@ -861,10 +861,15 @@ Expected: 仅 `src/parser/extractor.rs`、`tests/regress_column_lineage.rs`、�
 ## 已知局限（有意不处理，记录备查）
 
 1. **整记录写入无列清单**：`INSERT INTO t VALUES r`（无 `(a,b)`）无法命名目标列——需要目标表 DDL 列序，超出静态解析能力，维持现状（不产生列映射）。
-2. **表锚定 + `SELECT *` 组合**：`r t_src%ROWTYPE` 且通过 `SELECT *` 游标 FETCH 填充——`record_cursors` 锚定为表名，`cursor_sources` 无对应条目 → 走 Task 2 的表锚定回退（`table: Some(t_src)`，列名取字段名），行为可接受。
-3. **子查询首表达式为记录字段**（真实项目 `v_fund_acnt_all.CLIENT_ACNT_ID`）：`FieldAccess` → `collect_value_sources` 递归到 `PlVariable` → `ColumnSource::Variable{v_fund_acnt_all}`——比 "No column lineage" 好（显示变量名），但不穿透到列；完整解析需在子查询内再做记录字段展开，属后续增强。
-4. **`Expr::ScalarSublink`（`expr OP ANY/ALL/SOME (subquery)`）作为值源**：非本计划场景（谓词形态），`collect_value_sources` 无分支 → 保持零源。
-5. **自定义 TYPE `%ROWTYPE` 锚定**：按 Task 2 回退归因到类型名（视为表名）——罕见形态，比 `?.field` 可归因。
+2. **整记录写入 + `SELECT *` 游标**：catch-all 无精确列名，位置归因无法证明与目标列清单一致——不猜测列名（不产生映射），避免重排列清单时静默错归因。
+3. **`Expr::ScalarSublink`（`expr OP ANY/ALL/SOME (subquery)`）作为值源**：谓词形态非值源，不处理。
+4. **自定义 TYPE `%ROWTYPE` 锚定**：按类型表归因（无 DDL 列序可循）；真实数据源优先由 FETCH 重绑到实际游标（review #153-3）。
+
+## 审核修订（review #153）
+
+- 标量子查询首表达式复用 `classify_value_expr` 分类，变换（UPPER/NVL/CAST…）标 Derived 并保留表达式文本，字面量标 Direct（review #153-1）。
+- 通用 walker 不再递归子查询 select（`visit_expr` 对 Subquery/Exists/InSubquery/ScalarSublink 返回 `SkipChildren`），子查询内 JOIN/filter 不泄漏到外层语句分析（review #153-2）。
+- `%ROWTYPE` 记录字段作为子查询首表达式**已穿透**：ogsql-parser v0.10 将 `rec.field` 解析为 dotted `ColumnRef`，经 `record_cursors` 解析到游标/表列（原「→ Variable」局限描述有误，review #153-4）。
 
 ## 验收标准
 
