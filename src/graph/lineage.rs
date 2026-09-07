@@ -1504,7 +1504,7 @@ fn mappings_of_routine(graph: &CodeGraph, routine: NodeIndex) -> Vec<ColumnMappi
 /// name resolves only when a single node carries it — with two schemas each holding a
 /// table of the same name, returning the first would report one schema's pipeline as the
 /// other's, so an ambiguous bare name resolves to `None`.
-fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
+pub(crate) fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex> {
     let name_of = |idx: &NodeIndex| match &graph[*idx] {
         crate::graph::Node::Table { schema, name, .. }
         | crate::graph::Node::View { schema, name, .. } => Some((schema.as_deref(), name.as_str())),

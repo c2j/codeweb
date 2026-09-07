@@ -1556,19 +1556,41 @@ fn cmd_lineage(
         );
     }
 
-    // `table` traces the table; `table.column` traces one column through it. Split on the
-    // last `.` so a schema-qualified `schema.table.column` keeps `schema.table` as the
-    // table part and only the final component as the column.
-    let (table_name, column_name) = match target.rsplit_once('.') {
-        Some((table, column)) if !table.is_empty() && !column.is_empty() => (table, Some(column)),
-        Some(_) => {
-            eprintln!(
-                "Invalid target format: {}. Use 'table' or 'table.column'",
-                target
-            );
-            return Ok(());
+    // Issue #154: `type:name` node keys (e.g. `table:schema.table`) resolve as whole
+    // node keys — same grammar as trace/detail — never get dot-split into
+    // `table.column`. Everything else keeps the legacy split: `table` traces the
+    // table; `table.column` / `schema.table.column` trace one column (split on the
+    // last `.` so the schema-qualified table part stays intact).
+    let (table_name, column_name) = if graph::key::split_type_prefix(target).is_some() {
+        (target, None)
+    } else {
+        match target.rsplit_once('.') {
+            Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+                (table, Some(column))
+            }
+            Some(_) => {
+                eprintln!(
+                    "Invalid target format: {}. Use 'table', 'table.column', or a node key like 'table:schema.table'",
+                    target
+                );
+                return Ok(());
+            }
+            None => (target, None),
         }
-        None => (target, None),
+    };
+
+    // Issue #154: a column spec whose table half cannot be resolved (e.g. bare
+    // `schema.table`, split into table=`schema` + column=`table`) falls back to
+    // treating the whole target as a table reference — with a transparent note.
+    let (table_name, column_name) = match column_name {
+        Some(_) if graph::lineage::find_table_node(graph, table_name).is_none() => {
+            eprintln!(
+                "note: no table '{}' found — interpreting '{}' as a table reference",
+                table_name, target
+            );
+            (target, None)
+        }
+        other => (table_name, other),
     };
 
     // Parse direction up front — both the table and column paths need it. `None` means
