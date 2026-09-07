@@ -3360,10 +3360,8 @@ impl ColumnAccessExtractor {
         position: Option<usize>,
         value: &Expr,
     ) {
-        // #142: a scalar subquery as a value (`INSERT .. SELECT (SELECT ...)`,
-        // `VALUES ((SELECT ...))`, `SET x = (SELECT ...)`, MERGE values) contributes
-        // the inner select's FIRST output expression as the source, resolved in the
-        // subquery's own FROM scope.
+        // A scalar subquery as a value carries its own FROM scope; resolve its first
+        // output expression there rather than against the enclosing statement.
         if let Expr::Subquery(select) = peel_parenthesized(value) {
             self.push_subquery_column_mapping(target_table, target_column, position, select);
             return;
@@ -3383,8 +3381,7 @@ impl ColumnAccessExtractor {
     /// subquery's first select-list expression against the subquery's own FROM
     /// aliases, then restore the enclosing statement's scope. Correlated
     /// references (`s.id` in the subquery's WHERE) are not value sources and are
-    /// intentionally not collected — only the first select-list expression feeds
-    /// the written column.
+    /// intentionally not collected.
     fn push_subquery_column_mapping(
         &mut self,
         target_table: Option<String>,
@@ -3392,45 +3389,32 @@ impl ColumnAccessExtractor {
         position: Option<usize>,
         select: &SelectStatement,
     ) {
+        // The first select-list expression is the value; classify it under the
+        // subquery's own FROM scope, then restore the enclosing scope.
         let saved_alias_map = self.alias_map.clone();
         self.collect_aliases_from_table_refs(&select.from);
         let new_scope = self.scope_sole_table_of(&select.from);
         let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
 
-        let mut sources = Vec::new();
-        let mut kind = MappingKind::Derived;
-        let mut expression: Option<String> = None;
-        if let Some(SelectTarget::Expr(first, _)) = select.targets.first() {
-            let first = peel_parenthesized(first);
-            self.collect_value_sources(first, &mut sources);
-            // An entirely-literal first target (`(SELECT 'x' FROM dual)`) is a
-            // constant; collect_value_sources skips literals by design, so record
-            // it here as a Literal source rather than leaving the mapping empty.
-            if sources.is_empty() {
-                if let Expr::Literal(lit) = first {
-                    sources.push(ColumnSource::Literal {
-                        value: format_literal_short(lit),
-                    });
-                }
+        let (sources, kind, expression) = match select.targets.first() {
+            Some(SelectTarget::Expr(first, _)) => {
+                self.classify_value_expr(peel_parenthesized(first))
             }
-            if matches!(sources.as_slice(), [ColumnSource::Column { .. }]) {
-                kind = MappingKind::Direct;
-            }
-            expression = Some(format_expr_short(first));
-        }
+            // A `SELECT *` target cannot be resolved to a column list without a
+            // schema; leave the mapping without sources.
+            _ => (Vec::new(), MappingKind::Derived, None),
+        };
 
         self.scope_sole_table = saved_scope;
         self.alias_map = saved_alias_map;
 
-        // A plain copy needs no expression text (mirrors `insert_select_maps_columns_by_position`).
-        let is_direct = matches!(kind, MappingKind::Direct);
         self.column_mappings.push(ColumnMapping {
             target_table,
             target_column,
             position,
             sources,
             kind,
-            expression: if is_direct { None } else { expression },
+            expression,
         });
     }
 
@@ -5284,6 +5268,42 @@ mod column_tests {
         assert_eq!(
             find_mapping(&maps, "code").sources,
             vec![col(Some("t_ref"), "code")]
+        );
+    }
+
+    /// Review #1: a scalar subquery whose first expression is a TRANSFORMED column
+    /// (`UPPER`, `+1`, `NVL`, `CAST`, …) must classify as Derived and keep the
+    /// expression text — not masquerade as a Direct copy.
+    #[test]
+    fn scalar_subquery_with_transformed_first_expr_is_derived() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) \
+             SELECT (SELECT UPPER(r.code) FROM t_ref r WHERE r.id = 1)",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Derived);
+        assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
+        assert!(
+            m.expression.as_deref().unwrap_or("").contains("UPPER"),
+            "expression text must survive: {:?}",
+            m.expression
+        );
+    }
+
+    /// Review #1: a literal-only scalar subquery is a constant → Direct + Literal
+    /// source, consistent with how `classify_value_expr` treats a bare literal.
+    #[test]
+    fn literal_only_scalar_subquery_classifies_direct() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) VALUES ((SELECT 'x' FROM dual))",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Direct);
+        assert_eq!(
+            m.sources,
+            vec![ColumnSource::Literal {
+                value: "'x'".to_string()
+            }]
         );
     }
 
