@@ -119,10 +119,10 @@ pub(crate) fn edge_label_for(
     from: NodeIndex,
     to: NodeIndex,
 ) -> Option<String> {
-    // `edges_connecting` yields parallel edges in reverse-insertion (most
-    // recently added first) order internally; `.rev()` restores creation
-    // order so the aggregated label matches the order edges were actually
-    // built in (e.g. TableAccess before AnchorsOn), not construction-order-agnostic.
+    // `edges_connecting` iterates parallel edges LIFO; `.rev()` restores the
+    // creation order of the *surviving* edges — robust even if other edges
+    // were removed via `remove_edge` (which does a swap_remove and reuses
+    // `EdgeIndex` slots, so sorting by index would scramble order instead).
     let mut parts: Vec<String> = Vec::new();
     for e in graph
         .edges_connecting(from, to)
@@ -1321,6 +1321,53 @@ mod tests {
             Some("[R,T]"),
             "duplicate TableAccess[Read] labels must collapse to one 'R', \
              followed by the distinct AnchorsOn 'T' in first-seen order"
+        );
+    }
+
+    #[test]
+    fn should_aggregate_three_parallel_edge_kinds() {
+        // Three distinct edge kinds on the same node pair — TableAccess[Read],
+        // AnchorsOn, and DependsOn — added in that order, must all survive
+        // aggregation in creation order: "[R,T,depends_on]".
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_triple");
+        let table = add_table_node(&mut graph, "t_triple");
+
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::AnchorsOn {
+                kind: crate::parser::AnchorKind::PercentType,
+                column: Some("col".into()),
+                site: crate::parser::AnchorSite::Variable,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::DependsOn {
+                location: make_loc(),
+                column_analysis: None,
+            },
+        );
+
+        let label = edge_label_for(&graph, proc, table);
+        assert_eq!(
+            label.as_deref(),
+            Some("[R,T,depends_on]"),
+            "three distinct parallel edge kinds must all appear in creation order"
         );
     }
 }
