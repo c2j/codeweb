@@ -9,14 +9,12 @@ let isLoading = false;
 let navHistory = [];
 let isNavigatingBack = false;
 let currentDetailData = null;
-let treeExpandDepth = parseInt(localStorage.getItem('codeweb-tree-expand-depth') ?? '1', 10);
-if (isNaN(treeExpandDepth)) treeExpandDepth = 1;
+const TREE_DEFAULT_DEPTH = 1;
 let treeCollapsed = {};
 try { treeCollapsed = JSON.parse(localStorage.getItem('codeweb-tree-collapsed') || '{}') || {}; } catch (_) {}
 if (typeof treeCollapsed !== 'object') treeCollapsed = {};
 
 function saveTreeState() {
-  localStorage.setItem('codeweb-tree-expand-depth', String(treeExpandDepth));
   localStorage.setItem('codeweb-tree-collapsed', JSON.stringify(treeCollapsed));
 }
 
@@ -376,7 +374,7 @@ function buildDetailHtml() {
 function isTreeNodeCollapsed(pathKey, depth) {
   const k = treeStateKey(pathKey);
   if (treeCollapsed[k] !== undefined) return treeCollapsed[k];
-  return depth >= treeExpandDepth;
+  return depth >= TREE_DEFAULT_DEPTH;
 }
 
 function toggleTreeNode(pathKey, depth) {
@@ -386,16 +384,29 @@ function toggleTreeNode(pathKey, depth) {
   renderDetail(true);
 }
 
+function collectExpandableKeys() {
+  const keys = [];
+  if (!currentDetailData) return keys;
+  const walk = (nodes, section, pathIdx) => {
+    (nodes || []).forEach((n, i) => {
+      const p = pathIdx.concat([i]);
+      if ((n.children && n.children.length > 0) || n.has_more) keys.push(section + '.' + p.join('.'));
+      walk(n.children, section, p);
+    });
+  };
+  walk(currentDetailData.trace.callers, 'callers', []);
+  walk(currentDetailData.trace.callees, 'callees', []);
+  return keys;
+}
+
 function expandAllTree() {
-  treeCollapsed = {};
-  treeExpandDepth = 99;
+  collectExpandableKeys().forEach(k => { treeCollapsed[treeStateKey(k)] = false; });
   saveTreeState();
   renderDetail(true);
 }
 
 function collapseAllTree() {
-  treeCollapsed = {};
-  treeExpandDepth = 0;
+  collectExpandableKeys().forEach(k => { treeCollapsed[treeStateKey(k)] = true; });
   saveTreeState();
   renderDetail(true);
 }
@@ -427,12 +438,12 @@ function renderTreeHtml(nodes, section, pathIdx, depth, prefixes) {
     html += label;
     html += '</div>';
 
-    if (isCollapsed) continue;
-    if (n.children && n.children.length > 0) {
+    if (!isCollapsed && n.children && n.children.length > 0) {
       const childPrefix = isLast ? '    ' : '\u2502   ';
       html += renderTreeHtml(n.children, section, pathIdx.concat([i]), depth + 1, prefixes.concat([childPrefix]));
     }
-    if (n.has_more) {
+    const childlessFakeLeaf = n.has_more && (!n.children || n.children.length === 0);
+    if (n.has_more && (!isCollapsed || childlessFakeLeaf)) {
       const childPrefix = isLast ? '    ' : '\u2502   ';
       html += '<div class="tree-node tree-more" data-key="' + esc(n.key) + '">' +
         '<span class="tree-prefix">' + esc(childPrefix + '    ') + '</span>' +
