@@ -34,6 +34,14 @@ pub struct TreeNode {
     pub idx: NodeIndex,
     pub edge_label: Option<String>,
     pub children: Vec<TreeNode>,
+    /// True when direct children of this node could not all be added to the
+    /// tree (node budget / depth clamp hit). A node with `children: []` and
+    /// `has_more: false` is a genuine leaf; with `has_more: true` it is a
+    /// truncated "fake leaf".
+    pub has_more: bool,
+    /// Number of direct children that exist in the graph but are missing
+    /// from the tree (always 0 when `has_more` is false).
+    pub more_count: usize,
 }
 
 pub struct CallChain {
@@ -110,9 +118,18 @@ fn build_tree_dfs(
     max_nodes: usize,
     visited: &mut usize,
     skip_builtins: bool,
-) -> Vec<TreeNode> {
+) -> (Vec<TreeNode>, usize) {
+    let neighbors: Vec<NodeIndex> = graph
+        .neighbors_directed(start, direction)
+        .filter(|n| !ancestors.contains(n))
+        .filter(|n| {
+            !skip_builtins || !matches!(graph[*n], crate::graph::Node::BuiltinFunction { .. })
+        })
+        .collect();
+    let effective = neighbors.len();
+
     if *visited >= max_nodes {
-        return Vec::new();
+        return (Vec::new(), effective);
     }
     if depth > max_depth {
         if max_depth > 20 {
@@ -123,18 +140,10 @@ fn build_tree_dfs(
                 max_depth, key
             );
         }
-        return Vec::new();
+        return (Vec::new(), effective);
     }
 
     let mut roots = Vec::new();
-    let neighbors: Vec<NodeIndex> = graph
-        .neighbors_directed(start, direction)
-        .filter(|n| !ancestors.contains(n))
-        .filter(|n| {
-            !skip_builtins || !matches!(graph[*n], crate::graph::Node::BuiltinFunction { .. })
-        })
-        .collect();
-
     for neighbor in neighbors {
         if *visited >= max_nodes {
             break;
@@ -146,7 +155,7 @@ fn build_tree_dfs(
         let edge_label = edge_label_for(graph, from, to);
         ancestors.insert(neighbor);
         *visited += 1;
-        let children = build_tree_dfs(
+        let (children, unexpanded) = build_tree_dfs(
             graph,
             neighbor,
             direction,
@@ -162,9 +171,12 @@ fn build_tree_dfs(
             idx: neighbor,
             edge_label,
             children,
+            has_more: unexpanded > 0,
+            more_count: unexpanded,
         });
     }
-    roots
+    let unexpanded_here = effective - roots.len();
+    (roots, unexpanded_here)
 }
 
 pub fn trace_chain(
@@ -181,7 +193,7 @@ pub fn trace_chain(
     } else {
         let mut caller_ancestors = HashSet::new();
         caller_ancestors.insert(start);
-        build_tree_dfs(
+        let (nodes, _) = build_tree_dfs(
             graph,
             start,
             Direction::Incoming,
@@ -191,7 +203,8 @@ pub fn trace_chain(
             max_nodes,
             &mut visited,
             skip_builtins,
-        )
+        );
+        nodes
     };
 
     let callees = if max_depth == 0 {
@@ -199,7 +212,7 @@ pub fn trace_chain(
     } else {
         let mut callee_ancestors = HashSet::new();
         callee_ancestors.insert(start);
-        build_tree_dfs(
+        let (nodes, _) = build_tree_dfs(
             graph,
             start,
             Direction::Outgoing,
@@ -209,7 +222,8 @@ pub fn trace_chain(
             max_nodes,
             &mut visited,
             skip_builtins,
-        )
+        );
+        nodes
     };
 
     (
@@ -951,6 +965,142 @@ mod tests {
             Some("[builtin]"),
             "UsesBuiltinFunction must produce [builtin] label"
         );
+    }
+
+    // ── has_more / more_count truncation markers (Issue #152) ──
+
+    /// Build a linear call chain n0 → n1 → … → n_{k-1} of procedure nodes.
+    fn make_chain(names: &[&str]) -> (crate::graph::CodeGraph, Vec<petgraph::graph::NodeIndex>) {
+        let mut graph = crate::graph::CodeGraph::new();
+        let idxs: Vec<_> = names.iter().map(|n| add_proc_node(&mut graph, n)).collect();
+        for w in idxs.windows(2) {
+            graph.add_edge(
+                w[0],
+                w[1],
+                crate::graph::Edge::DirectCall {
+                    scope: crate::graph::CallScope::IntraPackage,
+                    location: make_loc(),
+                },
+            );
+        }
+        (graph, idxs)
+    }
+
+    fn add_call(graph: &mut crate::graph::CodeGraph, from: NodeIndex, to: NodeIndex) {
+        graph.add_edge(
+            from,
+            to,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: make_loc(),
+            },
+        );
+    }
+
+    #[test]
+    fn truncated_by_budget_marks_has_more_with_exact_count() {
+        // Chain a→b→c→d with budget 2: b and c are visited; recursion into c
+        // hits the budget cap, so c is a "fake leaf" with one hidden child (d).
+        let (graph, idxs) = make_chain(&["a", "b", "c", "d"]);
+        let (chain, _) = trace_chain(&graph, idxs[0], 10, 2, false);
+
+        let b = &chain.callees[0];
+        assert!(!b.has_more, "b is fully expanded within budget");
+        assert_eq!(b.more_count, 0);
+
+        let c = &b.children[0];
+        assert!(c.has_more, "budget-truncated node must report has_more");
+        assert_eq!(c.more_count, 1, "d is the single unexpanded direct child");
+        assert!(
+            c.children.is_empty(),
+            "truncated node must have no children"
+        );
+    }
+
+    #[test]
+    fn sibling_truncation_marks_parent_has_more() {
+        // a→b, b→{c,d} with budget 2: only one of c/d fits; the other is
+        // silently dropped by the loop break — b must report it.
+        let (mut graph, idxs) = make_chain(&["a", "b"]);
+        let c = add_proc_node(&mut graph, "c");
+        let d = add_proc_node(&mut graph, "d");
+        add_call(&mut graph, idxs[1], c);
+        add_call(&mut graph, idxs[1], d);
+        let (chain, _) = trace_chain(&graph, idxs[0], 10, 2, false);
+
+        let b = &chain.callees[0];
+        assert!(
+            b.has_more,
+            "loop-break truncation must mark parent has_more"
+        );
+        assert_eq!(b.more_count, 1, "exactly one direct child was dropped");
+        assert_eq!(b.children.len(), 1, "only one of c/d fits in budget");
+    }
+
+    #[test]
+    fn depth_boundary_marks_has_more() {
+        // a→b→c with max_depth=1: b is shown but its children are not explored.
+        let (graph, idxs) = make_chain(&["a", "b", "c"]);
+        let (chain, _) = trace_chain(&graph, idxs[0], 1, 100, false);
+
+        let b = &chain.callees[0];
+        assert!(b.has_more, "depth-clamped node must report has_more");
+        assert_eq!(b.more_count, 1, "c is the single unexplored direct child");
+        assert!(b.children.is_empty());
+    }
+
+    #[test]
+    fn true_leaf_has_no_more() {
+        let (graph, idxs) = make_chain(&["a", "b"]);
+        let (chain, _) = trace_chain(&graph, idxs[0], 10, 100, false);
+
+        let b = &chain.callees[0];
+        assert!(!b.has_more, "a real leaf must not be flagged as truncated");
+        assert_eq!(b.more_count, 0);
+    }
+
+    #[test]
+    fn cycle_neighbors_do_not_false_positive() {
+        // a↔b: b's only neighbor is its own ancestor and must be excluded,
+        // so b is a genuine leaf — has_more must stay false.
+        let (mut graph, idxs) = make_chain(&["a", "b"]);
+        add_call(&mut graph, idxs[1], idxs[0]);
+        let (chain, _) = trace_chain(&graph, idxs[0], 10, 100, false);
+
+        let b = &chain.callees[0];
+        assert!(
+            !b.has_more,
+            "ancestor-filtered neighbors must not count as more"
+        );
+        assert_eq!(b.more_count, 0);
+    }
+
+    #[test]
+    fn skip_builtins_respected_in_more_count() {
+        // b→{builtin, c} with skip_builtins=true: the builtin is filtered
+        // before counting, so b shows exactly one child and no truncation.
+        let (mut graph, idxs) = make_chain(&["a", "b"]);
+        let c = add_proc_node(&mut graph, "c");
+        add_call(&mut graph, idxs[1], c);
+        let builtin = graph.add_node(crate::graph::Node::BuiltinFunction {
+            name: "count".into(),
+            category: "aggregate".into(),
+            domain: "sql".into(),
+            location: make_loc(),
+        });
+        graph.add_edge(
+            idxs[1],
+            builtin,
+            crate::graph::Edge::UsesBuiltinFunction {
+                location: make_loc(),
+            },
+        );
+        let (chain, _) = trace_chain(&graph, idxs[0], 10, 100, true);
+
+        let b = &chain.callees[0];
+        assert!(!b.has_more, "filtered builtins must not inflate more_count");
+        assert_eq!(b.more_count, 0);
+        assert_eq!(b.children.len(), 1, "only proc c remains after filtering");
     }
 
     #[test]
