@@ -3116,6 +3116,13 @@ impl Visitor for ColumnAccessExtractor {
                     }
                 }
             }
+            // Subqueries carry their own scope; the generic walker would otherwise
+            // recurse into their SELECT and leak its alias/join/filter state into
+            // this statement's analysis (review #153-2).
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InSubquery { .. }
+            | Expr::ScalarSublink { .. } => return VisitorResult::SkipChildren,
             _ => {}
         }
         VisitorResult::Continue
@@ -3390,8 +3397,14 @@ impl ColumnAccessExtractor {
         select: &SelectStatement,
     ) {
         // The first select-list expression is the value; classify it under the
-        // subquery's own FROM scope, then restore the enclosing scope.
+        // subquery's own FROM scope, then restore the enclosing scope. Alias
+        // collection doubles as join/filter extraction, so snapshot the
+        // statement-level accumulators too — a subquery JOIN must not leak into
+        // the parent analysis.
         let saved_alias_map = self.alias_map.clone();
+        let saved_joins = self.join_conditions.len();
+        let saved_filters = self.hard_filters.len();
+        let saved_refs = self.column_refs.len();
         self.collect_aliases_from_table_refs(&select.from);
         let new_scope = self.scope_sole_table_of(&select.from);
         let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
@@ -3407,6 +3420,9 @@ impl ColumnAccessExtractor {
 
         self.scope_sole_table = saved_scope;
         self.alias_map = saved_alias_map;
+        self.join_conditions.truncate(saved_joins);
+        self.hard_filters.truncate(saved_filters);
+        self.column_refs.truncate(saved_refs);
 
         self.column_mappings.push(ColumnMapping {
             target_table,
@@ -5304,6 +5320,24 @@ mod column_tests {
             vec![ColumnSource::Literal {
                 value: "'x'".to_string()
             }]
+        );
+    }
+
+    /// Review #2: a JOIN inside the scalar subquery's FROM must not leak its
+    /// join/filter state into the enclosing statement's analysis — the subquery
+    /// carries its own scope.
+    #[test]
+    fn scalar_subquery_join_does_not_leak_into_parent_analysis() {
+        let analyses = extract_column_analysis(
+            "INSERT INTO t_out (code) \
+             SELECT (SELECT r.code FROM t_ref r JOIN t_other o ON r.id = o.id WHERE r.id = 1)",
+        );
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(
+            a.join_conditions.is_empty(),
+            "subquery JOIN must not leak into the parent analysis: {:?}",
+            a.join_conditions
         );
     }
 
