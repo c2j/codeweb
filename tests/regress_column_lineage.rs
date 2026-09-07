@@ -484,6 +484,41 @@ END;
     );
 }
 
+/// Review #5: whole-record insert over a `SELECT *` cursor with a REORDERED
+/// column list must not silently misattribute — leave unmapped rather than
+/// guess names.
+#[test]
+fn star_cursor_whole_record_insert_does_not_misattribute_reordered_columns() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(amt NUMBER, id NUMBER);
+CREATE PROCEDURE p_rec_reorder AS
+  CURSOR cur IS SELECT * FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (amt, id) VALUES r;
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    // Positionally t_src.id (cursor col 0) fills t_dst.amt, but the SELECT *
+    // catch-all cannot prove that — emitting `t_dst.amt ← t_src.amt` would be a
+    // silent lie. Unmapped is correct.
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        !out.contains("t_src.amt"),
+        "reordered whole-record insert must not fabricate a name match:\n{out}"
+    );
+}
+
 /// Review #3: FETCH fills the record, so `r t_type%ROWTYPE` + `FETCH cur INTO r`
 /// (cur reads t_other) must resolve to t_other, not the declared type table.
 #[test]

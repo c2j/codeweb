@@ -2963,14 +2963,10 @@ impl Visitor for ColumnAccessExtractor {
                                                 table: c.source_table.clone(),
                                                 column: c.source_col.clone(),
                                             })
-                                        } else if c.source_table.is_some() {
-                                            // Catch-all (`SELECT *` cursor): attribute
-                                            // under the target column's own name.
-                                            Some(ColumnSource::Column {
-                                                table: c.source_table.clone(),
-                                                column: column.clone(),
-                                            })
                                         } else {
+                                            // A catch-all (`SELECT *`) cursor has no
+                                            // exact column; guessing under the target
+                                            // name would misattribute reordered lists.
                                             None
                                         }
                                     });
@@ -5431,6 +5427,29 @@ mod column_tests {
         assert_eq!(
             find_mapping(&maps, "amt").sources,
             vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// Review #5: whole-record insert from a `SELECT *` cursor has no exact column
+    /// names — attributing each INSERT column under its own name would silently
+    /// misattribute a reordered column list. Leave such mappings unmapped instead.
+    #[test]
+    fn whole_record_insert_from_star_cursor_yields_no_guessed_mappings() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context("INSERT INTO t_dst (id, amt) VALUES r", &ctx);
+        assert!(
+            maps.is_empty(),
+            "a SELECT * catch-all must not fabricate column names: {maps:#?}"
         );
     }
 
