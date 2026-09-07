@@ -10,6 +10,7 @@
 //! inferred `table*` node with only an `AnchorsOn` edge, no `TableAccess`.
 
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 const ANCHOR_EDGES: &str =
@@ -186,4 +187,298 @@ fn issue_158_no_cursor_rowtype_anchor_edges_present() {
             "this fixture declares no cursors — no percent_row_type anchor should exist, got {edge:?}"
         );
     }
+}
+
+// ── Remaining #158 acceptance items: lineage / conflicts / impact / detail ──
+//
+// These four tests need a real `codeweb.toml` project (via `init`) because
+// `lineage`, `conflicts`, `impact`, and `detail` all load a `GraphStore` via
+// `project::Project::find`, unlike the legacy no-subcommand `analyze_json`
+// path above which only exports the freshly built graph. This file only has
+// access to the compiled binary's CLI surface (no `[lib]` target exists in
+// this crate — see Cargo.toml — so integration tests cannot call
+// `GraphBuilder`, `find_conflicts`, or `edge_label_for` directly).
+
+/// Run `codeweb` with `dir` as the working directory (needed for `init`,
+/// which always operates on `std::env::current_dir()`).
+fn run_in_dir(dir: &Path, args: &[&str]) -> std::process::Output {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let bin_name = if cfg!(windows) {
+        "codeweb.exe"
+    } else {
+        "codeweb"
+    };
+    let bin = std::fs::read_dir(&base)
+        .unwrap_or_else(|_| panic!("no target dir"))
+        .flatten()
+        .map(|entry| entry.path().join("debug").join(bin_name))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| base.join("debug").join(bin_name));
+    std::process::Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run codeweb")
+}
+
+/// Write `sql` as the sole source file of a fresh project directory and
+/// `init` it (which also runs the first full analysis). Returns the project
+/// root (== `dir.path()`).
+fn init_project(dir: &TempDir, name: &str, sql: &str) -> std::path::PathBuf {
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("t.sql"), sql).unwrap();
+    let out = run_in_dir(&root, &["init", name, "-d", "."]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    root
+}
+
+/// A table (`par_sys_purchase`) reached only via a `%TYPE` anchor by
+/// `proc_anchor_only` (no DML at all on that table — the write it does
+/// perform, to `anchor_target`, is in a statement with zero relation to
+/// `par_sys_purchase`), alongside `proc_with_dml`, which genuinely reads
+/// `par_sys_purchase` and writes `dml_target` in the same statement.
+const LINEAGE_ANCHOR_SQL: &str = r#"
+CREATE TABLE par_sys_purchase(id NUMBER, purchase_days NUMBER);
+CREATE TABLE anchor_target(id NUMBER);
+CREATE TABLE dml_target(id NUMBER, purchase_days NUMBER);
+
+CREATE OR REPLACE PROCEDURE proc_anchor_only IS
+    v_days par_sys_purchase.purchase_days%TYPE;
+BEGIN
+    INSERT INTO anchor_target(id) VALUES (1);
+END;
+/
+
+CREATE OR REPLACE PROCEDURE proc_with_dml AS
+BEGIN
+    INSERT INTO dml_target(id, purchase_days)
+    SELECT id, purchase_days FROM par_sys_purchase;
+END;
+/
+"#;
+
+/// `AnchorsOn` edges must not produce table-level lineage hops: `lineage`
+/// only pattern-matches `Edge::TableAccess` (see
+/// `src/graph/lineage.rs::build_table_lineage`), so a routine connected to a
+/// table solely through a `%TYPE` anchor must never be treated as a reader
+/// or writer of that table. If a future change broadened the match to also
+/// treat `AnchorsOn` as an implicit read, `proc_anchor_only` would wrongly
+/// qualify as a downstream reader of `par_sys_purchase` and leak its
+/// unrelated write to `anchor_target` into the lineage tree — this test
+/// would then fail on the last two assertions.
+#[test]
+fn issue_158_lineage_ignores_anchor_edges() {
+    let dir = TempDir::new().unwrap();
+    let root = init_project(&dir, "lineage-anchor-test", LINEAGE_ANCHOR_SQL);
+
+    let out = run_in_dir(
+        &root,
+        &[
+            "lineage",
+            "par_sys_purchase",
+            "--direction",
+            "downstream",
+            "--format",
+            "tree",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "lineage failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
+
+    assert!(
+        stdout.contains("dml_target"),
+        "genuine DML-connected downstream table missing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("proc_with_dml"),
+        "connecting DML routine missing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("proc_anchor_only"),
+        "AnchorsOn-only routine must never be treated as a lineage hop:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("anchor_target"),
+        "table only reachable through the anchor-only routine's unrelated \
+         write must not leak into par_sys_purchase's lineage:\n{stdout}"
+    );
+}
+
+/// Same fixture idea for lock-conflict detection: `proc_anchor_only` only
+/// anchors to `par_sys_purchase` via `%TYPE` and performs no DML on it at
+/// all, while `proc_trunc`/`proc_select` genuinely conflict (TRUNCATE vs.
+/// SELECT — same HIGH-severity pattern already locked by
+/// `regress_issue_144_ddl_locks.rs`).
+const CONFLICT_ANCHOR_SQL: &str = r#"
+CREATE TABLE par_sys_purchase(id NUMBER, purchase_days NUMBER);
+
+CREATE OR REPLACE PROCEDURE proc_anchor_only IS
+    v_days par_sys_purchase.purchase_days%TYPE;
+BEGIN
+    NULL;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE proc_trunc IS
+BEGIN
+    TRUNCATE TABLE par_sys_purchase;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE proc_select IS
+    v INT;
+BEGIN
+    SELECT COUNT(*) INTO v FROM par_sys_purchase;
+END;
+/
+"#;
+
+/// `find_conflicts` (src/graph/conflict.rs) only collects locks from
+/// `Edge::TableAccess { flow_kind: DmlAccess, .. }` edges — `AnchorsOn`
+/// edges carry no `AccessMode` and are a different enum variant entirely, so
+/// they can never contribute a `ProcTableLock`. `proc_anchor_only` must
+/// therefore never appear in any conflict entry, while the genuinely
+/// conflicting DML pair still must be reported (proving the check isn't
+/// vacuously true because conflict detection produced nothing at all).
+#[test]
+fn issue_158_conflicts_ignore_anchor_edges() {
+    let dir = TempDir::new().unwrap();
+    let root = init_project(&dir, "conflict-anchor-test", CONFLICT_ANCHOR_SQL);
+
+    let out = run_in_dir(&root, &["conflicts", "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "conflicts failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let conflicts = json["conflicts"].as_array().unwrap();
+
+    assert!(
+        conflicts.iter().all(|c| {
+            let a = c["proc_a"].as_str().unwrap_or("").to_lowercase();
+            let b = c["proc_b"].as_str().unwrap_or("").to_lowercase();
+            !a.contains("proc_anchor_only") && !b.contains("proc_anchor_only")
+        }),
+        "an AnchorsOn-only routine must never appear in a lock conflict: {conflicts:?}"
+    );
+
+    let has_dml_conflict = conflicts.iter().any(|c| {
+        c["severity"].as_str() == Some("high")
+            && c["table"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("par_sys_purchase")
+            && {
+                let a = c["proc_a"].as_str().unwrap_or("").to_lowercase();
+                let b = c["proc_b"].as_str().unwrap_or("").to_lowercase();
+                (a.contains("proc_trunc") && b.contains("proc_select"))
+                    || (a.contains("proc_select") && b.contains("proc_trunc"))
+            }
+    });
+    assert!(
+        has_dml_conflict,
+        "expected HIGH proc_trunc vs proc_select conflict on par_sys_purchase \
+         (sanity check that conflict detection is actually exercised): {conflicts:?}"
+    );
+}
+
+/// `impact`'s core value for #158: a table reached only via an `AnchorsOn`
+/// edge (`dat_trd_repurchase`, from the same fixture Task 7 uses for the
+/// coexistence/inferred-table tests above) must still resolve upstream
+/// impact back to the anchoring function — `impact`'s default `EdgeFilter`
+/// has no category restriction (`EdgeFilter::new()` → `categories: None`,
+/// see `src/graph/query/filter.rs`), so it traverses every edge kind
+/// including `AnchorsOn`. If a future change scoped the default filter to
+/// exclude `AnchorsOn`, this table would show empty upstream impact even
+/// though the function is the entire reason the table node exists.
+#[test]
+fn issue_158_impact_reaches_via_anchor_edge() {
+    let dir = TempDir::new().unwrap();
+    let root = init_project(&dir, "impact-anchor-test", ANCHOR_EDGES);
+
+    let out = run_in_dir(
+        &root,
+        &["impact", "--node", "dat_trd_repurchase", "--format", "json"],
+    );
+    assert!(
+        out.status.success(),
+        "impact failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+
+    let upstream = json["upstream"].as_array().unwrap();
+    assert!(
+        upstream.iter().any(|e| e["symbol"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("fnc_get_purchase_js_days")),
+        "impact from dat_trd_repurchase (reachable only through an AnchorsOn \
+         edge) must surface the anchoring function as upstream: {upstream:?}"
+    );
+}
+
+/// `detail`'s CALLEES section renders each edge label via
+/// `traverse::edge_label_for`, which is `pub(crate)` — integration tests
+/// cannot call it directly (this crate has no `[lib]` target at all, so even
+/// `pub` items are unreachable from `tests/`; see the module comment above).
+/// The equivalent, fully public-API verification is running the actual
+/// `codeweb detail` CLI command and asserting on its rendered text: the
+/// coexisting-edges table (`par_sys_purchase`) must show the aggregated
+/// `[R,T]` bracket (both TableAccess-Read and AnchorsOn present), while the
+/// anchor-only table (`dat_trd_repurchase`) must show `[T]` alone. This is
+/// the same invariant `edge_label_for`'s unit tests in
+/// `src/graph/traverse.rs` already lock (e.g.
+/// `should_aggregate_table_access_and_anchors_on` asserting `Some("[R,T]")`),
+/// verified here through the same public path an actual user runs.
+#[test]
+fn issue_158_detail_labels_show_both_r_and_t() {
+    let dir = TempDir::new().unwrap();
+    let root = init_project(&dir, "detail-anchor-test", ANCHOR_EDGES);
+
+    let out = run_in_dir(&root, &["detail", "fnc_get_purchase_js_days"]);
+    assert!(
+        out.status.success(),
+        "detail failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let callees_section = stdout
+        .split("── CALLEES ──")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no CALLEES section in detail output:\n{stdout}"));
+
+    let dml_and_anchor_line = callees_section
+        .lines()
+        .find(|l| l.to_lowercase().contains("par_sys_purchase"))
+        .unwrap_or_else(|| panic!("par_sys_purchase missing from CALLEES:\n{stdout}"));
+    assert!(
+        dml_and_anchor_line.contains("[R,T]"),
+        "par_sys_purchase CALLEES line must show the aggregated [R,T] label \
+         (TableAccess-Read + AnchorsOn coexisting): {dml_and_anchor_line}"
+    );
+
+    let anchor_only_line = callees_section
+        .lines()
+        .find(|l| l.to_lowercase().contains("dat_trd_repurchase"))
+        .unwrap_or_else(|| panic!("dat_trd_repurchase missing from CALLEES:\n{stdout}"));
+    assert!(
+        anchor_only_line.contains("[T]") && !anchor_only_line.contains("[R"),
+        "dat_trd_repurchase CALLEES line must show [T] alone (no DML read \
+         ever happens on it): {anchor_only_line}"
+    );
 }
