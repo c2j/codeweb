@@ -378,7 +378,9 @@ enum Commands {
 
     /// Table-level and column-level lineage analysis
     Lineage {
-        /// Target table name (e.g., "my_table") for table-level, or "table.column" for column-level
+        /// Target for lineage: "my_table" (table-level), "table.column" or
+        /// "schema.table.column" (column-level), or a node key like
+        /// "table:schema.table" (table-level, same grammar as trace/detail)
         target: String,
 
         /// Lineage direction: upstream (who writes/defines), downstream (who consumes),
