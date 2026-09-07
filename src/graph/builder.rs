@@ -303,6 +303,7 @@ impl GraphBuilder {
             &ctx.proc_index,
             &ctx.type_index,
             &ctx.sequence_index,
+            &mut ctx.table_index,
         );
     }
 
@@ -1729,12 +1730,58 @@ impl GraphBuilder {
         Self::create_edges(&all_edges, graph, proc_index, builtin_index);
     }
 
+    /// Resolve a flat `%TYPE`/`%ROWTYPE` signature anchor to its target table (creating
+    /// an inferred `Node::Table` if no DDL-backed table exists yet) and add an
+    /// `AnchorsOn` edge from `proc_idx` to it (issue #158).
+    fn add_anchor_edge(
+        graph: &mut CodeGraph,
+        proc_idx: petgraph::graph::NodeIndex,
+        anchor: &crate::parser::AnchorRef,
+        file: Arc<PathBuf>,
+        line: usize,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        let (schema, table) = match anchor.object.rsplit_once('.') {
+            Some((s, t)) => (Some(s), t),
+            None => (None, anchor.object.as_str()),
+        };
+        let key = normalize_table_key(schema, table);
+        let table_idx = *table_index.entry(key).or_insert_with(|| {
+            let node = Node::Table {
+                schema: schema.map(str::to_string),
+                name: table.to_string(),
+                explicit: false,
+                system: is_system(schema, table),
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            };
+            graph.add_node(node)
+        });
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            Edge::AnchorsOn {
+                kind: anchor.kind,
+                column: anchor.column.clone(),
+                site: anchor.site,
+                location: SourceLocation { file, line },
+            },
+        );
+    }
+
     fn create_object_ref_edges(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -1795,6 +1842,21 @@ impl GraphBuilder {
                                                 line: info.start_line,
                                             },
                                         },
+                                    );
+                                }
+                            }
+                            for param in &p.parameters {
+                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                                    &param.data_type,
+                                    crate::parser::AnchorSite::Param,
+                                ) {
+                                    Self::add_anchor_edge(
+                                        graph,
+                                        proc_idx,
+                                        &a,
+                                        file_arc.clone(),
+                                        info.start_line,
+                                        table_index,
                                     );
                                 }
                             }
@@ -1866,6 +1928,36 @@ impl GraphBuilder {
                                                 line: info.start_line,
                                             },
                                         },
+                                    );
+                                }
+                            }
+                            for param in &f.parameters {
+                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                                    &param.data_type,
+                                    crate::parser::AnchorSite::Param,
+                                ) {
+                                    Self::add_anchor_edge(
+                                        graph,
+                                        proc_idx,
+                                        &a,
+                                        file_arc.clone(),
+                                        info.start_line,
+                                        table_index,
+                                    );
+                                }
+                            }
+                            if let Some(rt) = &f.return_type {
+                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                                    rt,
+                                    crate::parser::AnchorSite::ReturnType,
+                                ) {
+                                    Self::add_anchor_edge(
+                                        graph,
+                                        proc_idx,
+                                        &a,
+                                        file_arc.clone(),
+                                        info.start_line,
+                                        table_index,
                                     );
                                 }
                             }
@@ -4527,6 +4619,106 @@ mod tests {
                 src, dowork_idx,
                 "DirectCall edges should originate from do_work"
             );
+        }
+    }
+
+    /// issue #158: a function's flat `RETURN par_sys_purchase.purchase_days%TYPE`
+    /// signature must produce an `AnchorsOn` edge from the function to the
+    /// (inferred, no-DDL) `par_sys_purchase` table, carrying the anchored column.
+    #[test]
+    fn should_create_anchor_edge_from_function_return_type() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION BIGFUND.FNC_GET_PURCHASE_JS_DAYS
+            RETURN par_sys_purchase.purchase_days%TYPE
+            IS
+            BEGIN
+                RETURN NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("FNC_GET_PURCHASE_JS_DAYS")))
+            .expect("function node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(func_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "Expected 1 AnchorsOn edge from function"
+        );
+
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn {
+                kind, column, site, ..
+            } => {
+                assert!(matches!(kind, crate::parser::AnchorKind::PercentType));
+                assert_eq!(column.as_deref(), Some("purchase_days"));
+                assert!(matches!(site, crate::parser::AnchorSite::ReturnType));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+
+        match &graph[target] {
+            Node::Table { name, explicit, .. } => {
+                assert_eq!(name.to_lowercase(), "par_sys_purchase");
+                assert!(
+                    !explicit,
+                    "table with no DDL must be inferred (explicit=false)"
+                );
+            }
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+    }
+
+    /// issue #158: a procedure parameter with a flat `%ROWTYPE` signature must
+    /// produce an `AnchorsOn` edge (site=Param, column=None) to the anchored table.
+    #[test]
+    fn should_create_anchor_edge_from_param_type() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_test(p_in DAT_TRD_REPURCHASE%ROWTYPE)
+            IS
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_test")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "Expected 1 AnchorsOn edge from procedure"
+        );
+
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn {
+                kind, column, site, ..
+            } => {
+                assert!(matches!(kind, crate::parser::AnchorKind::PercentRowType));
+                assert_eq!(*column, None);
+                assert!(matches!(site, crate::parser::AnchorSite::Param));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
         }
     }
 
