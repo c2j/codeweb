@@ -1063,8 +1063,12 @@ impl Visitor for TypeSequenceRefExtractor {
 }
 
 /// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
-/// Cursor-anchored `%ROWTYPE` is deliberately skipped (issue #147/#142:
-/// record fields resolve via cursor SELECT sources, not table edges).
+/// `push_anchor` skips any anchor whose object name (lowercased) matches a
+/// known cursor name. This mainly guards `cursor%ROWTYPE` (issue #147/#142:
+/// record fields resolve via cursor SELECT sources, not table edges); a
+/// `%TYPE` table name colliding with a cursor name can't happen in practice,
+/// but the guard applies uniformly to both branches to keep a single
+/// enforcement point (Task 4 will extend it with a variable-name guard).
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
@@ -1096,12 +1100,6 @@ impl AnchorExtractor {
             kind,
             site,
         });
-    }
-}
-
-impl Default for AnchorExtractor {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -4614,10 +4612,24 @@ mod tests {
             $$ DECLARE r dat_trd_repurchase%ROWTYPE; BEGIN NULL; END; $$;";
         let anchors = extract_anchors(sql);
         assert_eq!(anchors.len(), 1);
-        assert_eq!(anchors[0].object.to_lowercase(), "dat_trd_repurchase");
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
         assert_eq!(anchors[0].column, None);
         assert!(matches!(anchors[0].site, AnchorSite::Variable));
         assert!(matches!(anchors[0].kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_skip_rowtype_anchored_to_cursor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE CURSOR cur_x FOR SELECT id FROM t_main; \
+            r cur_x%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "cursor%ROWTYPE must not produce a table anchor: {:?}",
+            anchors
+        );
     }
 
     #[test]
