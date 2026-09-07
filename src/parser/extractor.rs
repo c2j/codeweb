@@ -5310,9 +5310,7 @@ mod column_tests {
     /// source, consistent with how `classify_value_expr` treats a bare literal.
     #[test]
     fn literal_only_scalar_subquery_classifies_direct() {
-        let maps = column_mappings_of(
-            "INSERT INTO t_out (code) VALUES ((SELECT 'x' FROM dual))",
-        );
+        let maps = column_mappings_of("INSERT INTO t_out (code) VALUES ((SELECT 'x' FROM dual))");
         let m = find_mapping(&maps, "code");
         assert_eq!(m.kind, MappingKind::Direct);
         assert_eq!(
