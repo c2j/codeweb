@@ -8,6 +8,21 @@ let currentOffset = 0;
 let isLoading = false;
 let navHistory = [];
 let isNavigatingBack = false;
+let currentDetailData = null;
+let treeExpandDepth = parseInt(localStorage.getItem('codeweb-tree-expand-depth') ?? '1', 10);
+if (isNaN(treeExpandDepth)) treeExpandDepth = 1;
+let treeCollapsed = {};
+try { treeCollapsed = JSON.parse(localStorage.getItem('codeweb-tree-collapsed') || '{}') || {}; } catch (_) {}
+if (typeof treeCollapsed !== 'object') treeCollapsed = {};
+
+function saveTreeState() {
+  localStorage.setItem('codeweb-tree-expand-depth', String(treeExpandDepth));
+  localStorage.setItem('codeweb-tree-collapsed', JSON.stringify(treeCollapsed));
+}
+
+function treeStateKey(pathKey) {
+  return (currentTraceKey || '') + '|' + pathKey;
+}
 
 const ITEM_HEIGHT = 36;
 const BUFFER = 5;
@@ -67,6 +82,11 @@ async function init() {
 
   document.getElementById('detail-panel').addEventListener('click', function(e) {
     if (e.target.closest('.copy-btn')) return;
+    const toggle = e.target.closest('.tree-toggle');
+    if (toggle && toggle.dataset.toggleKey) {
+      toggleTreeNode(toggle.dataset.toggleKey, parseInt(toggle.dataset.depth, 10));
+      return;
+    }
     const treeNode = e.target.closest('.tree-node');
     if (treeNode && treeNode.dataset.key) {
       navigateTo(treeNode.dataset.key);
@@ -245,7 +265,7 @@ async function navigateTo(key) {
 
   currentTraceKey = key;
   const [trace, detail] = await Promise.all([
-    api('/trace?from=' + encodeURIComponent(key) + '&depth=50&max_nodes=500'),
+    api('/trace?from=' + encodeURIComponent(key) + '&depth=10&max_nodes=500'),
     selectedNodeId !== null ? api('/nodes/' + selectedNodeId) : Promise.resolve(null),
   ]);
   if (currentTraceKey !== key) return;
@@ -305,6 +325,21 @@ function renderPropertiesHtml(detail, showBodySql) {
 }
 
 function showDetail(trace, detail, mode) {
+  currentDetailData = { trace, detail, mode };
+  renderDetail(false);
+  document.getElementById('detail-panel').classList.remove('hidden');
+  updateBackButton();
+}
+
+function renderDetail(preserveScroll) {
+  const el = document.getElementById('detail-content');
+  const scrollTop = preserveScroll ? el.scrollTop : 0;
+  el.innerHTML = buildDetailHtml();
+  el.scrollTop = scrollTop;
+}
+
+function buildDetailHtml() {
+  const { trace, detail, mode } = currentDetailData;
   const target = trace.target;
   const inDeg = trace.caller_count;
   const outDeg = trace.callee_count;
@@ -313,30 +348,59 @@ function showDetail(trace, detail, mode) {
   showProperties = localStorage.getItem('codeweb-props-expanded') !== 'false';
   document.getElementById('detail-title').textContent = target.type + ' ' + target.key;
 
+  const treeActions = ' <span class="tree-actions">' +
+    '<a href="#" onclick="expandAllTree(); return false;">expand all</a> · ' +
+    '<a href="#" onclick="collapseAllTree(); return false;">collapse all</a></span>';
+
   let h = '<div class="section-title first">Degree</div>';
   h += '<div>in:' + inDeg + ' out:' + outDeg + ' total:' + (inDeg + outDeg) + '</div>';
 
   h += renderPropertiesHtml(detail, showBodySql);
 
-  h += '<div class="section-title">Callers (' + inDeg + ')</div>';
+  h += '<div class="section-title">Callers (' + inDeg + ')' + treeActions + '</div>';
   h += '<div class="tree-list">';
-  h += renderTreeHtml(trace.callers);
+  h += renderTreeHtml(trace.callers, 'callers', [], 0);
   h += '</div>';
 
-  h += '<div class="section-title">Callees (' + outDeg + ')</div>';
+  h += '<div class="section-title">Callees (' + outDeg + ')' + treeActions + '</div>';
   h += '<div class="tree-list">';
-  h += renderTreeHtml(trace.callees);
+  h += renderTreeHtml(trace.callees, 'callees', [], 0);
   h += '</div>';
 
   if (trace.truncated) {
     h += '<div class="truncated">Results truncated \u2014 too many nodes</div>';
   }
-
-  document.getElementById('detail-content').innerHTML = h;
-  document.getElementById('detail-panel').classList.remove('hidden');
+  return h;
 }
 
-function renderTreeHtml(nodes, prefixes) {
+function isTreeNodeCollapsed(pathKey, depth) {
+  const k = treeStateKey(pathKey);
+  if (treeCollapsed[k] !== undefined) return treeCollapsed[k];
+  return depth >= treeExpandDepth;
+}
+
+function toggleTreeNode(pathKey, depth) {
+  const k = treeStateKey(pathKey);
+  treeCollapsed[k] = !isTreeNodeCollapsed(pathKey, depth);
+  saveTreeState();
+  renderDetail(true);
+}
+
+function expandAllTree() {
+  treeCollapsed = {};
+  treeExpandDepth = 99;
+  saveTreeState();
+  renderDetail(true);
+}
+
+function collapseAllTree() {
+  treeCollapsed = {};
+  treeExpandDepth = 0;
+  saveTreeState();
+  renderDetail(true);
+}
+
+function renderTreeHtml(nodes, section, pathIdx, depth, prefixes) {
   if (!nodes || nodes.length === 0) return '<div class="tree-empty">(none)</div>';
   prefixes = prefixes || [];
   let html = '';
@@ -346,18 +410,34 @@ function renderTreeHtml(nodes, prefixes) {
     const connector = isLast ? '\u2514\u2500\u2500 ' : '\u251c\u2500\u2500 ';
     const prefix = prefixes.join('');
     const label = n.edge_label ? ' <span class="edge-label">' + esc(n.edge_label) + '</span>' : '';
+    const pathKey = section + '.' + pathIdx.concat([i]).join('.');
+    const expandable = (n.children && n.children.length > 0) || n.has_more;
+    const isCollapsed = expandable && isTreeNodeCollapsed(pathKey, depth);
 
     html += '<div class="tree-node" data-key="' + esc(n.key) + '">';
     html += '<span class="tree-prefix">' + esc(prefix + connector) + '</span>';
+    if (expandable) {
+      html += '<span class="tree-toggle" data-toggle-key="' + esc(pathKey) + '" data-depth="' + depth + '">' + (isCollapsed ? '[+]' : '[-]') + '</span> ';
+    } else {
+      html += '<span class="tree-toggle tree-toggle-leaf">&nbsp;</span> ';
+    }
     html += '<span class="node-tag" style="color:' + (TAG_COLORS[n.type] || '#999') + '">' + n.type + '</span>';
     html += '<span class="tree-key">' + esc(n.key) + '</span>';
     html += '<span class="copy-btn" onclick="event.stopPropagation(); copyToClipboard(this)" data-copy-key="' + esc(n.key) + '" title="Copy name">📋</span>';
     html += label;
     html += '</div>';
 
+    if (isCollapsed) continue;
     if (n.children && n.children.length > 0) {
       const childPrefix = isLast ? '    ' : '\u2502   ';
-      html += renderTreeHtml(n.children, prefixes.concat([childPrefix]));
+      html += renderTreeHtml(n.children, section, pathIdx.concat([i]), depth + 1, prefixes.concat([childPrefix]));
+    }
+    if (n.has_more) {
+      const childPrefix = isLast ? '    ' : '\u2502   ';
+      html += '<div class="tree-node tree-more" data-key="' + esc(n.key) + '">' +
+        '<span class="tree-prefix">' + esc(childPrefix + '    ') + '</span>' +
+        '<span class="tree-more-badge">\u25be ' + n.more_count + ' more \u2014 click to open</span>' +
+        '</div>';
     }
   }
   return html;
@@ -367,6 +447,7 @@ function hideDetail() {
   document.getElementById('detail-panel').classList.add('hidden');
   selectedNodeId = null;
   currentTraceKey = null;
+  currentDetailData = null;
   navHistory = [];
   renderVirtualList();
 }

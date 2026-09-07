@@ -45,6 +45,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .tree-key{overflow:hidden;text-overflow:ellipsis}
 .edge-label{color:#666;font-size:13px}
 .tree-empty{padding:4px 0;color:#666;font-size:14px;font-style:italic}
+.tree-toggle{font-family:'Cascadia Code',Consolas,monospace;color:#888;cursor:pointer;user-select:none;flex-shrink:0}
+.tree-toggle:hover{color:#fff}
+.tree-toggle-leaf{visibility:hidden}
+.tree-actions{font-size:11px;font-weight:400;margin-left:8px;text-transform:none}
+.tree-actions a{color:#6fb3e0;cursor:pointer;text-decoration:none}
+.tree-actions a:hover{text-decoration:underline}
+.tree-node.tree-more{cursor:pointer}
+.tree-node.tree-more:hover{background:#2a2a4e}
+.tree-more-badge{color:#e0a96f;font-size:12px;font-style:italic}
 .prop-list{padding:2px 0}
 .prop-entry{padding:2px 0;font-size:14px}
 .prop-label{color:#e94560;font-weight:700;margin-right:6px}
