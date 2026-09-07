@@ -110,6 +110,17 @@ fn is_system(schema: Option<&str>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Dedup key for `AnchorsOn` edges within a single routine/package-variable
+/// scope: (lowercased object, column, kind, site). See
+/// [`GraphBuilder::anchor_dedup_key`] for why signature anchors and
+/// variable/nested-type anchors can collide on this key.
+type AnchorDedupKey = (
+    String,
+    Option<String>,
+    crate::parser::AnchorKind,
+    crate::parser::AnchorSite,
+);
+
 pub struct GraphBuilder;
 
 /// A column comment from a standalone `COMMENT ON COLUMN` statement,
@@ -1737,14 +1748,7 @@ impl GraphBuilder {
     /// from different sources within the same routine and can collide on the
     /// same column (e.g. a `RETURN t.c%TYPE` clause and a `RESULT t.c%TYPE`
     /// local variable) — each distinct combination gets exactly one edge.
-    fn anchor_dedup_key(
-        a: &crate::parser::AnchorRef,
-    ) -> (
-        String,
-        Option<String>,
-        crate::parser::AnchorKind,
-        crate::parser::AnchorSite,
-    ) {
+    fn anchor_dedup_key(a: &crate::parser::AnchorRef) -> AnchorDedupKey {
         (a.object.to_lowercase(), a.column.clone(), a.kind, a.site)
     }
 
@@ -1791,6 +1795,66 @@ impl GraphBuilder {
                 location: SourceLocation { file, line },
             },
         );
+    }
+
+    /// Collect every `AnchorsOn` edge for a single routine: signature
+    /// (`Param`/`ReturnType`) anchors from a flat type string, plus
+    /// variable/nested-type anchors from walking `block` with a fresh
+    /// `AnchorExtractor` (issue #158). `pkg_cursor_names` is empty for a
+    /// top-level `CreateProcedure`/`CreateFunction`; a package member routine
+    /// passes its package's cursor names so `rec pkg_cursor%ROWTYPE` inside
+    /// the body is guarded the same way a routine-local cursor would be.
+    /// Shared across the three call sites (top-level procedure, top-level
+    /// function, package member) that previously duplicated this sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_routine_anchor_edges(
+        graph: &mut CodeGraph,
+        proc_idx: petgraph::graph::NodeIndex,
+        parameters: &[ogsql_parser::ast::RoutineParam],
+        return_type: Option<&str>,
+        block: Option<&ogsql_parser::ast::plpgsql::PlBlock>,
+        pkg_cursor_names: &[String],
+        file: Arc<PathBuf>,
+        line: usize,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        let mut anchor_seen: HashSet<AnchorDedupKey> = HashSet::new();
+
+        for param in parameters {
+            if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                &param.data_type,
+                crate::parser::AnchorSite::Param,
+            ) {
+                if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                    Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
+                }
+            }
+        }
+        if let Some(rt) = return_type {
+            if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                rt,
+                crate::parser::AnchorSite::ReturnType,
+            ) {
+                if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                    Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
+                }
+            }
+        }
+
+        let Some(block) = block else {
+            return;
+        };
+
+        let mut anchor_extractor = AnchorExtractor::new();
+        for cname in pkg_cursor_names {
+            anchor_extractor.register_cursor_name(cname);
+        }
+        walk_pl_block(&mut anchor_extractor, block);
+        for a in &anchor_extractor.anchors {
+            if anchor_seen.insert(Self::anchor_dedup_key(a)) {
+                Self::add_anchor_edge(graph, proc_idx, a, file.clone(), line, table_index);
+            }
+        }
     }
 
     fn create_object_ref_edges(
@@ -1864,45 +1928,17 @@ impl GraphBuilder {
                                     );
                                 }
                             }
-                            let mut anchor_seen: HashSet<(
-                                String,
-                                Option<String>,
-                                crate::parser::AnchorKind,
-                                crate::parser::AnchorSite,
-                            )> = HashSet::new();
-                            for param in &p.parameters {
-                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
-                                    &param.data_type,
-                                    crate::parser::AnchorSite::Param,
-                                ) {
-                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
-                                        Self::add_anchor_edge(
-                                            graph,
-                                            proc_idx,
-                                            &a,
-                                            file_arc.clone(),
-                                            info.start_line,
-                                            table_index,
-                                        );
-                                    }
-                                }
-                            }
-                            let mut anchor_extractor = AnchorExtractor::new();
-                            if let Some(ref block) = p.block {
-                                walk_pl_block(&mut anchor_extractor, block);
-                            }
-                            for a in &anchor_extractor.anchors {
-                                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
-                                    Self::add_anchor_edge(
-                                        graph,
-                                        proc_idx,
-                                        a,
-                                        file_arc.clone(),
-                                        info.start_line,
-                                        table_index,
-                                    );
-                                }
-                            }
+                            Self::collect_routine_anchor_edges(
+                                graph,
+                                proc_idx,
+                                &p.parameters,
+                                None,
+                                p.block.as_ref(),
+                                &[],
+                                file_arc.clone(),
+                                info.start_line,
+                                table_index,
+                            );
                         }
                     }
                     Statement::CreateFunction(f) => {
@@ -1974,62 +2010,17 @@ impl GraphBuilder {
                                     );
                                 }
                             }
-                            let mut anchor_seen: HashSet<(
-                                String,
-                                Option<String>,
-                                crate::parser::AnchorKind,
-                                crate::parser::AnchorSite,
-                            )> = HashSet::new();
-                            for param in &f.parameters {
-                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
-                                    &param.data_type,
-                                    crate::parser::AnchorSite::Param,
-                                ) {
-                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
-                                        Self::add_anchor_edge(
-                                            graph,
-                                            proc_idx,
-                                            &a,
-                                            file_arc.clone(),
-                                            info.start_line,
-                                            table_index,
-                                        );
-                                    }
-                                }
-                            }
-                            if let Some(rt) = &f.return_type {
-                                if let Some(a) = crate::parser::parse_anchor_from_type_string(
-                                    rt,
-                                    crate::parser::AnchorSite::ReturnType,
-                                ) {
-                                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
-                                        Self::add_anchor_edge(
-                                            graph,
-                                            proc_idx,
-                                            &a,
-                                            file_arc.clone(),
-                                            info.start_line,
-                                            table_index,
-                                        );
-                                    }
-                                }
-                            }
-                            let mut anchor_extractor = AnchorExtractor::new();
-                            if let Some(ref block) = f.block {
-                                walk_pl_block(&mut anchor_extractor, block);
-                            }
-                            for a in &anchor_extractor.anchors {
-                                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
-                                    Self::add_anchor_edge(
-                                        graph,
-                                        proc_idx,
-                                        a,
-                                        file_arc.clone(),
-                                        info.start_line,
-                                        table_index,
-                                    );
-                                }
-                            }
+                            Self::collect_routine_anchor_edges(
+                                graph,
+                                proc_idx,
+                                &f.parameters,
+                                f.return_type.as_deref(),
+                                f.block.as_ref(),
+                                &[],
+                                file_arc.clone(),
+                                info.start_line,
+                                table_index,
+                            );
                         }
                     }
                     Statement::CreatePackage(pkg) => {
@@ -2106,12 +2097,7 @@ impl GraphBuilder {
                 {
                     let obj_lower = object.to_lowercase();
                     if !pkg_cursor_names.contains(&obj_lower) {
-                        let qualified = match &schema_part {
-                            Some(s) => {
-                                format!("{}.{}", s.to_lowercase(), pkg_name_part.to_lowercase())
-                            }
-                            None => pkg_name_part.to_lowercase(),
-                        };
+                        let qualified = pkg_qualified_key(pkg_name);
                         if let Some(&pkg_idx) = package_index.get(&qualified) {
                             let anchor = crate::parser::AnchorRef {
                                 object,
@@ -2163,47 +2149,17 @@ impl GraphBuilder {
                 continue;
             };
 
-            let mut anchor_seen: HashSet<(
-                String,
-                Option<String>,
-                crate::parser::AnchorKind,
-                crate::parser::AnchorSite,
-            )> = HashSet::new();
-
-            for param in parameters {
-                if let Some(a) = crate::parser::parse_anchor_from_type_string(
-                    &param.data_type,
-                    crate::parser::AnchorSite::Param,
-                ) {
-                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
-                        Self::add_anchor_edge(
-                            graph,
-                            proc_idx,
-                            &a,
-                            file_path.clone(),
-                            info.start_line,
-                            table_index,
-                        );
-                    }
-                }
-            }
-            if let Some(rt) = return_type {
-                if let Some(a) = crate::parser::parse_anchor_from_type_string(
-                    rt,
-                    crate::parser::AnchorSite::ReturnType,
-                ) {
-                    if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
-                        Self::add_anchor_edge(
-                            graph,
-                            proc_idx,
-                            &a,
-                            file_path.clone(),
-                            info.start_line,
-                            table_index,
-                        );
-                    }
-                }
-            }
+            Self::collect_routine_anchor_edges(
+                graph,
+                proc_idx,
+                parameters,
+                return_type.map(|s| s.as_str()),
+                block.as_ref(),
+                &pkg_cursor_names,
+                file_path.clone(),
+                info.start_line,
+                table_index,
+            );
 
             let Some(ref block) = block else {
                 continue;
@@ -2238,24 +2194,6 @@ impl GraphBuilder {
                                 line: info.start_line,
                             },
                         },
-                    );
-                }
-            }
-
-            let mut anchor_extractor = AnchorExtractor::new();
-            for cname in &pkg_cursor_names {
-                anchor_extractor.register_cursor_name(cname);
-            }
-            walk_pl_block(&mut anchor_extractor, block);
-            for a in &anchor_extractor.anchors {
-                if anchor_seen.insert(Self::anchor_dedup_key(a)) {
-                    Self::add_anchor_edge(
-                        graph,
-                        proc_idx,
-                        a,
-                        file_path.clone(),
-                        info.start_line,
-                        table_index,
                     );
                 }
             }
