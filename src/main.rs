@@ -1589,10 +1589,12 @@ fn cmd_lineage(
             graph::lineage::TableLookup::Found(_) => (table_name, Some(column)),
             graph::lineage::TableLookup::Ambiguous => {
                 eprintln!(
-                    "note: table '{}' is ambiguous across schemas — interpreting '{}' as a table reference",
-                    table_name, target
+                    "error: table '{}' is ambiguous across schemas — qualify it as \
+                     'schema.{table_name}' for table-level, or 'schema.{table_name}.{column}' \
+                     for column-level lineage",
+                    table_name
                 );
-                (target, None)
+                return Ok(());
             }
             graph::lineage::TableLookup::Missing => {
                 eprintln!(

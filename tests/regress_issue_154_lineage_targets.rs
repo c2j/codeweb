@@ -227,9 +227,27 @@ CREATE TABLE archive.mid_yjqs_detail(id NUMBER);
             root.to_str().unwrap(),
         ],
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success());
     assert!(
-        stderr.contains("ambiguous"),
-        "ambiguous table half must be identified accurately, stderr:\n{stderr}"
+        stderr.contains("ambiguous across schemas"),
+        "expected ambiguous-schema error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("qualify"),
+        "expected schema qualification hint, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("interpreting"),
+        "ambiguous must not fall back, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No table found matching"),
+        "dead-end fallback must be gone, stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "no lineage output expected, stdout: {stdout}"
     );
 }
