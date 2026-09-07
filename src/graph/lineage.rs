@@ -1514,8 +1514,9 @@ pub(crate) fn find_table_node(graph: &CodeGraph, name: &str) -> Option<NodeIndex
     if let Some((schema, table)) = name.rsplit_once('.') {
         if !schema.is_empty() {
             return graph.node_indices().find(|idx| {
-                name_of(idx)
-                    .is_some_and(|(s, n)| n.eq_ignore_ascii_case(table) && s == Some(schema))
+                name_of(idx).is_some_and(|(s, n)| {
+                    n.eq_ignore_ascii_case(table) && s.is_some_and(|s| eq(s, schema))
+                })
             });
         }
     }

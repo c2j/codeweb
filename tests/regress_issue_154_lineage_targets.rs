@@ -135,6 +135,31 @@ fn should_keep_column_level_for_existing_table_and_column() {
 }
 
 #[test]
+fn should_resolve_column_query_with_differently_cased_schema() {
+    let tmp = TempDir::new().unwrap();
+    let root = project_with_sql(&tmp, FIXTURE_SQL);
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "lineage",
+            "Bigfund.mid_yjqs_detail.amt",
+            "-p",
+            root.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("interpreting"),
+        "schema casing must not trigger table fallback, stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Bigfund.mid_yjqs_detail.amt"),
+        "column-level root line expected, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn should_keep_no_column_lineage_hint_when_table_exists_but_column_unknown() {
     let tmp = TempDir::new().unwrap();
     let root = project_with_sql(&tmp, FIXTURE_SQL);
