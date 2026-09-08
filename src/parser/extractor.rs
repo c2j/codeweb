@@ -1145,7 +1145,11 @@ pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<Str
 ///   table, anchors targeting that name are conservatively skipped rather
 ///   than resolved to the table. This is intentional: PL/SQL identifier
 ///   shadowing means the name resolves to the local declaration, not the
-///   table, at the point of use.
+///   table, at the point of use. The skip set also includes routine
+///   parameter names injected via [`register_var_name`](AnchorExtractor::register_var_name)
+///   (parameters are not `PlDeclaration`s inside the block), so a
+///   parameter literally named `par_sys_purchase` shadowing the real table
+///   of that name is this same documented behavior, not an accident.
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
