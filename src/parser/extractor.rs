@@ -3385,9 +3385,11 @@ impl ColumnAccessExtractor {
         });
     }
 
-    /// Column mapping for `target = (SELECT first_expr FROM ...)`: resolve the
-    /// subquery's first select-list expression against the subquery's own FROM
-    /// aliases, then restore the enclosing statement's scope. Correlated
+    /// Column mapping for `target = (SELECT ... FROM ...)`: map the written column
+    /// to the subquery's select expression — a scalar subquery's single output, or
+    /// — for a multi-column subquery shared by an UPDATE SET list — the output at
+    /// the written column's position. Resolves against the subquery's own FROM
+    /// aliases, then restores the enclosing statement's scope. Correlated
     /// references (`s.id` in the subquery's WHERE) are not value sources and are
     /// intentionally not collected.
     fn push_subquery_column_mapping(
@@ -3410,7 +3412,12 @@ impl ColumnAccessExtractor {
         let new_scope = self.scope_sole_table_of(&select.from);
         let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
 
-        let (sources, kind, expression) = match select.targets.first() {
+        let target = if select.targets.len() <= 1 {
+            select.targets.first()
+        } else {
+            position.and_then(|p| select.targets.get(p))
+        };
+        let (sources, kind, expression) = match target {
             Some(SelectTarget::Expr(first, _)) => {
                 self.classify_value_expr(peel_parenthesized(first))
             }
@@ -5319,6 +5326,23 @@ mod column_tests {
             vec![ColumnSource::Literal {
                 value: "'x'".to_string()
             }]
+        );
+    }
+
+    /// Review (5136742683): a multi-column subquery applied to a multi-column
+    /// UPDATE SET target must align each target column to its OWN select-list
+    /// position — not copy the first expression into every column.
+    #[test]
+    fn multi_column_set_subquery_aligns_by_position() {
+        let maps = column_mappings_of("UPDATE u_dst SET (a, b) = (SELECT x, y FROM u_src)");
+        assert_eq!(
+            find_mapping(&maps, "a").sources,
+            vec![col(Some("u_src"), "x")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "b").sources,
+            vec![col(Some("u_src"), "y")],
+            "each SET column must pair with its own subquery output, not copy the first"
         );
     }
 
