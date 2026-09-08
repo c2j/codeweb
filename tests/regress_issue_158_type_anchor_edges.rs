@@ -555,3 +555,119 @@ fn issue_158_package_nested_type_anchor_end_to_end() {
         "package-level TYPE name t_list_e2e must never surface as a graph node"
     );
 }
+
+// ── PR #164 review round 2 (#158): SPEC inheritance + signature guard +
+//    self-naming idiom, combined end-to-end ──
+
+/// Combines all three PR #164 review round 2 fixes in one SPEC+BODY
+/// fixture, verified through the JSON export:
+/// - SPEC declares `CURSOR c` / `TYPE rec_t` / `v_emp employees_e2e_r2%ROWTYPE`.
+/// - BODY's `p_body(p_rec c%ROWTYPE)` anchors its parameter to the
+///   SPEC-inherited cursor `c` (Task 1 SPEC inheritance + Task 2 signature
+///   guard) and its locals to the SPEC-inherited `rec_t`/`v_emp` (Task 1 +
+///   existing body-walk guard) — all three must produce no fake table.
+/// - BODY's `v_ok real_table_e2e_r2.real_col_e2e_r2%TYPE` is the control:
+///   a genuine, unrelated table anchor that must still come through.
+/// - BODY's `p(employees_e2e_r2 employees_e2e_r2%ROWTYPE)` is the Oracle
+///   self-naming idiom (Task 3 signature side, via Task 2's self-exclusion)
+///   and must anchor to the real `employees_e2e_r2` table (site=param).
+/// - The SPEC's own `v_emp employees_e2e_r2%ROWTYPE` is a genuine
+///   package-level anchor and must also survive (site=variable).
+#[test]
+fn issue_158_spec_body_inherited_guards_end_to_end() {
+    let sql = r#"
+        CREATE OR REPLACE PACKAGE pkg_e2e_review2 AS
+            CURSOR c IS SELECT id FROM t_cursor_src_e2e_r2;
+            TYPE rec_t IS RECORD (f INTEGER);
+            v_emp employees_e2e_r2%ROWTYPE;
+        END pkg_e2e_review2;
+
+        CREATE OR REPLACE PACKAGE BODY pkg_e2e_review2 AS
+            PROCEDURE p_body(p_rec c%ROWTYPE) IS
+                v1 rec_t.f%TYPE;
+                v2 v_emp.empno%TYPE;
+                v_ok real_table_e2e_r2.real_col_e2e_r2%TYPE;
+            BEGIN
+                NULL;
+            END;
+
+            PROCEDURE p(employees_e2e_r2 employees_e2e_r2%ROWTYPE) IS
+            BEGIN
+                NULL;
+            END;
+        END pkg_e2e_review2;
+    "#;
+    let json = analyze_json(sql);
+
+    // Fake tables that must never appear: the cursor name, the
+    // package-level TYPE name, and the sibling-guarded reference name.
+    for fake in ["c", "rec_t"] {
+        assert!(
+            node_id_by_name(&json, fake).is_none(),
+            "'{fake}' must never surface as a graph node, json: {json}"
+        );
+    }
+
+    // v_ok's control anchor: p_body -> real_table_e2e_r2.
+    let control_edges = edges_between(&json, "p_body", "real_table_e2e_r2");
+    assert!(
+        !control_edges.is_empty(),
+        "expected p_body -> real_table_e2e_r2 anchors_on edge (control case), json: {json}"
+    );
+    assert!(
+        control_edges
+            .iter()
+            .all(|e| e["type"].as_str() == Some("anchors_on")),
+        "control edge must be anchors_on, got {control_edges:?}"
+    );
+
+    // Self-naming idiom on a signature parameter: p -> employees_e2e_r2,
+    // site=param.
+    let self_named_edges = edges_between(&json, "p", "employees_e2e_r2");
+    assert!(
+        !self_named_edges.is_empty(),
+        "expected p -> employees_e2e_r2 anchors_on edge (self-named param), json: {json}"
+    );
+    assert!(
+        self_named_edges
+            .iter()
+            .any(|e| e["site"].as_str() == Some("param")),
+        "expected an anchors_on edge with site=param, got {self_named_edges:?}"
+    );
+
+    // SPEC's own package-level anchor: pkg_e2e_review2 -> employees_e2e_r2,
+    // site=variable.
+    let spec_edges = edges_between(&json, "pkg_e2e_review2", "employees_e2e_r2");
+    assert!(
+        !spec_edges.is_empty(),
+        "expected pkg_e2e_review2 -> employees_e2e_r2 anchors_on edge (SPEC variable), \
+         json: {json}"
+    );
+    assert!(
+        spec_edges
+            .iter()
+            .any(|e| e["site"].as_str() == Some("variable")),
+        "expected an anchors_on edge with site=variable, got {spec_edges:?}"
+    );
+
+    // No anchors_on edge anywhere may target 'c' or 'rec_t' — the fake
+    // table names themselves are already checked above, but this also
+    // rules out an anchor pointing at them via schema-qualification or any
+    // other resolution path.
+    let anchor_edges: Vec<_> = json["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("anchors_on"))
+        .collect();
+    for edge in &anchor_edges {
+        let target_id = edge["target"].as_u64();
+        for fake in ["c", "rec_t"] {
+            assert_ne!(
+                target_id,
+                node_id_by_name(&json, fake).map(|id| id as u64),
+                "no anchors_on edge may target the fake node '{fake}': {edge:?}"
+            );
+        }
+    }
+}
