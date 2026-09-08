@@ -863,6 +863,7 @@ git commit -m "test: #158 验收矩阵端到端回归（锚定边可见性与隔
 - Task 7：包级 Variable 此前完全被 `continue`（无既有锚定主体先例）→ 锚定到 Package 节点；包成员例程签名锚定此前缺失 → 补齐；提取 `collect_routine_anchor_edges` 消除三处 ~35 行重复；`AnchorKind`/`AnchorSite` 补 `Hash` derive（去重键需要）。
 - Task 8：petgraph `edges_connecting` 平行边为 LIFO 迭代，计划参考代码会产生 `[T,R]` —— 收集后 `.rev()` 还原创建顺序（经实证：比按 EdgeIndex 排序更稳健，remove_edge 的 swap_remove 会重用索引）。
 - Task 9：crate 为 bin-only（无 lib target），集成测试一律走编译后 CLI 二进制（与既有 tests/ 全部一致）；4 个验收缺口（lineage 排除 / conflicts 排除 / impact 可达 / detail 双标签）全部以 CLI 等价验证 + 变异法证明测试有效性。
+- 外部 review 修复：局部 TYPE/RECORD 声明名纳入 var_names 守卫（防伪表锚）；dedup 键 column 小写归一（对齐 openGauss 标识符折叠语义）；记录已知近似——锚定边 line 取 routine 起始行（AST 无 span，结构化签名类型是 ogsql-parser follow-up）。
 
 ## Non-goals（本期不做）
 

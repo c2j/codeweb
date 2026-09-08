@@ -2039,7 +2039,7 @@ impl GraphStore {
                             kind, column, site, ..
                         } = &self.graph[edge_idx]
                         {
-                            let key = (*kind, column.clone(), *site);
+                            let key = (*kind, column.clone().map(|c| c.to_lowercase()), *site);
                             if seen.contains(&key) {
                                 to_remove.push(edge_idx);
                             } else {
@@ -2695,6 +2695,80 @@ mod tests {
             columns,
             vec![Some("id".to_string()), Some("name".to_string())]
         );
+    }
+
+    /// issue #158 external review (Finding 3): the `(kind, column, site)` dedup key
+    /// for `AnchorsOn` edges must fold `column` case-insensitively — openGauss folds
+    /// unquoted identifiers to lowercase, so `emp.id%TYPE` and `emp.ID%TYPE` name the
+    /// same column and must collapse to a single edge, not two.
+    #[test]
+    fn should_dedupe_anchor_edges_case_insensitively_by_column() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let mut graph = CodeGraph::new();
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let proc_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        // v1 emp.id%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+        // v2 emp.ID%TYPE — same column, different case; must dedup with v1.
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("ID".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+
+        let mut store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.graph().edge_count(), 2);
+
+        let report = store.dedup();
+        assert_eq!(
+            report.edges_removed, 1,
+            "case-only-differing column must be treated as the same anchor edge"
+        );
+        assert_eq!(store.graph().edge_count(), 1);
     }
 
     /// Mirrors `load_bincode_rejects_header_version_mismatch_with_friendly_error`: a

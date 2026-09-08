@@ -1743,13 +1743,18 @@ impl GraphBuilder {
     }
 
     /// Dedup key for `AnchorsOn` edges within a single routine/package-variable
-    /// scope: (lowercased object, column, kind, site). Signature anchors
+    /// scope: (lowercased object, lowercased column, kind, site). Signature anchors
     /// (`Param`/`ReturnType`) and variable/nested-type anchors are collected
     /// from different sources within the same routine and can collide on the
     /// same column (e.g. a `RETURN t.c%TYPE` clause and a `RESULT t.c%TYPE`
     /// local variable) — each distinct combination gets exactly one edge.
     fn anchor_dedup_key(a: &crate::parser::AnchorRef) -> AnchorDedupKey {
-        (a.object.to_lowercase(), a.column.clone(), a.kind, a.site)
+        (
+            a.object.to_lowercase(),
+            a.column.clone().map(|c| c.to_lowercase()),
+            a.kind,
+            a.site,
+        )
     }
 
     /// Resolve a flat `%TYPE`/`%ROWTYPE` signature anchor to its target table (creating
