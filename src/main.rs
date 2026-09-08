@@ -537,6 +537,10 @@ enum Commands {
         #[arg(short, long)]
         files: bool,
 
+        /// Include satellite DDL files of chain objects (indexes, synonyms, triggers)
+        #[arg(long = "related-ddl", requires = "files")]
+        related_ddl: bool,
+
         /// Show built-in function calls in the chain (default: hidden)
         #[arg(long = "builtfunc")]
         builtfunc: bool,
@@ -981,6 +985,7 @@ fn run() -> Result<()> {
             style,
             depth,
             files,
+            related_ddl,
             builtfunc,
             verbose,
             exact,
@@ -994,6 +999,7 @@ fn run() -> Result<()> {
             &style,
             depth,
             files,
+            related_ddl,
             builtfunc,
             verbose,
             match_mode_from_flags(exact, regex),
@@ -2074,6 +2080,7 @@ fn cmd_detail(
     style: &str,
     depth: i64,
     show_files: bool,
+    related_ddl: bool,
     show_builtins: bool,
     verbose: bool,
     match_mode: crate::graph::search::MatchMode,
@@ -2093,6 +2100,7 @@ fn cmd_detail(
             style,
             depth,
             show_files,
+            related_ddl,
             show_builtins,
             verbose,
             match_mode,
@@ -2113,6 +2121,7 @@ fn detail_one(
     style: &str,
     depth: i64,
     show_files: bool,
+    related_ddl: bool,
     show_builtins: bool,
     verbose: bool,
     match_mode: crate::graph::search::MatchMode,
@@ -2132,6 +2141,7 @@ fn detail_one(
                     style,
                     depth,
                     show_files,
+                    related_ddl,
                     show_builtins,
                     verbose,
                 );
@@ -2159,6 +2169,7 @@ fn detail_one(
         style,
         depth,
         show_files,
+        related_ddl,
         show_builtins,
         verbose,
     );
@@ -2270,6 +2281,7 @@ fn print_node_detail(
     style: &str,
     depth: i64,
     show_files: bool,
+    related_ddl: bool,
     show_builtins: bool,
     verbose: bool,
 ) {
@@ -2376,7 +2388,7 @@ fn print_node_detail(
     }
 
     if show_files {
-        let chain_files = graph::traverse::collect_chain_files(&chain, graph);
+        let chain_files = graph::traverse::collect_chain_files(&chain, graph, related_ddl);
         println_stdout!();
         println_stdout!("── FILES ({}) ──", chain_files.len());
         if chain_files.is_empty() {

@@ -477,7 +477,7 @@ Path 3      1 hops
 查看指定节点的完整详情——包括属性信息、直接上下游、完整调用链。
 
 ```bash
-codeweb detail <节点名称> [-p <项目目录>] [-s <风格>] [-d <深度>] [--files] [--builtfunc]
+codeweb detail <节点名称> [-p <项目目录>] [-s <风格>] [-d <深度>] [--files] [--related-ddl] [--builtfunc]
 ```
 
 | 参数 | 说明 |
@@ -486,6 +486,7 @@ codeweb detail <节点名称> [-p <项目目录>] [-s <风格>] [-d <深度>] [-
 | `-s, --style <风格>` | `tree`（默认）或 `path` |
 | `-d, --depth <深度>` | 遍历深度，1=仅直接上下游，0=无限制（默认 1） |
 | `--files` | 同时列出调用链涉及的文件 |
+| `--related-ddl` | 在 `--files` 基础上纳入链上对象的附属 DDL 文件（索引、同义词、触发器）。必须与 `--files` 同时使用 |
 | `--builtfunc` | 显示内建函数调用 |
 
 **输出注意事项**：
@@ -493,12 +494,14 @@ codeweb detail <节点名称> [-p <项目目录>] [-s <风格>] [-d <深度>] [-
 - `proc*` / `func*` 标签表示部分解析节点 —— `⚠ partial node` 警告
 - `table*` / `view*` 标签表示推测型节点 —— `⚠ inferred node — no DDL definition found` 警告
 - 系统对象 —— `⚙ system object — belongs to a known system schema` 提示
+- `--related-ddl` 把索引/同义词/触发器文件合并进 `── FILES ──`，不改变调用树；依赖该表的视图不算附属 DDL
 
 **示例**：
 
 ```bash
 codeweb detail "create_order"
 codeweb detail "OrderMapper.insert" --depth 3 --files
+codeweb detail "create_order" --files --related-ddl
 ```
 
 ---
@@ -969,6 +972,7 @@ codeweb trace "create_order"
 
 # 5. 查看节点详情（含文件信息）
 codeweb detail "create_order" --depth 3 --files
+codeweb detail "create_order" --files --related-ddl
 ```
 
 ### 场景 2：修改代码前的影响评估

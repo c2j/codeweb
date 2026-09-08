@@ -265,7 +265,7 @@ impl App {
         lines.extend(chain_lines);
 
         if self.show_chain_files {
-            let chain_files = traverse::collect_chain_files(&chain, graph);
+            let chain_files = traverse::collect_chain_files(&chain, graph, false);
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("── {} ({}) ──", t!("section.files"), chain_files.len()),

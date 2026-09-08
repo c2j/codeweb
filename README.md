@@ -105,6 +105,7 @@ codeweb trace "process_order"
 
 # Show node details with callers/callees
 codeweb detail "calculate_total"
+codeweb detail "calculate_total" --files --related-ddl
 
 # Search nodes by SQL fragment and trace to Java callers
 codeweb trace-sql "SELECT * FROM orders WHERE"
@@ -445,6 +446,7 @@ codeweb trace "process_order"
 
 # 查看节点详情（含上游/下游）
 codeweb detail "calculate_total"
+codeweb detail "calculate_total" --files --related-ddl
 
 # 按 SQL 片段搜索并追踪到 Java 调用方
 codeweb trace-sql "SELECT * FROM orders WHERE"
