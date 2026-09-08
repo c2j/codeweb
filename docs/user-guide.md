@@ -22,15 +22,18 @@
   - [6.8 节点列表：`nodes`](#68-节点列表nodes)
   - [6.9 SQL 搜索与追踪：`trace-sql`](#69-sql-搜索与追踪trace-sql)
   - [6.10 影响分析：`impact`](#610-影响分析impact)
-  - [6.11 图谱导出：`export`](#611-图谱导出export)
-  - [6.12 声明式查询：`query`](#612-声明式查询query)
-  - [6.13 图谱去重：`dedup`](#613-图谱去重dedup)
-  - [6.14 系统分解：`partition`](#614-系统分解partition)
-  - [6.15 CGEF 导入：`import`](#615-cgef-导入import)
-  - [6.16 多项目合并：`merge`](#616-多项目合并merge)
-  - [6.17 交互式终端：`tui`](#617-交互式终端tui)
-  - [6.18 HTTP 服务：`serve`](#618-http-服务serve)
-  - [6.19 MCP 服务：`mcp`](#619-mcp-服务mcp)
+  - [6.11 血缘分析：`lineage`](#611-血缘分析lineage)
+  - [6.12 列级分析聚合：`columns`](#612-列级分析聚合columns)
+  - [6.13 PL 谓词解析：`predicates`](#613-pl-谓词解析predicates)
+  - [6.14 图谱导出：`export`](#614-图谱导出export)
+  - [6.15 声明式查询：`query`](#615-声明式查询query)
+  - [6.16 图谱去重：`dedup`](#616-图谱去重dedup)
+  - [6.17 系统分解：`partition`](#617-系统分解partition)
+  - [6.18 CGEF 导入：`import`](#618-cgef-导入import)
+  - [6.19 多项目合并：`merge`](#619-多项目合并merge)
+  - [6.20 交互式终端：`tui`](#620-交互式终端tui)
+  - [6.21 HTTP 服务：`serve`](#621-http-服务serve)
+  - [6.22 MCP 服务：`mcp`](#622-mcp-服务mcp)
 - [7. 典型使用场景](#7-典型使用场景)
 - [8. 常见问题](#8-常见问题)
 - [附录：节点类型与边类型](#附录节点类型与边类型)
@@ -662,7 +665,98 @@ done
 
 ---
 
-### 6.11 图谱导出：`export`
+### 6.11 血缘分析：`lineage`
+
+执行表级或列级的血缘分析，追踪数据的来源（上游）或去向（下游）。
+
+```bash
+codeweb lineage <目标> [OPTIONS]
+```
+
+| 参数 | 说明 |
+|------|------|
+| `<目标>` | 血缘分析目标：`table_name`（表级）、`table.column`（列级）或节点标识如 `table:schema.table` |
+| `--direction <方向>` | 血缘方向：`upstream`（溯源）、`downstream`（去向）或 `both`（双向，默认） |
+| `--depth <深度>` | 递归深度（默认 5） |
+| `--format <格式>` | 输出格式：`tree`（树形，默认）、`json`、`dot`、`mermaid` |
+| `--view <视图>` | 渲染视图：`tree`（默认）、`entity`（隐藏过程节点）、`relation`（显式关系线）、`grouped`（按过程分组） |
+| `--flow-only` | 仅显示流转源，隐藏参考源（受配置阈值影响） |
+
+**与 `trace` 的区别**：
+- `trace` 侧重于**调用链**（谁调用了谁），展示过程间的控制流。
+- `lineage` 侧重于**数据流**（数据从哪张表的哪个列流向了哪张表的哪个列），会自动穿透存储过程内部的赋值和 `INSERT..SELECT` 逻辑。
+
+**注意**：
+- 列级血缘需要存储版本 ≥ v7。如果 store 版本过低，会提示 "No column lineage" 或建议重新运行 `analyze`。
+
+**示例**：
+```bash
+# 追踪 t_out 表 amt 列的来源
+codeweb lineage t_out.amt --direction upstream
+
+# 导出表级血缘为 Mermaid 流程图
+codeweb lineage t_orders --format mermaid
+```
+
+---
+
+### 6.12 列级分析聚合：`columns`
+
+按存储过程或包聚合导出详细的列级分析结果（包括 Hard Filter、Join 条件、SELECT INTO 映射、枚举映射等）。这是为自动化造数或 Mock 环境提供的机器可读入口。
+
+```bash
+codeweb columns <--procedure <名称>|--package <名称>> [OPTIONS]
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--procedure <名称>` | 要聚合的存储过程或函数名（支持子串匹配） |
+| `--package <名称>` | 要聚合的包名（导出该包下所有过程的并集） |
+| `--table <表名>` | 仅输出与指定表相关的诊断信息（不区分大小写） |
+| `--format <格式>` | 输出格式（目前仅支持 `json`） |
+
+**注意**：
+- 该命令需要存储版本 ≥ v10。旧版本 store 仅包含基础血缘，缺少详细的过滤和关联诊断。
+
+**示例**：
+```bash
+# 导出过程 prc_trd_hz 的列级分析 JSON
+codeweb columns --procedure prc_trd_hz --format json
+```
+
+---
+
+### 6.13 PL 谓词解析：`predicates`
+
+解析 PL/SQL 内部的 `IF` 和 `CASE` 分支条件，将其转化为针对表列的谓词约束。
+
+```bash
+codeweb predicates --procedure <名称> [OPTIONS]
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--procedure <名称>` | 存储过程或函数名（支持子串匹配） |
+| `--format <格式>` | 输出格式（目前仅支持 `json`） |
+
+**输出包含**：
+- **过程身份**：`procedure` 始终为裸过程/函数名；包内例程另有 `package` 字段，便于与 `columns` 输出关联。
+- **置信度 (Confidence)**：High（直接列比较）、Medium（经变量传递）、Low（复杂表达式或维表关联）。
+- **Param Table Hint**：如果谓词涉及维表开关，会产出造数建议。
+- **Needs Review**：对于无法自动解析的复杂逻辑，保留原始代码片段供人工审计。
+
+**注意**：
+- 该命令需要存储版本 ≥ v12。
+- 已解析到过程但没有 `IF`/`CASE` 谓词时命令仍成功，并返回 `"predicates": []`；仅名称不存在或存在歧义时失败。
+
+**示例**：
+```bash
+codeweb predicates --procedure prc_calc_fee --format json
+```
+
+---
+
+### 6.14 图谱导出：`export`
 
 将代码图谱导出为不同格式，用于可视化或集成。
 

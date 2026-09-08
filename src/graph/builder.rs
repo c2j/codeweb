@@ -134,6 +134,9 @@ pub struct GraphBuildContext {
     /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
     /// builtin called from multiple paths is a single graph node.
     pub builtin_index: HashMap<String, petgraph::graph::NodeIndex>,
+    /// Branch predicates keyed by the routine's serialized [`NodeKey`]. Kept outside
+    /// the graph because predicates are an analysis side-table, not traversable edges.
+    pub procedure_predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
     /// Deferred column comments from `COMMENT ON COLUMN` statements.
     /// Collected during `create_sql_nodes` and applied in `finalize_graph`
     /// after all table columns are populated.
@@ -152,6 +155,7 @@ impl GraphBuildContext {
             sequence_index: HashMap::new(),
             inferred_sequence_index: HashMap::new(),
             builtin_index: HashMap::new(),
+            procedure_predicates: HashMap::new(),
             deferred_column_comments: Vec::new(),
         }
     }
@@ -189,13 +193,35 @@ impl GraphBuilder {
 
     #[allow(dead_code)]
     pub fn build_store(&self, all: &AllParsedFiles, project_name: &str) -> GraphStore {
-        let graph = Self::build_graph_internal(
-            &all.sql_files,
+        let mut ctx = GraphBuildContext::new();
+        Self::build_sql_chunk(&mut ctx, &all.sql_files);
+        Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
-            &all.java_files,
-            &all.java_method_results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &mut ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
         );
-        GraphStore::from_graph(project_name, graph)
+        Self::add_java_nodes_from_parsed(
+            &all.java_files,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+            &mut ctx.table_index,
+            &mut ctx.builtin_index,
+        );
+        Self::add_java_method_nodes_from_parsed(
+            &all.java_method_results,
+            &mut ctx.graph,
+            &mut ctx.proc_index,
+            &ctx.mapper_index,
+        );
+        Self::finalize_graph(&mut ctx);
+        let predicates = std::mem::take(&mut ctx.procedure_predicates);
+        let mut store = GraphStore::from_graph(project_name, ctx.graph);
+        store.set_procedure_predicates(predicates);
+        store
     }
 
     fn build_graph_internal(
@@ -308,6 +334,133 @@ impl GraphBuilder {
             &ctx.sequence_index,
             &mut ctx.inferred_sequence_index,
         );
+        Self::collect_procedure_predicates(ctx, sql_files);
+    }
+
+    fn collect_procedure_predicates(ctx: &mut GraphBuildContext, files: &[ParsedFile]) {
+        for file in files {
+            for info in &file.statements {
+                match &info.statement {
+                    Statement::CreateProcedure(procedure) => {
+                        // Storage key must match the lowercase normalization that
+                        // `NodeKey::from_node` applies (graph nodes are keyed off
+                        // `RoutineId::normalized()`); otherwise `cmd_predicates`
+                        // silently misses raw-case routines (#167 Finding 1).
+                        let id =
+                            RoutineId::from_object_name(&procedure.name, RoutineKind::Procedure)
+                                .normalized();
+                        if let Some(block) = &procedure.block {
+                            Self::collect_block_predicates(
+                                ctx,
+                                NodeKey::Procedure {
+                                    schema: id.schema.clone(),
+                                    package: id.package.clone(),
+                                    name: id.name.clone(),
+                                }
+                                .to_string(),
+                                block,
+                            );
+                        }
+                    }
+                    Statement::CreateFunction(function) => {
+                        let id = RoutineId::from_object_name(&function.name, RoutineKind::Function)
+                            .normalized();
+                        if let Some(block) = &function.block {
+                            Self::collect_block_predicates(
+                                ctx,
+                                NodeKey::Function {
+                                    schema: id.schema.clone(),
+                                    package: id.package.clone(),
+                                    name: id.name.clone(),
+                                }
+                                .to_string(),
+                                block,
+                            );
+                        }
+                    }
+                    Statement::CreatePackage(package) => {
+                        Self::collect_package_predicates(ctx, &package.name, &package.items)
+                    }
+                    Statement::CreatePackageBody(package) => {
+                        Self::collect_package_predicates(ctx, &package.name, &package.items)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn collect_package_predicates(
+        ctx: &mut GraphBuildContext,
+        name: &ogsql_parser::ast::ObjectName,
+        items: &[PackageItem],
+    ) {
+        // Mirrors `create_package_nodes`'s RoutineId construction exactly, then
+        // normalizes it — this must produce the same key as the actual graph
+        // node's `NodeKey::from_node` (#167 Finding 1).
+        let schema = (name.len() > 1).then(|| name[..name.len() - 1].join("."));
+        let package_name = name.last().map(ToString::to_string);
+        for item in items {
+            match item {
+                PackageItem::Procedure(procedure) => {
+                    if let Some(block) = &procedure.block {
+                        let id = RoutineId {
+                            schema: schema.clone(),
+                            package: package_name.clone(),
+                            name: procedure.name.join("."),
+                            kind: RoutineKind::Procedure,
+                        }
+                        .normalized();
+                        Self::collect_block_predicates(
+                            ctx,
+                            NodeKey::Procedure {
+                                schema: id.schema,
+                                package: id.package,
+                                name: id.name,
+                            }
+                            .to_string(),
+                            block,
+                        );
+                    }
+                }
+                PackageItem::Function(function) => {
+                    if let Some(block) = &function.block {
+                        let id = RoutineId {
+                            schema: schema.clone(),
+                            package: package_name.clone(),
+                            name: function.name.join("."),
+                            kind: RoutineKind::Function,
+                        }
+                        .normalized();
+                        Self::collect_block_predicates(
+                            ctx,
+                            NodeKey::Function {
+                                schema: id.schema,
+                                package: id.package,
+                                name: id.name,
+                            }
+                            .to_string(),
+                            block,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_block_predicates(
+        ctx: &mut GraphBuildContext,
+        key: String,
+        block: &ogsql_parser::ast::plpgsql::PlBlock,
+    ) {
+        let mut columns = crate::parser::ColumnAccessExtractor::new();
+        walk_pl_block(&mut columns, block);
+        let procedure_ctx = columns.procedure_context();
+        let predicates = crate::parser::extract_predicates(block, &procedure_ctx);
+        if !predicates.is_empty() {
+            ctx.procedure_predicates.insert(key, predicates);
+        }
     }
 
     /// Finalize the graph after all files are processed.
@@ -3327,6 +3480,18 @@ impl GraphBuilder {
         }
     }
 
+    /// Append items from `src` to `dst` that are not already present in `dst`
+    /// (order-preserving, `Hash + Eq` dedup), used by `merge_table_access_edges`
+    /// to union `ColumnAnalysis` diagnostic fields across merged edges (issue #165).
+    fn union_dedup_vec<T: Clone + std::hash::Hash + Eq>(dst: &mut Vec<T>, src: &[T]) {
+        let mut seen: std::collections::HashSet<T> = dst.iter().cloned().collect();
+        for item in src {
+            if seen.insert(item.clone()) {
+                dst.push(item.clone());
+            }
+        }
+    }
+
     fn merge_table_access_edges(graph: &mut CodeGraph) {
         let mut merge_targets: HashMap<
             (
@@ -3374,9 +3539,14 @@ impl GraphBuilder {
                     for wk in write_kinds {
                         merged_kinds.insert(*wk);
                     }
-                    // Union the per-statement analyses: mappings and same-statement
-                    // read tables accumulate across the statements merged into this edge
-                    // (issue #147); the remaining diagnostic fields keep the first.
+                    // Union the per-statement analyses across all edges merged into this
+                    // (src, dst, flow_kind) key (issue #147 introduced column_mappings/
+                    // read_tables union; issue #165 extends the union to every diagnostic
+                    // Vec field — join_conditions, hard_filters, enum_mappings,
+                    // select_into, insert_columns, update_columns, column_refs — plus an
+                    // alias_map extend (first-wins on key collision), so statements that
+                    // write the same table with distinct filters/joins don't lose all but
+                    // the first statement's diagnostics.
                     if let Some(ca) = column_analysis {
                         match &mut merged_col {
                             Some(m) => {
@@ -3395,6 +3565,18 @@ impl GraphBuilder {
                                     }
                                     (Some(rt), None) => m.read_tables = Some(rt.clone()),
                                     _ => {}
+                                }
+                                Self::union_dedup_vec(&mut m.join_conditions, &ca.join_conditions);
+                                Self::union_dedup_vec(&mut m.hard_filters, &ca.hard_filters);
+                                Self::union_dedup_vec(&mut m.enum_mappings, &ca.enum_mappings);
+                                Self::union_dedup_vec(&mut m.select_into, &ca.select_into);
+                                Self::union_dedup_vec(&mut m.insert_columns, &ca.insert_columns);
+                                Self::union_dedup_vec(&mut m.update_columns, &ca.update_columns);
+                                Self::union_dedup_vec(&mut m.column_refs, &ca.column_refs);
+                                for (alias, table) in &ca.alias_map {
+                                    m.alias_map
+                                        .entry(alias.clone())
+                                        .or_insert_with(|| table.clone());
                                 }
                             }
                             None => merged_col = Some(ca.clone()),
@@ -4521,6 +4703,7 @@ impl Default for GraphBuilder {
 #[cfg(test)]
 mod tests {
     use crate::graph::builder::GraphBuilder;
+    use crate::graph::key::NodeKey;
     use crate::graph::{Edge, Node};
     use crate::parser::ParsedFile;
     use std::collections::HashMap;
@@ -4540,6 +4723,212 @@ mod tests {
             content_hash: String::new(),
         }];
         GraphBuilder::new().build(&parsed)
+    }
+
+    #[test]
+    fn procedure_predicates_are_collected_under_routine_node_key() {
+        let sql = r#"
+            CREATE TABLE main_data(x VARCHAR(10));
+            CREATE PROCEDURE P AS
+              CURSOR c IS SELECT x FROM main_data;
+              r c%ROWTYPE;
+            BEGIN
+              IF r.x = '1' THEN NULL; END IF;
+            END;
+        "#;
+        let parsed = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let mut ctx = crate::graph::builder::GraphBuildContext::new();
+
+        GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+
+        // #167 fix: storage keys are lowercase-normalized (matching `NodeKey::from_node`),
+        // so the raw-case "P" from the source is stored as "proc:p".
+        let predicates = ctx
+            .procedure_predicates
+            .get("proc:p")
+            .expect("predicates stored by routine node key");
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].confidence, crate::parser::Confidence::High);
+    }
+
+    /// Regression for the review Finding 1: `collect_procedure_predicates` /
+    /// `collect_package_predicates` must build storage keys using the SAME
+    /// lowercase normalization that `NodeKey::from_node` applies when
+    /// `cmd_predicates` looks the key back up. Fixture procedures are declared
+    /// UPPERCASE (both standalone and inside a package body) to prove the
+    /// storage key isn't accidentally case-matching by coincidence.
+    #[test]
+    fn predicates_stored_under_lowercase_node_key() {
+        let sql = r#"
+            CREATE TABLE main_data(x VARCHAR(10));
+
+            CREATE PROCEDURE PRC_STAR_MARKET AS
+              CURSOR c IS SELECT x FROM main_data;
+              r c%ROWTYPE;
+            BEGIN
+              IF r.x = '1' THEN NULL; END IF;
+            END;
+
+            CREATE OR REPLACE PACKAGE BODY PKG_MAIN AS
+                PROCEDURE PRC_IN_PKG IS
+                  CURSOR c IS SELECT x FROM main_data;
+                  r c%ROWTYPE;
+                BEGIN
+                  IF r.x = '2' THEN NULL; END IF;
+                END;
+            END PKG_MAIN;
+        "#;
+        let parsed = vec![ParsedFile {
+            path: PathBuf::from("test.sql"),
+            statements: parse_sql(sql),
+            content_hash: String::new(),
+        }];
+        let mut ctx = crate::graph::builder::GraphBuildContext::new();
+
+        GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+
+        let standalone_idx = ctx
+            .graph
+            .node_indices()
+            .find(|&idx| {
+                matches!(&ctx.graph[idx], Node::Procedure { id, .. } if id.name == "prc_star_market")
+            })
+            .expect("standalone procedure node exists");
+        let standalone_key = NodeKey::from_node(&ctx.graph[standalone_idx]).to_string();
+        let predicates = ctx
+            .procedure_predicates
+            .get(&standalone_key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "predicates stored under key matching NodeKey::from_node ({standalone_key}); \
+                     available keys: {:?}",
+                    ctx.procedure_predicates.keys().collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(predicates.len(), 1);
+
+        let package_idx = ctx
+            .graph
+            .node_indices()
+            .find(|&idx| {
+                matches!(&ctx.graph[idx], Node::Procedure { id, .. } if id.name == "prc_in_pkg")
+            })
+            .expect("package procedure node exists");
+        let package_key = NodeKey::from_node(&ctx.graph[package_idx]).to_string();
+        let predicates = ctx
+            .procedure_predicates
+            .get(&package_key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "package predicates stored under key matching NodeKey::from_node ({package_key}); \
+                     available keys: {:?}",
+                    ctx.procedure_predicates.keys().collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(predicates.len(), 1);
+    }
+
+    /// 方案A (issue #165): merged TableAccess edges must UNION diagnostic fields,
+    /// not keep only the first edge's. Two statements → same proc/table pair with
+    /// distinct hard filters (and only one carrying a join condition) must both
+    /// survive the merge, not just the first statement's.
+    #[test]
+    fn merge_table_access_unions_hard_filters_and_joins() {
+        let sql = r#"
+            CREATE TABLE s (col NUMBER, id NUMBER);
+            CREATE TABLE u (id NUMBER);
+            CREATE TABLE t (col NUMBER);
+
+            CREATE OR REPLACE PROCEDURE p AS
+            BEGIN
+                INSERT INTO t(col) SELECT x.col FROM s x WHERE x.col = 1;
+                INSERT INTO t(col) SELECT y.col FROM s y JOIN u z ON y.id = z.id WHERE y.col = 2;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name == "p"))
+            .expect("procedure p should exist");
+        let table_t_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Table { name, .. } if name == "t"))
+            .expect("table t should exist");
+
+        let write_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                let (src, dst) = graph.edge_endpoints(*e).unwrap();
+                src == proc_idx
+                    && dst == table_t_idx
+                    && matches!(&graph[*e], Edge::TableAccess { modes, .. } if modes.contains(crate::graph::AccessMode::Write))
+            })
+            .collect();
+        assert_eq!(
+            write_edges.len(),
+            1,
+            "the two INSERT statements into t should merge into exactly 1 TableAccess edge, got {}",
+            write_edges.len()
+        );
+
+        let ca = match &graph[write_edges[0]] {
+            Edge::TableAccess {
+                column_analysis: Some(ca),
+                ..
+            } => ca,
+            other => panic!("expected TableAccess edge with column_analysis, got {other:?}"),
+        };
+
+        use crate::parser::{FilterOperator, FilterValue};
+
+        let has_filter_1 = ca.hard_filters.iter().any(|hf| {
+            hf.column == "col"
+                && hf.operator == FilterOperator::Eq
+                && hf.value == FilterValue::Integer(1)
+        });
+        let has_filter_2 = ca.hard_filters.iter().any(|hf| {
+            hf.column == "col"
+                && hf.operator == FilterOperator::Eq
+                && hf.value == FilterValue::Integer(2)
+        });
+        assert!(
+            has_filter_1,
+            "merged hard_filters should still contain the first statement's col=1 filter, got: {:?}",
+            ca.hard_filters
+        );
+        assert!(
+            has_filter_2,
+            "merged hard_filters should contain the second statement's col=2 filter \
+             (this is the union bug: pre-fix code only kept the first edge's hard_filters), got: {:?}",
+            ca.hard_filters
+        );
+
+        assert_eq!(
+            ca.join_conditions.len(),
+            1,
+            "merged join_conditions should contain the join from the second statement \
+             (pre-fix code kept only the first edge's join_conditions, which had none), got: {:?}",
+            ca.join_conditions
+        );
+        let jc = &ca.join_conditions[0];
+        assert_eq!(jc.left_table, "s");
+        assert_eq!(jc.left_column, "id");
+        assert_eq!(jc.right_table, "u");
+        assert_eq!(jc.right_column, "id");
+
+        // column_mappings must still be deduplicated (both statements produce the
+        // identical mapping t.col ← s.col), not doubled by the union.
+        assert_eq!(
+            ca.column_mappings.len(),
+            1,
+            "identical column_mappings across merged statements should stay deduplicated, got: {:?}",
+            ca.column_mappings
+        );
     }
 
     #[test]

@@ -163,6 +163,9 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb files` | List analyzed files with node counts |
 | `codeweb nodes` | List graph nodes with filtering |
 | `codeweb trace-sql <sql>` | Search by SQL fragment and trace to Java methods |
+| `codeweb lineage <target>` | Table-level and column-level lineage analysis |
+| `codeweb columns --procedure <name>` | Aggregate column-analysis for a procedure/package (JSON) |
+| `codeweb predicates --procedure <name>` | PL IF/CASE predicates resolved to table columns (JSON) |
 | `codeweb query` | Execute declarative JSON QuerySpec |
 | `codeweb import` | Import CGEF JSON graph file |
 | `codeweb merge` | Merge multiple graph stores |
@@ -219,6 +222,8 @@ When built with `--features serve`, codeweb provides a RESTful API:
 | GET | `/api/v1/nodes/:id/callees` | Downstream callees |
 | GET | `/api/v1/nodes/search-sql` | Search nodes by SQL fragment |
 | GET | `/api/v1/trace` | Bidirectional call chain tracing |
+| GET | `/api/v1/lineage` | Table-level and column-level lineage |
+| GET | `/api/v1/columns` | Aggregate column-analysis for a procedure/package |
 | POST | `/api/v1/query` | Execute declarative QuerySpec |
 | GET | `/api/v1/export` | Export graph (DOT/JSON/Mermaid) |
 
@@ -263,6 +268,8 @@ Add to `claude_desktop_config.json`:
 | `codeweb_trace` | Bidirectional call chain tracing from a node name |
 | `codeweb_search_sql` | Search nodes by SQL text content with scoring |
 | `codeweb_query` | Execute declarative JSON QuerySpec for complex traversals |
+| `codeweb_column_analysis` | Aggregate column-analysis for a procedure/package |
+| `codeweb_lineage` | Table-level and column-level lineage analysis |
 
 ## Project Structure
 
@@ -501,6 +508,9 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb files` | 列出已分析文件及节点数 |
 | `codeweb nodes` | 列出图节点（支持过滤） |
 | `codeweb trace-sql <sql>` | 按 SQL 片段搜索并追踪到 Java 方法 |
+| `codeweb lineage <target>` | 表级与列级血缘分析 |
+| `codeweb columns --procedure <name>` | 按过程/包聚合列级分析结果 (JSON) |
+| `codeweb predicates --procedure <name>` | 解析 PL IF/CASE 条件为表列谓词 (JSON) |
 | `codeweb query` | 执行声明式 JSON QuerySpec |
 | `codeweb import` | 导入 CGEF JSON 图谱文件 |
 | `codeweb merge` | 合并多个图谱存储 |
@@ -557,6 +567,8 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | GET | `/api/v1/nodes/:id/callees` | 下游被调用方 |
 | GET | `/api/v1/nodes/search-sql` | 按 SQL 文本搜索节点 |
 | GET | `/api/v1/trace` | 双向调用链追踪 |
+| GET | `/api/v1/lineage` | 表级与列级血缘分析 |
+| GET | `/api/v1/columns` | 按过程/包聚合列级分析结果 |
 | POST | `/api/v1/query` | 执行声明式 QuerySpec |
 | GET | `/api/v1/export` | 导出图谱（DOT/JSON/Mermaid） |
 
@@ -601,6 +613,8 @@ codeweb mcp --project /path/to/your/project
 | `codeweb_trace` | 从节点名双向追踪调用链 |
 | `codeweb_search_sql` | 按 SQL 文本搜索节点（含相关性评分） |
 | `codeweb_query` | 执行声明式 JSON QuerySpec，支持复杂多步遍历 |
+| `codeweb_column_analysis` | 按过程/包聚合列级分析结果 |
+| `codeweb_lineage` | 表级与列级血缘分析 |
 
 ## 项目结构
 

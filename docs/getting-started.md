@@ -364,6 +364,36 @@ Key options:
 
 ✅ **Success**: Output shows the path(s) between your nodes with hop count and edge types.
 
+### 4.6 Data lineage — "Where does this column come from?"
+
+`lineage` traces data flow between tables and columns. It "looks inside" procedures to see how data moves.
+
+```sql
+-- Add this to your myapp.sql
+CREATE TABLE t_src (id INT, amt NUMBER);
+CREATE TABLE t_out (id INT, amt NUMBER);
+
+CREATE OR REPLACE PROCEDURE proc_copy_amt AS
+BEGIN
+  INSERT INTO t_out (id, amt)
+  SELECT id, amt FROM t_src;
+END;
+/
+```
+
+After `codeweb analyze`, run:
+
+```bash
+codeweb lineage t_out.amt --direction upstream
+```
+
+```
+t_out.amt
+  ← t_src.amt  [direct]  via proc:proc_copy_amt
+```
+
+✅ **Success**: codeweb correctly identified that `t_out.amt` is populated from `t_src.amt` via the `proc_copy_amt` procedure.
+
 ---
 
 ## 5. Visual exploration (going further)

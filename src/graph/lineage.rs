@@ -1900,6 +1900,59 @@ pub fn format_column_lineage_json(
     })
 }
 
+/// Outcome of [`parse_lineage_target`]: a target string resolves to either a bare table
+/// (table-level lineage) or a `table.column` pair (column-level lineage).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedLineageTarget {
+    Table(String),
+    Column(String, String),
+}
+
+/// Handles the same three grammars as the CLI: a node-key (`table:schema.table`, left
+/// alone — table-level), `table.column` (column-level, but only once the table half is
+/// confirmed to exist unambiguously), and a bare table name (table-level).
+pub(crate) fn parse_lineage_target(
+    graph: &CodeGraph,
+    target: &str,
+) -> Result<ParsedLineageTarget, String> {
+    // Node keys (`table:schema.table`) must not be last-dot-split — the final dot is
+    // part of the key, not a `table.column` separator.
+    let (table_name, column_name) = if crate::graph::key::split_type_prefix(target).is_some() {
+        (target, None)
+    } else {
+        match target.rsplit_once('.') {
+            Some((table, column)) if !table.is_empty() && !column.is_empty() => {
+                (table, Some(column))
+            }
+            Some(_) => {
+                return Err(format!(
+                    "Invalid target format: {}. Use 'table', 'table.column', or a node key like 'table:schema.table'",
+                    target
+                ));
+            }
+            None => (target, None),
+        }
+    };
+
+    // A missing table half means the split was probably `schema.table`: reinterpret the
+    // whole target as a table reference. An ambiguous half stops with a qualifier hint.
+    match column_name {
+        Some(column) => match lookup_table_node(graph, table_name) {
+            TableLookup::Found(_) => Ok(ParsedLineageTarget::Column(
+                table_name.to_string(),
+                column.to_string(),
+            )),
+            TableLookup::Ambiguous => Err(format!(
+                "table '{table_name}' is ambiguous across schemas — qualify it as \
+                 'schema.{table_name}' for table-level, or 'schema.{table_name}.{column}' \
+                 for column-level lineage"
+            )),
+            TableLookup::Missing => Ok(ParsedLineageTarget::Table(target.to_string())),
+        },
+        None => Ok(ParsedLineageTarget::Table(table_name.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,6 +1961,105 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// #165 P1: a bare table name with no dot parses as a table-level target.
+    #[test]
+    fn parse_lineage_target_bare_table_is_table() {
+        let graph = CodeGraph::new();
+        let result = parse_lineage_target(&graph, "orders").expect("should parse");
+        assert_eq!(result, ParsedLineageTarget::Table("orders".to_string()));
+    }
+
+    /// #165 P1: a node-key (`table:schema.table`) is left alone as a table target, not
+    /// split on its dot.
+    #[test]
+    fn parse_lineage_target_node_key_is_table() {
+        let graph = CodeGraph::new();
+        let result = parse_lineage_target(&graph, "table:public.orders").expect("should parse");
+        assert_eq!(
+            result,
+            ParsedLineageTarget::Table("table:public.orders".to_string())
+        );
+    }
+
+    /// #165 P1: `table.column` where `table` resolves uniquely parses as column-level.
+    #[test]
+    fn parse_lineage_target_table_dot_column_when_table_exists_is_column() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(table_node("orders", &["id", "amt"]));
+        let result = parse_lineage_target(&graph, "orders.amt").expect("should parse");
+        assert_eq!(
+            result,
+            ParsedLineageTarget::Column("orders".to_string(), "amt".to_string())
+        );
+    }
+
+    /// #165 P1: when the table half doesn't exist, the recent fix (#154) reinterprets the
+    /// whole string as a table reference instead of guessing a column split — e.g.
+    /// `schema.table` with no such table gets treated as one table-level target.
+    #[test]
+    fn parse_lineage_target_missing_table_reinterprets_whole_string_as_table() {
+        let graph = CodeGraph::new();
+        let result = parse_lineage_target(&graph, "public.orders").expect("should parse");
+        assert_eq!(
+            result,
+            ParsedLineageTarget::Table("public.orders".to_string())
+        );
+    }
+
+    /// #165 P1: an ambiguous bare table name (same name in 2+ schemas) errors instead of
+    /// guessing.
+    #[test]
+    fn parse_lineage_target_ambiguous_table_errors() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(Node::Table {
+            schema: Some("s1".to_string()),
+            name: "orders".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(Vec::new()),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph.add_node(Node::Table {
+            schema: Some("s2".to_string()),
+            name: "orders".to_string(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(Vec::new()),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        let err =
+            parse_lineage_target(&graph, "orders.amt").expect_err("ambiguous table should error");
+        assert!(
+            err.contains("ambiguous"),
+            "error should mention ambiguity, got: {err}"
+        );
+    }
+
+    /// #165 P1: an empty column half (`table.`) is an invalid-format error, not silently
+    /// treated as a table.
+    #[test]
+    fn parse_lineage_target_trailing_dot_errors() {
+        let graph = CodeGraph::new();
+        let err = parse_lineage_target(&graph, "orders.")
+            .expect_err("trailing dot with empty column should error");
+        assert!(
+            err.contains("Invalid target format"),
+            "error should mention invalid format, got: {err}"
+        );
+    }
 
     fn table_node(name: &str, cols: &[&str]) -> Node {
         Node::Table {

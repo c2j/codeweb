@@ -140,6 +140,31 @@ impl CodeGraph {
 }
 ```
 
+### ColumnAnalysis（列级分析模型）
+
+`ColumnAnalysis` 结构体（以及通过 `codeweb columns` 导出的 `AggregatedColumnAnalysis`）承载了过程或语句级别的详细列约束面，其核心字段如下：
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| `alias_map` | `BTreeMap<String, String>` | 表别名到实际表名的映射关系 |
+| `column_refs` | `HashSet<ColumnRef>` | 语句中出现的所有列引用集合 |
+| `join_conditions` | `Vec<JoinCondition>` | 等值关联条件。`JoinCondition` 包含左右表列、关联类型及来源 `source`（`ImplicitWhere` \| `ExplicitOn` \| `RecordField` — 其中 `RecordField` 表示由 `%ROWTYPE` 记录字段推导出的跨表等值键） |
+| `hard_filters` | `Vec<HardFilter>` | 字面量过滤条件。`HardFilter` 包含表、列、操作符（Eq, Neq, Gt, Gte, Lt, Lte, Like, NotLike, In, Between, IsNull, IsNotNull）、字面量值，以及可选的 `transform`（函数包裹描述，如 `{"fn": "substr", "args": [...]}`） |
+| `enum_mappings` | `Vec<EnumMapping>` | 基于 `CASE` / `DECODE` 的离散值枚举转换映射 |
+| `select_into` | `Vec<SelectIntoMapping>` | `SELECT INTO` 赋值到 PL 变量的映射关系 |
+| `column_mappings` | `Vec<ColumnMapping>` | 目标表列到源表列的血缘映射，区分 `Direct`（直接赋值）、`Derived`（表达式派生）、`Aggregated`（聚合函数）等种类 |
+| `insert_columns` | `Vec<InsertColumnInfo>` | `INSERT` 语句写入的目标列集合 |
+| `update_columns` | `Vec<UpdateColumnInfo>` | `UPDATE` 语句更新的目标列集合 |
+| `read_tables` | `Vec<String>` | 语句或过程读取的源表列表 |
+
+#### 自动化造数与 Mock 消费场景
+
+`ColumnAnalysis` 的结构化输出是自动化测试数据生成（Mock 数据生成）的核心输入源：
+1. **跨表键关联**：利用 `join_conditions`（特别是 `RecordField` 隐式推导键）可以自动构建跨表的主外键关联池，确保生成的 Mock 数据在多表 JOIN 时不会因关联落空而变成空结果。
+2. **边界约束提取**：通过 `hard_filters` 提取出各表各列必须满足的字面量强约束（如 `status = '05'`），并结合 `transform` 逆向推导原始列的取值范围（如 `substr(kind,1,2)='05'` 要求 `kind` 前两位必须是 `'05'`）。
+3. **有效值集合播种**：从 `enum_mappings` 中收集列的离散有效值边界，避免生成非法的业务状态码。
+4. **靶向分支覆盖**：结合 `predicates`（PL 谓词解析）的条件约束与置信度，可以逆向推导触发特定 PL 分支（如特定的 `IF` 逻辑块）所需的数据特征，实现面向代码分支覆盖的靶向数据播种。
+
 ---
 
 ## GraphStore 存储层
@@ -205,6 +230,8 @@ HTTP API 通过 `axum` 框架提供，所有端点以 `/api/v1/` 为前缀，启
 | GET | `/api/v1/nodes/:id/callees` | 节点下游被调用方（分页） |
 | GET | `/api/v1/nodes/search-sql` | 按 SQL 文本搜索（`q` 参数） |
 | GET | `/api/v1/trace` | 双向调用链追踪（`from`, `depth`, `max_nodes`） |
+| GET | `/api/v1/lineage` | 表级与列级血缘分析（`target`, `direction`, `depth`） |
+| GET | `/api/v1/columns` | 按过程/包聚合列级分析结果（`procedure`, `package`, `table`） |
 | POST | `/api/v1/query` | 执行 QuerySpec 声明式查询 |
 | GET | `/api/v1/export` | 导出图谱（`format` 参数：dot/json/mermaid） |
 | GET | `/api/v1/graph` | 完整图谱 JSON 数据 |
@@ -331,6 +358,8 @@ codeweb 提供四种 MCP/外部集成方式：
 | `codeweb_nodes` | `search`, `node_type`, `limit`, `offset` | 节点列表（搜索、类型过滤、分页） |
 | `codeweb_node_detail` | `id` (usize) | 节点详情：属性 + callers + callees |
 | `codeweb_trace` | `from`, `depth`, `max_nodes` | 双向调用链追踪 |
+| `codeweb_column_analysis` | `procedure`, `package`, `table` | 按过程/包聚合列级分析结果 |
+| `codeweb_lineage` | `target`, `direction`, `depth` | 表级与列级血缘分析 |
 | `codeweb_search_sql` | `sql` | SQL 片段搜索 |
 | `codeweb_query` | `spec` (QuerySpec JSON) | 声明式复杂遍历 |
 

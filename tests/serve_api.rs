@@ -203,6 +203,73 @@ mod tests {
     }
 
     #[test]
+    fn test_serve_columns_endpoint() {
+        let port = 19884;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/columns?procedure=p_demo_query");
+        stop_server(&mut child);
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert!(
+            json["hard_filters"].is_array(),
+            "expected hard_filters array, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_serve_columns_endpoint_missing_target_is_400() {
+        let port = 19889;
+        let mut child = start_server(port);
+
+        let (status, _body) = get(port, "/api/v1/columns");
+        stop_server(&mut child);
+
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn test_serve_columns_ambiguous_target_is_400() {
+        let port = 19890;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/columns?procedure=p_demo");
+        stop_server(&mut child);
+
+        assert_eq!(status, 400);
+        assert!(body.contains("Ambiguous match"), "unexpected body: {body}");
+    }
+
+    #[test]
+    fn test_serve_lineage_endpoint() {
+        let port = 19885;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/lineage?target=t_users");
+        stop_server(&mut child);
+
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json.get("upstream").is_some() && json.get("downstream").is_some(),
+            "default direction=both should return upstream+downstream keys, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_serve_lineage_endpoint_unknown_target_is_404() {
+        let port = 19886;
+        let mut child = start_server(port);
+
+        let (status, _body) = get(port, "/api/v1/lineage?target=no_such_table_xyz");
+        stop_server(&mut child);
+
+        assert_eq!(status, 404);
+    }
+
+    #[test]
     fn test_serve_access_log_combined_format() {
         let port = 19883;
         let mut child = start_server(port);

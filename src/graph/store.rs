@@ -19,7 +19,18 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 9;
+///
+/// v10: `merge_table_access_edges` now unions ALL `ColumnAnalysis` diagnostic
+/// Vec fields (join_conditions/hard_filters/enum_mappings/select_into/
+/// insert_columns/update_columns/column_refs) instead of keeping only the
+/// first merged edge's, plus a reserved (serde-default) `HardFilter.transform`
+/// slot for future function-wrapped-column filters. Refs #165, #169.
+/// v11: adds the `procedure_predicates` side-table populated by the branch-aware
+/// PL/SQL predicate pass (#167).
+/// v12: `PredicateClause` gains a reserved (serde-default) `transform` slot for
+/// column-transform conditions (e.g. `substr(col,1,2) = 'x'`), mirroring
+/// `HardFilter.transform`. Refs #167, #169.
+const STORE_VERSION: u32 = 12;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +77,9 @@ pub struct GraphStore {
     /// Built from ogsql-parser AST for O(1) lookup of FOR UPDATE / FOR SHARE etc.
     #[serde(default)]
     lock_clause_index: HashMap<String, Vec<(NodeIndex, String)>>,
+    /// Routine NodeKey string (`proc:...` / `func:...`) → PL IF/CASE predicates.
+    #[serde(default)]
+    pub procedure_predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
 }
 
 #[allow(dead_code)]
@@ -90,6 +104,7 @@ impl GraphStore {
             edge_category_index: HashMap::new(),
             sql_fingerprint_index: HashMap::new(),
             lock_clause_index: HashMap::new(),
+            procedure_predicates: HashMap::new(),
         }
     }
 
@@ -321,7 +336,15 @@ impl GraphStore {
             edge_category_index,
             sql_fingerprint_index,
             lock_clause_index,
+            procedure_predicates: HashMap::new(),
         }
+    }
+
+    pub fn set_procedure_predicates(
+        &mut self,
+        predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
+    ) {
+        self.procedure_predicates = predicates;
     }
 
     pub fn graph(&self) -> &CodeGraph {
@@ -1319,6 +1342,14 @@ impl GraphStore {
         let mut merged = GraphStore::new(merged_name);
 
         for store in &stores {
+            for (key, predicates) in &store.procedure_predicates {
+                let entry = merged.procedure_predicates.entry(key.clone()).or_default();
+                for predicate in predicates {
+                    if !entry.contains(predicate) {
+                        entry.push(predicate.clone());
+                    }
+                }
+            }
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
             // Build a reverse-relaxed index: maps relaxed(key) → existing index
@@ -2394,6 +2425,56 @@ mod tests {
             loaded.err()
         );
         assert_eq!(loaded.unwrap().version, STORE_VERSION);
+    }
+
+    #[test]
+    fn procedure_predicates_survive_bincode_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("predicates.bincode");
+        let mut store = GraphStore::from_graph("roundtrip", CodeGraph::new());
+        store.procedure_predicates.insert(
+            "proc:p".to_string(),
+            vec![crate::parser::PlPredicate {
+                id: "B001".to_string(),
+                line: 3,
+                origin: "IF r.x = '1'".to_string(),
+                kind: crate::parser::PredicateKind::If,
+                confidence: crate::parser::Confidence::High,
+                table_predicate: Some(crate::parser::TablePredicate {
+                    table: "t".to_string(),
+                    clauses: vec![
+                        crate::parser::PredicateClause {
+                            column: "x".to_string(),
+                            op: crate::parser::FilterOperator::Eq,
+                            value: crate::parser::FilterValue::String("1".to_string()),
+                            transform: None,
+                        },
+                        // #167/#169: a transform-carrying clause must also survive the
+                        // bincode round-trip via the hand-written `is_human_readable`
+                        // Serialize impl (skip_serializing_if would corrupt the layout).
+                        crate::parser::PredicateClause {
+                            column: "stock_kind".to_string(),
+                            op: crate::parser::FilterOperator::Eq,
+                            value: crate::parser::FilterValue::String("05".to_string()),
+                            transform: Some(crate::parser::FilterTransform {
+                                fn_name: "substr".to_string(),
+                                args: vec![
+                                    crate::parser::FilterValue::Integer(1),
+                                    crate::parser::FilterValue::Integer(2),
+                                ],
+                            }),
+                        },
+                    ],
+                }),
+                needs_review: None,
+                param_table_hint: None,
+            }],
+        );
+
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+
+        assert_eq!(loaded.procedure_predicates, store.procedure_predicates);
     }
 
     /// A store written by the previous layout (version 7, before `ColumnAnalysis.read_tables`,

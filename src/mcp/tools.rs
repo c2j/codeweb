@@ -99,6 +99,25 @@ pub struct QueryParams {
     pub spec: serde_json::Value,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ColumnAnalysisParams {
+    #[serde(default)]
+    pub procedure: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct LineageParams {
+    pub target: String,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
 // ── Helper functions ──
 
 fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<serde_json::Value> {
@@ -529,6 +548,196 @@ impl McpState {
             }
         }
     }
+
+    /// Aggregate per-procedure/per-package column analysis
+    #[tool(
+        description = "Aggregate hard filters, join conditions, SELECT INTO mappings, and enum/column mappings for a procedure or package — same JSON schema as `codeweb columns --format json` (issue #165). Provide exactly one of procedure or package; table optionally narrows to one table's diagnostics."
+    )]
+    fn codeweb_column_analysis(
+        &self,
+        Parameters(params): Parameters<ColumnAnalysisParams>,
+    ) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
+        if params.procedure.is_some() == params.package.is_some() {
+            let err = serde_json::json!({
+                "error": "exactly one of 'procedure' or 'package' is required",
+            });
+            return serde_json::to_string(&err).unwrap_or_default();
+        }
+
+        let store = self.store();
+        let graph = self.graph();
+        let table_filter = params.table.as_deref();
+
+        let result = if let Some(name) = &params.procedure {
+            let idx = match resolve_node(store, name, true) {
+                Ok(idx) => idx,
+                Err(msg) => return msg,
+            };
+            if !matches!(&graph[idx], Node::Procedure { .. } | Node::Function { .. }) {
+                let err = serde_json::json!({
+                    "error": format!("'{}' is not a procedure or function", name),
+                });
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+            crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
+        } else {
+            let name = params.package.as_ref().expect("checked exactly-one above");
+            let idx = match resolve_node(store, name, true) {
+                Ok(idx) => idx,
+                Err(msg) => return msg,
+            };
+            if !matches!(&graph[idx], Node::Package { .. }) {
+                let err = serde_json::json!({"error": format!("'{}' is not a package", name)});
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+            crate::graph::columns::column_analysis_of_package(graph, idx, table_filter)
+        };
+
+        match result {
+            Some(analysis) => serde_json::to_string(&analysis).unwrap_or_default(),
+            None => {
+                let err = serde_json::json!({"error": "failed to aggregate column analysis"});
+                serde_json::to_string(&err).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Table-level or column-level lineage for a target
+    #[tool(
+        description = "Table-level or column-level lineage for a target ('table', 'table.column', or a node key like 'table:schema.table') — same functions/JSON shape as `codeweb lineage --format json` (issue #165 P1). direction: upstream/downstream/both (default both); depth default 5."
+    )]
+    fn codeweb_lineage(&self, Parameters(params): Parameters<LineageParams>) -> String {
+        if self.graph_empty() {
+            return self.empty_graph_response();
+        }
+        let graph = self.graph();
+        let store = self.store();
+        let depth = params.depth.unwrap_or(5);
+        let direction = params.direction.as_deref().unwrap_or("both");
+
+        let dir_spec = match direction.to_lowercase().as_str() {
+            "upstream" => Some(crate::graph::lineage::LineageDirection::Upstream),
+            "downstream" => Some(crate::graph::lineage::LineageDirection::Downstream),
+            "both" => None,
+            _ => {
+                let err = serde_json::json!({
+                    "error": format!(
+                        "Unknown direction: {}. Use 'upstream', 'downstream' or 'both'",
+                        direction
+                    ),
+                });
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+        };
+
+        let parsed = match crate::graph::lineage::parse_lineage_target(graph, &params.target) {
+            Ok(p) => p,
+            Err(e) => {
+                let err = serde_json::json!({"error": e});
+                return serde_json::to_string(&err).unwrap_or_default();
+            }
+        };
+
+        match parsed {
+            crate::graph::lineage::ParsedLineageTarget::Column(table, column) => {
+                let render = |dir: crate::graph::lineage::LineageDirection| {
+                    let node =
+                        crate::graph::lineage::lineage_column(graph, &table, &column, dir, depth);
+                    crate::graph::lineage::format_column_lineage_json(&node, graph)
+                };
+                let json = match dir_spec {
+                    Some(dir) => render(dir),
+                    None => serde_json::json!({
+                        "upstream": render(crate::graph::lineage::LineageDirection::Upstream),
+                        "downstream": render(crate::graph::lineage::LineageDirection::Downstream),
+                    }),
+                };
+                serde_json::to_string(&json).unwrap_or_default()
+            }
+            crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
+                let table_idx = match resolve_node(store, &table_name, false) {
+                    Ok(idx) => idx,
+                    Err(msg) => return msg,
+                };
+                if !matches!(&graph[table_idx], Node::Table { .. } | Node::View { .. }) {
+                    let err = serde_json::json!({
+                        "error": format!("'{}' is not a table or view", table_name),
+                    });
+                    return serde_json::to_string(&err).unwrap_or_default();
+                }
+
+                let cfg = crate::graph::lineage::LineageConfig::default();
+                let opts = crate::graph::lineage::DisplayOptions::new(
+                    crate::graph::lineage::LineageView::Tree,
+                    false,
+                );
+                let json = match dir_spec {
+                    Some(dir) => {
+                        let node = crate::graph::lineage::lineage_table(
+                            graph, table_idx, dir, depth, &cfg,
+                        );
+                        crate::graph::lineage::format_lineage_json(&node, graph, &opts)
+                    }
+                    None => {
+                        let up = crate::graph::lineage::lineage_table(
+                            graph,
+                            table_idx,
+                            crate::graph::lineage::LineageDirection::Upstream,
+                            depth,
+                            &cfg,
+                        );
+                        let down = crate::graph::lineage::lineage_table(
+                            graph,
+                            table_idx,
+                            crate::graph::lineage::LineageDirection::Downstream,
+                            depth,
+                            &cfg,
+                        );
+                        serde_json::json!({
+                            "upstream": crate::graph::lineage::format_lineage_json(&up, graph, &opts),
+                            "downstream": crate::graph::lineage::format_lineage_json(&down, graph, &opts),
+                        })
+                    }
+                };
+                serde_json::to_string(&json).unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// Resolve `name` (substring match, same as `trace`/CLI `columns`/`lineage`) to a single
+/// node, or a pre-serialized `{"error": ...}` JSON string on empty/ambiguous match —
+/// shared by `codeweb_column_analysis` and `codeweb_lineage`.
+fn resolve_node(
+    store: &GraphStore,
+    name: &str,
+    fail_on_multiple: bool,
+) -> Result<NodeIndex, String> {
+    match store.resolve_single_node(
+        name,
+        crate::graph::search::MatchMode::Substring,
+        false,
+        fail_on_multiple,
+    ) {
+        crate::graph::search::ResolveResult::Single(idx, _) => Ok(idx),
+        crate::graph::search::ResolveResult::Empty => {
+            let err = serde_json::json!({"error": format!("No nodes matching '{}'", name)});
+            Err(serde_json::to_string(&err).unwrap_or_default())
+        }
+        crate::graph::search::ResolveResult::Ambiguous => {
+            let count = store
+                .search_nodes_with_mode(name, crate::graph::search::MatchMode::Substring)
+                .len();
+            let err = serde_json::json!({
+                "error": format!("Ambiguous match: {} candidates for '{}'", count, name)
+            });
+            Err(serde_json::to_string(&err).unwrap_or_default())
+        }
+        crate::graph::search::ResolveResult::Multiple(_) => unreachable!("all_matches is false"),
+    }
 }
 
 // ── ServerHandler implementation ──
@@ -544,6 +753,8 @@ use rmcp::ServerHandler;
         codeweb_trace to follow call chains bidirectionally, \
         codeweb_search_sql to find SQL by text content, \
         codeweb_node_detail for properties + callers + callees, \
-        codeweb_query for complex multi-step traversals via JSON QuerySpec."
+        codeweb_query for complex multi-step traversals via JSON QuerySpec, \
+        codeweb_column_analysis for per-procedure/per-package hard filters, joins, and column mappings, \
+        codeweb_lineage for table/column-level lineage tracing."
 )]
 impl ServerHandler for McpState {}
