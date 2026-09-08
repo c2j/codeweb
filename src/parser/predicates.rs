@@ -1,4 +1,4 @@
-//! PL/SQL branch predicates extracted from `IF` and `CASE WHEN` conditions (#167).
+//! PL/SQL branch predicates extracted from `IF` and `CASE WHEN` conditions.
 
 use super::extractor::{
     as_column_ref, column_transform_of, format_expr_short, literal_to_filter_value,
@@ -46,19 +46,13 @@ pub struct PredicateClause {
     pub column: String,
     pub op: FilterOperator,
     pub value: FilterValue,
-    /// #167/#169: describes a whitelisted pure column transform (e.g. `substr`)
-    /// applied to the column before comparison, so consumers don't misread
-    /// `substr(col,1,2) = 'x'` as an exact-value equality on `col`.
+    /// A pure transform applied before comparison, preventing transformed equality
+    /// from being mistaken for exact column equality.
     #[serde(default)]
     pub transform: Option<FilterTransform>,
 }
 
-/// `PredicateClause` is bincode-persisted inside `GraphStore.procedure_predicates`.
-/// `#[serde(skip_serializing_if = ...)]` would change bincode's fixed field count
-/// depending on data, corrupting the binary layout. Branching manually
-/// on `Serializer::is_human_readable()` keeps bincode's field count fixed while
-/// still omitting `transform` from JSON when absent — same pattern as
-/// `HardFilter` (#169).
+/// Human-readable serializers may omit `transform`, while bincode requires a fixed field count.
 impl serde::Serialize for PredicateClause {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -223,9 +217,7 @@ impl<'a> PredicateExtractor<'a> {
             .map(|predicate| predicate.clauses)
             .unwrap_or_default();
 
-        // Finding 3 (#167): `zip` silently drops extras on length mismatch. Surface
-        // it via parse.log before falling back to the (still-truncating) zip so a
-        // malformed/unsupported SELECT INTO doesn't fail silently.
+        // Report mismatched targets because `zip` necessarily drops extras.
         if select.targets.len() != into_targets.len() {
             crate::parse_log::warn(
                 "predicates",
@@ -274,15 +266,32 @@ impl<'a> PredicateExtractor<'a> {
 impl Visitor for PredicateExtractor<'_> {
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
         match stmt {
-            PlStatement::If(spanned) => self.push_condition(
-                &spanned.condition,
-                PredicateKind::If,
-                spanned.span.as_ref().map_or(0, |span| span.start.line),
-            ),
+            PlStatement::If(spanned) => {
+                self.push_condition(
+                    &spanned.condition,
+                    PredicateKind::If,
+                    spanned.span.as_ref().map_or(0, |span| span.start.line),
+                );
+                for elsif in &spanned.elsifs {
+                    self.push_condition(&elsif.condition, PredicateKind::If, 0);
+                }
+            }
             PlStatement::Case(spanned) => {
                 let line = spanned.span.as_ref().map_or(0, |span| span.start.line);
                 for when in &spanned.whens {
-                    self.push_condition(&when.condition, PredicateKind::CaseWhen, line);
+                    if let Some(expression) = &spanned.expression {
+                        self.push_condition(
+                            &Expr::BinaryOp {
+                                left: Box::new(expression.clone()),
+                                op: "=".to_string(),
+                                right: Box::new(when.condition.clone()),
+                            },
+                            PredicateKind::CaseWhen,
+                            line,
+                        );
+                    } else {
+                        self.push_condition(&when.condition, PredicateKind::CaseWhen, line);
+                    }
                 }
             }
             PlStatement::SqlStatement { statement, .. } => {
@@ -391,23 +400,28 @@ fn condition_operand(
     let column_ref = as_column_ref(expr);
     let transform_hit = column_transform_of(expr);
     let names = column_ref.or_else(|| transform_hit.as_ref().map(|(names, _)| names.clone()));
-    // #167/#169: the transform (if any) describes the VALUE shape (e.g. a
-    // prefix match via `substr`), not the binding — confidence is unaffected.
+    // A transform changes the compared value shape, not binding confidence.
     let transform = transform_hit.map(|(_, t)| t);
     if let Some(names) = &names {
         if let Some(resolved) = resolved_clause(ctx, names, op, value.clone(), transform.clone()) {
             return Some(ConditionResolution::Direct(vec![resolved]));
         }
     }
-    let name = expr_name(expr)?.to_lowercase();
-    if let Some(source) = var_sources.get(&name) {
+    let source_name = expr_name(expr)
+        .or_else(|| {
+            names
+                .as_ref()
+                .and_then(|names| names.last().map(ToString::to_string))
+        })
+        .map(|name| name.to_lowercase());
+    if let Some(source) = source_name.as_ref().and_then(|name| var_sources.get(name)) {
         return Some(ConditionResolution::Derived(vec![(
             source.clone(),
             PredicateClause {
                 column: source.column.clone(),
                 op,
                 value,
-                transform: None,
+                transform,
             },
         )]));
     }
@@ -747,6 +761,78 @@ END;
     }
 
     #[test]
+    fn elsif_conditions_collected_as_predicates() {
+        let sql = r#"
+CREATE PROCEDURE elsif_predicates AS
+  CURSOR c_data IS SELECT x FROM main_data;
+  r c_data%ROWTYPE;
+BEGIN
+  IF r.x = '1' THEN NULL;
+  ELSIF r.x = '2' THEN NULL;
+  ELSIF r.x = '3' THEN NULL;
+  END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 3);
+        for (index, predicate) in predicates.iter().enumerate() {
+            assert_eq!(predicate.id, format!("B{:03}", index + 1));
+            assert_eq!(predicate.kind, PredicateKind::If);
+            assert_eq!(predicate.confidence, Confidence::High);
+            let table = predicate.table_predicate.as_ref().expect("table predicate");
+            assert_eq!(table.table, "main_data");
+            assert_eq!(table.clauses[0].column, "x");
+            assert_eq!(
+                table.clauses[0].value,
+                FilterValue::String((index + 1).to_string())
+            );
+        }
+        assert!(predicates[0].line > 0);
+        assert_eq!(predicates[1].line, 0);
+        assert_eq!(predicates[2].line, 0);
+    }
+
+    #[test]
+    fn simple_case_synthesizes_expression_comparison() {
+        let sql = r#"
+CREATE PROCEDURE simple_case_predicates AS
+  CURSOR c_data IS SELECT x FROM main_data;
+  r c_data%ROWTYPE;
+BEGIN
+  CASE r.x
+    WHEN '1' THEN NULL;
+    WHEN '2' THEN NULL;
+  END CASE;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 2);
+        for (index, predicate) in predicates.iter().enumerate() {
+            assert_eq!(predicate.kind, PredicateKind::CaseWhen);
+            assert_eq!(predicate.confidence, Confidence::High);
+            let table = predicate.table_predicate.as_ref().expect("table predicate");
+            assert_eq!(table.table, "main_data");
+            assert_eq!(
+                table.clauses,
+                vec![PredicateClause {
+                    column: "x".to_string(),
+                    op: FilterOperator::Eq,
+                    value: FilterValue::String((index + 1).to_string()),
+                    transform: None,
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn cursor_where_hard_filters_not_in_predicates() {
         let sql = r#"
 CREATE PROCEDURE cursor_filter_isolation AS
@@ -841,10 +927,6 @@ END;
         assert_eq!(table.clauses[0].value, FilterValue::Integer(100));
     }
 
-    /// Regression for review Finding 2 (#167/#169): a column-transform condition
-    /// like `substr(r.stock_kind, 1, 2) = '05'` must carry the `FilterTransform`
-    /// on the clause rather than silently emitting a plain `Eq` clause that would
-    /// misrepresent a prefix match as an exact-value match.
     #[test]
     fn transformed_condition_clause_carries_transform() {
         let sql = r#"
@@ -872,6 +954,106 @@ END;
         assert_eq!(clause.value, FilterValue::String("05".to_string()));
         assert_eq!(
             clause.transform,
+            Some(FilterTransform {
+                fn_name: "substr".to_string(),
+                args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
+            })
+        );
+    }
+
+    #[test]
+    fn naked_column_substr_resolves_via_sole_table() {
+        let sql = r#"
+CREATE PROCEDURE naked_substr_predicate AS
+  CURSOR c_get_data IS SELECT stock_kind FROM mid_yjqs_detail;
+BEGIN
+  IF substr(stock_kind, 1, 2) = '05' THEN NULL; END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 1);
+        let predicate = &predicates[0];
+        assert_eq!(predicate.confidence, Confidence::High);
+        let table = predicate.table_predicate.as_ref().expect("table predicate");
+        assert_eq!(table.table, "mid_yjqs_detail");
+        assert_eq!(table.clauses[0].column, "stock_kind");
+        assert_eq!(
+            table.clauses[0].transform,
+            Some(FilterTransform {
+                fn_name: "substr".to_string(),
+                args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
+            })
+        );
+    }
+
+    #[test]
+    fn select_into_var_substr_resolves_via_var_source() {
+        let sql = r#"
+CREATE PROCEDURE select_into_substr_predicate AS
+  CURSOR c_data IS SELECT stock_kind FROM main_data;
+  v_kind VARCHAR(10);
+BEGIN
+  SELECT kind_id INTO v_kind FROM swh_all_kind;
+  IF substr(v_kind, 1, 2) = '05' THEN NULL; END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+        let mut source_extractor = PredicateExtractor::new_with_context(&ctx);
+        let PlStatement::SqlStatement { statement, .. } = &block.body[0] else {
+            panic!("expected SELECT statement, got {:?}", block.body[0]);
+        };
+        let Statement::Select(select) = statement.as_ref() else {
+            panic!("expected parsed SELECT, got {statement:?}");
+        };
+        source_extractor.record_select_into(&select.node);
+        assert!(source_extractor.var_sources.contains_key("v_kind"));
+        let PlStatement::If(if_statement) = &block.body[1] else {
+            panic!("expected IF statement, got {:?}", block.body[1]);
+        };
+        let Expr::BinaryOp { left, .. } = &if_statement.condition else {
+            panic!("expected binary condition: {:?}", if_statement.condition);
+        };
+        assert!(column_transform_of(left).is_some(), "operand: {left:?}");
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 1);
+        let predicate = &predicates[0];
+        assert_eq!(predicate.confidence, Confidence::Low);
+        assert!(predicate.table_predicate.is_none());
+        let hint = predicate.param_table_hint.as_ref().expect("parameter hint");
+        assert_eq!(hint.table, "swh_all_kind");
+        assert_eq!(
+            hint.set,
+            vec![("kind_id".to_string(), FilterValue::String("05".to_string()))]
+        );
+        let resolved = condition_clauses(
+            match &block.body[1] {
+                PlStatement::If(statement) => &statement.condition,
+                other => panic!("expected IF statement, got {other:?}"),
+            },
+            &ctx,
+            &{
+                let mut extractor = PredicateExtractor::new_with_context(&ctx);
+                if let PlStatement::SqlStatement { statement, .. } = &block.body[0] {
+                    if let Statement::Select(select) = statement.as_ref() {
+                        extractor.record_select_into(&select.node);
+                    }
+                }
+                extractor.var_sources
+            },
+        )
+        .expect("derived condition");
+        let ConditionResolution::Derived(clauses) = resolved else {
+            panic!("expected derived condition");
+        };
+        assert_eq!(
+            clauses[0].1.transform,
             Some(FilterTransform {
                 fn_name: "substr".to_string(),
                 args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
