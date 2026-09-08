@@ -1814,9 +1814,8 @@ impl GraphBuilder {
         file: Arc<PathBuf>,
         line: usize,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        anchor_seen: &mut HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
     ) {
-        let mut anchor_seen: HashSet<AnchorDedupKey> = HashSet::new();
-
         // Signature (`Param`/`ReturnType`) anchors must be guarded the same
         // way the body-walk `AnchorExtractor` guards variable/nested-type
         // anchors: skip if the anchored object (lowercased, full string —
@@ -1825,7 +1824,7 @@ impl GraphBuilder {
         // variable/TYPE, or another parameter's name. The *current*
         // parameter's own name is excluded from the "other param" check so
         // the Oracle self-naming idiom (`p(employees employees%ROWTYPE)`)
-        // still anchors to the real table (PR #164 review round 2 issue 1).
+        // still anchors to the real table.
         let pkg_cursor_set: HashSet<String> = pkg_cursor_names.iter().cloned().collect();
         let pkg_var_type_set: HashSet<String> = pkg_var_type_names.iter().cloned().collect();
         let param_name_set: HashSet<String> =
@@ -1844,7 +1843,7 @@ impl GraphBuilder {
                 if guarded {
                     continue;
                 }
-                if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                if anchor_seen.insert((proc_idx, Self::anchor_dedup_key(&a))) {
                     Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
                 }
             }
@@ -1861,7 +1860,7 @@ impl GraphBuilder {
                 let guarded = pkg_cursor_set.contains(&obj_lower)
                     || pkg_var_type_set.contains(&obj_lower)
                     || param_name_set.contains(&obj_lower);
-                if !guarded && anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                if !guarded && anchor_seen.insert((proc_idx, Self::anchor_dedup_key(&a))) {
                     Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
                 }
             }
@@ -1883,7 +1882,7 @@ impl GraphBuilder {
         }
         walk_pl_block(&mut anchor_extractor, block);
         for a in &anchor_extractor.anchors {
-            if anchor_seen.insert(Self::anchor_dedup_key(a)) {
+            if anchor_seen.insert((proc_idx, Self::anchor_dedup_key(a))) {
                 Self::add_anchor_edge(graph, proc_idx, a, file.clone(), line, table_index);
             }
         }
@@ -1899,6 +1898,17 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
         let spec_items_by_pkg = build_spec_items_index(files);
+        // A package's SPEC (`CreatePackage`) and BODY (`CreatePackageBody`)
+        // are separate `Statement`s, each triggering its own
+        // `collect_package_object_ref_edges` call for the same member
+        // routines (same `RoutineId`/graph node). Keyed by package
+        // qualified name so the dedup set spans *both* calls — a signature
+        // anchor declared identically in the SPEC and the BODY collapses to
+        // one edge; an anchor unique to only one side still survives.
+        let mut pkg_anchor_seen: HashMap<
+            String,
+            HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
+        > = HashMap::new();
 
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -1973,6 +1983,7 @@ impl GraphBuilder {
                                 file_arc.clone(),
                                 info.start_line,
                                 table_index,
+                                &mut HashSet::new(),
                             );
                         }
                     }
@@ -2056,10 +2067,14 @@ impl GraphBuilder {
                                 file_arc.clone(),
                                 info.start_line,
                                 table_index,
+                                &mut HashSet::new(),
                             );
                         }
                     }
                     Statement::CreatePackage(pkg) => {
+                        let anchor_seen = pkg_anchor_seen
+                            .entry(pkg_qualified_key(&pkg.name))
+                            .or_default();
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
@@ -2072,6 +2087,7 @@ impl GraphBuilder {
                             package_index,
                             table_index,
                             graph,
+                            anchor_seen,
                         );
                     }
                     Statement::CreatePackageBody(pkg) => {
@@ -2079,6 +2095,9 @@ impl GraphBuilder {
                             .get(&pkg_qualified_key(&pkg.name))
                             .copied()
                             .unwrap_or(&[]);
+                        let anchor_seen = pkg_anchor_seen
+                            .entry(pkg_qualified_key(&pkg.name))
+                            .or_default();
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
@@ -2091,6 +2110,7 @@ impl GraphBuilder {
                             package_index,
                             table_index,
                             graph,
+                            anchor_seen,
                         );
                     }
                     _ => {}
@@ -2112,6 +2132,7 @@ impl GraphBuilder {
         package_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
+        anchor_seen: &mut HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
@@ -2278,6 +2299,7 @@ impl GraphBuilder {
                 file_path.clone(),
                 info.start_line,
                 table_index,
+                anchor_seen,
             );
 
             let Some(ref block) = block else {
@@ -5586,6 +5608,103 @@ mod tests {
                 "'{}' must never become a table node via a signature anchor",
                 fake
             );
+        }
+    }
+
+    /// PR #164 review round 3 (#158): a package member routine's signature
+    /// declared in the SPEC (`CREATE PACKAGE ... PROCEDURE p(t t%ROWTYPE);`,
+    /// no body) and re-declared in the BODY (`CREATE PACKAGE BODY ...
+    /// PROCEDURE p(t t%ROWTYPE) IS ... END;`, with body) both resolve to the
+    /// same `RoutineId`/graph node — `create_object_ref_edges` walks the
+    /// SPEC statement and the BODY statement separately, each calling
+    /// `collect_package_object_ref_edges` → `collect_routine_anchor_edges`
+    /// once. Without a dedup set that spans *both* calls, the identical
+    /// `Param` signature anchor (`t t%ROWTYPE`) is emitted twice. A
+    /// `Variable`-site anchor that only exists in the BODY's local
+    /// declaration must still be emitted — different `site` never folds.
+    #[test]
+    fn should_dedupe_signature_anchors_across_spec_and_body() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE pkg_spec_body_dup AS
+                PROCEDURE p(t t%ROWTYPE);
+            END pkg_spec_body_dup;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_spec_body_dup AS
+                PROCEDURE p(t t%ROWTYPE) IS
+                    v1 other_table.other_col%TYPE;
+                BEGIN
+                    NULL;
+                END;
+            END pkg_spec_body_dup;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected exactly 2 AnchorsOn edges (t->t Param anchor deduped across \
+             SPEC+BODY, plus v1->other_table Variable anchor from BODY only), got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let param_anchors: Vec<_> = anchor_edges
+            .iter()
+            .filter(|&&e| {
+                matches!(
+                    &graph[e],
+                    Edge::AnchorsOn {
+                        site: crate::parser::AnchorSite::Param,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            param_anchors.len(),
+            1,
+            "the identical t->t Param signature anchor from SPEC and BODY must \
+             collapse to exactly 1 edge, got {:?}",
+            param_anchors
+                .iter()
+                .map(|&&e| &graph[e])
+                .collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(*param_anchors[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "t"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        let variable_anchors: Vec<_> = anchor_edges
+            .iter()
+            .filter(|&&e| {
+                matches!(
+                    &graph[e],
+                    Edge::AnchorsOn {
+                        site: crate::parser::AnchorSite::Variable,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            variable_anchors.len(),
+            1,
+            "the BODY-only v1->other_table Variable anchor must still be emitted \
+             (different site never folds), got {:?}",
+            variable_anchors
+                .iter()
+                .map(|&&e| &graph[e])
+                .collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(*variable_anchors[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "other_table"),
+            other => panic!("expected Node::Table, got {:?}", other),
         }
     }
 
