@@ -1173,27 +1173,33 @@ impl Visitor for AnchorExtractor {
                 self.var_names.insert(v.name.to_lowercase());
                 self.visit_pl_data_type(&v.data_type, AnchorSite::Variable);
             }
-            PlDeclaration::Type(t) => match t {
-                PlTypeDecl::TableOf {
-                    elem_type,
-                    index_by,
-                    ..
-                } => {
-                    self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
-                    if let Some(ib) = index_by {
-                        self.visit_pl_data_type(ib, AnchorSite::NestedType);
+            PlDeclaration::Record(r) => {
+                self.var_names.insert(r.name.to_lowercase());
+            }
+            PlDeclaration::Type(t) => {
+                self.var_names.insert(pl_type_decl_name(t).to_lowercase());
+                match t {
+                    PlTypeDecl::TableOf {
+                        elem_type,
+                        index_by,
+                        ..
+                    } => {
+                        self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
+                        if let Some(ib) = index_by {
+                            self.visit_pl_data_type(ib, AnchorSite::NestedType);
+                        }
                     }
-                }
-                PlTypeDecl::VarrayOf { elem_type, .. } => {
-                    self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
-                }
-                PlTypeDecl::Record { fields, .. } => {
-                    for f in fields {
-                        self.visit_pl_data_type(&f.data_type, AnchorSite::NestedType);
+                    PlTypeDecl::VarrayOf { elem_type, .. } => {
+                        self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
                     }
+                    PlTypeDecl::Record { fields, .. } => {
+                        for f in fields {
+                            self.visit_pl_data_type(&f.data_type, AnchorSite::NestedType);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
         VisitorResult::Continue
@@ -4721,6 +4727,38 @@ mod tests {
         assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
         assert_eq!(anchors[0].object, "dat_trd_repurchase");
         assert!(matches!(anchors[0].site, AnchorSite::Variable));
+    }
+
+    #[test]
+    fn should_skip_type_anchored_to_local_type_declaration() {
+        // 局部 TYPE 声明名（typ_list）同样是遮蔽表名的本地标识符：
+        // v_list typ_list%TYPE 锚到本地 TYPE，不是表。
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE typ_list IS TABLE OF INTEGER; \
+            v_list typ_list%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "local TYPE name must not become a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    #[test]
+    fn should_skip_type_anchored_to_plain_record_variable() {
+        // plain RECORD 变量名（rec2）同样遮蔽表名：
+        // v2 rec2%TYPE 锚到 record 变量，不是表。
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE rec2 RECORD; \
+            v2 rec2%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "record variable name must not become a table anchor: {:?}",
+            anchors
+        );
     }
 
     #[test]
