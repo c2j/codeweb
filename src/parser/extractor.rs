@@ -1086,6 +1086,49 @@ pub fn anchor_from_pl_data_type(
     }
 }
 
+/// Extract every `%TYPE`/`%ROWTYPE` anchor target `(object, column, kind)`
+/// nested inside a `PlTypeDecl`'s element/field types (`TABLE OF` elem/index
+/// type, `VARRAY OF` elem type, `RECORD (...)` field types), with no
+/// cursor/variable guard applied — same no-guard contract as
+/// [`anchor_from_pl_data_type`], which this reuses per element/field.
+/// Shared by [`AnchorExtractor::visit_pl_declaration`] (routine-local walk,
+/// which applies the guard via `push_anchor`) and package-level nested
+/// `TYPE` handling in `graph::builder`, which is declared outside any
+/// `PlBlock` and must apply its own (package-level) guard.
+pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<String>, AnchorKind)> {
+    let mut out = Vec::new();
+    match t {
+        PlTypeDecl::TableOf {
+            elem_type,
+            index_by,
+            ..
+        } => {
+            if let Some(a) = anchor_from_pl_data_type(elem_type) {
+                out.push(a);
+            }
+            if let Some(ib) = index_by {
+                if let Some(a) = anchor_from_pl_data_type(ib) {
+                    out.push(a);
+                }
+            }
+        }
+        PlTypeDecl::VarrayOf { elem_type, .. } => {
+            if let Some(a) = anchor_from_pl_data_type(elem_type) {
+                out.push(a);
+            }
+        }
+        PlTypeDecl::Record { fields, .. } => {
+            for f in fields {
+                if let Some(a) = anchor_from_pl_data_type(&f.data_type) {
+                    out.push(a);
+                }
+            }
+        }
+        PlTypeDecl::RefCursor { .. } => {}
+    }
+    out
+}
+
 /// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
 /// `push_anchor` skips any anchor whose object name (lowercased) matches a
 /// known cursor name or a declared local variable name. This guards both
@@ -1179,7 +1222,6 @@ impl Visitor for AnchorExtractor {
         &mut self,
         decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
     ) -> VisitorResult {
-        use ogsql_parser::ast::plpgsql::PlTypeDecl;
         match decl {
             PlDeclaration::Cursor(c) => {
                 self.cursor_names.insert(c.name.to_lowercase());
@@ -1193,26 +1235,8 @@ impl Visitor for AnchorExtractor {
             }
             PlDeclaration::Type(t) => {
                 self.var_names.insert(pl_type_decl_name(t).to_lowercase());
-                match t {
-                    PlTypeDecl::TableOf {
-                        elem_type,
-                        index_by,
-                        ..
-                    } => {
-                        self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
-                        if let Some(ib) = index_by {
-                            self.visit_pl_data_type(ib, AnchorSite::NestedType);
-                        }
-                    }
-                    PlTypeDecl::VarrayOf { elem_type, .. } => {
-                        self.visit_pl_data_type(elem_type, AnchorSite::NestedType);
-                    }
-                    PlTypeDecl::Record { fields, .. } => {
-                        for f in fields {
-                            self.visit_pl_data_type(&f.data_type, AnchorSite::NestedType);
-                        }
-                    }
-                    _ => {}
+                for (object, column, kind) in anchor_targets_in_pl_type_decl(t) {
+                    self.push_anchor(object, column, kind, AnchorSite::NestedType);
                 }
             }
             _ => {}

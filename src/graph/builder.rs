@@ -2149,6 +2149,39 @@ impl GraphBuilder {
                 continue;
             }
 
+            if let PackageItem::Type(t) = item {
+                // Package-level nested TYPE declarations (`TABLE OF` /
+                // `VARRAY OF` / `RECORD (...)`) anchor to the **package**
+                // node, the same way a package-level Variable does (issue
+                // #158 NestedType; PR #164 review).
+                for (object, column, kind) in crate::parser::anchor_targets_in_pl_type_decl(t) {
+                    let obj_lower = object.to_lowercase();
+                    if pkg_cursor_names.contains(&obj_lower)
+                        || pkg_var_type_names.contains(&obj_lower)
+                    {
+                        continue;
+                    }
+                    let qualified = pkg_qualified_key(pkg_name);
+                    if let Some(&pkg_idx) = package_index.get(&qualified) {
+                        let anchor = crate::parser::AnchorRef {
+                            object,
+                            column,
+                            kind,
+                            site: crate::parser::AnchorSite::NestedType,
+                        };
+                        Self::add_anchor_edge(
+                            graph,
+                            pkg_idx,
+                            &anchor,
+                            file_path.clone(),
+                            info.start_line,
+                            table_index,
+                        );
+                    }
+                }
+                continue;
+            }
+
             let (proc_name, parameters, return_type, block, kind) = match item {
                 PackageItem::Procedure(p) => (
                     p.name.join("."),
@@ -5241,6 +5274,79 @@ mod tests {
         assert!(
             fake_table.is_none(),
             "package-level TYPE name pkg_rec_t must never become a table node"
+        );
+    }
+
+    /// PR #164 review (issue #158 NestedType): a package-level nested `TYPE`
+    /// declaration (`TABLE OF` / `RECORD (...)`) whose element/field type is
+    /// `%TYPE`-anchored to a real table must produce an `AnchorsOn` edge
+    /// from the **package** node (site=NestedType) — the same site used for
+    /// routine-local nested TYPE declarations. A nested TYPE anchored to
+    /// another package-level TYPE name must be guarded like any other
+    /// package-level name collision.
+    #[test]
+    fn should_anchor_package_level_nested_type() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_nested_type AS
+                TYPE t_list IS TABLE OF some_table.some_col%TYPE;
+                TYPE t_rec IS RECORD (f other_table.other_col%TYPE);
+                TYPE t_bad IS TABLE OF t_list.col%TYPE;
+            END pkg_nested_type;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_nested_type"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 AnchorsOn edges (t_list->some_table, t_rec->other_table); t_bad must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let mut targets: Vec<(String, Option<String>)> = anchor_edges
+            .iter()
+            .map(|&e| {
+                let (_, target) = graph.edge_endpoints(e).unwrap();
+                let name = match &graph[target] {
+                    Node::Table { name, .. } => name.to_lowercase(),
+                    other => panic!("expected Node::Table, got {:?}", other),
+                };
+                let column = match &graph[e] {
+                    Edge::AnchorsOn { column, site, .. } => {
+                        assert!(matches!(site, crate::parser::AnchorSite::NestedType));
+                        column.clone()
+                    }
+                    other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+                };
+                (name, column)
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                ("other_table".to_string(), Some("other_col".to_string())),
+                ("some_table".to_string(), Some("some_col".to_string())),
+            ]
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("t_list")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package-level TYPE name t_list must never become a table node"
         );
     }
 
