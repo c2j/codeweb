@@ -3122,11 +3122,16 @@ impl Visitor for ColumnAccessExtractor {
             }
             // Subqueries carry their own scope; the generic walker would otherwise
             // recurse into their SELECT and leak its alias/join/filter state into
-            // this statement's analysis (review #153-2).
-            Expr::Subquery(_)
-            | Expr::Exists(_)
-            | Expr::InSubquery { .. }
-            | Expr::ScalarSublink { .. } => return VisitorResult::SkipChildren,
+            // this statement's analysis (review #153-2). Exists/Subquery have no
+            // left operand, so skipping is complete.
+            Expr::Subquery(_) | Expr::Exists(_) => return VisitorResult::SkipChildren,
+            // InSubquery/ScalarSublink DO have a left operand (`t.x > ANY (...)`,
+            // `t.id IN (...)`): collect its column references first, then skip the
+            // nested SELECT (review 5136742683).
+            Expr::InSubquery { expr, .. } | Expr::ScalarSublink { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+                return VisitorResult::SkipChildren;
+            }
             _ => {}
         }
         VisitorResult::Continue
@@ -5361,6 +5366,48 @@ mod column_tests {
             a.join_conditions.is_empty(),
             "subquery JOIN must not leak into the parent analysis: {:?}",
             a.join_conditions
+        );
+    }
+
+    /// Review (5136742683): `t.x > ANY (SELECT ...)` — the left operand `t.x` is a
+    /// real column reference of the enclosing query and must still be collected;
+    /// only the nested SELECT's own scope must be skipped.
+    #[test]
+    fn scalar_sublink_left_operand_column_is_collected() {
+        let analyses =
+            extract_column_analysis("SELECT * FROM t WHERE t.x > ANY (SELECT y FROM t2)");
+        assert_eq!(analyses.len(), 1);
+        let x_refs: Vec<&ColumnRef> = analyses[0]
+            .column_refs
+            .iter()
+            .filter(|r| r.column == "x")
+            .collect();
+        assert_eq!(
+            x_refs.len(),
+            1,
+            "left operand of ANY/ALL must be collected, got: {:?}",
+            analyses[0].column_refs
+        );
+        assert_eq!(x_refs[0].resolved_table.as_deref(), Some("t"));
+    }
+
+    /// Review (5136742683): the left operand of `IN (SELECT ...)` in an ON clause
+    /// must still be collected (the generic walker was its only collector).
+    #[test]
+    fn in_subquery_left_operand_in_join_condition_is_collected() {
+        let analyses =
+            extract_column_analysis("SELECT * FROM t1 JOIN t2 ON t1.id IN (SELECT id FROM t3)");
+        assert_eq!(analyses.len(), 1);
+        let id_refs: Vec<&ColumnRef> = analyses[0]
+            .column_refs
+            .iter()
+            .filter(|r| r.column == "id" && r.alias_prefix.as_deref() == Some("t1"))
+            .collect();
+        assert_eq!(
+            id_refs.len(),
+            1,
+            "t1.id left operand of IN-subquery must be collected, got: {:?}",
+            analyses[0].column_refs
         );
     }
 
