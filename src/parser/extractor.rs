@@ -1253,18 +1253,27 @@ impl Visitor for AnchorExtractor {
                 }
                 self.var_names.insert(pl_type_decl_name(t).to_lowercase());
             }
-            // Nested routines have their own parameter list and scope. The
-            // default walker recurses into the nested block AFTER this
-            // returns, with no cleanup — leaking nested locals outward and
-            // never registering the nested parameters as guarded names. We
-            // prevent this by returning SkipChildren and manually walking
-            // the nested block with a save/restore barrier, mirroring
+            // Nested routines have their own parameter list and scope, but
+            // PL/SQL scoping is lexical: a nested routine's body still sees
+            // every cursor/variable/parameter name guarded in the
+            // enclosing routine (and package), it just adds its own
+            // parameters on top (shadowing same-named outer locals within
+            // its own body only). The default walker recurses into the
+            // nested block AFTER this returns, with no cleanup — leaking
+            // nested locals outward and never registering the nested
+            // parameters as guarded names. We prevent this by returning
+            // SkipChildren and manually walking the nested block with a
+            // save/restore barrier: *clone* (not take) the guard sets so
+            // outer names remain visible inside the nested body, register
+            // the nested parameters on top, walk, then restore the
+            // pre-nesting snapshot so the nested routine's own locals don't
+            // leak into the enclosing scope. Mirrors
             // `CallExtractor::visit_pl_declaration`'s `NestedProcedure`/
             // `NestedFunction` arms. Nested RETURN-type anchoring is not
             // done — a nested routine has no independent graph node.
             PlDeclaration::NestedProcedure(p) => {
-                let saved_cursors = std::mem::take(&mut self.cursor_names);
-                let saved_vars = std::mem::take(&mut self.var_names);
+                let saved_cursors = self.cursor_names.clone();
+                let saved_vars = self.var_names.clone();
                 for param in &p.parameters {
                     self.register_var_name(&param.name);
                 }
@@ -1276,8 +1285,8 @@ impl Visitor for AnchorExtractor {
                 return VisitorResult::SkipChildren;
             }
             PlDeclaration::NestedFunction(f) => {
-                let saved_cursors = std::mem::take(&mut self.cursor_names);
-                let saved_vars = std::mem::take(&mut self.var_names);
+                let saved_cursors = self.cursor_names.clone();
+                let saved_vars = self.var_names.clone();
                 for param in &f.parameters {
                     self.register_var_name(&param.name);
                 }
@@ -5000,6 +5009,55 @@ mod tests {
         );
         assert_eq!(anchors[0].object, "v_local");
         assert_eq!(anchors[0].column.as_deref(), Some("some_col"));
+    }
+
+    /// Issue #158 (review round 4): nested routine scope is lexical
+    /// inheritance, not a fresh restart. An outer-scope `CURSOR` name must
+    /// stay guarded *inside* the nested routine's own body — `rec c%ROWTYPE`
+    /// where `c` is the enclosing routine's cursor must not fabricate a
+    /// `c` table anchor just because the nested body walks with a
+    /// momentarily-emptied guard set.
+    #[test]
+    fn should_skip_nested_body_anchor_using_outer_cursor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            CURSOR c IS SELECT id FROM t_main; \
+            PROCEDURE inner IS rec c%ROWTYPE; BEGIN NULL; END inner; \
+            BEGIN NULL; END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "outer cursor must stay guarded inside nested body: {:?}",
+            anchors
+        );
+    }
+
+    /// Issue #158 (review round 4): companion case for a nested routine's
+    /// own *parameter* name being inherited by a routine nested one level
+    /// further in. `mid`'s parameter `p_emp` is registered when entering
+    /// `mid`'s own `NestedProcedure` arm; `inner_f` — declared inside
+    /// `mid`'s body — must still see `p_emp` as guarded (lexical
+    /// inheritance), so `v p_emp.empno%TYPE` must not anchor to a
+    /// fabricated `p_emp` table. (The plan's literal top-level-signature
+    /// variant does not exercise this code path: `extract_anchors()`
+    /// never registers a `CREATE FUNCTION`'s own top-level parameters —
+    /// only `GraphBuilder::collect_routine_anchor_edges` does, downstream
+    /// of `AnchorExtractor` — so the nearest faithful reproduction of
+    /// "enclosing routine's parameter must guard a nested body" at this
+    /// unit's level is nested-within-nested, which is also the exact
+    /// boundary the `take`→`clone` fix touches.)
+    #[test]
+    fn should_skip_nested_function_body_anchor_using_outer_param() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            PROCEDURE mid(p_emp VARCHAR2) IS \
+                FUNCTION inner_f RETURN INTEGER IS v p_emp.empno%TYPE; BEGIN RETURN v; END inner_f; \
+            BEGIN NULL; END mid; \
+            BEGIN RETURN NULL; END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "outer param must stay guarded inside nested body: {:?}",
+            anchors
+        );
     }
 
     #[test]
