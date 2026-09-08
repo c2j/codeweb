@@ -1308,37 +1308,37 @@ impl GraphStore {
         self.updated_at = timestamp_ms();
     }
 
-    /// Dedup key for `merge`'s per-edge duplicate check. `AnchorsOn` edges
-    /// extend the base `(src, dst, tag)` key with `(kind, lowercased
-    /// column, site)` — mirrors `dedup()`'s `(kind, column, site)` key
-    /// (see `should_keep_distinct_anchor_edges_through_dedup`) so two
-    /// params anchoring the same table on different columns survive a
-    /// `merge` the same way they survive a `dedup`. Non-`AnchorsOn` edges
-    /// get `None` in the extension fields, leaving their key unchanged.
-    fn edge_dedup_key(
+    /// Dedup key for `AnchorsOn` edges specifically in `merge`'s per-edge
+    /// duplicate check — `(src, dst, kind, lowercased column, site)`,
+    /// mirroring `dedup()`'s `(kind, column, site)` key (see
+    /// `should_keep_distinct_anchor_edges_through_dedup`) so two params
+    /// anchoring the same table on different columns survive a `merge` the
+    /// same way they survive a `dedup`. Kept in a *separate* set from the
+    /// generic `(src, dst, tag)` `seen_edges` (below) because it alone is
+    /// checked across the *whole* merge (all stores), not reset per store —
+    /// every other edge type (in particular `TableAccess`) must stay on the
+    /// per-store generic key or `merge_duplicate_table_access_edges`'s
+    /// cross-store `AccessMode` union never gets a second edge to union
+    /// (regression fixed in commit following d667927: a global generic key
+    /// silently dropped a second store's `TableAccess` edge for the same
+    /// (proc, table) pair before it ever reached the union step).
+    fn anchor_merge_key(
         src: &NodeKey,
         dst: &NodeKey,
-        tag: &str,
         edge: &crate::graph::Edge,
-    ) -> EdgeDedupKey {
-        let (kind, column, site) = match edge {
+    ) -> Option<AnchorMergeKey> {
+        match edge {
             crate::graph::Edge::AnchorsOn {
                 kind, column, site, ..
-            } => (
-                Some(*kind),
+            } => Some((
+                src.clone(),
+                dst.clone(),
+                *kind,
                 column.clone().map(|c| c.to_lowercase()),
-                Some(*site),
-            ),
-            _ => (None, None, None),
-        };
-        (
-            src.clone(),
-            dst.clone(),
-            tag.to_string(),
-            kind,
-            column,
-            site,
-        )
+                *site,
+            )),
+            _ => None,
+        }
     }
 
     /// Merge multiple stores into one, deduplicating shared nodes by NodeKey.
@@ -1351,11 +1351,11 @@ impl GraphStore {
     /// but CGEF import produces `proc:pkg_foo.sp` (no schema).
     pub fn merge(stores: Vec<Self>, merged_name: &str) -> Self {
         let mut merged = GraphStore::new(merged_name);
-        // Declared once for the whole merge, not per store: an edge from a
-        // later store that duplicates one already copied from an earlier
-        // store must still collapse — the accumulator's prior edges need
-        // the same dedup key check as edges within a single store.
-        let mut seen_edges: HashSet<EdgeDedupKey> = HashSet::new();
+        // `AnchorsOn` edges use a dedicated cross-store key (see
+        // `anchor_merge_key`); `merged.graph` starts empty above, so this
+        // naturally covers "already in the accumulator" duplicates from
+        // earlier stores without needing to be seeded from anything.
+        let mut seen_anchor_keys: HashSet<AnchorMergeKey> = HashSet::new();
 
         for store in &stores {
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
@@ -1399,6 +1399,7 @@ impl GraphStore {
                 idx_map.insert(old_idx, new_idx);
             }
 
+            let mut seen_edges: HashSet<(NodeKey, NodeKey, String)> = HashSet::new();
             let mut table_access_merge_map: HashMap<
                 (NodeKey, NodeKey),
                 petgraph::graph::EdgeIndex,
@@ -1409,13 +1410,15 @@ impl GraphStore {
                 let dst_key = NodeKey::from_node(&store.graph[dst]);
                 let edge_type = edge_type_tag(&store.graph[old_edge_idx]);
 
-                let dedup_key = Self::edge_dedup_key(
-                    &src_key,
-                    &dst_key,
-                    &edge_type,
-                    &store.graph[old_edge_idx],
-                );
-                if !seen_edges.insert(dedup_key) {
+                let is_duplicate =
+                    match Self::anchor_merge_key(&src_key, &dst_key, &store.graph[old_edge_idx]) {
+                        Some(anchor_key) => !seen_anchor_keys.insert(anchor_key),
+                        None => {
+                            let dedup_key = (src_key.clone(), dst_key.clone(), edge_type.clone());
+                            !seen_edges.insert(dedup_key)
+                        }
+                    };
+                if is_duplicate {
                     continue;
                 }
 
@@ -1801,16 +1804,10 @@ fn timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// See [`GraphStore::edge_dedup_key`] for why `AnchorsOn` edges need the
-/// three trailing fields while every other edge type leaves them `None`.
-type EdgeDedupKey = (
-    NodeKey,
-    NodeKey,
-    String,
-    Option<AnchorKind>,
-    Option<String>,
-    Option<AnchorSite>,
-);
+/// See [`GraphStore::anchor_merge_key`] for why `AnchorsOn` edges get a
+/// dedicated cross-store dedup key, checked separately from the generic
+/// per-store `(src, dst, tag)` key used by every other edge type in `merge`.
+type AnchorMergeKey = (NodeKey, NodeKey, AnchorKind, Option<String>, AnchorSite);
 
 fn edge_type_tag(edge: &crate::graph::Edge) -> String {
     match edge {
@@ -3800,6 +3797,110 @@ mod tests {
             columns,
             vec![Some("id".to_string()), Some("name".to_string())]
         );
+    }
+
+    /// Regression guard (#158, commit d667927): a global (whole-merge)
+    /// `seen_edges` broke `merge_duplicate_table_access_edges`'s AccessMode
+    /// union. That function relies on *both* stores' `TableAccess` edges
+    /// for the same (proc, table) pair actually landing in `merged.graph`
+    /// before it unions their `modes`/`write_kinds` — a global tag-only key
+    /// silently drops the second store's edge before it ever reaches the
+    /// union step, so `Write` from store_b is lost and only `Read` from
+    /// store_a survives.
+    #[test]
+    fn should_union_table_access_modes_across_stores_on_merge() {
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_a = graph_a.add_node(make_proc(None, Some("pkg_x"), "proc_a"));
+        let table_a = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "t_orders".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_a.add_edge(
+            proc_a,
+            table_a,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        let proc_b = graph_b.add_node(make_proc(None, Some("pkg_x"), "proc_a"));
+        let table_b = graph_b.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "t_orders".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_b.add_edge(
+            proc_b,
+            table_b,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let access_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::TableAccess { .. }))
+            .collect();
+        assert_eq!(
+            access_edges.len(),
+            1,
+            "proc_a->t_orders from both stores must resolve to the same merged \
+             node pair and collapse to a single TableAccess edge, got {:?}",
+            access_edges
+        );
+        match access_edges[0] {
+            crate::graph::Edge::TableAccess { modes, .. } => {
+                assert!(
+                    modes.contains(crate::graph::AccessMode::Read),
+                    "Read from store_a must survive, got {:?}",
+                    modes
+                );
+                assert!(
+                    modes.contains(crate::graph::AccessMode::Write),
+                    "Write from store_b must not be silently dropped, got {:?}",
+                    modes
+                );
+            }
+            other => panic!("expected Edge::TableAccess, got {:?}", other),
+        }
     }
 
     #[test]
