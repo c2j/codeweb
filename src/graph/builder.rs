@@ -7,7 +7,7 @@ use crate::graph::{
 };
 use crate::graph::{ColumnSummary, DistributeInfo, IndexConstraint, PartitionInfo};
 use crate::parser::{
-    AllParsedFiles, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
+    AllParsedFiles, AnchorExtractor, CallEdge, CallExtractor, ParsedFile, TypeSequenceRefExtractor,
 };
 use ogsql_parser::ast::{
     AlterTableAction, ColumnConstraint, PackageItem, Statement, TableConstraint,
@@ -109,6 +109,17 @@ fn is_system(schema: Option<&str>, name: &str) -> bool {
         .map(|s| SYSTEM_SCHEMAS.contains(&s.to_lowercase().as_str()))
         .unwrap_or(false)
 }
+
+/// Dedup key for `AnchorsOn` edges within a single routine/package-variable
+/// scope: (lowercased object, column, kind, site). See
+/// [`GraphBuilder::anchor_dedup_key`] for why signature anchors and
+/// variable/nested-type anchors can collide on this key.
+type AnchorDedupKey = (
+    String,
+    Option<String>,
+    crate::parser::AnchorKind,
+    crate::parser::AnchorSite,
+);
 
 pub struct GraphBuilder;
 
@@ -333,6 +344,8 @@ impl GraphBuilder {
             &ctx.type_index,
             &ctx.sequence_index,
             &mut ctx.inferred_sequence_index,
+            &ctx.package_index,
+            &mut ctx.table_index,
         );
         Self::collect_procedure_predicates(ctx, sql_files);
     }
@@ -1787,19 +1800,7 @@ impl GraphBuilder {
 
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
-        // Index package SPEC items by lowercased qualified package name so a
-        // package BODY can inherit the spec's public Variable/Type declarations
-        // into its call-edge extraction scope. Spec and body are parsed as
-        // independent statements; without this linkage, a spec-declared symbol
-        // (e.g. `vchar_array`) used in a body procedure is misread as a call.
-        let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
-        for file in files {
-            for info in &file.statements {
-                if let Statement::CreatePackage(pkg) = &info.statement {
-                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
-                }
-            }
-        }
+        let spec_items_by_pkg = build_spec_items_index(files);
 
         for file in files {
             let file_sw = std::time::Instant::now();
@@ -1908,6 +1909,165 @@ impl GraphBuilder {
         Self::create_edges(&all_edges, graph, proc_index, builtin_index);
     }
 
+    /// Dedup key for `AnchorsOn` edges within a single routine/package-variable
+    /// scope: (lowercased object, lowercased column, kind, site). Signature anchors
+    /// (`Param`/`ReturnType`) and variable/nested-type anchors are collected
+    /// from different sources within the same routine and can collide on the
+    /// same column (e.g. a `RETURN t.c%TYPE` clause and a `RESULT t.c%TYPE`
+    /// local variable) — each distinct combination gets exactly one edge.
+    fn anchor_dedup_key(a: &crate::parser::AnchorRef) -> AnchorDedupKey {
+        (
+            a.object.to_lowercase(),
+            a.column.clone().map(|c| c.to_lowercase()),
+            a.kind,
+            a.site,
+        )
+    }
+
+    /// Resolve a flat `%TYPE`/`%ROWTYPE` signature anchor to its target table (creating
+    /// an inferred `Node::Table` if no DDL-backed table exists yet) and add an
+    /// `AnchorsOn` edge from `proc_idx` to it (issue #158).
+    fn add_anchor_edge(
+        graph: &mut CodeGraph,
+        proc_idx: petgraph::graph::NodeIndex,
+        anchor: &crate::parser::AnchorRef,
+        file: Arc<PathBuf>,
+        line: usize,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        let (schema, table) = match anchor.object.rsplit_once('.') {
+            Some((s, t)) => (Some(s), t),
+            None => (None, anchor.object.as_str()),
+        };
+        let key = normalize_table_key(schema, table);
+        let table_idx = *table_index.entry(key).or_insert_with(|| {
+            let node = Node::Table {
+                schema: schema.map(str::to_string),
+                name: table.to_string(),
+                explicit: false,
+                system: is_system(schema, table),
+                location: None,
+                columns: Box::new(vec![]),
+                partition_by: None,
+                distribute_by: None,
+                tablespace: None,
+                temporary: false,
+                unlogged: false,
+                ddl_source: None,
+            };
+            graph.add_node(node)
+        });
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            Edge::AnchorsOn {
+                kind: anchor.kind,
+                column: anchor.column.clone(),
+                site: anchor.site,
+                location: SourceLocation { file, line },
+            },
+        );
+    }
+
+    /// Collect every `AnchorsOn` edge for a single routine: signature
+    /// (`Param`/`ReturnType`) anchors from a flat type string, plus
+    /// variable/nested-type anchors from walking `block` with a fresh
+    /// `AnchorExtractor` (issue #158). `pkg_cursor_names` and
+    /// `pkg_var_type_names` are empty for a top-level
+    /// `CreateProcedure`/`CreateFunction`; a package member routine passes
+    /// its package's cursor and variable/TYPE names so that `%ROWTYPE`/
+    /// `%TYPE` anchored to any of them inside the body is guarded the same
+    /// way a routine-local declaration would be — package-level
+    /// declarations live outside the routine's own `PlBlock`, so the walker
+    /// cannot see them without this injection. Shared across the three call
+    /// sites: top-level procedure, top-level function, package member.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_routine_anchor_edges(
+        graph: &mut CodeGraph,
+        proc_idx: petgraph::graph::NodeIndex,
+        parameters: &[ogsql_parser::ast::RoutineParam],
+        return_type: Option<&str>,
+        block: Option<&ogsql_parser::ast::plpgsql::PlBlock>,
+        pkg_cursor_names: &[String],
+        pkg_var_type_names: &[String],
+        file: Arc<PathBuf>,
+        line: usize,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        anchor_seen: &mut HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
+    ) {
+        // Signature (`Param`/`ReturnType`) anchors must be guarded the same
+        // way the body-walk `AnchorExtractor` guards variable/nested-type
+        // anchors: skip if the anchored object (lowercased, full string —
+        // a schema-qualified `a.object` like `schema.table` never collides
+        // with these bare names) matches a package cursor, a package
+        // variable/TYPE, or another parameter's name. The *current*
+        // parameter's own name is excluded from the "other param" check so
+        // the Oracle self-naming idiom (`p(employees employees%ROWTYPE)`)
+        // still anchors to the real table.
+        let pkg_cursor_set: HashSet<String> = pkg_cursor_names.iter().cloned().collect();
+        let pkg_var_type_set: HashSet<String> = pkg_var_type_names.iter().cloned().collect();
+        let param_name_set: HashSet<String> =
+            parameters.iter().map(|p| p.name.to_lowercase()).collect();
+
+        for param in parameters {
+            if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                &param.data_type,
+                crate::parser::AnchorSite::Param,
+            ) {
+                let obj_lower = a.object.to_lowercase();
+                let is_self = param.name.to_lowercase() == obj_lower;
+                let guarded = pkg_cursor_set.contains(&obj_lower)
+                    || pkg_var_type_set.contains(&obj_lower)
+                    || (param_name_set.contains(&obj_lower) && !is_self);
+                if guarded {
+                    continue;
+                }
+                if anchor_seen.insert((proc_idx, Self::anchor_dedup_key(&a))) {
+                    Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
+                }
+            }
+        }
+        if let Some(rt) = return_type {
+            if let Some(a) = crate::parser::parse_anchor_from_type_string(
+                rt,
+                crate::parser::AnchorSite::ReturnType,
+            ) {
+                let obj_lower = a.object.to_lowercase();
+                // No self-exclusion for RETURN — a routine has no "own
+                // name" among its parameters, so any param-name match is
+                // conservatively guarded.
+                let guarded = pkg_cursor_set.contains(&obj_lower)
+                    || pkg_var_type_set.contains(&obj_lower)
+                    || param_name_set.contains(&obj_lower);
+                if !guarded && anchor_seen.insert((proc_idx, Self::anchor_dedup_key(&a))) {
+                    Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
+                }
+            }
+        }
+
+        let Some(block) = block else {
+            return;
+        };
+
+        let mut anchor_extractor = AnchorExtractor::new();
+        for cname in pkg_cursor_names {
+            anchor_extractor.register_cursor_name(cname);
+        }
+        for vname in pkg_var_type_names {
+            anchor_extractor.register_var_name(vname);
+        }
+        for param in parameters {
+            anchor_extractor.register_var_name(&param.name);
+        }
+        walk_pl_block(&mut anchor_extractor, block);
+        for a in &anchor_extractor.anchors {
+            if anchor_seen.insert((proc_idx, Self::anchor_dedup_key(a))) {
+                Self::add_anchor_edge(graph, proc_idx, a, file.clone(), line, table_index);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_object_ref_edges(
         files: &[ParsedFile],
         graph: &mut CodeGraph,
@@ -1915,7 +2075,22 @@ impl GraphBuilder {
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
         inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        package_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
+        let spec_items_by_pkg = build_spec_items_index(files);
+        // A package's SPEC (`CreatePackage`) and BODY (`CreatePackageBody`)
+        // are separate `Statement`s, each triggering its own
+        // `collect_package_object_ref_edges` call for the same member
+        // routines (same `RoutineId`/graph node). Keyed by package
+        // qualified name so the dedup set spans *both* calls — a signature
+        // anchor declared identically in the SPEC and the BODY collapses to
+        // one edge; an anchor unique to only one side still survives.
+        let mut pkg_anchor_seen: HashMap<
+            String,
+            HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
+        > = HashMap::new();
+
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
@@ -1980,6 +2155,19 @@ impl GraphBuilder {
                                     },
                                 );
                             }
+                            Self::collect_routine_anchor_edges(
+                                graph,
+                                proc_idx,
+                                &p.parameters,
+                                None,
+                                p.block.as_ref(),
+                                &[],
+                                &[],
+                                file_arc.clone(),
+                                info.start_line,
+                                table_index,
+                                &mut HashSet::new(),
+                            );
                         }
                     }
                     Statement::CreateFunction(f) => {
@@ -2053,32 +2241,63 @@ impl GraphBuilder {
                                     },
                                 );
                             }
+                            Self::collect_routine_anchor_edges(
+                                graph,
+                                proc_idx,
+                                &f.parameters,
+                                f.return_type.as_deref(),
+                                f.block.as_ref(),
+                                &[],
+                                &[],
+                                file_arc.clone(),
+                                info.start_line,
+                                table_index,
+                                &mut HashSet::new(),
+                            );
                         }
                     }
                     Statement::CreatePackage(pkg) => {
+                        let anchor_seen = pkg_anchor_seen
+                            .entry(pkg_qualified_key(&pkg.name))
+                            .or_default();
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
+                            &[],
                             info,
                             &file_arc,
                             proc_index,
                             type_index,
                             sequence_index,
                             inferred_sequence_index,
+                            package_index,
+                            table_index,
                             graph,
+                            anchor_seen,
                         );
                     }
                     Statement::CreatePackageBody(pkg) => {
+                        let inherited: &[PackageItem] = spec_items_by_pkg
+                            .get(&pkg_qualified_key(&pkg.name))
+                            .copied()
+                            .unwrap_or(&[]);
+                        let anchor_seen = pkg_anchor_seen
+                            .entry(pkg_qualified_key(&pkg.name))
+                            .or_default();
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
+                            inherited,
                             info,
                             &file_arc,
                             proc_index,
                             type_index,
                             sequence_index,
                             inferred_sequence_index,
+                            package_index,
+                            table_index,
                             graph,
+                            anchor_seen,
                         );
                     }
                     _ => {}
@@ -2091,13 +2310,17 @@ impl GraphBuilder {
     fn collect_package_object_ref_edges(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
+        inherited_items: &[PackageItem],
         info: &ogsql_parser::StatementInfo,
         file_path: &Arc<PathBuf>,
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
         inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        package_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         graph: &mut CodeGraph,
+        anchor_seen: &mut HashSet<(petgraph::graph::NodeIndex, AnchorDedupKey)>,
     ) {
         let pkg_name_part = pkg_name.last().cloned().unwrap_or_default().to_string();
         let schema_part: Option<String> = if pkg_name.len() > 1 {
@@ -2107,10 +2330,137 @@ impl GraphBuilder {
         };
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
+        // Package-level cursor names guard %ROWTYPE anchors for package-level
+        // variables below, and are injected into every member routine's
+        // AnchorExtractor so `rec pkg_cursor%ROWTYPE` inside a routine body
+        // is guarded the same way a routine-local cursor would be (#158).
+        // For a BODY, `inherited_items` carries the matching SPEC's public
+        // Cursor/Variable/Type declarations.
+        let pkg_cursor_names: Vec<String> = pkg_items
+            .iter()
+            .chain(inherited_items.iter())
+            .filter_map(|item| match item {
+                PackageItem::Cursor(c) => Some(c.name.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        // Package-level variable and TYPE names guard %TYPE anchors for
+        // package-level variables below (a variable can shadow an earlier
+        // sibling variable or a package-level TYPE, not just a cursor), and
+        // are injected into every member routine's AnchorExtractor the same
+        // way pkg_cursor_names is.
+        let pkg_var_type_names: Vec<String> = pkg_items
+            .iter()
+            .chain(inherited_items.iter())
+            .filter_map(|item| match item {
+                PackageItem::Variable(v) => Some(v.name.to_lowercase()),
+                PackageItem::Type(t) => Some(crate::parser::pl_type_decl_name(t).to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        // Package-level item anchoring (Variable/Type below) uses an
+        // incremental "declared earlier" set rather than the full
+        // `pkg_var_type_names` above: a package-level declaration's own
+        // name must never guard its own anchor (same insert-after-visit
+        // principle as the extractor, applied to this loop's iteration
+        // order), while a *later* sibling
+        // referencing an *earlier* one is still guarded. Seeded from the
+        // SPEC's inherited var/type names (already fully declared before
+        // this BODY starts); cursor names stay on the full `pkg_cursor_names`
+        // set above — cursor earlier-only ordering is a documented
+        // non-goal.
+        let mut declared_earlier: HashSet<String> = inherited_items
+            .iter()
+            .filter_map(|item| match item {
+                PackageItem::Variable(v) => Some(v.name.to_lowercase()),
+                PackageItem::Type(t) => Some(crate::parser::pl_type_decl_name(t).to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
         for item in pkg_items {
-            let (proc_name, block, kind) = match item {
-                PackageItem::Procedure(p) => (p.name.join("."), &p.block, RoutineKind::Procedure),
-                PackageItem::Function(f) => (f.name.join("."), &f.block, RoutineKind::Function),
+            if let PackageItem::Variable(v) = item {
+                if let Some((object, column, kind)) =
+                    crate::parser::anchor_from_pl_data_type(&v.data_type)
+                {
+                    let obj_lower = object.to_lowercase();
+                    if !pkg_cursor_names.contains(&obj_lower)
+                        && !declared_earlier.contains(&obj_lower)
+                    {
+                        let qualified = pkg_qualified_key(pkg_name);
+                        if let Some(&pkg_idx) = package_index.get(&qualified) {
+                            let anchor = crate::parser::AnchorRef {
+                                object,
+                                column,
+                                kind,
+                                site: crate::parser::AnchorSite::Variable,
+                            };
+                            Self::add_anchor_edge(
+                                graph,
+                                pkg_idx,
+                                &anchor,
+                                file_path.clone(),
+                                info.start_line,
+                                table_index,
+                            );
+                        }
+                    }
+                }
+                declared_earlier.insert(v.name.to_lowercase());
+                continue;
+            }
+
+            if let PackageItem::Type(t) = item {
+                // Package-level nested TYPE declarations (`TABLE OF` /
+                // `VARRAY OF` / `RECORD (...)`) anchor to the **package**
+                // node, the same way a package-level Variable does (issue
+                // #158 NestedType).
+                for (object, column, kind) in crate::parser::anchor_targets_in_pl_type_decl(t) {
+                    let obj_lower = object.to_lowercase();
+                    if pkg_cursor_names.contains(&obj_lower)
+                        || declared_earlier.contains(&obj_lower)
+                    {
+                        continue;
+                    }
+                    let qualified = pkg_qualified_key(pkg_name);
+                    if let Some(&pkg_idx) = package_index.get(&qualified) {
+                        let anchor = crate::parser::AnchorRef {
+                            object,
+                            column,
+                            kind,
+                            site: crate::parser::AnchorSite::NestedType,
+                        };
+                        Self::add_anchor_edge(
+                            graph,
+                            pkg_idx,
+                            &anchor,
+                            file_path.clone(),
+                            info.start_line,
+                            table_index,
+                        );
+                    }
+                }
+                declared_earlier.insert(crate::parser::pl_type_decl_name(t).to_lowercase());
+                continue;
+            }
+
+            let (proc_name, parameters, return_type, block, kind) = match item {
+                PackageItem::Procedure(p) => (
+                    p.name.join("."),
+                    p.parameters.as_slice(),
+                    None,
+                    &p.block,
+                    RoutineKind::Procedure,
+                ),
+                PackageItem::Function(f) => (
+                    f.name.join("."),
+                    f.parameters.as_slice(),
+                    f.return_type.as_ref(),
+                    &f.block,
+                    RoutineKind::Function,
+                ),
                 PackageItem::Raw(_)
                 | PackageItem::Variable(_)
                 | PackageItem::Type(_)
@@ -2125,6 +2475,21 @@ impl GraphBuilder {
             let Some(proc_idx) = proc_index.get(&proc_id.normalized()).copied() else {
                 continue;
             };
+
+            Self::collect_routine_anchor_edges(
+                graph,
+                proc_idx,
+                parameters,
+                return_type.map(|s| s.as_str()),
+                block.as_ref(),
+                &pkg_cursor_names,
+                &pkg_var_type_names,
+                file_path.clone(),
+                info.start_line,
+                table_index,
+                anchor_seen,
+            );
+
             let Some(ref block) = block else {
                 continue;
             };
@@ -4681,6 +5046,25 @@ fn pkg_qualified_key(name: &ogsql_parser::ast::ObjectName) -> String {
     }
 }
 
+// Index package SPEC items by lowercased qualified package name so a package
+// BODY can inherit the SPEC's public Cursor/Variable/Type declarations into
+// both the call-edge extraction scope (`create_sql_edges`) and the anchor
+// guard scope (`create_object_ref_edges`). SPEC and BODY are parsed as
+// independent statements; without this linkage, a spec-declared symbol used
+// in a body procedure is misread as a call, or a spec-declared name shadows
+// a real table without guarding a BODY member routine's anchor to it.
+fn build_spec_items_index(files: &[ParsedFile]) -> HashMap<String, &[PackageItem]> {
+    let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
+    for file in files {
+        for info in &file.statements {
+            if let Statement::CreatePackage(pkg) = &info.statement {
+                spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
+            }
+        }
+    }
+    spec_items_by_pkg
+}
+
 fn edge_call_scope(
     graph: &CodeGraph,
     caller_idx: petgraph::graph::NodeIndex,
@@ -4996,6 +5380,893 @@ mod tests {
                 src, dowork_idx,
                 "DirectCall edges should originate from do_work"
             );
+        }
+    }
+
+    /// issue #158: a function's flat, schema-qualified
+    /// `RETURN bigfund.par_sys_purchase.purchase_days%TYPE` signature must produce an
+    /// `AnchorsOn` edge from the function to the (inferred, no-DDL)
+    /// `bigfund.par_sys_purchase` table, carrying the anchored column and schema.
+    #[test]
+    fn should_create_anchor_edge_from_function_return_type() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION BIGFUND.FNC_GET_PURCHASE_JS_DAYS
+            RETURN bigfund.par_sys_purchase.purchase_days%TYPE
+            IS
+            BEGIN
+                RETURN NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("FNC_GET_PURCHASE_JS_DAYS")))
+            .expect("function node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(func_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "Expected 1 AnchorsOn edge from function"
+        );
+
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn {
+                kind, column, site, ..
+            } => {
+                assert!(matches!(kind, crate::parser::AnchorKind::PercentType));
+                assert_eq!(column.as_deref(), Some("purchase_days"));
+                assert!(matches!(site, crate::parser::AnchorSite::ReturnType));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+
+        match &graph[target] {
+            Node::Table {
+                schema,
+                name,
+                explicit,
+                ..
+            } => {
+                assert_eq!(schema.as_deref(), Some("bigfund"));
+                assert_eq!(name.to_lowercase(), "par_sys_purchase");
+                assert!(
+                    !explicit,
+                    "table with no DDL must be inferred (explicit=false)"
+                );
+            }
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+    }
+
+    /// issue #158: a procedure parameter with a flat `%ROWTYPE` signature must
+    /// produce an `AnchorsOn` edge (site=Param, column=None) to the anchored table.
+    #[test]
+    fn should_create_anchor_edge_from_param_type() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_test(p_in DAT_TRD_REPURCHASE%ROWTYPE)
+            IS
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_test")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "Expected 1 AnchorsOn edge from procedure"
+        );
+
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn {
+                kind, column, site, ..
+            } => {
+                assert!(matches!(kind, crate::parser::AnchorKind::PercentRowType));
+                assert_eq!(*column, None);
+                assert!(matches!(site, crate::parser::AnchorSite::Param));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+    }
+
+    /// issue #158: a routine body that both `SELECT`s from a table and
+    /// declares a `%TYPE` variable anchored to the same table must produce
+    /// two distinct edges — `TableAccess` (DML) and `AnchorsOn` (schema
+    /// anchor) — neither collapsing into or replacing the other.
+    #[test]
+    fn should_keep_table_access_and_anchor_edges_separate() {
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION fnc_test RETURN INT
+            IS
+                v par_sys_purchase.purchase_days%TYPE;
+            BEGIN
+                SELECT t.purchase_days INTO v FROM par_sys_purchase t;
+                RETURN v;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("fnc_test")))
+            .expect("function node should exist");
+        let table_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("par_sys_purchase")))
+            .expect("par_sys_purchase table node should exist");
+
+        let edges_between: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| graph.edge_endpoints(*e) == Some((func_idx, table_idx)))
+            .map(|e| &graph[e])
+            .collect();
+
+        let table_access_count = edges_between
+            .iter()
+            .filter(|e| matches!(e, Edge::TableAccess { .. }))
+            .count();
+        let anchor_count = edges_between
+            .iter()
+            .filter(|e| matches!(e, Edge::AnchorsOn { .. }))
+            .count();
+        assert_eq!(
+            table_access_count, 1,
+            "expected exactly 1 TableAccess edge, got {:?}",
+            edges_between
+        );
+        assert_eq!(
+            anchor_count, 1,
+            "expected exactly 1 AnchorsOn edge, got {:?}",
+            edges_between
+        );
+
+        let has_read = edges_between.iter().any(|e| {
+            matches!(e, Edge::TableAccess { modes, .. } if modes.contains(crate::graph::AccessMode::Read))
+        });
+        assert!(has_read, "TableAccess edge must carry Read mode");
+    }
+
+    /// issue #158 (D3 non-goal / #147 guard): a `cursor%ROWTYPE` record
+    /// variable must NOT produce an `AnchorsOn` edge — the cursor's query
+    /// source table only gets the normal `TableAccess` edge.
+    #[test]
+    fn should_not_create_anchor_edge_for_cursor_rowtype() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_test
+            IS
+                CURSOR c IS SELECT * FROM t_main;
+                rec c%ROWTYPE;
+            BEGIN
+                OPEN c;
+                CLOSE c;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_test")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "cursor%ROWTYPE must not produce any AnchorsOn edge, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let table_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("t_main")))
+            .expect("t_main table node should exist");
+        let has_table_access = graph.edge_indices().any(|e| {
+            graph.edge_endpoints(e) == Some((proc_idx, table_idx))
+                && matches!(&graph[e], Edge::TableAccess { .. })
+        });
+        assert!(
+            has_table_access,
+            "t_main must still get a TableAccess edge from the cursor's SELECT"
+        );
+    }
+
+    /// issue #158: a package-level variable's `%TYPE` anchors to the
+    /// **package** node (package-level variables belong to the package, not
+    /// to any single routine), while a package member function's
+    /// `RETURN ...%TYPE` signature anchors to that **routine's** node.
+    #[test]
+    fn should_anchor_package_level_variable_and_routine_signature() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_anchor AS
+                v_x some_table.some_col%TYPE;
+
+                FUNCTION f RETURN other_tbl.other_col%TYPE IS
+                BEGIN
+                    RETURN NULL;
+                END;
+            END pkg_anchor;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_anchor"))
+            .expect("package node should exist");
+        let func_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Function { id, .. } if id.name.eq_ignore_ascii_case("f")))
+            .expect("function node should exist");
+
+        // Package-level variable anchor: pkg -> some_table, site=Variable.
+        let pkg_anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            pkg_anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge from the package node"
+        );
+        let (_, pkg_anchor_target) = graph.edge_endpoints(pkg_anchor_edges[0]).unwrap();
+        match &graph[pkg_anchor_target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "some_table"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[pkg_anchor_edges[0]] {
+            Edge::AnchorsOn { column, site, .. } => {
+                assert_eq!(column.as_deref(), Some("some_col"));
+                assert!(matches!(site, crate::parser::AnchorSite::Variable));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+
+        // Routine signature anchor: f -> other_tbl, site=ReturnType.
+        let func_anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(func_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            func_anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge from the package function"
+        );
+        let (_, func_anchor_target) = graph.edge_endpoints(func_anchor_edges[0]).unwrap();
+        match &graph[func_anchor_target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "other_tbl"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[func_anchor_edges[0]] {
+            Edge::AnchorsOn { column, site, .. } => {
+                assert_eq!(column.as_deref(), Some("other_col"));
+                assert!(matches!(site, crate::parser::AnchorSite::ReturnType));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+    }
+
+    /// issue #158: a package-level `CURSOR` guards a package-level
+    /// `%ROWTYPE` variable anchored to it — no `AnchorsOn` (or table) edge
+    /// must be created for the cursor name itself.
+    #[test]
+    fn should_skip_package_level_cursor_rowtype() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_cur AS
+                CURSOR c IS SELECT * FROM t_pkg_main;
+                rec c%ROWTYPE;
+
+                PROCEDURE noop IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_cur;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package-level cursor%ROWTYPE must not produce any AnchorsOn edge, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let cursor_node = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("c")),
+        );
+        assert!(
+            cursor_node.is_none(),
+            "the cursor name 'c' must never become a table node"
+        );
+    }
+
+    /// A routine parameter is never a `PlDeclaration` inside
+    /// the block, so the body-walking `AnchorExtractor` cannot see it
+    /// without explicit injection. A `%TYPE` anchored to a parameter name
+    /// must be guarded like any other local variable — not resolved into a
+    /// fake inferred table.
+    #[test]
+    fn should_skip_type_anchored_to_param_name() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_param_guard(p_emp VARCHAR2)
+            IS
+                v p_emp.empno%TYPE;
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_param_guard")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "parameter name p_emp must guard the %TYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("p_emp")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "parameter name p_emp must never become a table node"
+        );
+    }
+
+    /// A package-level `%TYPE` anchored to an *earlier*
+    /// package-level variable name must be guarded (not just cursor names),
+    /// while a real table anchor on another package variable is unaffected.
+    #[test]
+    fn should_skip_package_var_anchored_to_earlier_package_var() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_var_guard AS
+                v_emp employees%ROWTYPE;
+                v_id v_emp.empno%TYPE;
+            END pkg_var_guard;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_var_guard"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp -> employees); v_id must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("v_emp")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package variable name v_emp must never become a table node"
+        );
+    }
+
+    /// A package-level `TYPE ... IS RECORD (...)` name is
+    /// visible to every member routine in the package (like a package-level
+    /// cursor). A `%TYPE` inside a member routine's body anchored to that
+    /// package-level TYPE name must be guarded, not resolved into a fake
+    /// inferred table.
+    #[test]
+    fn should_skip_type_anchored_to_package_level_record() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_rec_guard AS
+                TYPE pkg_rec_t IS RECORD (col1 INTEGER);
+
+                FUNCTION f RETURN INT IS
+                    v pkg_rec_t.col1%TYPE;
+                BEGIN
+                    RETURN NULL;
+                END;
+            END pkg_rec_guard;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package-level TYPE name pkg_rec_t must guard the member routine's %TYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("pkg_rec_t")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package-level TYPE name pkg_rec_t must never become a table node"
+        );
+    }
+
+    /// Issue #158 NestedType: a package-level nested `TYPE`
+    /// declaration (`TABLE OF` / `RECORD (...)`) whose element/field type is
+    /// `%TYPE`-anchored to a real table must produce an `AnchorsOn` edge
+    /// from the **package** node (site=NestedType) — the same site used for
+    /// routine-local nested TYPE declarations. A nested TYPE anchored to
+    /// another package-level TYPE name must be guarded like any other
+    /// package-level name collision.
+    #[test]
+    fn should_anchor_package_level_nested_type() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_nested_type AS
+                TYPE t_list IS TABLE OF some_table.some_col%TYPE;
+                TYPE t_rec IS RECORD (f other_table.other_col%TYPE);
+                TYPE t_bad IS TABLE OF t_list.col%TYPE;
+            END pkg_nested_type;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_nested_type"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 AnchorsOn edges (t_list->some_table, t_rec->other_table); t_bad must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let mut targets: Vec<(String, Option<String>)> = anchor_edges
+            .iter()
+            .map(|&e| {
+                let (_, target) = graph.edge_endpoints(e).unwrap();
+                let name = match &graph[target] {
+                    Node::Table { name, .. } => name.to_lowercase(),
+                    other => panic!("expected Node::Table, got {:?}", other),
+                };
+                let column = match &graph[e] {
+                    Edge::AnchorsOn { column, site, .. } => {
+                        assert!(matches!(site, crate::parser::AnchorSite::NestedType));
+                        column.clone()
+                    }
+                    other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+                };
+                (name, column)
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                ("other_table".to_string(), Some("other_col".to_string())),
+                ("some_table".to_string(), Some("some_col".to_string())),
+            ]
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("t_list")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package-level TYPE name t_list must never become a table node"
+        );
+    }
+
+    /// A package BODY's anchor guards must
+    /// inherit its SPEC's cursor/variable/TYPE names, the same way the
+    /// call-edge extraction path already inherits `spec_items_by_pkg`.
+    /// Without inheritance, a member routine in the BODY that anchors to a
+    /// SPEC-declared variable/TYPE produces a false table anchor because
+    /// `collect_package_object_ref_edges` only sees the BODY's own
+    /// `pkg_items` when building its guard sets.
+    #[test]
+    fn should_inherit_spec_names_for_body_anchor_guards() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE pkg_spec AS
+                CURSOR c IS SELECT id FROM t_cursor_src;
+                TYPE rec_t IS RECORD (f INTEGER);
+                v_emp employees%ROWTYPE;
+            END pkg_spec;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_spec AS
+                PROCEDURE p_body IS
+                    v1 rec_t.f%TYPE;
+                    v2 v_emp.empno%TYPE;
+                    v_ok real_table.real_col%TYPE;
+                BEGIN
+                    NULL;
+                END;
+            END pkg_spec;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+
+        // Two legitimate anchors survive: SPEC's own v_emp->employees, and
+        // BODY's v_ok->real_table. rec_t/v_emp must be guarded in the BODY
+        // member routine via SPEC inheritance (v1/v2 produce no anchors).
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 AnchorsOn edges (v_emp->employees from SPEC, v_ok->real_table \
+             from BODY); v1/v2 must be guarded via SPEC inheritance, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let mut target_names: Vec<String> = anchor_edges
+            .iter()
+            .map(|&e| {
+                let (_, target) = graph.edge_endpoints(e).unwrap();
+                match &graph[target] {
+                    Node::Table { name, .. } => name.to_lowercase(),
+                    other => panic!("expected Node::Table, got {:?}", other),
+                }
+            })
+            .collect();
+        target_names.sort();
+        assert_eq!(target_names, vec!["employees", "real_table"]);
+
+        for fake in ["c", "rec_t", "v_emp"] {
+            let fake_table = graph.node_indices().find(
+                |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case(fake)),
+            );
+            assert!(
+                fake_table.is_none(),
+                "SPEC-declared name '{}' must never become a table node",
+                fake
+            );
+        }
+    }
+
+    /// Issue #158: a routine parameter's flat
+    /// `%ROWTYPE` signature anchor bypasses the guard entirely — the
+    /// signature loop in `collect_routine_anchor_edges` never consults
+    /// `pkg_cursor_names`/`pkg_var_type_names`/other-param names, unlike
+    /// the body-walk `AnchorExtractor` which does. `p(p_rec c%ROWTYPE)`
+    /// with `c` a package-level cursor must not produce a fake `c` table.
+    #[test]
+    fn should_skip_signature_anchor_to_package_cursor() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_sig_cursor AS
+                CURSOR c IS SELECT id FROM t_cursor_src;
+
+                PROCEDURE p(p_rec c%ROWTYPE) IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_sig_cursor;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package cursor 'c' must guard the signature %ROWTYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("c")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "cursor name 'c' must never become a table node via a signature anchor"
+        );
+    }
+
+    /// Same bypass as above (issue #158), but for
+    /// package-level TYPE and Variable names anchored via a parameter's
+    /// `%TYPE` signature.
+    #[test]
+    fn should_skip_signature_anchor_to_package_type_and_variable() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_sig_type_var AS
+                TYPE emp_rec IS RECORD (f INTEGER);
+                v_emp employees%ROWTYPE;
+
+                FUNCTION f1(p_id emp_rec.empno%TYPE) RETURN INT IS
+                BEGIN
+                    RETURN NULL;
+                END;
+
+                PROCEDURE p2(p_id v_emp.empno%TYPE) IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_sig_type_var;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+
+        // Only the SPEC-independent package-level v_emp->employees anchor
+        // (from the Variable declaration itself) may survive; f1/p2's
+        // signature anchors to emp_rec/v_emp must both be guarded.
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp->employees); f1/p2 signature \
+             anchors to emp_rec/v_emp must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        for fake in ["emp_rec", "v_emp"] {
+            let fake_table = graph.node_indices().find(
+                |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case(fake)),
+            );
+            assert!(
+                fake_table.is_none(),
+                "'{}' must never become a table node via a signature anchor",
+                fake
+            );
+        }
+    }
+
+    /// Issue #158: a package member routine's signature
+    /// declared in the SPEC (`CREATE PACKAGE ... PROCEDURE p(t t%ROWTYPE);`,
+    /// no body) and re-declared in the BODY (`CREATE PACKAGE BODY ...
+    /// PROCEDURE p(t t%ROWTYPE) IS ... END;`, with body) both resolve to the
+    /// same `RoutineId`/graph node — `create_object_ref_edges` walks the
+    /// SPEC statement and the BODY statement separately, each calling
+    /// `collect_package_object_ref_edges` → `collect_routine_anchor_edges`
+    /// once. Without a dedup set that spans *both* calls, the identical
+    /// `Param` signature anchor (`t t%ROWTYPE`) is emitted twice. A
+    /// `Variable`-site anchor that only exists in the BODY's local
+    /// declaration must still be emitted — different `site` never folds.
+    #[test]
+    fn should_dedupe_signature_anchors_across_spec_and_body() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE pkg_spec_body_dup AS
+                PROCEDURE p(t t%ROWTYPE);
+            END pkg_spec_body_dup;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_spec_body_dup AS
+                PROCEDURE p(t t%ROWTYPE) IS
+                    v1 other_table.other_col%TYPE;
+                BEGIN
+                    NULL;
+                END;
+            END pkg_spec_body_dup;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected exactly 2 AnchorsOn edges (t->t Param anchor deduped across \
+             SPEC+BODY, plus v1->other_table Variable anchor from BODY only), got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let param_anchors: Vec<_> = anchor_edges
+            .iter()
+            .filter(|&&e| {
+                matches!(
+                    &graph[e],
+                    Edge::AnchorsOn {
+                        site: crate::parser::AnchorSite::Param,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            param_anchors.len(),
+            1,
+            "the identical t->t Param signature anchor from SPEC and BODY must \
+             collapse to exactly 1 edge, got {:?}",
+            param_anchors
+                .iter()
+                .map(|&&e| &graph[e])
+                .collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(*param_anchors[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "t"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        let variable_anchors: Vec<_> = anchor_edges
+            .iter()
+            .filter(|&&e| {
+                matches!(
+                    &graph[e],
+                    Edge::AnchorsOn {
+                        site: crate::parser::AnchorSite::Variable,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            variable_anchors.len(),
+            1,
+            "the BODY-only v1->other_table Variable anchor must still be emitted \
+             (different site never folds), got {:?}",
+            variable_anchors
+                .iter()
+                .map(|&&e| &graph[e])
+                .collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(*variable_anchors[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "other_table"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+    }
+
+    /// Issue #158: the signature guard must
+    /// exclude the *currently declared* parameter's own name from the
+    /// "other param names" skip set — `PROCEDURE p(employees employees%ROWTYPE)`
+    /// is the Oracle self-naming idiom (parameter named after its anchored
+    /// table) and must still anchor to the real `employees` table.
+    #[test]
+    fn should_still_anchor_param_named_after_table() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p(employees employees%ROWTYPE)
+            IS
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("p")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "self-named parameter must still anchor to the real table, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn { site, .. } => {
+                assert!(matches!(site, crate::parser::AnchorSite::Param));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+    }
+
+    /// Issue #158: the self-naming idiom applies
+    /// to package-level variable declarations too — `v_emp v_emp%ROWTYPE`
+    /// at package scope must anchor to the real `v_emp` table (insert-
+    /// after-visit in the extractor), while a sibling variable anchored to
+    /// that same, now *earlier*-declared package variable (`v_id
+    /// v_emp.empno%TYPE`) is still guarded by the earlier-only set.
+    #[test]
+    fn should_anchor_package_var_self_named_after_table() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_self_named AS
+                v_emp v_emp%ROWTYPE;
+                v_id v_emp.empno%TYPE;
+            END pkg_self_named;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_self_named"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp->v_emp table, self-named); v_id \
+             must still be guarded (v_emp declared earlier), got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "v_emp"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn { site, .. } => {
+                assert!(matches!(site, crate::parser::AnchorSite::Variable));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
         }
     }
 

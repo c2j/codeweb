@@ -369,6 +369,10 @@ fn edge_dot_attrs(edge: &Edge) -> (String, String) {
             "label=\"aliases\"".to_string(),
             "color=purple, style=dashed,".to_string(),
         ),
+        Edge::AnchorsOn { .. } => (
+            "label=\"anchors_on\"".to_string(),
+            "color=teal,".to_string(),
+        ),
         Edge::CustomEdge { type_name, .. } => (
             format!("label=\"{}\"", dot_escape(type_name)),
             "style=dashed,".to_string(),

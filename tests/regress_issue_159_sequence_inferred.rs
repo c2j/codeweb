@@ -150,7 +150,7 @@ $$ LANGUAGE plpgsql;
     assert_eq!(&rebuilt_store[..9], b"CWEBSTORE");
     assert_eq!(
         u32::from_le_bytes(rebuilt_store[9..13].try_into().unwrap()),
-        12
+        13
     );
     assert_one_inferred_sequence_edge(&export_json(temp.path()));
 }
