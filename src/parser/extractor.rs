@@ -1247,6 +1247,41 @@ impl Visitor for AnchorExtractor {
                 }
                 self.var_names.insert(pl_type_decl_name(t).to_lowercase());
             }
+            // Nested routines have their own parameter list and scope. The
+            // default walker recurses into the nested block AFTER this
+            // returns, with no cleanup — leaking nested locals outward and
+            // never registering the nested parameters as guarded names. We
+            // prevent this by returning SkipChildren and manually walking
+            // the nested block with a save/restore barrier, mirroring
+            // `CallExtractor::visit_pl_declaration`'s `NestedProcedure`/
+            // `NestedFunction` arms. Nested RETURN-type anchoring is not
+            // done — a nested routine has no independent graph node.
+            PlDeclaration::NestedProcedure(p) => {
+                let saved_cursors = std::mem::take(&mut self.cursor_names);
+                let saved_vars = std::mem::take(&mut self.var_names);
+                for param in &p.parameters {
+                    self.register_var_name(&param.name);
+                }
+                if let Some(ref block) = p.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.cursor_names = saved_cursors;
+                self.var_names = saved_vars;
+                return VisitorResult::SkipChildren;
+            }
+            PlDeclaration::NestedFunction(f) => {
+                let saved_cursors = std::mem::take(&mut self.cursor_names);
+                let saved_vars = std::mem::take(&mut self.var_names);
+                for param in &f.parameters {
+                    self.register_var_name(&param.name);
+                }
+                if let Some(ref block) = f.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.cursor_names = saved_cursors;
+                self.var_names = saved_vars;
+                return VisitorResult::SkipChildren;
+            }
             _ => {}
         }
         VisitorResult::Continue
@@ -4896,6 +4931,69 @@ mod tests {
         assert!(matches!(anchors[0].site, AnchorSite::NestedType));
         assert_eq!(anchors[0].object, "par_sys_purchase");
         assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+    }
+
+    /// PR #164 review round 3 (#158): a nested routine (declared inside an
+    /// enclosing routine's `DECLARE` section) has its own parameter list.
+    /// `AnchorExtractor` has no `NestedProcedure`/`NestedFunction` arm, so
+    /// the default walker recurses into the nested block with the *same*
+    /// extractor — the nested parameter `p_emp` is never registered as a
+    /// guarded local name, so `v p_emp.empno%TYPE` inside the nested body
+    /// wrongly anchors to a fabricated `p_emp` table.
+    #[test]
+    fn should_skip_type_anchored_to_nested_proc_param() {
+        let sql = "CREATE OR REPLACE PROCEDURE outer_proc(p1 IN NUMBER) AS \
+            PROCEDURE inner_proc(p_emp VARCHAR2) AS \
+                v p_emp.empno%TYPE; \
+            BEGIN \
+                NULL; \
+            END inner_proc; \
+            BEGIN \
+                inner_proc(p1); \
+            END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "nested routine's own parameter 'p_emp' must guard the %TYPE anchor, got {:?}",
+            anchors
+        );
+    }
+
+    /// PR #164 review round 3 (#158): without a save/restore scope barrier,
+    /// a nested routine's local `CURSOR`/variable declarations are inserted
+    /// directly into the shared `cursor_names`/`var_names` sets (no
+    /// isolation), leaking into the enclosing routine's guard state after
+    /// the nested block finishes walking.
+    #[test]
+    fn should_restore_scope_after_nested_routine() {
+        let sql = "CREATE OR REPLACE PROCEDURE outer_proc(p1 IN NUMBER) AS \
+            PROCEDURE inner_proc(p_emp VARCHAR2) AS \
+                CURSOR c_inner IS SELECT id FROM t_x; \
+                v_local INTEGER; \
+            BEGIN \
+                NULL; \
+            END inner_proc; \
+            BEGIN \
+                inner_proc(p1); \
+            END;";
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut ex = AnchorExtractor::new();
+        for info in &stmts {
+            walk_statement(&mut ex, &info.statement);
+        }
+        assert!(
+            ex.cursor_names.is_empty(),
+            "nested cursor name must not leak into the outer scope after the \
+             nested routine's block finishes walking, got {:?}",
+            ex.cursor_names
+        );
+        assert!(
+            !ex.var_names.contains("v_local") && !ex.var_names.contains("p_emp"),
+            "nested local var/param names must not leak into the outer scope, got {:?}",
+            ex.var_names
+        );
     }
 
     #[test]
