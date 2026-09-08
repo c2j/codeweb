@@ -572,7 +572,7 @@ impl McpState {
         let table_filter = params.table.as_deref();
 
         let result = if let Some(name) = &params.procedure {
-            let idx = match resolve_node(store, name) {
+            let idx = match resolve_node(store, name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -585,7 +585,7 @@ impl McpState {
             crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
         } else {
             let name = params.package.as_ref().expect("checked exactly-one above");
-            let idx = match resolve_node(store, name) {
+            let idx = match resolve_node(store, name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -658,7 +658,7 @@ impl McpState {
                 serde_json::to_string(&json).unwrap_or_default()
             }
             crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
-                let table_idx = match resolve_node(store, &table_name) {
+                let table_idx = match resolve_node(store, &table_name, false) {
                     Ok(idx) => idx,
                     Err(msg) => return msg,
                 };
@@ -711,18 +711,32 @@ impl McpState {
 /// Resolve `name` (substring match, same as `trace`/CLI `columns`/`lineage`) to a single
 /// node, or a pre-serialized `{"error": ...}` JSON string on empty/ambiguous match —
 /// shared by `codeweb_column_analysis` and `codeweb_lineage`.
-fn resolve_node(store: &GraphStore, name: &str) -> Result<NodeIndex, String> {
+fn resolve_node(
+    store: &GraphStore,
+    name: &str,
+    fail_on_multiple: bool,
+) -> Result<NodeIndex, String> {
     match store.resolve_single_node(
         name,
         crate::graph::search::MatchMode::Substring,
         false,
-        false,
+        fail_on_multiple,
     ) {
         crate::graph::search::ResolveResult::Single(idx, _) => Ok(idx),
-        _ => {
+        crate::graph::search::ResolveResult::Empty => {
             let err = serde_json::json!({"error": format!("No nodes matching '{}'", name)});
             Err(serde_json::to_string(&err).unwrap_or_default())
         }
+        crate::graph::search::ResolveResult::Ambiguous => {
+            let count = store
+                .search_nodes_with_mode(name, crate::graph::search::MatchMode::Substring)
+                .len();
+            let err = serde_json::json!({
+                "error": format!("Ambiguous match: {} candidates for '{}'", count, name)
+            });
+            Err(serde_json::to_string(&err).unwrap_or_default())
+        }
+        crate::graph::search::ResolveResult::Multiple(_) => unreachable!("all_matches is false"),
     }
 }
 

@@ -224,6 +224,29 @@ fn columns_unknown_procedure_errors_cleanly() {
     );
 }
 
+#[test]
+fn columns_ambiguous_substring_fails_explicitly() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE PROCEDURE prc_order AS BEGIN NULL; END;
+CREATE PROCEDURE prc_order_header AS BEGIN NULL; END;
+"#,
+    );
+
+    let out = columns_json(&root, &["--procedure", "prc_order"]);
+
+    assert!(!out.status.success(), "ambiguous query should fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .to_lowercase()
+            .contains("ambiguous"),
+        "stderr should explain ambiguity: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// #168: a `%ROWTYPE` record fetched from a cursor over a "detail" table
 /// (`mid_yjqs_detail`), referenced in a `SELECT ... INTO` WHERE clause against a
 /// dimension table (`par_sys_purchase`), must surface as a cross-table

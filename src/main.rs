@@ -182,6 +182,8 @@ struct ImpactResult {
 struct PredicatesResult {
     schema_version: u32,
     procedure: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
     predicates: Vec<crate::parser::PlPredicate>,
 }
 
@@ -1624,49 +1626,36 @@ fn cmd_lineage(
         );
     }
 
-    // Node keys (`table:schema.table`) must not be last-dot-split — the final dot is
-    // part of the key, not a `table.column` separator.
-    let (table_name, column_name) = if graph::key::split_type_prefix(target).is_some() {
-        (target, None)
-    } else {
-        match target.rsplit_once('.') {
-            Some((table, column)) if !table.is_empty() && !column.is_empty() => {
-                (table, Some(column))
+    let parsed_target = match graph::lineage::parse_lineage_target(graph, target) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            if message.starts_with("table '") {
+                eprintln!("error: {}", message);
+            } else {
+                eprintln!("{}", message);
             }
-            Some(_) => {
-                eprintln!(
-                    "Invalid target format: {}. Use 'table', 'table.column', or a node key like 'table:schema.table'",
-                    target
-                );
-                return Ok(());
-            }
-            None => (target, None),
+            return Ok(());
         }
     };
-
-    // A missing table half means the split was probably `schema.table`: reinterpret the
-    // whole target as a table reference. An ambiguous half stops with a qualifier hint.
-    let (table_name, column_name) = match column_name {
-        Some(column) => match graph::lineage::lookup_table_node(graph, table_name) {
-            graph::lineage::TableLookup::Found(_) => (table_name, Some(column)),
-            graph::lineage::TableLookup::Ambiguous => {
-                eprintln!(
-                    "error: table '{}' is ambiguous across schemas — qualify it as \
-                     'schema.{table_name}' for table-level, or 'schema.{table_name}.{column}' \
-                     for column-level lineage",
-                    table_name
-                );
-                return Ok(());
+    let (table_name, column_name) = match &parsed_target {
+        graph::lineage::ParsedLineageTarget::Column(table, column) => {
+            (table.as_str(), Some(column.as_str()))
+        }
+        graph::lineage::ParsedLineageTarget::Table(table) => {
+            if let Some((prefix, suffix)) = target.rsplit_once('.') {
+                if !prefix.is_empty()
+                    && !suffix.is_empty()
+                    && graph::key::split_type_prefix(target).is_none()
+                    && table == target
+                {
+                    eprintln!(
+                        "note: no table '{}' found — interpreting '{}' as a table reference (for column-level lineage, the table must exist)",
+                        prefix, target
+                    );
+                }
             }
-            graph::lineage::TableLookup::Missing => {
-                eprintln!(
-                    "note: no table '{}' found — interpreting '{}' as a table reference (for column-level lineage, the table must exist)",
-                    table_name, target
-                );
-                (target, None)
-            }
-        },
-        None => (table_name, None),
+            (table.as_str(), None)
+        }
     };
 
     // Parse direction up front — both the table and column paths need it. `None` means
@@ -1895,7 +1884,7 @@ fn cmd_columns(
             &name,
             crate::graph::search::MatchMode::Substring,
             false,
-            false,
+            true,
         );
         let idx = match resolved {
             crate::graph::search::ResolveResult::Single(idx, _) => idx,
@@ -1991,10 +1980,10 @@ fn cmd_predicates(procedure: &str, format: &str, project: &Path) -> Result<()> {
         procedure,
         crate::graph::search::MatchMode::Substring,
         false,
-        false,
+        true,
     );
-    let (idx, display) = match resolved {
-        crate::graph::search::ResolveResult::Single(idx, display) => (idx, display),
+    let idx = match resolved {
+        crate::graph::search::ResolveResult::Single(idx, _) => idx,
         crate::graph::search::ResolveResult::Empty => {
             return Err(error::CodeWebError::ExportError {
                 message: format!("No procedure or function found matching '{}'", procedure),
@@ -2019,17 +2008,17 @@ fn cmd_predicates(procedure: &str, format: &str, project: &Path) -> Result<()> {
         .procedure_predicates
         .get(&key)
         .cloned()
-        .filter(|predicates| !predicates.is_empty())
-        .ok_or_else(|| error::CodeWebError::ExportError {
-            message: format!("No PL predicates found for '{}'", procedure),
-        })?;
-    let procedure_name = display
-        .split_once(':')
-        .map_or(display.as_str(), |(_, name)| name)
-        .to_string();
+        .unwrap_or_default();
+    let (procedure_name, package) = match &store.graph()[idx] {
+        graph::Node::Procedure { id, .. } | graph::Node::Function { id, .. } => {
+            (id.name.clone(), id.package.clone())
+        }
+        _ => unreachable!("routine node type checked above"),
+    };
     let result = PredicatesResult {
         schema_version: 1,
         procedure: procedure_name,
+        package,
         predicates,
     };
     match format {

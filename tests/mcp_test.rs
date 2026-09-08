@@ -317,6 +317,24 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_column_analysis_reports_ambiguous_match() {
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"codeweb_column_analysis","arguments":{"procedure":"p_demo"}}}"#,
+        );
+        let resp = mcp.recv_response(6);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool response text");
+        let error: serde_json::Value = serde_json::from_str(text).expect("error JSON");
+
+        assert_eq!(error["error"], "Ambiguous match: 2 candidates for 'p_demo'");
+    }
+
+    #[test]
     fn test_mcp_call_lineage() {
         let (_tmpdir, project) = create_analyzed_project();
         let mut mcp = McpChild::start(&project);

@@ -685,6 +685,7 @@ curl http://127.0.0.1:3000/api/v1/graph
 | `table` | string | 否 | 仅输出与指定表相关的诊断信息 |
 
 `procedure` 与 `package` 必须提供其中之一。
+名称不存在时返回 `404`；子串匹配到多个候选时返回 `400`，不会静默选择首个结果。
 
 ### 请求示例
 
@@ -847,6 +848,6 @@ curl "http://127.0.0.1:3000/api/v1/trace?from=sp_calc_risk&depth=5&max_nodes=100
 | HTTP 状态码 | 说明 |
 |-------------|------|
 | `200` | 成功 |
-| `400` | 请求参数错误（如 QuerySpec JSON 格式错误、不支持的导出格式） |
-| `404` | 节点不存在（`node_detail`、`node_callers`、`node_callees`、`trace`） |
+| `400` | 请求参数错误或 `/api/v1/columns` 名称匹配存在歧义 |
+| `404` | 节点不存在（包括 `/api/v1/columns` 无匹配） |
 | `500` | 服务器内部错误 |

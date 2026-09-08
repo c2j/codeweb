@@ -483,15 +483,43 @@ async fn trace(
 
 /// Resolve `name` (substring match, same as `trace`/CLI `columns`/`lineage`) to a single
 /// node — shared by the `columns` and `lineage` handlers.
-fn resolve_node(store: &GraphStore, name: &str) -> Option<NodeIndex> {
+enum ResolveNodeError {
+    Empty,
+    Ambiguous(usize),
+}
+
+fn resolve_node(
+    store: &GraphStore,
+    name: &str,
+    fail_on_multiple: bool,
+) -> Result<NodeIndex, ResolveNodeError> {
     match store.resolve_single_node(
         name,
         crate::graph::search::MatchMode::Substring,
         false,
-        false,
+        fail_on_multiple,
     ) {
-        crate::graph::search::ResolveResult::Single(idx, _) => Some(idx),
-        _ => None,
+        crate::graph::search::ResolveResult::Single(idx, _) => Ok(idx),
+        crate::graph::search::ResolveResult::Empty => Err(ResolveNodeError::Empty),
+        crate::graph::search::ResolveResult::Ambiguous => Err(ResolveNodeError::Ambiguous(
+            store
+                .search_nodes_with_mode(name, crate::graph::search::MatchMode::Substring)
+                .len(),
+        )),
+        crate::graph::search::ResolveResult::Multiple(_) => unreachable!("all_matches is false"),
+    }
+}
+
+fn resolve_http_error(name: &str, error: ResolveNodeError) -> (StatusCode, String) {
+    match error {
+        ResolveNodeError::Empty => (
+            StatusCode::NOT_FOUND,
+            format!("No nodes matching '{}'", name),
+        ),
+        ResolveNodeError::Ambiguous(count) => (
+            StatusCode::BAD_REQUEST,
+            format!("Ambiguous match: {} candidates for '{}'", count, name),
+        ),
     }
 }
 
@@ -518,12 +546,8 @@ async fn columns(
     let table_filter = query.table.as_deref();
 
     let result = if let Some(name) = &query.procedure {
-        let idx = resolve_node(store, name).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("No nodes matching '{}'", name),
-            )
-        })?;
+        let idx =
+            resolve_node(store, name, true).map_err(|error| resolve_http_error(name, error))?;
         if !matches!(&graph[idx], Node::Procedure { .. } | Node::Function { .. }) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -533,12 +557,8 @@ async fn columns(
         crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
     } else {
         let name = query.package.as_ref().expect("checked exactly-one above");
-        let idx = resolve_node(store, name).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("No nodes matching '{}'", name),
-            )
-        })?;
+        let idx =
+            resolve_node(store, name, true).map_err(|error| resolve_http_error(name, error))?;
         if !matches!(&graph[idx], Node::Package { .. }) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -608,7 +628,7 @@ async fn lineage(
             Ok(Json(json))
         }
         crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
-            let table_idx = resolve_node(store, &table_name).ok_or_else(|| {
+            let table_idx = resolve_node(store, &table_name, false).map_err(|_| {
                 (
                     StatusCode::NOT_FOUND,
                     format!("No table found matching '{}'", table_name),

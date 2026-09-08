@@ -231,6 +231,18 @@ mod tests {
     }
 
     #[test]
+    fn test_serve_columns_ambiguous_target_is_400() {
+        let port = 19890;
+        let mut child = start_server(port);
+
+        let (status, body) = get(port, "/api/v1/columns?procedure=p_demo");
+        stop_server(&mut child);
+
+        assert_eq!(status, 400);
+        assert!(body.contains("Ambiguous match"), "unexpected body: {body}");
+    }
+
+    #[test]
     fn test_serve_lineage_endpoint() {
         let port = 19885;
         let mut child = start_server(port);

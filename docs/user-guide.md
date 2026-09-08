@@ -740,12 +740,14 @@ codeweb predicates --procedure <名称> [OPTIONS]
 | `--format <格式>` | 输出格式（目前仅支持 `json`） |
 
 **输出包含**：
+- **过程身份**：`procedure` 始终为裸过程/函数名；包内例程另有 `package` 字段，便于与 `columns` 输出关联。
 - **置信度 (Confidence)**：High（直接列比较）、Medium（经变量传递）、Low（复杂表达式或维表关联）。
 - **Param Table Hint**：如果谓词涉及维表开关，会产出造数建议。
 - **Needs Review**：对于无法自动解析的复杂逻辑，保留原始代码片段供人工审计。
 
 **注意**：
-- 该命令需要存储版本 ≥ v11。
+- 该命令需要存储版本 ≥ v12。
+- 已解析到过程但没有 `IF`/`CASE` 谓词时命令仍成功，并返回 `"predicates": []`；仅名称不存在或存在歧义时失败。
 
 **示例**：
 ```bash
