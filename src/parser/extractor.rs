@@ -1874,7 +1874,7 @@ pub struct CursorColumn {
 }
 
 /// Column reference.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ColumnRef {
     /// Resolved table name (via alias_map). None if unresolvable or unprefixed.
     pub resolved_table: Option<String>,
@@ -1901,7 +1901,7 @@ pub enum ColumnContext {
 }
 
 /// Equi-join condition.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct JoinCondition {
     pub left_table: String,
     pub left_column: String,
@@ -1911,7 +1911,7 @@ pub struct JoinCondition {
     pub source: JoinConditionSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
@@ -1920,22 +1920,66 @@ pub enum JoinType {
     Cross,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JoinConditionSource {
     ImplicitWhere,
     ExplicitOn,
+    /// #168: one side is a `%ROWTYPE` record field resolved to its underlying cursor
+    /// source column (via `resolve_record_field`), not a plain SQL table alias. Kept
+    /// distinct from `ImplicitWhere`/`ExplicitOn` so downstream consumers can weigh the
+    /// confidence of a derived cross-table key differently from a literal equi-join.
+    RecordField,
 }
 
 /// WHERE clause hard-coded filter.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// `Serialize` is hand-written (not derived) for `transform`: this struct is persisted
+/// via bincode (GraphStore, non-self-describing — every field must occupy a fixed byte
+/// position) AND exported via JSON (self-describing). `#[serde(skip_serializing_if)]`
+/// would omit the field's bytes on bincode writes whenever `transform` is `None`,
+/// desyncing every subsequent field on read (`bincode deserialize: io error`). Branching
+/// on `Serializer::is_human_readable()` keeps bincode's field count fixed while still
+/// omitting `transform` from JSON when absent, per issue #169's schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
 pub struct HardFilter {
     pub table: Option<String>,
     pub column: String,
     pub operator: FilterOperator,
     pub value: FilterValue,
+    #[serde(default)]
+    pub transform: Option<FilterTransform>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+impl serde::Serialize for HardFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let omit_transform = serializer.is_human_readable() && self.transform.is_none();
+        let field_count = if omit_transform { 4 } else { 5 };
+        let mut state = serializer.serialize_struct("HardFilter", field_count)?;
+        state.serialize_field("table", &self.table)?;
+        state.serialize_field("column", &self.column)?;
+        state.serialize_field("operator", &self.operator)?;
+        state.serialize_field("value", &self.value)?;
+        if !omit_transform {
+            state.serialize_field("transform", &self.transform)?;
+        }
+        state.end()
+    }
+}
+
+/// #169: descriptor of a whitelisted pure column transform in a filter.
+/// Serialized as {"fn": "substr", "args": [1, 2]} per issue schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FilterTransform {
+    #[serde(rename = "fn")]
+    pub fn_name: String,
+    pub args: Vec<FilterValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FilterOperator {
     Eq,
     Neq,
@@ -1951,7 +1995,7 @@ pub enum FilterOperator {
     IsNotNull,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FilterValue {
     String(String),
     Integer(i64),
@@ -1963,7 +2007,7 @@ pub enum FilterValue {
 }
 
 /// CASE/DECODE enum value mapping.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EnumMapping {
     pub column: String,
     pub table_alias: Option<String>,
@@ -1972,21 +2016,21 @@ pub struct EnumMapping {
 }
 
 /// SELECT INTO variable assignment.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SelectIntoMapping {
     pub column_expr: String,
     pub into_variable: String,
 }
 
 /// INSERT column info.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InsertColumnInfo {
     pub table: String,
     pub columns: Vec<String>,
 }
 
 /// UPDATE SET column info.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UpdateColumnInfo {
     pub table: String,
     pub set_columns: Vec<String>,
@@ -2379,6 +2423,13 @@ impl ColumnAccessExtractor {
                                 join_type,
                                 is_explicit_on,
                             );
+                            // #168: a `%ROWTYPE` record field also parses as a
+                            // multi-part ColumnRef, so `extract_join_condition` above
+                            // silently no-ops on it (its alias prefix fails
+                            // `resolve_alias`, a plain-table-alias lookup). Retry via
+                            // `resolve_record_field` — a no-op itself when neither side
+                            // is a registered record field.
+                            self.extract_record_field_join(&l_names, &r_names, join_type);
                             // Also add column refs in join context
                             self.add_column_ref(&l_names, Some(ColumnContext::JoinCondition));
                             self.add_column_ref(&r_names, Some(ColumnContext::JoinCondition));
@@ -2389,6 +2440,24 @@ impl ColumnAccessExtractor {
                         } else if let Some(col_names) = as_column_ref(right) {
                             if let Some(val) = literal_to_filter_value(left) {
                                 self.add_hard_filter(&col_names, FilterOperator::Eq, val);
+                            }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Eq,
+                                    val,
+                                    Some(transform),
+                                );
+                            }
+                        } else if let Some((col_names, transform)) = column_transform_of(right) {
+                            if let Some(val) = literal_to_filter_value(left) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Eq,
+                                    val,
+                                    Some(transform),
+                                );
                             }
                         }
                     }
@@ -2401,12 +2470,39 @@ impl ColumnAccessExtractor {
                             if let Some(val) = literal_to_filter_value(left) {
                                 self.add_hard_filter(&col_names, FilterOperator::Neq, val);
                             }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Neq,
+                                    val,
+                                    Some(transform),
+                                );
+                            }
+                        } else if let Some((col_names, transform)) = column_transform_of(right) {
+                            if let Some(val) = literal_to_filter_value(left) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Neq,
+                                    val,
+                                    Some(transform),
+                                );
+                            }
                         }
                     }
                     ">" => {
                         if let Some(col_names) = as_column_ref(left) {
                             if let Some(val) = literal_to_filter_value(right) {
                                 self.add_hard_filter(&col_names, FilterOperator::Gt, val);
+                            }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Gt,
+                                    val,
+                                    Some(transform),
+                                );
                             }
                         }
                     }
@@ -2415,6 +2511,15 @@ impl ColumnAccessExtractor {
                             if let Some(val) = literal_to_filter_value(right) {
                                 self.add_hard_filter(&col_names, FilterOperator::Gte, val);
                             }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Gte,
+                                    val,
+                                    Some(transform),
+                                );
+                            }
                         }
                     }
                     "<" => {
@@ -2422,12 +2527,30 @@ impl ColumnAccessExtractor {
                             if let Some(val) = literal_to_filter_value(right) {
                                 self.add_hard_filter(&col_names, FilterOperator::Lt, val);
                             }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Lt,
+                                    val,
+                                    Some(transform),
+                                );
+                            }
                         }
                     }
                     "<=" => {
                         if let Some(col_names) = as_column_ref(left) {
                             if let Some(val) = literal_to_filter_value(right) {
                                 self.add_hard_filter(&col_names, FilterOperator::Lte, val);
+                            }
+                        } else if let Some((col_names, transform)) = column_transform_of(left) {
+                            if let Some(val) = literal_to_filter_value(right) {
+                                self.add_hard_filter_with_transform(
+                                    &col_names,
+                                    FilterOperator::Lte,
+                                    val,
+                                    Some(transform),
+                                );
                             }
                         }
                     }
@@ -2558,11 +2681,86 @@ impl ColumnAccessExtractor {
         }
     }
 
+    /// #168: an equi-comparison where exactly one side is a `%ROWTYPE` record field
+    /// (resolved via `resolve_record_field`) and the other a plain table column produces
+    /// a cross-table `JoinCondition` tagged `JoinConditionSource::RecordField`. Symmetric
+    /// in `left_names`/`right_names` — the record may appear on either side — so a single
+    /// call covers both orientations, unlike `extract_join_condition`'s two-direction
+    /// dedup-by-reverse pattern. Produces nothing when both or neither side resolves as a
+    /// record field (plain equi-joins are `extract_join_condition`'s territory; a record
+    /// vs. a parameter/PL-variable/unregistered-record side resolves to `None` on both
+    /// legs and is dropped here, never guessing a table).
+    fn extract_record_field_join(
+        &mut self,
+        left_names: &[ogsql_parser::Ident],
+        right_names: &[ogsql_parser::Ident],
+        join_type: &AstJoinType,
+    ) {
+        let left_record = self.resolve_record_field(left_names);
+        let right_record = self.resolve_record_field(right_names);
+        let ((record_table, record_col), plain_names) = match (left_record, right_record) {
+            (Some(rec), None) => (rec, right_names),
+            (None, Some(rec)) => (rec, left_names),
+            _ => return,
+        };
+
+        let (plain_alias, plain_col) = split_alias_column(plain_names);
+        let Some(plain_table) = plain_alias
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone())
+        else {
+            return;
+        };
+
+        let jt = match join_type {
+            AstJoinType::Inner => JoinType::Inner,
+            AstJoinType::Left => JoinType::Left,
+            AstJoinType::Right => JoinType::Right,
+            AstJoinType::Full => JoinType::Full,
+            AstJoinType::Cross => JoinType::Cross,
+        };
+
+        let candidate = JoinCondition {
+            left_table: plain_table.clone(),
+            left_column: plain_col.clone(),
+            right_table: record_table.clone(),
+            right_column: record_col.clone(),
+            join_type: jt,
+            source: JoinConditionSource::RecordField,
+        };
+        let already_exists = self.join_conditions.iter().any(|existing| {
+            (existing.left_table == plain_table
+                && existing.left_column == plain_col
+                && existing.right_table == record_table
+                && existing.right_column == record_col)
+                || (existing.left_table == record_table
+                    && existing.left_column == record_col
+                    && existing.right_table == plain_table
+                    && existing.right_column == plain_col)
+        });
+        if !already_exists {
+            self.join_conditions.push(candidate);
+        }
+    }
+
     fn add_hard_filter(
         &mut self,
         col_names: &[ogsql_parser::Ident],
         op: FilterOperator,
         val: FilterValue,
+    ) {
+        self.add_hard_filter_with_transform(col_names, op, val, None);
+    }
+
+    /// #169: like `add_hard_filter`, but also records the whitelisted column transform
+    /// (`substr`/`nvl`/`trim`/`upper`/`lower`) the column was wrapped in, if any.
+    fn add_hard_filter_with_transform(
+        &mut self,
+        col_names: &[ogsql_parser::Ident],
+        op: FilterOperator,
+        val: FilterValue,
+        transform: Option<FilterTransform>,
     ) {
         let (alias_prefix, column) = split_alias_column(col_names);
         let table = alias_prefix
@@ -2574,6 +2772,7 @@ impl ColumnAccessExtractor {
             column,
             operator: op,
             value: val,
+            transform,
         });
     }
 
@@ -3152,42 +3351,8 @@ impl ColumnAccessExtractor {
         // `%ROWTYPE` record field (issue #147 L2): `rec.id` where rec is a record
         // resolves to the cursor's source column by output name.
         if let Some(record) = &alias_prefix {
-            if let Some(cursor) = self.record_cursors.get(&record.to_lowercase()) {
-                if let Some(cols) = self.cursor_sources.get(cursor) {
-                    if let Some(col) = cols
-                        .iter()
-                        .find(|c| c.output_name.eq_ignore_ascii_case(&column))
-                    {
-                        if !col.source_col.is_empty() {
-                            return ColumnSource::Column {
-                                table: col.source_table.clone(),
-                                column: col.source_col.clone(),
-                            };
-                        }
-                    }
-                    // #142: a single catch-all cursor source (empty output name —
-                    // `SELECT *` cursor, or dynamic-SQL attribution) covers every
-                    // record field: the exact column is unknown, attribute to the
-                    // cursor's table under the field's own name (same philosophy as
-                    // `resolve_cursor_flows`).
-                    if let [single] = cols.as_slice() {
-                        if single.output_name.is_empty() {
-                            if let Some(ref t) = single.source_table {
-                                return ColumnSource::Column {
-                                    table: Some(t.clone()),
-                                    column: column.clone(),
-                                };
-                            }
-                        }
-                    }
-                } else {
-                    // A table-anchored %ROWTYPE record has no cursor_sources entry;
-                    // its fields are the anchor table's columns.
-                    return ColumnSource::Column {
-                        table: Some(cursor.clone()),
-                        column: column.clone(),
-                    };
-                }
+            if let Some(source) = self.record_field_source(record, &column) {
+                return source;
             }
         }
 
@@ -3196,6 +3361,71 @@ impl ColumnAccessExtractor {
             None => self.scope_sole_table.clone(),
         };
         ColumnSource::Column { table, column }
+    }
+
+    /// Shared record-field resolution rules (issue #142/#147), factored out of
+    /// `column_source` so `resolve_record_field` (issue #168: WHERE/JOIN ON join
+    /// extraction) can reuse the exact same three rules without duplicating them:
+    /// (1) cursor-anchored record whose SELECT output name matches `column` exactly →
+    /// the cursor's source column; (2) a single catch-all cursor source (`SELECT *` /
+    /// dynamic SQL, empty output name) → the cursor's anchor table + `column`'s own
+    /// name; (3) table-anchored `%ROWTYPE` (no `cursor_sources` entry) → anchor table +
+    /// `column`. Returns `None` when `alias_prefix` is not a registered record variable,
+    /// or none of the three rules apply — callers fall back to their own default (never
+    /// a guessed table).
+    fn record_field_source(&self, alias_prefix: &str, column: &str) -> Option<ColumnSource> {
+        let cursor = self.record_cursors.get(&alias_prefix.to_lowercase())?;
+        let Some(cols) = self.cursor_sources.get(cursor) else {
+            // A table-anchored %ROWTYPE record has no cursor_sources entry; its fields
+            // are the anchor table's columns.
+            return Some(ColumnSource::Column {
+                table: Some(cursor.clone()),
+                column: column.to_string(),
+            });
+        };
+        if let Some(col) = cols
+            .iter()
+            .find(|c| c.output_name.eq_ignore_ascii_case(column))
+        {
+            if !col.source_col.is_empty() {
+                return Some(ColumnSource::Column {
+                    table: col.source_table.clone(),
+                    column: col.source_col.clone(),
+                });
+            }
+        }
+        // #142: a single catch-all cursor source (empty output name — `SELECT *`
+        // cursor, or dynamic-SQL attribution) covers every record field: the exact
+        // column is unknown, attribute to the cursor's table under the field's own
+        // name (same philosophy as `resolve_cursor_flows`).
+        if let [single] = cols.as_slice() {
+            if single.output_name.is_empty() {
+                if let Some(ref t) = single.source_table {
+                    return Some(ColumnSource::Column {
+                        table: Some(t.clone()),
+                        column: column.to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// #168: resolve a `%ROWTYPE` record field appearing in a WHERE/JOIN ON
+    /// equi-comparison to its underlying `(table, column)` pair, via `record_field_source`.
+    /// Returns `None` for anything that is not a resolvable record field: a plain table
+    /// column, a procedure parameter/PL variable, or a record variable with no registered
+    /// cursor/table anchor. Never guesses a table.
+    fn resolve_record_field(&self, names: &[ogsql_parser::Ident]) -> Option<(String, String)> {
+        let (alias_prefix, column) = split_alias_column(names);
+        let alias_prefix = alias_prefix?;
+        match self.record_field_source(&alias_prefix, &column)? {
+            ColumnSource::Column {
+                table: Some(t),
+                column,
+            } => Some((t, column)),
+            _ => None,
+        }
     }
 
     /// Describe how `expr` produces a value: which inputs feed it, and whether it is a
@@ -3658,7 +3888,7 @@ fn peel_parenthesized(mut expr: &Expr) -> &Expr {
     expr
 }
 
-fn format_expr_short(expr: &Expr) -> String {
+pub(crate) fn format_expr_short(expr: &Expr) -> String {
     match expr {
         Expr::ColumnRef(names) => names.join("."),
         Expr::ColumnRefOuterJoin(names) => format!("{}(+)", names.join(".")),
@@ -3869,7 +4099,7 @@ fn format_literal_short(lit: &Literal) -> String {
     }
 }
 
-fn split_alias_column(names: &[ogsql_parser::Ident]) -> (Option<String>, String) {
+pub(crate) fn split_alias_column(names: &[ogsql_parser::Ident]) -> (Option<String>, String) {
     if names.len() >= 2 {
         (
             Some(names[0].to_string()),
@@ -3892,15 +4122,68 @@ fn split_schema_table(name: &ObjectName) -> (Option<String>, String) {
 }
 
 /// Check if an expression is a ColumnRef and return the names.
-fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {
+pub(crate) fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {
     match expr {
         Expr::ColumnRef(names) => Some(names.clone()),
         _ => None,
     }
 }
 
+/// #169: functions whose result is a pure transform of a single column argument —
+/// eligible for a HardFilter `transform` descriptor when compared to a literal. D5
+/// (closed set; no arbitrary function is accepted).
+const FILTER_TRANSFORM_WHITELIST: &[&str] = &["substr", "nvl", "trim", "upper", "lower"];
+
+/// #169: detect a whitelisted pure column transform (`substr(col, 1, 2)`, `nvl(col, 0)`,
+/// keyword-syntax `substring(col FROM 1 FOR 2)`, ...) wrapping exactly one column
+/// reference, with every other argument a literal. Handles both `Expr::FunctionCall`
+/// (comma syntax) and `Expr::SpecialFunction` (keyword syntax) per D5. Returns the
+/// target column's raw name segments plus the transform descriptor (function name
+/// lowercased; "substring" normalized to "substr"). Returns `None` when: the function
+/// is not whitelisted, zero or more-than-one argument is a column reference, or any
+/// other argument fails `literal_to_filter_value` (e.g. a PL variable) — the caller then
+/// produces no HardFilter for that side.
+pub(crate) fn column_transform_of(
+    expr: &Expr,
+) -> Option<(Vec<ogsql_parser::Ident>, FilterTransform)> {
+    let (raw_name, args): (String, &[Expr]) = match expr {
+        Expr::FunctionCall { name, args, .. } => (name.join(".").to_lowercase(), args.as_slice()),
+        Expr::SpecialFunction { name, args, .. } => (name.to_lowercase(), args.as_slice()),
+        _ => return None,
+    };
+    let fn_name = if raw_name == "substring" {
+        "substr".to_string()
+    } else {
+        raw_name
+    };
+    if !FILTER_TRANSFORM_WHITELIST.contains(&fn_name.as_str()) {
+        return None;
+    }
+
+    let mut target: Option<Vec<ogsql_parser::Ident>> = None;
+    let mut other_args: Vec<FilterValue> = Vec::new();
+    for arg in args {
+        if let Some(col_names) = as_column_ref(arg) {
+            if target.is_some() {
+                return None;
+            }
+            target = Some(col_names);
+        } else {
+            other_args.push(literal_to_filter_value(arg)?);
+        }
+    }
+    let target = target?;
+    Some((
+        target,
+        FilterTransform {
+            fn_name,
+            args: other_args,
+        },
+    ))
+}
+
 /// Convert a Literal expression to FilterValue. Returns None for non-literal (PL variables, etc).
-fn literal_to_filter_value(expr: &Expr) -> Option<FilterValue> {
+pub(crate) fn literal_to_filter_value(expr: &Expr) -> Option<FilterValue> {
     match expr {
         Expr::Literal(lit) => Some(literal_to_fv(lit)),
         Expr::TypeCast { expr, .. } => literal_to_filter_value(expr),
@@ -3909,6 +4192,38 @@ fn literal_to_filter_value(expr: &Expr) -> Option<FilterValue> {
             FilterValue::Float(f) => FilterValue::Float(format!("-{}", f)),
             other => other,
         }),
+        _ => None,
+    }
+}
+
+/// Resolve a `%ROWTYPE` record field from procedure context without coupling another
+/// analysis pass to `ColumnAccessExtractor`'s mutable statement state. This is the same
+/// three-rule policy used by `record_field_source`: exact cursor output, one catch-all
+/// cursor source, then table-anchored `%ROWTYPE`; unresolved fields are never guessed.
+pub(crate) fn resolve_record_field_from_context(
+    ctx: &ProcedureVarContext,
+    names: &[ogsql_parser::Ident],
+) -> Option<(String, String)> {
+    let (record, column) = split_alias_column(names);
+    let cursor = ctx.record_cursors.get(&record?.to_lowercase())?;
+    let Some(cols) = ctx.cursor_sources.get(cursor) else {
+        return Some((cursor.clone(), column));
+    };
+    if let Some(source) = cols
+        .iter()
+        .find(|source| source.output_name.eq_ignore_ascii_case(&column))
+    {
+        if let Some(table) = &source.source_table {
+            if !source.source_col.is_empty() {
+                return Some((table.clone(), source.source_col.clone()));
+            }
+        }
+    }
+    match cols.as_slice() {
+        [source] if source.output_name.is_empty() => source
+            .source_table
+            .as_ref()
+            .map(|table| (table.clone(), column)),
         _ => None,
     }
 }
@@ -4787,6 +5102,25 @@ mod column_tests {
         results
     }
 
+    /// #168: like `extract_column_analysis`, but seeded with a procedure variable
+    /// context (cursor/record bindings that in real procedures come from the DECLARE
+    /// block) — needed for tests exercising record-field WHERE/JOIN ON resolution.
+    fn extract_column_analysis_with_context(
+        sql: &str,
+        ctx: &ProcedureVarContext,
+    ) -> Vec<ColumnAnalysis> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut results = Vec::new();
+        for info in &stmts {
+            let mut extractor = ColumnAccessExtractor::new_with_context(ctx);
+            walk_statement(&mut extractor, &info.statement);
+            results.push(extractor.finish());
+        }
+        results
+    }
+
     fn find_column_ref<'a>(refs: &'a [ColumnRef], col: &str) -> Option<&'a ColumnRef> {
         refs.iter().find(|r| r.column == col)
     }
@@ -4834,6 +5168,209 @@ mod column_tests {
         assert_eq!(hf.table, Some("table_a".to_string()));
         assert_eq!(hf.operator, FilterOperator::Eq);
         assert_eq!(&hf.value, &FilterValue::String("active".to_string()));
+    }
+
+    // ── Record-field cross-table joins (#168) ──────────────────────────────
+
+    /// #168: a record field on the right of a WHERE equi-comparison resolves through
+    /// the cursor's SELECT source, producing a cross-table `JoinCondition` tagged
+    /// `RecordField` (par_sys_purchase.security_id ↔ mid_yjqs_detail.security_id).
+    #[test]
+    fn record_field_in_where_resolves_to_cross_table_join() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "c_get_data".to_string(),
+            vec![
+                CursorColumn {
+                    output_name: "security_id".to_string(),
+                    source_table: Some("mid_yjqs_detail".to_string()),
+                    source_col: "security_id".to_string(),
+                },
+                CursorColumn {
+                    output_name: "fund_code".to_string(),
+                    source_table: Some("mid_yjqs_detail".to_string()),
+                    source_col: "fund_code".to_string(),
+                },
+            ],
+        );
+        ctx.record_cursors
+            .insert("r_get_purchase".to_string(), "c_get_data".to_string());
+
+        let analyses = extract_column_analysis_with_context(
+            "SELECT t.purchase_days INTO v_purchase_days FROM par_sys_purchase t \
+             WHERE t.security_id = r_get_purchase.security_id",
+            &ctx,
+        );
+        assert_eq!(analyses.len(), 1);
+        let jc = analyses[0]
+            .join_conditions
+            .iter()
+            .find(|jc| jc.source == JoinConditionSource::RecordField)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no RecordField join condition in {:#?}",
+                    analyses[0].join_conditions
+                )
+            });
+        assert_eq!(jc.left_table, "par_sys_purchase");
+        assert_eq!(jc.left_column, "security_id");
+        assert_eq!(jc.right_table, "mid_yjqs_detail");
+        assert_eq!(jc.right_column, "security_id");
+    }
+
+    /// #168: the record field may appear on either side of `=`; the resolved join must
+    /// be the same regardless of source order.
+    #[test]
+    fn record_field_join_works_in_both_orientations() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "c_get_data".to_string(),
+            vec![CursorColumn {
+                output_name: "fund_code".to_string(),
+                source_table: Some("mid_yjqs_detail".to_string()),
+                source_col: "fund_code".to_string(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r_get_purchase".to_string(), "c_get_data".to_string());
+
+        let analyses = extract_column_analysis_with_context(
+            "SELECT t.purchase_days INTO v_purchase_days FROM par_sys_purchase t \
+             WHERE r_get_purchase.fund_code = t.fund_code",
+            &ctx,
+        );
+        assert_eq!(analyses.len(), 1);
+        let jc = analyses[0]
+            .join_conditions
+            .iter()
+            .find(|jc| jc.source == JoinConditionSource::RecordField)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no RecordField join condition in {:#?}",
+                    analyses[0].join_conditions
+                )
+            });
+        assert_eq!(jc.left_table, "par_sys_purchase");
+        assert_eq!(jc.left_column, "fund_code");
+        assert_eq!(jc.right_table, "mid_yjqs_detail");
+        assert_eq!(jc.right_column, "fund_code");
+    }
+
+    /// #168: a plain `ON a.id = b.id` equi-join must regress unchanged — no
+    /// `RecordField` rows sneak in when neither side is a record.
+    #[test]
+    fn plain_on_equi_join_unchanged() {
+        let sql = "SELECT a.id FROM table_a a JOIN table_b b ON a.id = b.id";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+
+        assert_eq!(a.join_conditions.len(), 1);
+        let jc = &a.join_conditions[0];
+        assert_eq!(jc.left_table, "table_a");
+        assert_eq!(jc.left_column, "id");
+        assert_eq!(jc.right_table, "table_b");
+        assert_eq!(jc.right_column, "id");
+        assert_eq!(jc.source, JoinConditionSource::ExplicitOn);
+    }
+
+    /// #168: a record vs. a procedure parameter/PL variable, and a record vs. an
+    /// unregistered record variable, must both produce no join — never guess a table.
+    #[test]
+    fn record_vs_param_or_unregistered_produces_no_join() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "c_get_data".to_string(),
+            vec![CursorColumn {
+                output_name: "security_id".to_string(),
+                source_table: Some("mid_yjqs_detail".to_string()),
+                source_col: "security_id".to_string(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "c_get_data".to_string());
+        let analyses = extract_column_analysis_with_context(
+            "SELECT t.id FROM par_sys_purchase t WHERE r.security_id = p_i_date",
+            &ctx,
+        );
+        assert!(
+            analyses[0].join_conditions.is_empty(),
+            "record vs. param/PL variable must not produce a join: {:#?}",
+            analyses[0].join_conditions
+        );
+
+        let analyses2 = extract_column_analysis(
+            "SELECT t.purchase_days FROM par_sys_purchase t \
+             WHERE t.security_id = r_unregistered.security_id",
+        );
+        assert!(
+            analyses2[0].join_conditions.is_empty(),
+            "unregistered record variable must not produce a join (no table guessing): {:#?}",
+            analyses2[0].join_conditions
+        );
+    }
+
+    /// #168: table-anchored `%ROWTYPE` (no `cursor_sources` entry — the record's type
+    /// is a table, not a cursor) resolves through the WHERE/JOIN path too.
+    #[test]
+    fn table_anchored_rowtype_resolves_in_where() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.record_cursors
+            .insert("r".to_string(), "t_src".to_string());
+        let analyses = extract_column_analysis_with_context(
+            "SELECT t.id FROM par_sys_purchase t WHERE t.id = r.id",
+            &ctx,
+        );
+        let jc = analyses[0]
+            .join_conditions
+            .iter()
+            .find(|jc| jc.source == JoinConditionSource::RecordField)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no RecordField join condition in {:#?}",
+                    analyses[0].join_conditions
+                )
+            });
+        assert_eq!(jc.left_table, "par_sys_purchase");
+        assert_eq!(jc.left_column, "id");
+        assert_eq!(jc.right_table, "t_src");
+        assert_eq!(jc.right_column, "id");
+    }
+
+    /// #168: a `SELECT *` cursor's single catch-all source (empty output name)
+    /// resolves through the WHERE/JOIN path too, attributing to the cursor's table
+    /// under the field's own name.
+    #[test]
+    fn star_cursor_catch_all_resolves_in_where() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let analyses = extract_column_analysis_with_context(
+            "SELECT t.id FROM par_sys_purchase t WHERE t.id = r.id",
+            &ctx,
+        );
+        let jc = analyses[0]
+            .join_conditions
+            .iter()
+            .find(|jc| jc.source == JoinConditionSource::RecordField)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no RecordField join condition in {:#?}",
+                    analyses[0].join_conditions
+                )
+            });
+        assert_eq!(jc.left_table, "par_sys_purchase");
+        assert_eq!(jc.left_column, "id");
+        assert_eq!(jc.right_table, "t_src");
+        assert_eq!(jc.right_column, "id");
     }
 
     #[test]
@@ -5065,6 +5602,163 @@ mod column_tests {
         assert!(
             id_refs[0].contexts.contains(&ColumnContext::OrderBy),
             "should have OrderBy context"
+        );
+    }
+
+    // ── #169: function-wrapped column filters (whitelist + transform) ────────
+
+    /// #169: a whitelisted pure column transform compared against a literal yields a
+    /// HardFilter on the underlying column, with a transform descriptor.
+    #[test]
+    fn substr_wrapped_column_literal_becomes_hard_filter_with_transform() {
+        let sql = "SELECT qs.stock_kind FROM t_quote_snapshot qs WHERE substr(qs.stock_kind, 1, 2) = '05'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        let hf = find_hard_filter(&a.hard_filters, "stock_kind").expect("stock_kind filter");
+        assert_eq!(hf.table, Some("t_quote_snapshot".to_string()));
+        assert_eq!(hf.operator, FilterOperator::Eq);
+        assert_eq!(hf.value, FilterValue::String("05".to_string()));
+        assert_eq!(
+            hf.transform,
+            Some(FilterTransform {
+                fn_name: "substr".to_string(),
+                args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
+            })
+        );
+    }
+
+    /// #169: the STEP3 mixed-cursor case — transformed and plain filters coexist.
+    #[test]
+    fn step3_cursor_mixed_filters_all_captured() {
+        let sql = "SELECT qs.stock_kind FROM t_quote_snapshot qs WHERE substr(qs.stock_kind,1,2)='05' AND qs.stock_kind <> '0509' AND qs.scdm = '001' AND qs.cjsl > 0";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert_eq!(
+            a.hard_filters.len(),
+            4,
+            "expected 4 hard filters, got: {:?}",
+            a.hard_filters
+        );
+
+        let transformed = find_hard_filter(&a.hard_filters, "stock_kind").expect("stock_kind");
+        assert!(transformed.transform.is_some());
+        assert_eq!(transformed.operator, FilterOperator::Eq);
+        assert_eq!(transformed.value, FilterValue::String("05".to_string()));
+
+        let scdm = find_hard_filter(&a.hard_filters, "scdm").expect("scdm");
+        assert_eq!(scdm.transform, None);
+        let cjsl = find_hard_filter(&a.hard_filters, "cjsl").expect("cjsl");
+        assert_eq!(cjsl.transform, None);
+
+        let neq_filters: Vec<_> = a
+            .hard_filters
+            .iter()
+            .filter(|f| f.operator == FilterOperator::Neq)
+            .collect();
+        assert_eq!(neq_filters.len(), 1);
+        assert_eq!(neq_filters[0].transform, None);
+    }
+
+    /// #169: non-literal extra args exclude the filter (PL variable in args).
+    #[test]
+    fn substr_with_variable_length_arg_is_excluded() {
+        let sql = "SELECT col FROM t WHERE substr(col, 1, v_len) = '05'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(
+            a.hard_filters.is_empty(),
+            "substr with variable length arg should not produce a hard filter, got: {:?}",
+            a.hard_filters
+        );
+    }
+
+    /// #169: non-whitelisted function or func-vs-func comparisons stay excluded.
+    #[test]
+    fn non_whitelisted_or_double_sided_function_is_excluded() {
+        let sql1 = "SELECT col FROM t WHERE fnc_x(col) = '1'";
+        let analyses1 = extract_column_analysis(sql1);
+        assert!(
+            analyses1[0].hard_filters.is_empty(),
+            "fnc_x is not whitelisted"
+        );
+
+        let sql2 = "SELECT a, b FROM t WHERE nvl(a,1) = nvl(b,2)";
+        let analyses2 = extract_column_analysis(sql2);
+        assert!(
+            analyses2[0].hard_filters.is_empty(),
+            "func-vs-func comparison should not produce a hard filter"
+        );
+    }
+
+    /// #169: SpecialFunction (keyword syntax) is covered too.
+    #[test]
+    fn substr_keyword_syntax_produces_transform() {
+        let sql = "SELECT col FROM t WHERE substring(col FROM 1 FOR 2) = '05'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        let hf = find_hard_filter(&a.hard_filters, "col").expect("col filter");
+        assert_eq!(
+            hf.transform,
+            Some(FilterTransform {
+                fn_name: "substr".to_string(),
+                args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
+            })
+        );
+    }
+
+    /// #169: nvl transform includes its default-value argument.
+    #[test]
+    fn nvl_transform_includes_default_arg() {
+        let sql = "SELECT col FROM t WHERE nvl(col, '0') = '1'";
+        let analyses = extract_column_analysis(sql);
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        let hf = find_hard_filter(&a.hard_filters, "col").expect("col filter");
+        assert_eq!(
+            hf.transform,
+            Some(FilterTransform {
+                fn_name: "nvl".to_string(),
+                args: vec![FilterValue::String("0".to_string())],
+            })
+        );
+    }
+
+    /// #169: plain filters must NOT carry a `transform` key in JSON (skip_serializing_if).
+    #[test]
+    fn plain_filter_json_has_no_transform_key_but_transformed_filter_does() {
+        let plain = HardFilter {
+            table: Some("t".to_string()),
+            column: "status".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::String("active".to_string()),
+            transform: None,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("transform"),
+            "plain filter JSON must omit transform key, got: {}",
+            json
+        );
+
+        let transformed = HardFilter {
+            table: Some("t".to_string()),
+            column: "stock_kind".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::String("05".to_string()),
+            transform: Some(FilterTransform {
+                fn_name: "substr".to_string(),
+                args: vec![FilterValue::Integer(1), FilterValue::Integer(2)],
+            }),
+        };
+        let json2 = serde_json::to_string(&transformed).unwrap();
+        assert!(
+            json2.contains(r#""transform":{"fn":"substr","args":["#),
+            "transformed filter JSON must contain a transform.fn key, got: {}",
+            json2
         );
     }
 
