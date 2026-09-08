@@ -2147,7 +2147,7 @@ impl GraphBuilder {
         // AnchorExtractor so `rec pkg_cursor%ROWTYPE` inside a routine body
         // is guarded the same way a routine-local cursor would be (#158).
         // For a BODY, `inherited_items` carries the matching SPEC's public
-        // Cursor/Variable/Type declarations (PR #164 review round 2).
+        // Cursor/Variable/Type declarations.
         let pkg_cursor_names: Vec<String> = pkg_items
             .iter()
             .chain(inherited_items.iter())
@@ -2161,7 +2161,7 @@ impl GraphBuilder {
         // package-level variables below (a variable can shadow an earlier
         // sibling variable or a package-level TYPE, not just a cursor), and
         // are injected into every member routine's AnchorExtractor the same
-        // way pkg_cursor_names is (PR #164 review).
+        // way pkg_cursor_names is.
         let pkg_var_type_names: Vec<String> = pkg_items
             .iter()
             .chain(inherited_items.iter())
@@ -2175,9 +2175,9 @@ impl GraphBuilder {
         // Package-level item anchoring (Variable/Type below) uses an
         // incremental "declared earlier" set rather than the full
         // `pkg_var_type_names` above: a package-level declaration's own
-        // name must never guard its own anchor (PR #164 review round 2
-        // issue 3 — same insert-after-visit principle as the extractor,
-        // applied to this loop's iteration order), while a *later* sibling
+        // name must never guard its own anchor (same insert-after-visit
+        // principle as the extractor, applied to this loop's iteration
+        // order), while a *later* sibling
         // referencing an *earlier* one is still guarded. Seeded from the
         // SPEC's inherited var/type names (already fully declared before
         // this BODY starts); cursor names stay on the full `pkg_cursor_names`
@@ -2228,7 +2228,7 @@ impl GraphBuilder {
                 // Package-level nested TYPE declarations (`TABLE OF` /
                 // `VARRAY OF` / `RECORD (...)`) anchor to the **package**
                 // node, the same way a package-level Variable does (issue
-                // #158 NestedType; PR #164 review).
+                // #158 NestedType).
                 for (object, column, kind) in crate::parser::anchor_targets_in_pl_type_decl(t) {
                     let obj_lower = object.to_lowercase();
                     if pkg_cursor_names.contains(&obj_lower)
@@ -5243,7 +5243,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review: a routine parameter is never a `PlDeclaration` inside
+    /// A routine parameter is never a `PlDeclaration` inside
     /// the block, so the body-walking `AnchorExtractor` cannot see it
     /// without explicit injection. A `%TYPE` anchored to a parameter name
     /// must be guarded like any other local variable — not resolved into a
@@ -5287,7 +5287,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review: a package-level `%TYPE` anchored to an *earlier*
+    /// A package-level `%TYPE` anchored to an *earlier*
     /// package-level variable name must be guarded (not just cursor names),
     /// while a real table anchor on another package variable is unaffected.
     #[test]
@@ -5333,7 +5333,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review: a package-level `TYPE ... IS RECORD (...)` name is
+    /// A package-level `TYPE ... IS RECORD (...)` name is
     /// visible to every member routine in the package (like a package-level
     /// cursor). A `%TYPE` inside a member routine's body anchored to that
     /// package-level TYPE name must be guarded, not resolved into a fake
@@ -5372,7 +5372,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review (issue #158 NestedType): a package-level nested `TYPE`
+    /// Issue #158 NestedType: a package-level nested `TYPE`
     /// declaration (`TABLE OF` / `RECORD (...)`) whose element/field type is
     /// `%TYPE`-anchored to a real table must produce an `AnchorsOn` edge
     /// from the **package** node (site=NestedType) — the same site used for
@@ -5445,16 +5445,13 @@ mod tests {
         );
     }
 
-    /// PR #164 review round 2 (#158): a package BODY's anchor guards must
+    /// A package BODY's anchor guards must
     /// inherit its SPEC's cursor/variable/TYPE names, the same way the
     /// call-edge extraction path already inherits `spec_items_by_pkg`.
     /// Without inheritance, a member routine in the BODY that anchors to a
     /// SPEC-declared variable/TYPE produces a false table anchor because
     /// `collect_package_object_ref_edges` only sees the BODY's own
-    /// `pkg_items` when building its guard sets. (The signature/`Param`
-    /// anchor path has no guard at all yet — that's PR #164 review issue 1,
-    /// fixed separately in Task 2; its SPEC-inherited variant is covered by
-    /// the Task 4 end-to-end fixture once both fixes are in.)
+    /// `pkg_items` when building its guard sets.
     #[test]
     fn should_inherit_spec_names_for_body_anchor_guards() {
         let sql = r#"
@@ -5516,7 +5513,7 @@ mod tests {
         }
     }
 
-    /// PR #164 review round 2 issue 1 (#158): a routine parameter's flat
+    /// Issue #158: a routine parameter's flat
     /// `%ROWTYPE` signature anchor bypasses the guard entirely — the
     /// signature loop in `collect_routine_anchor_edges` never consults
     /// `pkg_cursor_names`/`pkg_var_type_names`/other-param names, unlike
@@ -5555,7 +5552,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review round 2 issue 1 (#158): same bypass as above, but for
+    /// Same bypass as above (issue #158), but for
     /// package-level TYPE and Variable names anchored via a parameter's
     /// `%TYPE` signature.
     #[test]
@@ -5611,7 +5608,7 @@ mod tests {
         }
     }
 
-    /// PR #164 review round 3 (#158): a package member routine's signature
+    /// Issue #158: a package member routine's signature
     /// declared in the SPEC (`CREATE PACKAGE ... PROCEDURE p(t t%ROWTYPE);`,
     /// no body) and re-declared in the BODY (`CREATE PACKAGE BODY ...
     /// PROCEDURE p(t t%ROWTYPE) IS ... END;`, with body) both resolve to the
@@ -5708,7 +5705,7 @@ mod tests {
         }
     }
 
-    /// PR #164 review round 2 issue 1 (#158): the signature guard must
+    /// Issue #158: the signature guard must
     /// exclude the *currently declared* parameter's own name from the
     /// "other param names" skip set — `PROCEDURE p(employees employees%ROWTYPE)`
     /// is the Oracle self-naming idiom (parameter named after its anchored
@@ -5755,7 +5752,7 @@ mod tests {
         }
     }
 
-    /// PR #164 review round 2 issue 3 (#158): the self-naming idiom applies
+    /// Issue #158: the self-naming idiom applies
     /// to package-level variable declarations too — `v_emp v_emp%ROWTYPE`
     /// at package scope must anchor to the real `v_emp` table (insert-
     /// after-visit in the extractor), while a sibling variable anchored to

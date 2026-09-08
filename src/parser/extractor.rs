@@ -1076,7 +1076,7 @@ pub fn anchor_from_pl_data_type(
     match dt {
         PlDataType::PercentType { table, column } => {
             if column.trim().is_empty() {
-                // `v1%TYPE` 单标识符形态：变量到变量锚定，不是表列引用（PR #164 review）
+                // `v1%TYPE` 单标识符形态：变量到变量锚定，不是表列引用
                 return None;
             }
             Some((table.clone(), Some(column.clone()), AnchorKind::PercentType))
@@ -1145,8 +1145,8 @@ pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<Str
 ///   target is visited (insert-after-visit), so a self-referential
 ///   declaration like `emp emp%ROWTYPE` — the standard Oracle idiom for a
 ///   record variable shaped like, and named after, a table — resolves to
-///   the real `emp` table rather than shadowing itself (PR #164 review
-///   round 2). When a *different*, already-declared local (an earlier
+///   the real `emp` table rather than shadowing itself. When a *different*,
+///   already-declared local (an earlier
 ///   sibling variable/TYPE, or a routine parameter name injected via
 ///   [`register_var_name`](AnchorExtractor::register_var_name); parameters
 ///   are not `PlDeclaration`s inside the block, so they carry no
@@ -1183,7 +1183,7 @@ impl AnchorExtractor {
     /// this extractor's own walk (routine parameters and package-level
     /// names are not `PlDeclaration`s inside the block) so `%TYPE` /
     /// `%ROWTYPE` anchored to them is guarded the same way a routine-local
-    /// declaration would be (PR #164 review).
+    /// declaration would be.
     pub fn register_var_name(&mut self, name: &str) {
         if !name.is_empty() {
             self.var_names.insert(name.to_lowercase());
@@ -4832,7 +4832,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review round 2 issue 3 (#158): `emp emp%ROWTYPE` is the
+    /// Issue #158: `emp emp%ROWTYPE` is the
     /// standard Oracle idiom for declaring a record variable shaped like
     /// table `emp` and named after it. The declared variable's own name
     /// must register only *after* its `%ROWTYPE` is resolved — insert-
@@ -4933,13 +4933,13 @@ mod tests {
         assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
     }
 
-    /// PR #164 review round 3 (#158): a nested routine (declared inside an
+    /// Issue #158: a nested routine (declared inside an
     /// enclosing routine's `DECLARE` section) has its own parameter list.
-    /// `AnchorExtractor` has no `NestedProcedure`/`NestedFunction` arm, so
-    /// the default walker recurses into the nested block with the *same*
-    /// extractor — the nested parameter `p_emp` is never registered as a
-    /// guarded local name, so `v p_emp.empno%TYPE` inside the nested body
-    /// wrongly anchors to a fabricated `p_emp` table.
+    /// Without a `NestedProcedure`/`NestedFunction` arm, the default walker
+    /// would recurse into the nested block with the *same*
+    /// extractor — the nested parameter `p_emp` would never be registered
+    /// as a guarded local name, so `v p_emp.empno%TYPE` inside the nested
+    /// body would wrongly anchor to a fabricated `p_emp` table.
     #[test]
     fn should_skip_type_anchored_to_nested_proc_param() {
         let sql = "CREATE OR REPLACE PROCEDURE outer_proc(p1 IN NUMBER) AS \
@@ -4959,7 +4959,7 @@ mod tests {
         );
     }
 
-    /// PR #164 review round 3 (#158): without a save/restore scope barrier,
+    /// Issue #158: without a save/restore scope barrier,
     /// a nested routine's local `CURSOR`/variable declarations are inserted
     /// directly into the shared `cursor_names`/`var_names` sets (no
     /// isolation), leaking into the enclosing routine's guard state after

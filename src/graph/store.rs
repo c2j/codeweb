@@ -3703,14 +3703,13 @@ mod tests {
         );
     }
 
-    /// PR #164 review round 3 (#158): `merge`'s edge dedup key is
-    /// `(src, dst, edge_type_tag)` only — parallel to the generic
-    /// same-(src,dst,tag) collapse that `dedup()` was fixed to exclude
-    /// `AnchorsOn` from (`should_keep_distinct_anchor_edges_through_dedup`).
-    /// Two params anchoring the *same* table on *different* columns
-    /// (`p1 emp.id%TYPE`, `p2 emp.name%TYPE`) must survive a `merge` the
-    /// same way they survive a `dedup` — only an exact
-    /// `(kind, column, site)` duplicate collapses.
+    /// Issue #158: `merge`'s edge dedup key is `(src, dst, edge_type_tag)`
+    /// only — parallel to the generic same-(src,dst,tag) collapse that
+    /// `dedup()` was fixed to exclude `AnchorsOn` from
+    /// (`should_keep_distinct_anchor_edges_through_dedup`). Two params
+    /// anchoring the *same* table on *different* columns (`p1 emp.id%TYPE`,
+    /// `p2 emp.name%TYPE`) must survive a `merge` the same way they survive
+    /// a `dedup` — only an exact `(kind, column, site)` duplicate collapses.
     #[test]
     fn should_keep_distinct_anchor_edges_through_merge() {
         use crate::parser::{AnchorKind, AnchorSite};
