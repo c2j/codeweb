@@ -1308,20 +1308,15 @@ impl GraphStore {
         self.updated_at = timestamp_ms();
     }
 
-    /// Dedup key for `AnchorsOn` edges specifically in `merge`'s per-edge
-    /// duplicate check — `(src, dst, kind, lowercased column, site)`,
-    /// mirroring `dedup()`'s `(kind, column, site)` key (see
-    /// `should_keep_distinct_anchor_edges_through_dedup`) so two params
-    /// anchoring the same table on different columns survive a `merge` the
-    /// same way they survive a `dedup`. Kept in a *separate* set from the
-    /// generic `(src, dst, tag)` `seen_edges` (below) because it alone is
-    /// checked across the *whole* merge (all stores), not reset per store —
-    /// every other edge type (in particular `TableAccess`) must stay on the
-    /// per-store generic key or `merge_duplicate_table_access_edges`'s
-    /// cross-store `AccessMode` union never gets a second edge to union
-    /// (regression fixed in commit following d667927: a global generic key
-    /// silently dropped a second store's `TableAccess` edge for the same
-    /// (proc, table) pair before it ever reached the union step).
+    /// `AnchorsOn` edges use a merge-spanning `(src, dst, kind, lowercased
+    /// column, site)` key, mirroring `dedup()`'s `(kind, column, site)` key
+    /// (see `should_keep_distinct_anchor_edges_through_dedup`): identical
+    /// anchors collapse across stores while two params anchoring the same
+    /// table on different columns both survive. Every other edge type
+    /// keeps the per-store generic `(src, dst, tag)` key (`seen_edges`,
+    /// below) — not reset per store would starve
+    /// `merge_duplicate_table_access_edges`'s cross-store `AccessMode`
+    /// union of the second store's `TableAccess` edge to union against.
     fn anchor_merge_key(
         src: &NodeKey,
         dst: &NodeKey,
@@ -3799,14 +3794,14 @@ mod tests {
         );
     }
 
-    /// Regression guard (#158, commit d667927): a global (whole-merge)
-    /// `seen_edges` broke `merge_duplicate_table_access_edges`'s AccessMode
-    /// union. That function relies on *both* stores' `TableAccess` edges
-    /// for the same (proc, table) pair actually landing in `merged.graph`
-    /// before it unions their `modes`/`write_kinds` — a global tag-only key
-    /// silently drops the second store's edge before it ever reaches the
-    /// union step, so `Write` from store_b is lost and only `Read` from
-    /// store_a survives.
+    /// Regression guard (#158): a whole-merge generic `(src, dst, tag)` key
+    /// would drop the second store's `TableAccess` edge for a given (proc,
+    /// table) pair before `merge_duplicate_table_access_edges` can union
+    /// its `AccessMode`/`write_kinds` against the first store's edge — a
+    /// global tag-only key silently drops the second store's edge before
+    /// it ever reaches the union step, so `Write` from store_b is lost and
+    /// only `Read` from store_a survives. Per-store keys plus the
+    /// dedicated `AnchorsOn` merge key above keep both behaviors.
     #[test]
     fn should_union_table_access_modes_across_stores_on_merge() {
         let loc = crate::graph::SourceLocation {
