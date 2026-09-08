@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
 use crate::graph::key::NodeKey;
@@ -275,46 +276,128 @@ pub fn neighbors_at_depth(
 ///
 /// Returns a sorted list of `(file_path, node_labels)` tuples, ordered by
 /// the number of nodes in descending order (most-referenced files first).
+///
+/// When `related_ddl` is true, also attach satellite DDL of chain nodes:
+/// incoming [`crate::graph::Edge::IndexesTable`] / [`crate::graph::Edge::AliasesObject`]
+/// (indexes, synonyms) and triggers whose `table` matches a table/view/mview
+/// already in the chain. Dependent views and DML callers are not included.
 pub fn collect_chain_files(
     chain: &CallChain,
     graph: &crate::graph::CodeGraph,
+    related_ddl: bool,
 ) -> Vec<(PathBuf, Vec<String>)> {
     let mut file_nodes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut chain_nodes = HashSet::new();
 
-    fn insert_node(
-        graph: &crate::graph::CodeGraph,
-        idx: NodeIndex,
-        file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
-    ) {
-        let file = graph[idx].file();
-        if !file.as_os_str().is_empty() {
-            let key = crate::graph::node_display_name(&graph[idx]);
-            let entry = file_nodes.entry(file.to_path_buf()).or_default();
-            if !entry.contains(&key) {
-                entry.push(key);
-            }
-        }
+    insert_file_node(graph, chain.target, &mut file_nodes);
+    chain_nodes.insert(chain.target);
+    collect_tree_files(&chain.callers, graph, &mut file_nodes, &mut chain_nodes);
+    collect_tree_files(&chain.callees, graph, &mut file_nodes, &mut chain_nodes);
+
+    if related_ddl {
+        attach_related_ddl(graph, &chain_nodes, &mut file_nodes);
     }
-
-    fn collect_from_tree(
-        nodes: &[TreeNode],
-        graph: &crate::graph::CodeGraph,
-        file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
-    ) {
-        for node in nodes {
-            insert_node(graph, node.idx, file_nodes);
-            collect_from_tree(&node.children, graph, file_nodes);
-        }
-    }
-
-    insert_node(graph, chain.target, &mut file_nodes);
-
-    collect_from_tree(&chain.callers, graph, &mut file_nodes);
-    collect_from_tree(&chain.callees, graph, &mut file_nodes);
 
     let mut result: Vec<_> = file_nodes.into_iter().collect();
     result.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     result
+}
+
+fn insert_file_node(
+    graph: &crate::graph::CodeGraph,
+    idx: NodeIndex,
+    file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
+) {
+    let file = graph[idx].file();
+    if !file.as_os_str().is_empty() {
+        let key = crate::graph::node_display_name(&graph[idx]);
+        let entry = file_nodes.entry(file.to_path_buf()).or_default();
+        if !entry.contains(&key) {
+            entry.push(key);
+        }
+    }
+}
+
+fn collect_tree_files(
+    nodes: &[TreeNode],
+    graph: &crate::graph::CodeGraph,
+    file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
+    chain_nodes: &mut HashSet<NodeIndex>,
+) {
+    for node in nodes {
+        insert_file_node(graph, node.idx, file_nodes);
+        chain_nodes.insert(node.idx);
+        collect_tree_files(&node.children, graph, file_nodes, chain_nodes);
+    }
+}
+
+fn attach_related_ddl(
+    graph: &crate::graph::CodeGraph,
+    chain_nodes: &HashSet<NodeIndex>,
+    file_nodes: &mut BTreeMap<PathBuf, Vec<String>>,
+) {
+    use crate::graph::{Edge, Node};
+
+    let mut host_names: HashSet<(Option<String>, String)> = HashSet::new();
+    for &idx in chain_nodes {
+        match &graph[idx] {
+            Node::Table { schema, name, .. }
+            | Node::View { schema, name, .. }
+            | Node::MaterializedView { schema, name, .. } => {
+                host_names.insert((
+                    schema.as_ref().map(|s| s.to_lowercase()),
+                    name.to_lowercase(),
+                ));
+            }
+            _ => {}
+        }
+
+        for edge in graph.edges_directed(idx, Direction::Incoming) {
+            match edge.weight() {
+                Edge::IndexesTable { .. } | Edge::AliasesObject { .. } => {
+                    insert_file_node(graph, edge.source(), file_nodes);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if host_names.is_empty() {
+        return;
+    }
+
+    for idx in graph.node_indices() {
+        if let Node::Trigger { table, .. } = &graph[idx] {
+            if trigger_matches_hosts(table, &host_names) {
+                insert_file_node(graph, idx, file_nodes);
+            }
+        }
+    }
+}
+
+fn trigger_matches_hosts(
+    trigger_table: &[String],
+    hosts: &HashSet<(Option<String>, String)>,
+) -> bool {
+    let Some(name) = trigger_table.last() else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    let schema = if trigger_table.len() >= 2 {
+        Some(trigger_table[trigger_table.len() - 2].to_lowercase())
+    } else {
+        None
+    };
+
+    hosts.iter().any(|(host_schema, host_name)| {
+        if *host_name != name {
+            return false;
+        }
+        match (&schema, host_schema) {
+            (Some(s), Some(h)) => s == h,
+            _ => true,
+        }
+    })
 }
 
 pub fn find_nodes_by_name(
@@ -1122,5 +1205,270 @@ mod tests {
                 edge
             );
         }
+    }
+
+    // ── collect_chain_files / related DDL ──
+
+    fn loc_in(file: &str) -> crate::graph::SourceLocation {
+        crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from(file)),
+            line: 1,
+        }
+    }
+
+    fn add_proc_in(
+        graph: &mut crate::graph::CodeGraph,
+        name: &str,
+        file: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: name.to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc_in(file),
+            partial: false,
+            body_sql: vec![],
+        })
+    }
+
+    fn add_table_in(
+        graph: &mut crate::graph::CodeGraph,
+        name: &str,
+        file: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: name.to_string(),
+            explicit: true,
+            system: false,
+            location: Some(loc_in(file)),
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        })
+    }
+
+    fn add_index_in(
+        graph: &mut crate::graph::CodeGraph,
+        name: &str,
+        table_name: &str,
+        file: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Index {
+            name: Some(name.to_string()),
+            table_schema: None,
+            table_name: table_name.to_string(),
+            unique: false,
+            global: false,
+            index_method: Some("btree".into()),
+            columns: vec!["id".into()],
+            tablespace: None,
+            where_clause: None,
+            constraint: None,
+            location: loc_in(file),
+        })
+    }
+
+    fn table_access_edge(file: &str) -> crate::graph::Edge {
+        crate::graph::Edge::TableAccess {
+            flow_kind: crate::graph::DataFlowKind::DmlAccess,
+            modes: crate::graph::AccessMode::Read,
+            write_kinds: std::collections::HashSet::new(),
+            location: loc_in(file),
+            column_analysis: None,
+        }
+    }
+
+    fn proc_table_index_graph(
+        index_file: &str,
+    ) -> (
+        crate::graph::CodeGraph,
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+    ) {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_in(&mut graph, "create_order", "proc.sql");
+        let table = add_table_in(&mut graph, "t_users", "table.sql");
+        let index = add_index_in(&mut graph, "idx_users", "t_users", index_file);
+        graph.add_edge(proc, table, table_access_edge("proc.sql"));
+        graph.add_edge(
+            index,
+            table,
+            crate::graph::Edge::IndexesTable {
+                location: loc_in(index_file),
+            },
+        );
+        (graph, proc, table, index)
+    }
+
+    fn files_contain(files: &[(PathBuf, Vec<String>)], path: &str) -> bool {
+        files.iter().any(|(p, _)| p.to_string_lossy() == path)
+    }
+
+    fn labels_in<'a>(files: &'a [(PathBuf, Vec<String>)], path: &str) -> Vec<&'a str> {
+        files
+            .iter()
+            .find(|(p, _)| p.to_string_lossy() == path)
+            .map(|(_, labels)| labels.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn collect_chain_files_omits_separate_index_file_by_default() {
+        let (graph, proc, _table, _index) = proc_table_index_graph("index.sql");
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, false);
+
+        assert!(files_contain(&files, "proc.sql"));
+        assert!(files_contain(&files, "table.sql"));
+        assert!(
+            !files_contain(&files, "index.sql"),
+            "default --files is call-chain only; index.sql must stay out: {files:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_includes_separate_index_file_with_related_ddl() {
+        let (graph, proc, _table, _index) = proc_table_index_graph("index.sql");
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert!(
+            files_contain(&files, "index.sql"),
+            "related-ddl must attach IndexesTable satellites: {files:?}"
+        );
+        let idx_labels = labels_in(&files, "index.sql");
+        assert!(
+            idx_labels.iter().any(|l| l.contains("idx_users")),
+            "index.sql should list the index node, got {idx_labels:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_related_ddl_same_file_adds_index_label_not_path() {
+        let (graph, proc, _table, _index) = proc_table_index_graph("table.sql");
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert_eq!(
+            files.len(),
+            2,
+            "index sharing table.sql must not add a third path: {files:?}"
+        );
+        let table_labels = labels_in(&files, "table.sql");
+        assert!(
+            table_labels.iter().any(|l| l.contains("t_users")),
+            "table.sql should still list the table, got {table_labels:?}"
+        );
+        assert!(
+            table_labels.iter().any(|l| l.contains("idx_users")),
+            "table.sql should also list the co-located index, got {table_labels:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_related_ddl_includes_synonym_and_trigger_files() {
+        let (mut graph, proc, table, _index) = proc_table_index_graph("index.sql");
+        let syn = graph.add_node(crate::graph::Node::Synonym {
+            schema: None,
+            name: "s_users".into(),
+            target_schema: None,
+            target_name: "t_users".into(),
+            location: loc_in("synonym.sql"),
+        });
+        graph.add_edge(
+            syn,
+            table,
+            crate::graph::Edge::AliasesObject {
+                location: loc_in("synonym.sql"),
+            },
+        );
+        graph.add_node(crate::graph::Node::Trigger {
+            name: "trg_users".into(),
+            table: vec!["t_users".into()],
+            location: loc_in("trigger.sql"),
+        });
+        graph.add_node(crate::graph::Node::Trigger {
+            name: "trg_other".into(),
+            table: vec!["t_other".into()],
+            location: loc_in("other_trigger.sql"),
+        });
+
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert!(files_contain(&files, "synonym.sql"), "{files:?}");
+        assert!(files_contain(&files, "trigger.sql"), "{files:?}");
+        assert!(
+            !files_contain(&files, "other_trigger.sql"),
+            "trigger on a table not in the chain must stay out: {files:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_related_ddl_on_table_target_includes_indexes() {
+        let (graph, _proc, table, _index) = proc_table_index_graph("index.sql");
+        let (chain, _) = trace_chain(&graph, table, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert!(
+            files_contain(&files, "index.sql"),
+            "detail on the table itself should still attach satellite index files: {files:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_related_ddl_depth_zero_proc_has_no_table_satellites() {
+        let (graph, proc, _table, _index) = proc_table_index_graph("index.sql");
+        let (chain, _) = trace_chain(&graph, proc, 0, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert!(files_contain(&files, "proc.sql"));
+        assert!(
+            !files_contain(&files, "index.sql"),
+            "depth 0 has no table in the chain, so no index satellites: {files:?}"
+        );
+        assert!(
+            !files_contain(&files, "table.sql"),
+            "depth 0 should not list the table file either: {files:?}"
+        );
+    }
+
+    #[test]
+    fn collect_chain_files_related_ddl_does_not_pull_dependent_views() {
+        let (mut graph, proc, table, _index) = proc_table_index_graph("index.sql");
+        let view = graph.add_node(crate::graph::Node::View {
+            schema: None,
+            name: "v_users".into(),
+            explicit: true,
+            system: false,
+            location: Some(loc_in("view.sql")),
+            columns: Box::new(vec![]),
+            ddl_source: None,
+        });
+        graph.add_edge(
+            view,
+            table,
+            crate::graph::Edge::DependsOn {
+                location: loc_in("view.sql"),
+                column_analysis: None,
+            },
+        );
+
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let files = collect_chain_files(&chain, &graph, true);
+
+        assert!(
+            !files_contain(&files, "view.sql"),
+            "dependent views are impact, not satellite DDL: {files:?}"
+        );
     }
 }
