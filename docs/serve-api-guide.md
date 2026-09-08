@@ -36,6 +36,8 @@ cargo run --features serve -- serve --open
 | GET | `/api/v1/nodes/:id/callees` | 节点的下游被调用方 |
 | GET | `/api/v1/nodes/search-sql` | 按 SQL 文本内容搜索节点 |
 | GET | `/api/v1/trace` | 双向调用链追踪 |
+| GET | `/api/v1/columns` | 按过程/包聚合列级分析（hard filters、joins 等，与 `codeweb columns --format json` 同构） |
+| GET | `/api/v1/lineage` | 表级/列级血缘（与 `codeweb lineage --format json` 同构） |
 | POST | `/api/v1/query` | 执行声明式查询（QuerySpec） |
 | GET | `/api/v1/export` | 导出图谱（DOT/JSON/Mermaid） |
 | GET | `/api/v1/graph` | 完整图谱数据（JSON） |
@@ -667,6 +669,109 @@ curl http://127.0.0.1:3000/api/v1/graph
 ### 响应
 
 与 `export?format=json` 等价，返回完整图谱的 JSON 序列化。
+
+---
+
+## 12. GET `/api/v1/columns` — 列级分析聚合
+
+按存储过程或包聚合导出详细的列级分析结果（Hard Filter、Join 条件、SELECT INTO 映射等）。
+
+### 请求参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `procedure` | string | 否 | 存储过程或函数名（子串匹配） |
+| `package` | string | 否 | 包名（导出该包下所有过程的并集） |
+| `table` | string | 否 | 仅输出与指定表相关的诊断信息 |
+
+`procedure` 与 `package` 必须提供其中之一。
+
+### 请求示例
+
+```bash
+curl "http://127.0.0.1:3000/api/v1/columns?procedure=p_test_hard"
+```
+
+### 响应
+
+```json
+{
+  "schema_version": 1,
+  "procedure": "p_test_hard",
+  "package": null,
+  "tables": ["t_out", "t_src"],
+  "join_conditions": [],
+  "hard_filters": [
+    {
+      "table": null,
+      "column": "kind",
+      "operator": "Eq",
+      "value": { "String": "05" },
+      "transform": {
+        "fn": "substr",
+        "args": [{ "Integer": 1 }, { "Integer": 2 }]
+      }
+    }
+  ],
+  "select_into": [],
+  "enum_mappings": [],
+  "column_mappings": [
+    {
+      "target_table": "t_out",
+      "target_column": "amt",
+      "position": 1,
+      "sources": [{ "Column": { "table": "t_src", "column": "amt" } }],
+      "kind": "Direct",
+      "expression": null
+    }
+  ],
+  "insert_columns": [{ "table": "t_out", "columns": ["id", "amt", "kind"] }],
+  "update_columns": [],
+  "read_tables": ["t_out", "t_src"]
+}
+```
+
+---
+
+## 13. GET `/api/v1/lineage` — 表级/列级血缘分析
+
+执行表级或列级的血缘分析，追踪数据的来源或去向。
+
+### 请求参数
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `target` | string | 是 | — | 分析目标：`table` 或 `table.column` |
+| `direction` | string | 否 | `both` | 方向：`upstream`、`downstream`、`both` |
+| `depth` | number | 否 | `5` | 递归深度 |
+
+### 请求示例
+
+```bash
+curl "http://127.0.0.1:3000/api/v1/lineage?target=t_out.amt&direction=upstream"
+```
+
+### 响应
+
+```json
+{
+  "table": "t_out",
+  "column": "amt",
+  "steps": [
+    {
+      "source": "t_src.amt",
+      "via": "proc:p_test_hard",
+      "kind": "direct",
+      "expression": null,
+      "next": {
+        "table": "t_src",
+        "column": "amt",
+        "steps": []
+      }
+    }
+  ]
+}
+```
 
 ---
 

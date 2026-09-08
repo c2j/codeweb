@@ -360,6 +360,36 @@ codeweb inspect proc_main proc_helper --style tree
 
 ✅ **验证成功**：输出展示节点间的路径、跳数和边类型。
 
+### 4.6 数据血缘分析 — "这个列的数据从哪来？"
+
+`lineage` 命令追踪表与表、列与列之间的数据流转。它能“看穿”存储过程内部逻辑，识别数据搬运路径。
+
+```sql
+-- 在 myapp.sql 中追加以下内容
+CREATE TABLE t_src (id INT, amt NUMBER);
+CREATE TABLE t_out (id INT, amt NUMBER);
+
+CREATE OR REPLACE PROCEDURE proc_copy_amt AS
+BEGIN
+  INSERT INTO t_out (id, amt)
+  SELECT id, amt FROM t_src;
+END;
+/
+```
+
+执行 `codeweb analyze` 后，运行：
+
+```bash
+codeweb lineage t_out.amt --direction upstream
+```
+
+```
+t_out.amt
+  ← t_src.amt  [direct]  via proc:proc_copy_amt
+```
+
+✅ **验证成功**：codeweb 准确识别出 `t_out.amt` 的数据来源于 `t_src.amt`，且流转路径经过了 `proc_copy_amt` 存储过程。
+
 ---
 
 ## 5. 可视化探索（进阶）
