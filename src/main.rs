@@ -178,6 +178,13 @@ struct ImpactResult {
     downstream: Vec<ImpactEntry>,
 }
 
+#[derive(Serialize)]
+struct PredicatesResult {
+    schema_version: u32,
+    procedure: String,
+    predicates: Vec<crate::parser::PlPredicate>,
+}
+
 const LOGO: &str = r#"
   ██████╗  ██████╗  ██████╗  ███████╗ ██╗    ██╗ ███████╗ ██████╗
  ██╔════╝ ██╔═══██╗ ██╔══██╗ ██╔════╝ ██║    ██║ ██╔════╝ ██╔══██╗
@@ -404,6 +411,47 @@ enum Commands {
         /// Show only flow sources, hiding reference sources (config: [lineage] thresholds)
         #[arg(long)]
         flow_only: bool,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// #165: per-procedure/per-package aggregated column-analysis export (hard filters,
+    /// joins, SELECT INTO, enum/column mappings) — the machine-readable entry point for
+    /// test-data/mock generation.
+    #[command(group(clap::ArgGroup::new("columns_target").required(true).multiple(false)))]
+    Columns {
+        /// Procedure or function name to aggregate (substring match, same as `trace`)
+        #[arg(long, group = "columns_target")]
+        procedure: Option<String>,
+
+        /// Package name to aggregate over all of its contained procedures/functions
+        #[arg(long, group = "columns_target")]
+        package: Option<String>,
+
+        /// Narrow output to one table's diagnostics (case-insensitive)
+        #[arg(long)]
+        table: Option<String>,
+
+        /// Output format (only "json" is supported today)
+        #[arg(long, default_value = "json", value_parser = ["json"])]
+        format: String,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
+    /// #167: PL IF/CASE predicates resolved to table columns.
+    Predicates {
+        /// Procedure or function name (substring match, same as `columns`)
+        #[arg(long)]
+        procedure: String,
+
+        /// Output format (only "json" is supported today)
+        #[arg(long, default_value = "json", value_parser = ["json"])]
+        format: String,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -944,6 +992,18 @@ fn run() -> Result<()> {
         }) => cmd_lineage(
             &target, &direction, depth, &format, &view, flow_only, &project,
         ),
+        Some(Commands::Columns {
+            procedure,
+            package,
+            table,
+            format,
+            project,
+        }) => cmd_columns(procedure, package, table, &format, &project),
+        Some(Commands::Predicates {
+            procedure,
+            format,
+            project,
+        }) => cmd_predicates(&procedure, &format, &project),
         Some(Commands::Stats { project }) => cmd_stats(&project),
         Some(Commands::Files { project }) => cmd_files(&project),
         Some(Commands::Nodes {
@@ -1799,6 +1859,194 @@ fn cmd_lineage(
         }
     }
 
+    Ok(())
+}
+
+/// #165: `codeweb columns --procedure X` / `--package Y` — aggregate every `TableAccess`
+/// diagnostic a routine (or a whole package's routines) touches. Errors
+/// cleanly (non-zero exit, message on stderr) on an unresolved name rather than printing
+/// an empty result — silent empty output would be indistinguishable from "this routine
+/// really has no constraints".
+fn cmd_columns(
+    procedure: Option<String>,
+    package: Option<String>,
+    table: Option<String>,
+    format: &str,
+    project: &Path,
+) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    // Stores built before the diagnostic-field union landed (STORE_VERSION 10, #165)
+    // under-report hard_filters/join_conditions for routines that touch the same table
+    // in more than one statement — only the first statement's diagnostics survive.
+    if store.version < 10 {
+        eprintln!(
+            "note: store version {} predates full column-analysis diagnostics (v10) — run `codeweb analyze` to rebuild.",
+            store.version
+        );
+    }
+
+    let table_filter = table.as_deref();
+
+    let result = if let Some(name) = procedure {
+        let resolved = store.resolve_single_node(
+            &name,
+            crate::graph::search::MatchMode::Substring,
+            false,
+            false,
+        );
+        let idx = match resolved {
+            crate::graph::search::ResolveResult::Single(idx, _) => idx,
+            crate::graph::search::ResolveResult::Empty => {
+                return Err(error::CodeWebError::ExportError {
+                    message: format!("No procedure or function found matching '{}'", name),
+                });
+            }
+            _ => {
+                return Err(error::CodeWebError::ExportError {
+                    message: format!("Ambiguous match for '{}'", name),
+                });
+            }
+        };
+        if !matches!(
+            &graph[idx],
+            graph::Node::Procedure { .. } | graph::Node::Function { .. }
+        ) {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("'{}' is not a procedure or function", name),
+            });
+        }
+        graph::columns::column_analysis_of_routine(graph, idx, table_filter).ok_or_else(|| {
+            error::CodeWebError::ExportError {
+                message: format!("failed to aggregate column analysis for '{}'", name),
+            }
+        })?
+    } else {
+        // clap's `columns_target` ArgGroup (required, mutually exclusive) guarantees
+        // exactly one of `procedure`/`package` is `Some` by the time we get here.
+        let name = package.expect("clap group guarantees procedure or package is set");
+        let resolved = store.resolve_single_node(
+            &name,
+            crate::graph::search::MatchMode::Substring,
+            false,
+            false,
+        );
+        let idx = match resolved {
+            crate::graph::search::ResolveResult::Single(idx, _) => idx,
+            crate::graph::search::ResolveResult::Empty => {
+                return Err(error::CodeWebError::ExportError {
+                    message: format!("No package found matching '{}'", name),
+                });
+            }
+            _ => {
+                return Err(error::CodeWebError::ExportError {
+                    message: format!("Ambiguous match for '{}'", name),
+                });
+            }
+        };
+        if !matches!(&graph[idx], graph::Node::Package { .. }) {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("'{}' is not a package", name),
+            });
+        }
+        graph::columns::column_analysis_of_package(graph, idx, table_filter).ok_or_else(|| {
+            error::CodeWebError::ExportError {
+                message: format!("failed to aggregate column analysis for package '{}'", name),
+            }
+        })?
+    };
+
+    match format {
+        "json" => {
+            let json_str = serde_json::to_string_pretty(&result).map_err(|e| {
+                error::CodeWebError::ExportError {
+                    message: format!("Failed to format JSON: {}", e),
+                }
+            })?;
+            println_stdout!("{}", json_str);
+        }
+        other => {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("Unknown format: {}. Use 'json'", other),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_predicates(procedure: &str, format: &str, project: &Path) -> Result<()> {
+    let mut proj = project::Project::find(project)?;
+    let store = proj.load_store()?;
+    if store.version < 12 {
+        eprintln!(
+            "note: store version {} predates PL predicate extraction (v12) — run `codeweb analyze` to rebuild.",
+            store.version
+        );
+    }
+
+    let resolved = store.resolve_single_node(
+        procedure,
+        crate::graph::search::MatchMode::Substring,
+        false,
+        false,
+    );
+    let (idx, display) = match resolved {
+        crate::graph::search::ResolveResult::Single(idx, display) => (idx, display),
+        crate::graph::search::ResolveResult::Empty => {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("No procedure or function found matching '{}'", procedure),
+            });
+        }
+        _ => {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("Ambiguous match for '{}'", procedure),
+            });
+        }
+    };
+    if !matches!(
+        &store.graph()[idx],
+        graph::Node::Procedure { .. } | graph::Node::Function { .. }
+    ) {
+        return Err(error::CodeWebError::ExportError {
+            message: format!("'{}' is not a procedure or function", procedure),
+        });
+    }
+    let key = crate::graph::key::NodeKey::from_node(&store.graph()[idx]).to_string();
+    let predicates = store
+        .procedure_predicates
+        .get(&key)
+        .cloned()
+        .filter(|predicates| !predicates.is_empty())
+        .ok_or_else(|| error::CodeWebError::ExportError {
+            message: format!("No PL predicates found for '{}'", procedure),
+        })?;
+    let procedure_name = display
+        .split_once(':')
+        .map_or(display.as_str(), |(_, name)| name)
+        .to_string();
+    let result = PredicatesResult {
+        schema_version: 1,
+        procedure: procedure_name,
+        predicates,
+    };
+    match format {
+        "json" => println_stdout!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|error| {
+                error::CodeWebError::ExportError {
+                    message: format!("Failed to format JSON: {}", error),
+                }
+            })?
+        ),
+        other => {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("Unknown format: {}. Use 'json'", other),
+            });
+        }
+    }
     Ok(())
 }
 
