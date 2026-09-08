@@ -1829,11 +1829,33 @@ impl GraphBuilder {
     ) {
         let mut anchor_seen: HashSet<AnchorDedupKey> = HashSet::new();
 
+        // Signature (`Param`/`ReturnType`) anchors must be guarded the same
+        // way the body-walk `AnchorExtractor` guards variable/nested-type
+        // anchors: skip if the anchored object (lowercased, full string —
+        // a schema-qualified `a.object` like `schema.table` never collides
+        // with these bare names) matches a package cursor, a package
+        // variable/TYPE, or another parameter's name. The *current*
+        // parameter's own name is excluded from the "other param" check so
+        // the Oracle self-naming idiom (`p(employees employees%ROWTYPE)`)
+        // still anchors to the real table (PR #164 review round 2 issue 1).
+        let pkg_cursor_set: HashSet<String> = pkg_cursor_names.iter().cloned().collect();
+        let pkg_var_type_set: HashSet<String> = pkg_var_type_names.iter().cloned().collect();
+        let param_name_set: HashSet<String> =
+            parameters.iter().map(|p| p.name.to_lowercase()).collect();
+
         for param in parameters {
             if let Some(a) = crate::parser::parse_anchor_from_type_string(
                 &param.data_type,
                 crate::parser::AnchorSite::Param,
             ) {
+                let obj_lower = a.object.to_lowercase();
+                let is_self = param.name.to_lowercase() == obj_lower;
+                let guarded = pkg_cursor_set.contains(&obj_lower)
+                    || pkg_var_type_set.contains(&obj_lower)
+                    || (param_name_set.contains(&obj_lower) && !is_self);
+                if guarded {
+                    continue;
+                }
                 if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
                     Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
                 }
@@ -1844,7 +1866,14 @@ impl GraphBuilder {
                 rt,
                 crate::parser::AnchorSite::ReturnType,
             ) {
-                if anchor_seen.insert(Self::anchor_dedup_key(&a)) {
+                let obj_lower = a.object.to_lowercase();
+                // No self-exclusion for RETURN — a routine has no "own
+                // name" among its parameters, so any param-name match is
+                // conservatively guarded.
+                let guarded = pkg_cursor_set.contains(&obj_lower)
+                    || pkg_var_type_set.contains(&obj_lower)
+                    || param_name_set.contains(&obj_lower);
+                if !guarded && anchor_seen.insert(Self::anchor_dedup_key(&a)) {
                     Self::add_anchor_edge(graph, proc_idx, &a, file.clone(), line, table_index);
                 }
             }
@@ -5444,6 +5473,148 @@ mod tests {
                 "SPEC-declared name '{}' must never become a table node",
                 fake
             );
+        }
+    }
+
+    /// PR #164 review round 2 issue 1 (#158): a routine parameter's flat
+    /// `%ROWTYPE` signature anchor bypasses the guard entirely — the
+    /// signature loop in `collect_routine_anchor_edges` never consults
+    /// `pkg_cursor_names`/`pkg_var_type_names`/other-param names, unlike
+    /// the body-walk `AnchorExtractor` which does. `p(p_rec c%ROWTYPE)`
+    /// with `c` a package-level cursor must not produce a fake `c` table.
+    #[test]
+    fn should_skip_signature_anchor_to_package_cursor() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_sig_cursor AS
+                CURSOR c IS SELECT id FROM t_cursor_src;
+
+                PROCEDURE p(p_rec c%ROWTYPE) IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_sig_cursor;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package cursor 'c' must guard the signature %ROWTYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("c")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "cursor name 'c' must never become a table node via a signature anchor"
+        );
+    }
+
+    /// PR #164 review round 2 issue 1 (#158): same bypass as above, but for
+    /// package-level TYPE and Variable names anchored via a parameter's
+    /// `%TYPE` signature.
+    #[test]
+    fn should_skip_signature_anchor_to_package_type_and_variable() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_sig_type_var AS
+                TYPE emp_rec IS RECORD (f INTEGER);
+                v_emp employees%ROWTYPE;
+
+                FUNCTION f1(p_id emp_rec.empno%TYPE) RETURN INT IS
+                BEGIN
+                    RETURN NULL;
+                END;
+
+                PROCEDURE p2(p_id v_emp.empno%TYPE) IS
+                BEGIN
+                    NULL;
+                END;
+            END pkg_sig_type_var;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+
+        // Only the SPEC-independent package-level v_emp->employees anchor
+        // (from the Variable declaration itself) may survive; f1/p2's
+        // signature anchors to emp_rec/v_emp must both be guarded.
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp->employees); f1/p2 signature \
+             anchors to emp_rec/v_emp must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        for fake in ["emp_rec", "v_emp"] {
+            let fake_table = graph.node_indices().find(
+                |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case(fake)),
+            );
+            assert!(
+                fake_table.is_none(),
+                "'{}' must never become a table node via a signature anchor",
+                fake
+            );
+        }
+    }
+
+    /// PR #164 review round 2 issue 1 (#158): the signature guard must
+    /// exclude the *currently declared* parameter's own name from the
+    /// "other param names" skip set — `PROCEDURE p(employees employees%ROWTYPE)`
+    /// is the Oracle self-naming idiom (parameter named after its anchored
+    /// table) and must still anchor to the real `employees` table.
+    #[test]
+    fn should_still_anchor_param_named_after_table() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE p(employees employees%ROWTYPE)
+            IS
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("p")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "self-named parameter must still anchor to the real table, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn { site, .. } => {
+                assert!(matches!(site, crate::parser::AnchorSite::Param));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
         }
     }
 
