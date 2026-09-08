@@ -129,6 +129,7 @@ pub struct GraphBuildContext {
     pub table_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub type_index: HashMap<String, petgraph::graph::NodeIndex>,
     pub sequence_index: HashMap<String, petgraph::graph::NodeIndex>,
+    pub inferred_sequence_index: HashMap<String, petgraph::graph::NodeIndex>,
     /// Shared dedup index for BuiltinFunction nodes (keyed by lowercased name).
     /// Threaded through SQL-proc / XML-mapper / Java / JSP paths so the same
     /// builtin called from multiple paths is a single graph node.
@@ -149,6 +150,7 @@ impl GraphBuildContext {
             table_index: HashMap::new(),
             type_index: HashMap::new(),
             sequence_index: HashMap::new(),
+            inferred_sequence_index: HashMap::new(),
             builtin_index: HashMap::new(),
             deferred_column_comments: Vec::new(),
         }
@@ -287,6 +289,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.type_index,
             &mut ctx.sequence_index,
+            &mut ctx.inferred_sequence_index,
             &mut ctx.deferred_column_comments,
         );
         Self::create_sql_edges(
@@ -303,6 +306,7 @@ impl GraphBuilder {
             &ctx.proc_index,
             &ctx.type_index,
             &ctx.sequence_index,
+            &mut ctx.inferred_sequence_index,
         );
     }
 
@@ -328,6 +332,7 @@ impl GraphBuilder {
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         type_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
+        inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
         deferred_column_comments: &mut Vec<DeferredColumnComment>,
     ) {
         for file in files {
@@ -648,16 +653,36 @@ impl GraphBuilder {
                         let short_key = normalize_object_key(None, &name);
                         let full_key = normalize_object_key(schema.as_deref(), &name);
                         if !sequence_index.contains_key(&full_key) {
-                            let seq_node = Node::Sequence {
-                                schema: schema.as_ref().map(|s| s.to_lowercase()),
-                                name: name.to_lowercase(),
-                                explicit: true,
-                                location: Some(SourceLocation {
-                                    file: file_arc.clone(),
-                                    line: info.start_line,
-                                }),
+                            // Promote only an exact inferred key; short-name fuzzing here
+                            // could incorrectly bind sequences from different schemas.
+                            let promoted = if schema.is_some() {
+                                inferred_sequence_index.remove(&full_key)
+                            } else {
+                                inferred_sequence_index.remove(&short_key)
                             };
-                            let idx = graph.add_node(seq_node);
+                            let idx = if let Some(idx) = promoted {
+                                if let Node::Sequence {
+                                    explicit, location, ..
+                                } = &mut graph[idx]
+                                {
+                                    *explicit = true;
+                                    *location = Some(SourceLocation {
+                                        file: file_arc.clone(),
+                                        line: info.start_line,
+                                    });
+                                }
+                                idx
+                            } else {
+                                graph.add_node(Node::Sequence {
+                                    schema: schema.as_ref().map(|s| s.to_lowercase()),
+                                    name: name.to_lowercase(),
+                                    explicit: true,
+                                    location: Some(SourceLocation {
+                                        file: file_arc.clone(),
+                                        line: info.start_line,
+                                    }),
+                                })
+                            };
                             sequence_index.entry(short_key).or_insert(idx);
                             sequence_index.insert(full_key, idx);
                         }
@@ -1736,8 +1761,8 @@ impl GraphBuilder {
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
         type_index: &HashMap<String, petgraph::graph::NodeIndex>,
         sequence_index: &HashMap<String, petgraph::graph::NodeIndex>,
+        inferred_sequence_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        let mut inferred_sequence_index = HashMap::new();
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
@@ -1788,7 +1813,7 @@ impl GraphBuilder {
                                 let seq_idx = Self::resolve_or_infer_sequence(
                                     &seq_ref.sequence_name,
                                     sequence_index,
-                                    &mut inferred_sequence_index,
+                                    inferred_sequence_index,
                                     graph,
                                 );
                                 graph.add_edge(
@@ -1861,7 +1886,7 @@ impl GraphBuilder {
                                 let seq_idx = Self::resolve_or_infer_sequence(
                                     &seq_ref.sequence_name,
                                     sequence_index,
-                                    &mut inferred_sequence_index,
+                                    inferred_sequence_index,
                                     graph,
                                 );
                                 graph.add_edge(
@@ -1886,7 +1911,7 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
-                            &mut inferred_sequence_index,
+                            inferred_sequence_index,
                             graph,
                         );
                     }
@@ -1899,7 +1924,7 @@ impl GraphBuilder {
                             proc_index,
                             type_index,
                             sequence_index,
-                            &mut inferred_sequence_index,
+                            inferred_sequence_index,
                             graph,
                         );
                     }
@@ -5091,6 +5116,187 @@ mod tests {
             vec!["finance", "hr"],
             "distinct inferred nodes per schema"
         );
+    }
+
+    #[test]
+    fn two_chunk_reference_then_ddl_promotes_inferred_sequence() {
+        use crate::graph::builder::GraphBuildContext;
+
+        let mut ctx = GraphBuildContext::new();
+        let file1 = ParsedFile {
+            path: PathBuf::from("chunk1.sql"),
+            statements: parse_sql(
+                r#"
+                CREATE PROCEDURE proc_a() AS $$
+                DECLARE v_id BIGINT;
+                BEGIN
+                    v_id := my_seq.NEXTVAL;
+                END;
+                $$ LANGUAGE plpgsql;
+                "#,
+            ),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file1]);
+
+        let file2 = ParsedFile {
+            path: PathBuf::from("chunk2.sql"),
+            statements: parse_sql("CREATE SEQUENCE my_seq;"),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file2]);
+        GraphBuilder::finalize_graph(&mut ctx);
+
+        let sequences: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(
+                |&idx| matches!(&ctx.graph[idx], Node::Sequence { name, .. } if name == "my_seq"),
+            )
+            .collect();
+        assert_eq!(sequences.len(), 1, "expected one promoted sequence node");
+        let sequence_idx = sequences[0];
+        assert!(matches!(
+            &ctx.graph[sequence_idx],
+            Node::Sequence {
+                explicit: true,
+                location: Some(_),
+                ..
+            }
+        ));
+        let uses_sequence_targets: Vec<_> = ctx
+            .graph
+            .edge_indices()
+            .filter(|&idx| matches!(&ctx.graph[idx], Edge::UsesSequence { .. }))
+            .map(|idx| ctx.graph.edge_endpoints(idx).unwrap().1)
+            .collect();
+        assert_eq!(uses_sequence_targets, vec![sequence_idx]);
+    }
+
+    #[test]
+    fn two_chunk_duplicate_references_share_single_inferred_sequence() {
+        use crate::graph::builder::GraphBuildContext;
+
+        let mut ctx = GraphBuildContext::new();
+        for (path, procedure) in [("chunk1.sql", "proc_a"), ("chunk2.sql", "proc_b")] {
+            let file = ParsedFile {
+                path: PathBuf::from(path),
+                statements: parse_sql(&format!(
+                    r#"
+                    CREATE PROCEDURE {procedure}() AS $$
+                    DECLARE v_id BIGINT;
+                    BEGIN
+                        v_id := my_seq.NEXTVAL;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    "#
+                )),
+                content_hash: String::new(),
+            };
+            GraphBuilder::build_sql_chunk(&mut ctx, &[file]);
+        }
+        GraphBuilder::finalize_graph(&mut ctx);
+
+        let sequences: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(
+                |&idx| matches!(&ctx.graph[idx], Node::Sequence { name, .. } if name == "my_seq"),
+            )
+            .collect();
+        assert_eq!(sequences.len(), 1, "expected one shared inferred sequence");
+        let sequence_idx = sequences[0];
+        assert!(matches!(
+            &ctx.graph[sequence_idx],
+            Node::Sequence {
+                explicit: false,
+                location: None,
+                ..
+            }
+        ));
+        let uses_sequence_targets: Vec<_> = ctx
+            .graph
+            .edge_indices()
+            .filter(|&idx| matches!(&ctx.graph[idx], Edge::UsesSequence { .. }))
+            .map(|idx| ctx.graph.edge_endpoints(idx).unwrap().1)
+            .collect();
+        assert_eq!(uses_sequence_targets, vec![sequence_idx, sequence_idx]);
+    }
+
+    #[test]
+    fn ddl_does_not_promote_other_schema_inferred_sequence() {
+        use crate::graph::builder::GraphBuildContext;
+
+        let mut ctx = GraphBuildContext::new();
+        let file1 = ParsedFile {
+            path: PathBuf::from("chunk1.sql"),
+            statements: parse_sql(
+                r#"
+                CREATE PROCEDURE proc_a() AS $$
+                DECLARE v_id BIGINT;
+                BEGIN
+                    v_id := hr.seq_id.NEXTVAL;
+                END;
+                $$ LANGUAGE plpgsql;
+                "#,
+            ),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file1]);
+
+        let file2 = ParsedFile {
+            path: PathBuf::from("chunk2.sql"),
+            statements: parse_sql("CREATE SEQUENCE finance.seq_id;"),
+            content_hash: String::new(),
+        };
+        GraphBuilder::build_sql_chunk(&mut ctx, &[file2]);
+        GraphBuilder::finalize_graph(&mut ctx);
+
+        let hr_sequence = ctx
+            .graph
+            .node_indices()
+            .find(|&idx| {
+                matches!(
+                    &ctx.graph[idx],
+                    Node::Sequence {
+                        schema: Some(schema),
+                        name,
+                        explicit: false,
+                        ..
+                    } if schema == "hr" && name == "seq_id"
+                )
+            })
+            .expect("expected inferred hr.seq_id");
+        let finance_sequences: Vec<_> = ctx
+            .graph
+            .node_indices()
+            .filter(|&idx| {
+                matches!(
+                    &ctx.graph[idx],
+                    Node::Sequence {
+                        schema: Some(schema),
+                        name,
+                        explicit: true,
+                        location: Some(_),
+                    } if schema == "finance" && name == "seq_id"
+                )
+            })
+            .collect();
+        assert_eq!(finance_sequences.len(), 1);
+        assert_eq!(
+            ctx.graph
+                .node_indices()
+                .filter(|&idx| matches!(&ctx.graph[idx], Node::Sequence { name, .. } if name == "seq_id"))
+                .count(),
+            2
+        );
+        let uses_sequence_targets: Vec<_> = ctx
+            .graph
+            .edge_indices()
+            .filter(|&idx| matches!(&ctx.graph[idx], Edge::UsesSequence { .. }))
+            .map(|idx| ctx.graph.edge_endpoints(idx).unwrap().1)
+            .collect();
+        assert_eq!(uses_sequence_targets, vec![hr_sequence]);
     }
 
     #[test]
