@@ -1145,15 +1145,21 @@ pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<Str
 ///   target is visited (insert-after-visit), so a self-referential
 ///   declaration like `emp emp%ROWTYPE` — the standard Oracle idiom for a
 ///   record variable shaped like, and named after, a table — resolves to
-///   the real `emp` table rather than shadowing itself. When a *different*,
-///   already-declared local (an earlier
-///   sibling variable/TYPE, or a routine parameter name injected via
+///   the real `emp` table rather than shadowing itself. When a
+///   *different*, already-declared local (an earlier sibling
+///   variable/TYPE, or a routine parameter name injected via
 ///   [`register_var_name`](AnchorExtractor::register_var_name); parameters
 ///   are not `PlDeclaration`s inside the block, so they carry no
 ///   self-exclusion here) shares the anchor's target name, the anchor is
 ///   still conservatively skipped: that shadowing is a genuine local
 ///   reference, not self-declaration, so it resolves to the local, not the
 ///   table, at the point of use.
+/// - A nested routine (`PlDeclaration::NestedProcedure`/`NestedFunction`)
+///   gets its own isolated scope: its parameters are injected into
+///   `var_names`, its body is walked with a save/restore barrier around
+///   `cursor_names`/`var_names`, and the saved state is restored once the
+///   nested block finishes — so a nested routine's own locals never leak
+///   into, and never shadow names in, the enclosing routine's scope.
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
@@ -4963,37 +4969,37 @@ mod tests {
     /// a nested routine's local `CURSOR`/variable declarations are inserted
     /// directly into the shared `cursor_names`/`var_names` sets (no
     /// isolation), leaking into the enclosing routine's guard state after
-    /// the nested block finishes walking.
+    /// the nested block finishes walking. Proven behaviorally rather than
+    /// by inspecting private extractor state: ogsql-parser's declaration
+    /// loop does not require nested routines to be the last `DECLARE`
+    /// item, so a sibling declaration can follow the nested routine in the
+    /// *same* `DECLARE` section and anchor to the nested routine's
+    /// exclusively-local variable name (`v_local`) — if that name had
+    /// leaked outward, `v_local` would be sitting in the outer
+    /// `var_names` guard set and this anchor would be wrongly suppressed.
     #[test]
-    fn should_restore_scope_after_nested_routine() {
-        let sql = "CREATE OR REPLACE PROCEDURE outer_proc(p1 IN NUMBER) AS \
-            PROCEDURE inner_proc(p_emp VARCHAR2) AS \
-                CURSOR c_inner IS SELECT id FROM t_x; \
+    fn should_not_leak_nested_routine_locals_into_outer_scope() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            PROCEDURE inner_proc AS \
                 v_local INTEGER; \
             BEGIN \
                 NULL; \
             END inner_proc; \
+            v2 v_local.some_col%TYPE; \
             BEGIN \
-                inner_proc(p1); \
+                RETURN NULL; \
             END;";
-        let tokens = Tokenizer::new(sql).tokenize().unwrap();
-        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
-        let stmts = parser.parse_with_text();
-        let mut ex = AnchorExtractor::new();
-        for info in &stmts {
-            walk_statement(&mut ex, &info.statement);
-        }
-        assert!(
-            ex.cursor_names.is_empty(),
-            "nested cursor name must not leak into the outer scope after the \
-             nested routine's block finishes walking, got {:?}",
-            ex.cursor_names
+        let anchors = extract_anchors(sql);
+        assert_eq!(
+            anchors.len(),
+            1,
+            "v2's anchor to v_local.some_col must survive — v_local is exclusively \
+             the nested routine's own local and must not leak into the outer \
+             scope's guard set, got {:?}",
+            anchors
         );
-        assert!(
-            !ex.var_names.contains("v_local") && !ex.var_names.contains("p_emp"),
-            "nested local var/param names must not leak into the outer scope, got {:?}",
-            ex.var_names
-        );
+        assert_eq!(anchors[0].object, "v_local");
+        assert_eq!(anchors[0].column.as_deref(), Some("some_col"));
     }
 
     #[test]

@@ -3903,6 +3903,116 @@ mod tests {
         }
     }
 
+    /// Locks the `seen_anchor_keys` cross-store property (the flip side of
+    /// `should_keep_distinct_anchor_edges_through_merge`, which checks
+    /// *different*-column anchors survive): two stores each carrying the
+    /// exact same `AnchorsOn` edge (same kind/column/site) on the same
+    /// (proc, table) pair must collapse to exactly one edge after `merge`,
+    /// not two.
+    #[test]
+    fn should_dedupe_identical_anchor_edge_across_stores() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_a = graph_a.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_a = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_a.add_edge(
+            proc_a,
+            table_a,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        // store_b: identical proc/table node keys and the identical
+        // AnchorsOn edge — after node-key merge this resolves to the same
+        // (proc, table) pair as store_a's.
+        let mut graph_b = CodeGraph::new();
+        let proc_b = graph_b.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_b = graph_b.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_b.add_edge(
+            proc_b,
+            table_b,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let anchor_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "identical AnchorsOn edges from two stores on the same (proc, table) \
+             pair must collapse to exactly 1 edge, got {:?}",
+            anchor_edges
+        );
+    }
+
     #[test]
     fn merge_populates_node_summaries() {
         let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
