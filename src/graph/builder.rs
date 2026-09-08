@@ -1881,6 +1881,19 @@ impl GraphBuilder {
         package_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
+        // Index package SPEC items by lowercased qualified package name so a
+        // package BODY's anchor guards (cursor/variable/TYPE names) inherit
+        // the SPEC's public declarations — mirrors the call-edge extraction
+        // path's `spec_items_by_pkg` (create_sql_edges).
+        let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
+        for file in files {
+            for info in &file.statements {
+                if let Statement::CreatePackage(pkg) = &info.statement {
+                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
+                }
+            }
+        }
+
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
             for info in &file.statements {
@@ -2044,6 +2057,7 @@ impl GraphBuilder {
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
+                            &[],
                             info,
                             &file_arc,
                             proc_index,
@@ -2055,9 +2069,14 @@ impl GraphBuilder {
                         );
                     }
                     Statement::CreatePackageBody(pkg) => {
+                        let inherited: &[PackageItem] = spec_items_by_pkg
+                            .get(&pkg_qualified_key(&pkg.name))
+                            .copied()
+                            .unwrap_or(&[]);
                         Self::collect_package_object_ref_edges(
                             &pkg.name,
                             &pkg.items,
+                            inherited,
                             info,
                             &file_arc,
                             proc_index,
@@ -2078,6 +2097,7 @@ impl GraphBuilder {
     fn collect_package_object_ref_edges(
         pkg_name: &ogsql_parser::ast::ObjectName,
         pkg_items: &[PackageItem],
+        inherited_items: &[PackageItem],
         info: &ogsql_parser::StatementInfo,
         file_path: &Arc<PathBuf>,
         proc_index: &HashMap<RoutineId, petgraph::graph::NodeIndex>,
@@ -2099,8 +2119,11 @@ impl GraphBuilder {
         // variables below, and are injected into every member routine's
         // AnchorExtractor so `rec pkg_cursor%ROWTYPE` inside a routine body
         // is guarded the same way a routine-local cursor would be (#158).
+        // For a BODY, `inherited_items` carries the matching SPEC's public
+        // Cursor/Variable/Type declarations (PR #164 review round 2).
         let pkg_cursor_names: Vec<String> = pkg_items
             .iter()
+            .chain(inherited_items.iter())
             .filter_map(|item| match item {
                 PackageItem::Cursor(c) => Some(c.name.to_lowercase()),
                 _ => None,
@@ -2114,6 +2137,7 @@ impl GraphBuilder {
         // way pkg_cursor_names is (PR #164 review).
         let pkg_var_type_names: Vec<String> = pkg_items
             .iter()
+            .chain(inherited_items.iter())
             .filter_map(|item| match item {
                 PackageItem::Variable(v) => Some(v.name.to_lowercase()),
                 PackageItem::Type(t) => Some(crate::parser::pl_type_decl_name(t).to_lowercase()),
@@ -5350,6 +5374,77 @@ mod tests {
             fake_table.is_none(),
             "package-level TYPE name t_list must never become a table node"
         );
+    }
+
+    /// PR #164 review round 2 (#158): a package BODY's anchor guards must
+    /// inherit its SPEC's cursor/variable/TYPE names, the same way the
+    /// call-edge extraction path already inherits `spec_items_by_pkg`.
+    /// Without inheritance, a member routine in the BODY that anchors to a
+    /// SPEC-declared variable/TYPE produces a false table anchor because
+    /// `collect_package_object_ref_edges` only sees the BODY's own
+    /// `pkg_items` when building its guard sets. (The signature/`Param`
+    /// anchor path has no guard at all yet — that's PR #164 review issue 1,
+    /// fixed separately in Task 2; its SPEC-inherited variant is covered by
+    /// the Task 4 end-to-end fixture once both fixes are in.)
+    #[test]
+    fn should_inherit_spec_names_for_body_anchor_guards() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE pkg_spec AS
+                CURSOR c IS SELECT id FROM t_cursor_src;
+                TYPE rec_t IS RECORD (f INTEGER);
+                v_emp employees%ROWTYPE;
+            END pkg_spec;
+
+            CREATE OR REPLACE PACKAGE BODY pkg_spec AS
+                PROCEDURE p_body IS
+                    v1 rec_t.f%TYPE;
+                    v2 v_emp.empno%TYPE;
+                    v_ok real_table.real_col%TYPE;
+                BEGIN
+                    NULL;
+                END;
+            END pkg_spec;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+
+        // Two legitimate anchors survive: SPEC's own v_emp->employees, and
+        // BODY's v_ok->real_table. rec_t/v_emp must be guarded in the BODY
+        // member routine via SPEC inheritance (v1/v2 produce no anchors).
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 AnchorsOn edges (v_emp->employees from SPEC, v_ok->real_table \
+             from BODY); v1/v2 must be guarded via SPEC inheritance, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let mut target_names: Vec<String> = anchor_edges
+            .iter()
+            .map(|&e| {
+                let (_, target) = graph.edge_endpoints(e).unwrap();
+                match &graph[target] {
+                    Node::Table { name, .. } => name.to_lowercase(),
+                    other => panic!("expected Node::Table, got {:?}", other),
+                }
+            })
+            .collect();
+        target_names.sort();
+        assert_eq!(target_names, vec!["employees", "real_table"]);
+
+        for fake in ["c", "rec_t", "v_emp"] {
+            let fake_table = graph.node_indices().find(
+                |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case(fake)),
+            );
+            assert!(
+                fake_table.is_none(),
+                "SPEC-declared name '{}' must never become a table node",
+                fake
+            );
+        }
     }
 
     #[test]
