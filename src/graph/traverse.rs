@@ -58,18 +58,16 @@ pub struct DegreeInfo {
     pub total_degree: usize,
 }
 
-pub(crate) fn edge_label_for(
-    graph: &crate::graph::CodeGraph,
-    from: NodeIndex,
-    to: NodeIndex,
-) -> Option<String> {
+/// Compute the display label fragment (without surrounding brackets) for a
+/// single edge weight. Returns `None` when the edge type has no directional
+/// marker (e.g. `ContainsRoutine`/`ContainsMethod`, structural-only edges).
+fn edge_label_part(edge: &crate::graph::Edge) -> Option<String> {
     use crate::graph::{CallScope, DataFlowKind, Edge};
-    let edge = graph.edges_connecting(from, to).next()?;
-    match edge.weight() {
+    match edge {
         Edge::DirectCall { scope, .. } => Some(match scope {
-            CallScope::IntraPackage => "[intra]".into(),
-            CallScope::CrossPackage => "[cross]".into(),
-            CallScope::External => "[external]".into(),
+            CallScope::IntraPackage => "intra".into(),
+            CallScope::CrossPackage => "cross".into(),
+            CallScope::External => "external".into(),
         }),
         Edge::TableAccess {
             flow_kind,
@@ -87,24 +85,62 @@ pub(crate) fn edge_label_for(
             if parts.is_empty() {
                 None
             } else {
-                Some(format!("[{}]", parts.join(",")))
+                Some(parts.join(","))
             }
         }
-        Edge::DependsOn { .. } => Some("[depends_on]".into()),
-        Edge::DynamicCall { .. } => Some("[dynamic]".into()),
-        Edge::UsesBuiltinFunction { .. } => Some("[builtin]".into()),
-        Edge::CallsProcedure { .. } => Some("[calls]".into()),
-        Edge::InvokesMapper { .. } => Some("[invokes]".into()),
-        Edge::CallsJava { .. } => Some("[calls_java]".into()),
-        Edge::Extends { .. } => Some("[extends]".into()),
-        Edge::Implements { .. } => Some("[implements]".into()),
-        Edge::TriggersRoutine { .. } => Some("[triggers]".into()),
-        Edge::ReferencesType { .. } => Some("[ref_type]".into()),
-        Edge::UsesSequence { .. } => Some("[uses_seq]".into()),
-        Edge::IndexesTable { .. } => Some("[indexes]".into()),
-        Edge::AliasesObject { .. } => Some("[aliases]".into()),
+        Edge::DependsOn { .. } => Some("depends_on".into()),
+        Edge::DynamicCall { .. } => Some("dynamic".into()),
+        Edge::UsesBuiltinFunction { .. } => Some("builtin".into()),
+        Edge::CallsProcedure { .. } => Some("calls".into()),
+        Edge::InvokesMapper { .. } => Some("invokes".into()),
+        Edge::CallsJava { .. } => Some("calls_java".into()),
+        Edge::Extends { .. } => Some("extends".into()),
+        Edge::Implements { .. } => Some("implements".into()),
+        Edge::TriggersRoutine { .. } => Some("triggers".into()),
+        Edge::ReferencesType { .. } => Some("ref_type".into()),
+        Edge::UsesSequence { .. } => Some("uses_seq".into()),
+        Edge::IndexesTable { .. } => Some("indexes".into()),
+        Edge::AliasesObject { .. } => Some("aliases".into()),
+        Edge::AnchorsOn { .. } => Some("T".into()),
         Edge::ContainsRoutine | Edge::ContainsMethod => None,
         _ => None,
+    }
+}
+
+/// Aggregate the label of every parallel edge between `from` and `to` into a
+/// single bracketed, comma-joined, de-duplicated (first-seen order) string.
+///
+/// petgraph is a multigraph: the same node pair may carry several edges of
+/// different kinds (e.g. `TableAccess` + `AnchorsOn`). Only inspecting the
+/// first edge (as the old implementation did) silently drops labels for the
+/// rest — this aggregates them so callers see every applicable marker, e.g.
+/// `[R,T]` instead of just `[R]` or `[T]` (issue #158).
+pub(crate) fn edge_label_for(
+    graph: &crate::graph::CodeGraph,
+    from: NodeIndex,
+    to: NodeIndex,
+) -> Option<String> {
+    // `edges_connecting` iterates parallel edges LIFO; `.rev()` restores the
+    // creation order of the *surviving* edges — robust even if other edges
+    // were removed via `remove_edge` (which does a swap_remove and reuses
+    // `EdgeIndex` slots, so sorting by index would scramble order instead).
+    let mut parts: Vec<String> = Vec::new();
+    for e in graph
+        .edges_connecting(from, to)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if let Some(label) = edge_label_part(e.weight()) {
+            if !parts.contains(&label) {
+                parts.push(label);
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("[{}]", parts.join(",")))
     }
 }
 
@@ -1255,6 +1291,28 @@ mod tests {
         })
     }
 
+    // ── parallel edge label aggregation tests (issue #158, Task 8) ──
+
+    fn add_table_node(
+        graph: &mut crate::graph::CodeGraph,
+        name: &str,
+    ) -> petgraph::graph::NodeIndex {
+        graph.add_node(crate::graph::Node::Table {
+            schema: Some("sch".into()),
+            name: name.to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        })
+    }
+
     fn add_index_in(
         graph: &mut crate::graph::CodeGraph,
         name: &str,
@@ -1375,6 +1433,44 @@ mod tests {
     }
 
     #[test]
+    fn should_aggregate_parallel_edge_labels_into_one_bracket() {
+        // proc → table with both TableAccess[Read] and AnchorsOn edges
+        // (parallel edges on the same node pair, e.g. `%TYPE` anchor + SELECT).
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_a");
+        let table = add_table_node(&mut graph, "par_sys_purchase");
+
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::AnchorsOn {
+                kind: crate::parser::AnchorKind::PercentType,
+                column: Some("purchase_days".into()),
+                site: crate::parser::AnchorSite::Variable,
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, proc, table);
+        assert_eq!(
+            label.as_deref(),
+            Some("[R,T]"),
+            "parallel TableAccess[Read] + AnchorsOn edges must aggregate into one bracket"
+        );
+    }
+
+    #[test]
     fn collect_chain_files_related_ddl_includes_synonym_and_trigger_files() {
         let (mut graph, proc, table, _index) = proc_table_index_graph("index.sql");
         let syn = graph.add_node(crate::graph::Node::Synonym {
@@ -1469,6 +1565,157 @@ mod tests {
         assert!(
             !files_contain(&files, "view.sql"),
             "dependent views are impact, not satellite DDL: {files:?}"
+        );
+    }
+
+    #[test]
+    fn should_keep_single_edge_label_unchanged() {
+        // Regression lock: single-edge cases must keep producing exactly the
+        // same label as before aggregation was introduced.
+
+        // TableAccess[Read] only → [R]
+        let mut g1 = crate::graph::CodeGraph::new();
+        let proc1 = add_proc_node(&mut g1, "proc_r");
+        let table1 = add_table_node(&mut g1, "t_read");
+        g1.add_edge(
+            proc1,
+            table1,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        assert_eq!(edge_label_for(&g1, proc1, table1).as_deref(), Some("[R]"));
+
+        // DirectCall (default scope: IntraPackage) only → [intra]
+        let mut g2 = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut g2, "a");
+        let b = add_proc_node(&mut g2, "b");
+        g2.add_edge(
+            a,
+            b,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: make_loc(),
+            },
+        );
+        assert_eq!(edge_label_for(&g2, a, b).as_deref(), Some("[intra]"));
+
+        // AnchorsOn only → [T]
+        let mut g3 = crate::graph::CodeGraph::new();
+        let proc3 = add_proc_node(&mut g3, "proc_t");
+        let table3 = add_table_node(&mut g3, "t_anchor");
+        g3.add_edge(
+            proc3,
+            table3,
+            crate::graph::Edge::AnchorsOn {
+                kind: crate::parser::AnchorKind::PercentType,
+                column: None,
+                site: crate::parser::AnchorSite::Param,
+                location: make_loc(),
+            },
+        );
+        assert_eq!(edge_label_for(&g3, proc3, table3).as_deref(), Some("[T]"));
+    }
+
+    #[test]
+    fn should_dedupe_and_keep_first_seen_order() {
+        // Two equivalent TableAccess[Read] edges collapse to a single "R".
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_dup");
+        let table = add_table_node(&mut graph, "t_dup");
+
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        // A distinct AnchorsOn edge should still be appended after the
+        // deduped TableAccess label, preserving first-seen order.
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::AnchorsOn {
+                kind: crate::parser::AnchorKind::PercentType,
+                column: Some("col".into()),
+                site: crate::parser::AnchorSite::Variable,
+                location: make_loc(),
+            },
+        );
+
+        let label = edge_label_for(&graph, proc, table);
+        assert_eq!(
+            label.as_deref(),
+            Some("[R,T]"),
+            "duplicate TableAccess[Read] labels must collapse to one 'R', \
+             followed by the distinct AnchorsOn 'T' in first-seen order"
+        );
+    }
+
+    #[test]
+    fn should_aggregate_three_parallel_edge_kinds() {
+        // Three distinct edge kinds on the same node pair — TableAccess[Read],
+        // AnchorsOn, and DependsOn — added in that order, must all survive
+        // aggregation in creation order: "[R,T,depends_on]".
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_triple");
+        let table = add_table_node(&mut graph, "t_triple");
+
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::AnchorsOn {
+                kind: crate::parser::AnchorKind::PercentType,
+                column: Some("col".into()),
+                site: crate::parser::AnchorSite::Variable,
+                location: make_loc(),
+            },
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::DependsOn {
+                location: make_loc(),
+                column_analysis: None,
+            },
+        );
+
+        let label = edge_label_for(&graph, proc, table);
+        assert_eq!(
+            label.as_deref(),
+            Some("[R,T,depends_on]"),
+            "three distinct parallel edge kinds must all appear in creation order"
         );
     }
 }

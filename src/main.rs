@@ -4683,6 +4683,7 @@ fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
         Edge::UsesSequence { location, .. } => Some(location.line),
         Edge::IndexesTable { location, .. } => Some(location.line),
         Edge::AliasesObject { location, .. } => Some(location.line),
+        Edge::AnchorsOn { location, .. } => Some(location.line),
         Edge::CustomEdge { location, .. } => location.as_ref().map(|l| l.line),
         Edge::ContainsMethod | Edge::ContainsRoutine => None,
         #[cfg(feature = "jsp")]

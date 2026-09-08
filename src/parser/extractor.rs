@@ -841,6 +841,81 @@ pub enum SequenceRefVia {
     DotCurrval,
 }
 
+/// Schema anchor kind for `AnchorsOn` edges (issue #158).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorKind {
+    PercentType,
+    PercentRowType,
+}
+
+/// Where in the routine the anchor appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorSite {
+    ReturnType,
+    Param,
+    Variable,
+    NestedType,
+}
+
+/// One `%TYPE` / `%ROWTYPE` anchor parsed from a declaration or signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRef {
+    pub object: String,
+    pub column: Option<String>,
+    pub kind: AnchorKind,
+    pub site: AnchorSite,
+}
+
+/// Parse a flat routine-signature type string (e.g. `par_sys_purchase. purchase_days% type`)
+/// into an anchor. Returns `None` for plain type names. Tolerates stray whitespace and case
+/// variation produced by ogsql-parser's token concatenation. `site` is supplied by the caller
+/// (e.g. `AnchorSite::Param` for a parameter declaration, `AnchorSite::ReturnType` for a
+/// RETURN clause) and is carried through unchanged into the resulting `AnchorRef`.
+pub fn parse_anchor_from_type_string(s: &str, site: AnchorSite) -> Option<AnchorRef> {
+    // '%' 是大小写不变的单字节 ASCII 字符，必须在原始串 `s` 上直接定位，而不能先对整串
+    // `to_lowercase()` 再用该偏移切 `s`：某些 Unicode 字符（如 İ U+0130）大小写折叠后
+    // 字节长度会变化，导致偏移漂移、把 '%' 吞进 head。仅对 '%' 之后的关键字部分做大小写折叠。
+    let pct_pos = s.find('%')?;
+    let after_pct = s[pct_pos + 1..].trim_start().to_lowercase();
+    let kind = if after_pct.starts_with("rowtype") {
+        AnchorKind::PercentRowType
+    } else if after_pct.starts_with("type") {
+        AnchorKind::PercentType
+    } else {
+        return None;
+    };
+    let head = &s[..pct_pos];
+    let idents: Vec<&str> = head
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    match (kind, idents.len()) {
+        (AnchorKind::PercentType, n) if n >= 2 => {
+            let column = idents[n - 1].to_string();
+            let object = idents[..n - 1].join(".");
+            Some(AnchorRef {
+                object,
+                column: Some(column),
+                kind,
+                site,
+            })
+        }
+        (AnchorKind::PercentRowType, n) if n >= 1 => {
+            let object = idents.join(".");
+            Some(AnchorRef {
+                object,
+                column: None,
+                kind,
+                site,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub struct TypeSequenceRefExtractor {
     pub known_types: HashSet<String>,
     pub type_refs: Vec<TypeRef>,
@@ -980,6 +1055,247 @@ impl Visitor for TypeSequenceRefExtractor {
                         context: self.current_context.clone(),
                     });
                 }
+            }
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+}
+
+/// Extract the raw `(object, column, kind)` triple from a `PlDataType` if it
+/// is `%TYPE` / `%ROWTYPE` anchored, with no cursor/variable guard applied.
+/// Shared by [`AnchorExtractor::visit_pl_data_type`] (routine-local walk,
+/// which does apply the guard) and package-level variable handling in
+/// `graph::builder`, which is declared outside any `PlBlock` and therefore
+/// cannot reuse the extractor's walk — it must apply its own (package-level)
+/// cursor guard against the returned object name.
+pub fn anchor_from_pl_data_type(
+    dt: &ogsql_parser::ast::plpgsql::PlDataType,
+) -> Option<(String, Option<String>, AnchorKind)> {
+    use ogsql_parser::ast::plpgsql::PlDataType;
+    match dt {
+        PlDataType::PercentType { table, column } => {
+            if column.trim().is_empty() {
+                // `v1%TYPE` 单标识符形态：变量到变量锚定，不是表列引用
+                return None;
+            }
+            Some((table.clone(), Some(column.clone()), AnchorKind::PercentType))
+        }
+        PlDataType::PercentRowType(name) => Some((name.clone(), None, AnchorKind::PercentRowType)),
+        _ => None,
+    }
+}
+
+/// Extract every `%TYPE`/`%ROWTYPE` anchor target `(object, column, kind)`
+/// nested inside a `PlTypeDecl`'s element/field types (`TABLE OF` elem/index
+/// type, `VARRAY OF` elem type, `RECORD (...)` field types), with no
+/// cursor/variable guard applied — same no-guard contract as
+/// [`anchor_from_pl_data_type`], which this reuses per element/field.
+/// Shared by [`AnchorExtractor::visit_pl_declaration`] (routine-local walk,
+/// which applies the guard via `push_anchor`) and package-level nested
+/// `TYPE` handling in `graph::builder`, which is declared outside any
+/// `PlBlock` and must apply its own (package-level) guard.
+pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<String>, AnchorKind)> {
+    let mut out = Vec::new();
+    match t {
+        PlTypeDecl::TableOf {
+            elem_type,
+            index_by,
+            ..
+        } => {
+            if let Some(a) = anchor_from_pl_data_type(elem_type) {
+                out.push(a);
+            }
+            if let Some(ib) = index_by {
+                if let Some(a) = anchor_from_pl_data_type(ib) {
+                    out.push(a);
+                }
+            }
+        }
+        PlTypeDecl::VarrayOf { elem_type, .. } => {
+            if let Some(a) = anchor_from_pl_data_type(elem_type) {
+                out.push(a);
+            }
+        }
+        PlTypeDecl::Record { fields, .. } => {
+            for f in fields {
+                if let Some(a) = anchor_from_pl_data_type(&f.data_type) {
+                    out.push(a);
+                }
+            }
+        }
+        PlTypeDecl::RefCursor { .. } => {}
+    }
+    out
+}
+
+/// Extracts `%TYPE` / table-level `%ROWTYPE` schema anchors (issue #158).
+/// `push_anchor` skips any anchor whose object name (lowercased) matches a
+/// known cursor name or a declared local variable name. This guards both
+/// `cursor%ROWTYPE` (issue #147/#142: record fields resolve via cursor
+/// SELECT sources, not table edges) and variable-to-variable anchoring
+/// (`v2 v1%TYPE`), neither of which are table references.
+///
+/// Caveats:
+/// - The cursor/variable guard assumes declare-before-use ordering (a
+///   `PlDeclaration::Cursor`/`Variable` must be visited before any anchor
+///   that shadows it is evaluated). This matches PL/SQL's own declaration
+///   order semantics, so out-of-order shadowing is not a real-world case.
+/// - A declaration's own name registers only *after* its `%ROWTYPE`/`%TYPE`
+///   target is visited (insert-after-visit), so a self-referential
+///   declaration like `emp emp%ROWTYPE` — the standard Oracle idiom for a
+///   record variable shaped like, and named after, a table — resolves to
+///   the real `emp` table rather than shadowing itself. When a
+///   *different*, already-declared local (an earlier sibling
+///   variable/TYPE, or a routine parameter name injected via
+///   [`register_var_name`](AnchorExtractor::register_var_name); parameters
+///   are not `PlDeclaration`s inside the block, so they carry no
+///   self-exclusion here) shares the anchor's target name, the anchor is
+///   still conservatively skipped: that shadowing is a genuine local
+///   reference, not self-declaration, so it resolves to the local, not the
+///   table, at the point of use.
+/// - A nested routine (`PlDeclaration::NestedProcedure`/`NestedFunction`)
+///   gets its own isolated scope: its parameters are injected into
+///   `var_names`, its body is walked with a save/restore barrier around
+///   `cursor_names`/`var_names`, and the saved state is restored once the
+///   nested block finishes — so a nested routine's own locals never leak
+///   into, and never shadow names in, the enclosing routine's scope.
+pub struct AnchorExtractor {
+    pub anchors: Vec<AnchorRef>,
+    cursor_names: HashSet<String>,
+    var_names: HashSet<String>,
+}
+
+impl AnchorExtractor {
+    pub fn new() -> Self {
+        Self {
+            anchors: Vec::new(),
+            cursor_names: HashSet::new(),
+            var_names: HashSet::new(),
+        }
+    }
+
+    /// Inject a cursor name declared outside this extractor's own walk (a
+    /// package-level `CURSOR` visible to every routine in the package) so
+    /// that `rec pkg_cursor%ROWTYPE` inside a routine body is guarded the
+    /// same way a routine-local cursor declaration would be (issue #158).
+    pub fn register_cursor_name(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.cursor_names.insert(name.to_lowercase());
+        }
+    }
+
+    /// Inject a local variable / type / parameter name declared outside
+    /// this extractor's own walk (routine parameters and package-level
+    /// names are not `PlDeclaration`s inside the block) so `%TYPE` /
+    /// `%ROWTYPE` anchored to them is guarded the same way a routine-local
+    /// declaration would be.
+    pub fn register_var_name(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.var_names.insert(name.to_lowercase());
+        }
+    }
+
+    fn push_anchor(
+        &mut self,
+        object: String,
+        column: Option<String>,
+        kind: AnchorKind,
+        site: AnchorSite,
+    ) {
+        let obj_lower = object.to_lowercase();
+        // 守卫：锚定目标是 cursor 或本 routine 已声明的局部变量 → 不建表锚
+        if self.cursor_names.contains(&obj_lower) || self.var_names.contains(&obj_lower) {
+            return;
+        }
+        self.anchors.push(AnchorRef {
+            object,
+            column,
+            kind,
+            site,
+        });
+    }
+
+    /// Visit a `PlDataType` reached from any declaration site — a plain
+    /// variable, or nested inside a `TYPE ... IS TABLE OF` / `VARRAY OF` /
+    /// `RECORD (...)` field — and push an anchor if it is `%TYPE` /
+    /// `%ROWTYPE`.
+    fn visit_pl_data_type(
+        &mut self,
+        dt: &ogsql_parser::ast::plpgsql::PlDataType,
+        site: AnchorSite,
+    ) {
+        if let Some((object, column, kind)) = anchor_from_pl_data_type(dt) {
+            self.push_anchor(object, column, kind, site);
+        }
+    }
+}
+
+impl Visitor for AnchorExtractor {
+    fn visit_pl_declaration(
+        &mut self,
+        decl: &ogsql_parser::ast::plpgsql::PlDeclaration,
+    ) -> VisitorResult {
+        match decl {
+            PlDeclaration::Cursor(c) => {
+                self.cursor_names.insert(c.name.to_lowercase());
+            }
+            PlDeclaration::Variable(v) => {
+                self.visit_pl_data_type(&v.data_type, AnchorSite::Variable);
+                self.var_names.insert(v.name.to_lowercase());
+            }
+            PlDeclaration::Record(r) => {
+                self.var_names.insert(r.name.to_lowercase());
+            }
+            PlDeclaration::Type(t) => {
+                for (object, column, kind) in anchor_targets_in_pl_type_decl(t) {
+                    self.push_anchor(object, column, kind, AnchorSite::NestedType);
+                }
+                self.var_names.insert(pl_type_decl_name(t).to_lowercase());
+            }
+            // Nested routines have their own parameter list and scope, but
+            // PL/SQL scoping is lexical: a nested routine's body still sees
+            // every cursor/variable/parameter name guarded in the
+            // enclosing routine (and package), it just adds its own
+            // parameters on top (shadowing same-named outer locals within
+            // its own body only). The default walker recurses into the
+            // nested block AFTER this returns, with no cleanup — leaking
+            // nested locals outward and never registering the nested
+            // parameters as guarded names. We prevent this by returning
+            // SkipChildren and manually walking the nested block with a
+            // save/restore barrier: *clone* (not take) the guard sets so
+            // outer names remain visible inside the nested body, register
+            // the nested parameters on top, walk, then restore the
+            // pre-nesting snapshot so the nested routine's own locals don't
+            // leak into the enclosing scope. Mirrors
+            // `CallExtractor::visit_pl_declaration`'s `NestedProcedure`/
+            // `NestedFunction` arms. Nested RETURN-type anchoring is not
+            // done — a nested routine has no independent graph node.
+            PlDeclaration::NestedProcedure(p) => {
+                let saved_cursors = self.cursor_names.clone();
+                let saved_vars = self.var_names.clone();
+                for param in &p.parameters {
+                    self.register_var_name(&param.name);
+                }
+                if let Some(ref block) = p.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.cursor_names = saved_cursors;
+                self.var_names = saved_vars;
+                return VisitorResult::SkipChildren;
+            }
+            PlDeclaration::NestedFunction(f) => {
+                let saved_cursors = self.cursor_names.clone();
+                let saved_vars = self.var_names.clone();
+                for param in &f.parameters {
+                    self.register_var_name(&param.name);
+                }
+                if let Some(ref block) = f.block {
+                    ogsql_parser::walk_pl_block(self, block);
+                }
+                self.cursor_names = saved_cursors;
+                self.var_names = saved_vars;
+                return VisitorResult::SkipChildren;
             }
             _ => {}
         }
@@ -4295,6 +4611,68 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_flat_return_string_percent_type() {
+        // 真实 parse_type_name 输出：杂散空格 + 大小写混乱
+        let a = parse_anchor_from_type_string(
+            "par_sys_purchase. purchase_days% type",
+            AnchorSite::Param,
+        )
+        .expect("should parse");
+        assert_eq!(a.object, "par_sys_purchase");
+        assert_eq!(a.column.as_deref(), Some("purchase_days"));
+        assert!(matches!(a.kind, AnchorKind::PercentType));
+        // site 由调用方显式传入，此处验证原样传回（Param 占位）；
+        // RETURN 场景调用方传 AnchorSite::ReturnType（builder 侧，后续 Task 6）
+        assert!(matches!(a.site, AnchorSite::Param));
+    }
+
+    #[test]
+    fn should_parse_flat_param_string_percent_rowtype() {
+        let a = parse_anchor_from_type_string("DAT_TRD_REPURCHASE%ROWTYPE", AnchorSite::Param)
+            .expect("should parse");
+        assert_eq!(a.object, "DAT_TRD_REPURCHASE");
+        assert_eq!(a.column, None);
+        assert!(matches!(a.kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_return_none_for_plain_type_names() {
+        assert!(parse_anchor_from_type_string("INTEGER", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("VARCHAR(100)", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("my_pkg.my_record", AnchorSite::Param).is_none());
+        assert!(parse_anchor_from_type_string("", AnchorSite::Param).is_none());
+    }
+
+    #[test]
+    fn should_parse_rowtype_not_mistaken_for_percent_type() {
+        // 混合大小写关键字 "RowType"：验证大小写折叠只作用于 %ROWTYPE/%TYPE 关键字判定，
+        // 不会误判成 %TYPE（区别于 should_parse_flat_param_string_percent_rowtype 的全大写场景）。
+        let a =
+            parse_anchor_from_type_string("t%RowType", AnchorSite::Param).expect("should parse");
+        assert_eq!(a.object, "t");
+        assert_eq!(a.column, None);
+        assert!(matches!(a.kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_parse_three_part_schema_percent_type() {
+        let a = parse_anchor_from_type_string("a. b. c% TYPE", AnchorSite::Param)
+            .expect("should parse");
+        assert_eq!(a.object, "a.b");
+        assert_eq!(a.column.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn should_parse_unicode_ident_percent_type() {
+        // İ (U+0130) 的 to_lowercase() 结果字节长度与原字符不同（2 bytes -> 3 bytes: "i" +
+        // 组合点 U+0307）。若 '%' 位置误从 lowercased 串计算再切原始串会导致偏移漂移。
+        let a =
+            parse_anchor_from_type_string("İ.col%TYPE", AnchorSite::Param).expect("should parse");
+        assert_eq!(a.object, "İ");
+        assert_eq!(a.column.as_deref(), Some("col"));
+    }
+
+    #[test]
     fn select_from_reads() {
         let sql = "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id";
         let accesses = extract_accesses(sql);
@@ -4827,6 +5205,318 @@ mod tests {
             walk_statement(&mut extractor, &info.statement);
         }
         (extractor.type_refs, extractor.sequence_refs)
+    }
+
+    fn extract_anchors(sql: &str) -> Vec<AnchorRef> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut out = Vec::new();
+        for info in &stmts {
+            let mut ex = AnchorExtractor::new();
+            walk_statement(&mut ex, &info.statement);
+            out.extend(ex.anchors);
+        }
+        out
+    }
+
+    #[test]
+    fn should_reject_empty_column_percent_type_from_ast() {
+        use ogsql_parser::ast::plpgsql::PlDataType;
+        // ogsql-parser v0.10.0: `v1%TYPE` 编码为单标识符 + 空 column —— 不是表锚
+        let single = PlDataType::PercentType {
+            table: "v1".into(),
+            column: String::new(),
+        };
+        assert!(
+            anchor_from_pl_data_type(&single).is_none(),
+            "empty-column PercentType is a variable anchor, not a table anchor"
+        );
+        let blank = PlDataType::PercentType {
+            table: "v1".into(),
+            column: "  ".into(),
+        };
+        assert!(anchor_from_pl_data_type(&blank).is_none());
+        // 正常表列锚不受影响
+        let normal = PlDataType::PercentType {
+            table: "t".into(),
+            column: "c".into(),
+        };
+        assert_eq!(
+            anchor_from_pl_data_type(&normal),
+            Some(("t".into(), Some("c".into()), AnchorKind::PercentType))
+        );
+        // PercentRowType 无列语义，不受影响
+        let row = PlDataType::PercentRowType("t".into());
+        assert_eq!(
+            anchor_from_pl_data_type(&row),
+            Some(("t".into(), None, AnchorKind::PercentRowType))
+        );
+    }
+
+    #[test]
+    fn should_collect_variable_percent_type_anchor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            $$ DECLARE v_days par_sys_purchase.purchase_days%TYPE; BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentType));
+    }
+
+    #[test]
+    fn should_collect_variable_table_rowtype_anchor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            $$ DECLARE r dat_trd_repurchase%ROWTYPE; BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
+        assert_eq!(anchors[0].column, None);
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentRowType));
+    }
+
+    #[test]
+    fn should_skip_rowtype_anchored_to_cursor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE CURSOR cur_x FOR SELECT id FROM t_main; \
+            r cur_x%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "cursor%ROWTYPE must not produce a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    #[test]
+    fn should_skip_var_anchored_type_to_local_variable() {
+        // PL/SQL 允许变量锚定到另一变量：v2 v1%TYPE —— 不是表锚
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE v1 INTEGER; v2 v1%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "variable%TYPE must not become a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    /// Issue #158: `emp emp%ROWTYPE` is the
+    /// standard Oracle idiom for declaring a record variable shaped like
+    /// table `emp` and named after it. The declared variable's own name
+    /// must register only *after* its `%ROWTYPE` is resolved — insert-
+    /// before-visit would make the variable shadow itself and wrongly skip
+    /// the anchor.
+    #[test]
+    fn should_anchor_variable_self_named_after_table() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE emp emp%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "emp");
+        assert_eq!(anchors[0].column, None);
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentRowType));
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
+    }
+
+    #[test]
+    fn should_keep_table_rowtype_when_cursor_exists_elsewhere() {
+        // 同 routine 内：cursor c 的存在不影响真正的表锚 rec2
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE CURSOR c IS SELECT id FROM t_main; \
+            rec c%ROWTYPE; rec2 dat_trd_repurchase%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
+    }
+
+    #[test]
+    fn should_skip_type_anchored_to_local_type_declaration() {
+        // 局部 TYPE 声明名（typ_list）同样是遮蔽表名的本地标识符：
+        // v_list typ_list%TYPE 锚到本地 TYPE，不是表。
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE typ_list IS TABLE OF INTEGER; \
+            v_list typ_list%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "local TYPE name must not become a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    #[test]
+    fn should_skip_type_anchored_to_plain_record_variable() {
+        // plain RECORD 变量名（rec2）同样遮蔽表名：
+        // v2 rec2%TYPE 锚到 record 变量，不是表。
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE rec2 RECORD; \
+            v2 rec2%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "record variable name must not become a table anchor: {:?}",
+            anchors
+        );
+    }
+
+    #[test]
+    fn should_collect_nested_table_of_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_list IS TABLE OF par_sys_purchase.purchase_days%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+    }
+
+    #[test]
+    fn should_collect_record_field_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_rec IS RECORD (d dat_trd_repurchase.purchase_date%TYPE); \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].object, "dat_trd_repurchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_date"));
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentType));
+    }
+
+    #[test]
+    fn should_collect_varray_of_percent_type() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE TYPE t_arr IS VARRAY(10) OF par_sys_purchase.purchase_days%TYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert!(matches!(anchors[0].site, AnchorSite::NestedType));
+        assert_eq!(anchors[0].object, "par_sys_purchase");
+        assert_eq!(anchors[0].column.as_deref(), Some("purchase_days"));
+    }
+
+    /// Issue #158: a nested routine (declared inside an
+    /// enclosing routine's `DECLARE` section) has its own parameter list.
+    /// Without a `NestedProcedure`/`NestedFunction` arm, the default walker
+    /// would recurse into the nested block with the *same*
+    /// extractor — the nested parameter `p_emp` would never be registered
+    /// as a guarded local name, so `v p_emp.empno%TYPE` inside the nested
+    /// body would wrongly anchor to a fabricated `p_emp` table.
+    #[test]
+    fn should_skip_type_anchored_to_nested_proc_param() {
+        let sql = "CREATE OR REPLACE PROCEDURE outer_proc(p1 IN NUMBER) AS \
+            PROCEDURE inner_proc(p_emp VARCHAR2) AS \
+                v p_emp.empno%TYPE; \
+            BEGIN \
+                NULL; \
+            END inner_proc; \
+            BEGIN \
+                inner_proc(p1); \
+            END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "nested routine's own parameter 'p_emp' must guard the %TYPE anchor, got {:?}",
+            anchors
+        );
+    }
+
+    /// Issue #158: without a save/restore scope barrier,
+    /// a nested routine's local `CURSOR`/variable declarations are inserted
+    /// directly into the shared `cursor_names`/`var_names` sets (no
+    /// isolation), leaking into the enclosing routine's guard state after
+    /// the nested block finishes walking. Proven behaviorally rather than
+    /// by inspecting private extractor state: ogsql-parser's declaration
+    /// loop does not require nested routines to be the last `DECLARE`
+    /// item, so a sibling declaration can follow the nested routine in the
+    /// *same* `DECLARE` section and anchor to the nested routine's
+    /// exclusively-local variable name (`v_local`) — if that name had
+    /// leaked outward, `v_local` would be sitting in the outer
+    /// `var_names` guard set and this anchor would be wrongly suppressed.
+    #[test]
+    fn should_not_leak_nested_routine_locals_into_outer_scope() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            PROCEDURE inner_proc AS \
+                v_local INTEGER; \
+            BEGIN \
+                NULL; \
+            END inner_proc; \
+            v2 v_local.some_col%TYPE; \
+            BEGIN \
+                RETURN NULL; \
+            END;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(
+            anchors.len(),
+            1,
+            "v2's anchor to v_local.some_col must survive — v_local is exclusively \
+             the nested routine's own local and must not leak into the outer \
+             scope's guard set, got {:?}",
+            anchors
+        );
+        assert_eq!(anchors[0].object, "v_local");
+        assert_eq!(anchors[0].column.as_deref(), Some("some_col"));
+    }
+
+    /// Issue #158 (review round 4): nested routine scope is lexical
+    /// inheritance, not a fresh restart. An outer-scope `CURSOR` name must
+    /// stay guarded *inside* the nested routine's own body — `rec c%ROWTYPE`
+    /// where `c` is the enclosing routine's cursor must not fabricate a
+    /// `c` table anchor just because the nested body walks with a
+    /// momentarily-emptied guard set.
+    #[test]
+    fn should_skip_nested_body_anchor_using_outer_cursor() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            CURSOR c IS SELECT id FROM t_main; \
+            PROCEDURE inner IS rec c%ROWTYPE; BEGIN NULL; END inner; \
+            BEGIN NULL; END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "outer cursor must stay guarded inside nested body: {:?}",
+            anchors
+        );
+    }
+
+    /// Issue #158 (review round 4): companion case for a nested routine's
+    /// own *parameter* name being inherited by a routine nested one level
+    /// further in. `mid`'s parameter `p_emp` is registered when entering
+    /// `mid`'s own `NestedProcedure` arm; `inner_f` — declared inside
+    /// `mid`'s body — must still see `p_emp` as guarded (lexical
+    /// inheritance), so `v p_emp.empno%TYPE` must not anchor to a
+    /// fabricated `p_emp` table. (The plan's literal top-level-signature
+    /// variant does not exercise this code path: `extract_anchors()`
+    /// never registers a `CREATE FUNCTION`'s own top-level parameters —
+    /// only `GraphBuilder::collect_routine_anchor_edges` does, downstream
+    /// of `AnchorExtractor` — so the nearest faithful reproduction of
+    /// "enclosing routine's parameter must guard a nested body" at this
+    /// unit's level is nested-within-nested, which is also the exact
+    /// boundary the `take`→`clone` fix touches.)
+    #[test]
+    fn should_skip_nested_function_body_anchor_using_outer_param() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS \
+            PROCEDURE mid(p_emp VARCHAR2) IS \
+                FUNCTION inner_f RETURN INTEGER IS v p_emp.empno%TYPE; BEGIN RETURN v; END inner_f; \
+            BEGIN NULL; END mid; \
+            BEGIN RETURN NULL; END;";
+        let anchors = extract_anchors(sql);
+        assert!(
+            anchors.is_empty(),
+            "outer param must stay guarded inside nested body: {:?}",
+            anchors
+        );
     }
 
     #[test]

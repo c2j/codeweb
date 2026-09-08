@@ -1,4 +1,4 @@
-use crate::parser::ColumnAnalysis;
+use crate::parser::{AnchorKind, AnchorSite, ColumnAnalysis};
 
 pub mod builder;
 pub mod cluster;
@@ -811,6 +811,16 @@ pub enum Edge {
         properties: JsonMap,
         location: Option<SourceLocation>,
     },
+
+    /// Compile-time schema anchor: `%TYPE` / table-level `%ROWTYPE` (issue #158).
+    /// Category = Reference. Visible in detail/trace/impact; excluded from
+    /// lineage, conflicts, --summarize-tables, and community weighting.
+    AnchorsOn {
+        kind: AnchorKind,
+        column: Option<String>,
+        site: AnchorSite,
+        location: SourceLocation,
+    },
 }
 
 /// The call graph itself.
@@ -833,7 +843,8 @@ impl Edge {
             | Edge::ReferencesType { .. }
             | Edge::UsesSequence { .. }
             | Edge::IndexesTable { .. }
-            | Edge::AliasesObject { .. } => EdgeCategory::Reference,
+            | Edge::AliasesObject { .. }
+            | Edge::AnchorsOn { .. } => EdgeCategory::Reference,
             Edge::Extends { .. } | Edge::Implements { .. } => EdgeCategory::Inheritance,
             Edge::CustomEdge { .. } => EdgeCategory::Reference,
         }

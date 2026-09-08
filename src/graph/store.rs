@@ -3,6 +3,7 @@ use crate::graph::node_type_tag;
 use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
+use crate::parser::{AnchorKind, AnchorSite};
 use crate::sql_match;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -30,7 +31,9 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// v12: `PredicateClause` gains a reserved (serde-default) `transform` slot for
 /// column-transform conditions (e.g. `substr(col,1,2) = 'x'`), mirroring
 /// `HardFilter.transform`. Refs #167, #169.
-const STORE_VERSION: u32 = 12;
+/// v13: adds the `Edge::AnchorsOn` variant for `%TYPE`/`%ROWTYPE` schema
+/// anchors (issue #158).
+const STORE_VERSION: u32 = 13;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1330,6 +1333,34 @@ impl GraphStore {
         self.updated_at = timestamp_ms();
     }
 
+    /// `AnchorsOn` edges use a merge-spanning `(src, dst, kind, lowercased
+    /// column, site)` key, mirroring `dedup()`'s `(kind, column, site)` key
+    /// (see `should_keep_distinct_anchor_edges_through_dedup`): identical
+    /// anchors collapse across stores while two params anchoring the same
+    /// table on different columns both survive. Every other edge type
+    /// keeps the per-store generic `(src, dst, tag)` key (`seen_edges`,
+    /// below) — not reset per store would starve
+    /// `merge_duplicate_table_access_edges`'s cross-store `AccessMode`
+    /// union of the second store's `TableAccess` edge to union against.
+    fn anchor_merge_key(
+        src: &NodeKey,
+        dst: &NodeKey,
+        edge: &crate::graph::Edge,
+    ) -> Option<AnchorMergeKey> {
+        match edge {
+            crate::graph::Edge::AnchorsOn {
+                kind, column, site, ..
+            } => Some((
+                src.clone(),
+                dst.clone(),
+                *kind,
+                column.clone().map(|c| c.to_lowercase()),
+                *site,
+            )),
+            _ => None,
+        }
+    }
+
     /// Merge multiple stores into one, deduplicating shared nodes by NodeKey.
     /// Edges pointing to the same semantic entity are consolidated.
     ///
@@ -1340,6 +1371,11 @@ impl GraphStore {
     /// but CGEF import produces `proc:pkg_foo.sp` (no schema).
     pub fn merge(stores: Vec<Self>, merged_name: &str) -> Self {
         let mut merged = GraphStore::new(merged_name);
+        // `AnchorsOn` edges use a dedicated cross-store key (see
+        // `anchor_merge_key`); `merged.graph` starts empty above, so this
+        // naturally covers "already in the accumulator" duplicates from
+        // earlier stores without needing to be seeded from anything.
+        let mut seen_anchor_keys: HashSet<AnchorMergeKey> = HashSet::new();
 
         for store in &stores {
             for (key, predicates) in &store.procedure_predicates {
@@ -1402,8 +1438,15 @@ impl GraphStore {
                 let dst_key = NodeKey::from_node(&store.graph[dst]);
                 let edge_type = edge_type_tag(&store.graph[old_edge_idx]);
 
-                let dedup_key = (src_key.clone(), dst_key.clone(), edge_type.clone());
-                if !seen_edges.insert(dedup_key) {
+                let is_duplicate =
+                    match Self::anchor_merge_key(&src_key, &dst_key, &store.graph[old_edge_idx]) {
+                        Some(anchor_key) => !seen_anchor_keys.insert(anchor_key),
+                        None => {
+                            let dedup_key = (src_key.clone(), dst_key.clone(), edge_type.clone());
+                            !seen_edges.insert(dedup_key)
+                        }
+                    };
+                if is_duplicate {
                     continue;
                 }
 
@@ -1789,6 +1832,11 @@ fn timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// See [`GraphStore::anchor_merge_key`] for why `AnchorsOn` edges get a
+/// dedicated cross-store dedup key, checked separately from the generic
+/// per-store `(src, dst, tag)` key used by every other edge type in `merge`.
+type AnchorMergeKey = (NodeKey, NodeKey, AnchorKind, Option<String>, AnchorSite);
+
 fn edge_type_tag(edge: &crate::graph::Edge) -> String {
     match edge {
         crate::graph::Edge::DirectCall { scope, .. } => match scope {
@@ -1814,6 +1862,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::UsesSequence { .. } => "uses_sequence",
         crate::graph::Edge::IndexesTable { .. } => "indexes_table",
         crate::graph::Edge::AliasesObject { .. } => "aliases_object",
+        crate::graph::Edge::AnchorsOn { .. } => "anchors_on",
         crate::graph::Edge::CustomEdge { type_name, .. } => {
             return format!("custom:{}", type_name);
         }
@@ -2061,10 +2110,37 @@ impl GraphStore {
             // so interleaving access with removal can panic when a cached
             // EdgeIndex equals the swapped-out last slot.
             let mut to_remove: Vec<petgraph::graph::EdgeIndex> = Vec::new();
-            for ((_src, _dst, tag), mut group) in edge_groups {
+            for ((_src, _dst, tag), group) in edge_groups {
                 if group.len() <= 1 {
                     continue;
                 }
+                if tag == "anchors_on" {
+                    // `AnchorsOn` edges on the same (proc, table) pair are not
+                    // interchangeable duplicates: distinct params/vars can each
+                    // anchor a different column of the same table (issue #158).
+                    // Only collapse edges whose (kind, column, site) are all equal;
+                    // keep one representative per distinct combination.
+                    let mut seen: Vec<(
+                        crate::parser::AnchorKind,
+                        Option<String>,
+                        crate::parser::AnchorSite,
+                    )> = Vec::new();
+                    for &edge_idx in &group {
+                        if let crate::graph::Edge::AnchorsOn {
+                            kind, column, site, ..
+                        } = &self.graph[edge_idx]
+                        {
+                            let key = (*kind, column.clone().map(|c| c.to_lowercase()), *site);
+                            if seen.contains(&key) {
+                                to_remove.push(edge_idx);
+                            } else {
+                                seen.push(key);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut group = group;
                 let keep = group.remove(0);
                 if tag == "table_access" {
                     // Merge modes/write_kinds from all remove edges into keep.
@@ -2621,6 +2697,301 @@ mod tests {
         let path = dir.path().join("missing.bincode");
         assert_eq!(GraphStore::peek_version(&path), None);
         assert!(!GraphStore::file_is_current(&path));
+    }
+
+    /// A store with an `Edge::AnchorsOn` edge (issue #158, `%TYPE`/`%ROWTYPE` schema
+    /// anchors) must round-trip through bincode save/load with the variant fields and
+    /// `EdgeCategory::Reference` intact.
+    #[test]
+    fn should_roundtrip_anchors_on_edge_through_bincode_store() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("anchors_on.bincode");
+
+        let mut graph = CodeGraph::new();
+        let file = std::sync::Arc::new(std::path::PathBuf::from("a.sql"));
+        let loc = crate::graph::SourceLocation {
+            file: file.clone(),
+            line: 7,
+        };
+
+        let proc = crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: Some("public".to_string()),
+                package: None,
+                name: "proc_purchase".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        };
+        let table = crate::graph::Node::Table {
+            schema: Some("public".to_string()),
+            name: "par_sys_purchase".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+
+        let proc_idx = graph.add_node(proc);
+        let table_idx = graph.add_node(table);
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("purchase_days".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+
+        let store = GraphStore::from_graph("anchors-on-test", graph);
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path).expect("round-trip should succeed");
+
+        assert_eq!(loaded.graph.node_count(), 2);
+        assert_eq!(loaded.graph.edge_count(), 1);
+
+        let edge = loaded
+            .graph
+            .edge_weights()
+            .next()
+            .expect("one edge must be present");
+        assert_eq!(edge.category(), crate::graph::EdgeCategory::Reference);
+        match edge {
+            crate::graph::Edge::AnchorsOn {
+                kind,
+                column,
+                site,
+                location,
+            } => {
+                assert!(matches!(kind, AnchorKind::PercentType));
+                assert_eq!(column.as_deref(), Some("purchase_days"));
+                assert!(matches!(site, AnchorSite::Variable));
+                assert_eq!(location.line, 7);
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+        }
+    }
+
+    /// issue #158 code review: `dedup()`'s generic same-(src,dst,tag) collapse
+    /// ("keep = group.remove(0)") must not apply to `AnchorsOn` edges wholesale —
+    /// two params anchoring the *same* table on *different* columns
+    /// (`p1 emp.id%TYPE`, `p2 emp.name%TYPE`) produce two distinct, both-correct
+    /// `AnchorsOn` edges on the same (proc, table) pair. Only an exact
+    /// `(kind, column, site)` duplicate should be removed.
+    #[test]
+    fn should_keep_distinct_anchor_edges_through_dedup() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let mut graph = CodeGraph::new();
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let proc_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        // p1 emp.id%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // p2 emp.name%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("name".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // Exact duplicate of p1 — this one must be removed.
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+
+        let mut store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.graph().edge_count(), 3);
+
+        let report = store.dedup();
+        assert_eq!(
+            report.edges_removed, 1,
+            "only the exact duplicate should be removed"
+        );
+        assert_eq!(store.graph().edge_count(), 2);
+
+        let mut columns: Vec<Option<String>> = store
+            .graph()
+            .edge_weights()
+            .map(|e| match e {
+                crate::graph::Edge::AnchorsOn { column, .. } => column.clone(),
+                other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+            })
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![Some("id".to_string()), Some("name".to_string())]
+        );
+    }
+
+    /// issue #158 external review (Finding 3): the `(kind, column, site)` dedup key
+    /// for `AnchorsOn` edges must fold `column` case-insensitively — openGauss folds
+    /// unquoted identifiers to lowercase, so `emp.id%TYPE` and `emp.ID%TYPE` name the
+    /// same column and must collapse to a single edge, not two.
+    #[test]
+    fn should_dedupe_anchor_edges_case_insensitively_by_column() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let mut graph = CodeGraph::new();
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let proc_idx = graph.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+
+        // v1 emp.id%TYPE
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+        // v2 emp.ID%TYPE — same column, different case; must dedup with v1.
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("ID".to_string()),
+                site: AnchorSite::Variable,
+                location: loc.clone(),
+            },
+        );
+
+        let mut store = GraphStore::from_graph("test", graph);
+        assert_eq!(store.graph().edge_count(), 2);
+
+        let report = store.dedup();
+        assert_eq!(
+            report.edges_removed, 1,
+            "case-only-differing column must be treated as the same anchor edge"
+        );
+        assert_eq!(store.graph().edge_count(), 1);
+    }
+
+    /// Mirrors `load_bincode_rejects_header_version_mismatch_with_friendly_error`: a
+    /// store saved under the current `STORE_VERSION` whose on-disk header byte is then
+    /// rewritten to `STORE_VERSION - 1` must be rejected by `load_bincode` with the
+    /// friendly "unsupported cache version" message, not a raw bincode error.
+    #[test]
+    fn should_reject_store_with_stale_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stale.bincode");
+
+        let store = GraphStore::from_graph("stale-version-test", CodeGraph::new());
+        store.save_bincode(&path).unwrap();
+
+        // Header layout (see save_bincode): 9-byte magic + 4-byte LE version at offset 9..13.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= 13, "file must have the magic+version header");
+        let stale_ver = STORE_VERSION - 1;
+        bytes[9..13].copy_from_slice(&stale_ver.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "stale-version store must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "error should mention the version gate: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains(&stale_ver.to_string()),
+            "error should report the stale version ({}): {}",
+            stale_ver,
+            err_msg
+        );
     }
 
     #[test]
@@ -3463,6 +3834,319 @@ mod tests {
             merged.graph().node_count(),
             2,
             "different procedures should remain separate"
+        );
+    }
+
+    /// Issue #158: `merge`'s edge dedup key is `(src, dst, edge_type_tag)`
+    /// only — parallel to the generic same-(src,dst,tag) collapse that
+    /// `dedup()` was fixed to exclude `AnchorsOn` from
+    /// (`should_keep_distinct_anchor_edges_through_dedup`). Two params
+    /// anchoring the *same* table on *different* columns (`p1 emp.id%TYPE`,
+    /// `p2 emp.name%TYPE`) must survive a `merge` the same way they survive
+    /// a `dedup` — only an exact `(kind, column, site)` duplicate collapses.
+    #[test]
+    fn should_keep_distinct_anchor_edges_through_merge() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_idx = graph_a.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        // p1 emp.id%TYPE
+        graph_a.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // p2 emp.name%TYPE
+        graph_a.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("name".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        // An unrelated second store — merge must still produce both distinct
+        // anchor edges from store_a untouched.
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(None, Some("pkg_other"), "proc_unrelated"));
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let anchor_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 distinct AnchorsOn edges (id, name) to survive merge, got {:?}",
+            anchor_edges
+        );
+        let mut columns: Vec<Option<String>> = anchor_edges
+            .iter()
+            .map(|e| match e {
+                crate::graph::Edge::AnchorsOn { column, .. } => column.clone(),
+                other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+            })
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![Some("id".to_string()), Some("name".to_string())]
+        );
+    }
+
+    /// Regression guard (#158): a whole-merge generic `(src, dst, tag)` key
+    /// would drop the second store's `TableAccess` edge for a given (proc,
+    /// table) pair before `merge_duplicate_table_access_edges` can union
+    /// its `AccessMode`/`write_kinds` against the first store's edge — a
+    /// global tag-only key silently drops the second store's edge before
+    /// it ever reaches the union step, so `Write` from store_b is lost and
+    /// only `Read` from store_a survives. Per-store keys plus the
+    /// dedicated `AnchorsOn` merge key above keep both behaviors.
+    #[test]
+    fn should_union_table_access_modes_across_stores_on_merge() {
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_a = graph_a.add_node(make_proc(None, Some("pkg_x"), "proc_a"));
+        let table_a = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "t_orders".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_a.add_edge(
+            proc_a,
+            table_a,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        let proc_b = graph_b.add_node(make_proc(None, Some("pkg_x"), "proc_a"));
+        let table_b = graph_b.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "t_orders".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_b.add_edge(
+            proc_b,
+            table_b,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Write,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc.clone(),
+                column_analysis: None,
+            },
+        );
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let access_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::TableAccess { .. }))
+            .collect();
+        assert_eq!(
+            access_edges.len(),
+            1,
+            "proc_a->t_orders from both stores must resolve to the same merged \
+             node pair and collapse to a single TableAccess edge, got {:?}",
+            access_edges
+        );
+        match access_edges[0] {
+            crate::graph::Edge::TableAccess { modes, .. } => {
+                assert!(
+                    modes.contains(crate::graph::AccessMode::Read),
+                    "Read from store_a must survive, got {:?}",
+                    modes
+                );
+                assert!(
+                    modes.contains(crate::graph::AccessMode::Write),
+                    "Write from store_b must not be silently dropped, got {:?}",
+                    modes
+                );
+            }
+            other => panic!("expected Edge::TableAccess, got {:?}", other),
+        }
+    }
+
+    /// Locks the `seen_anchor_keys` cross-store property (the flip side of
+    /// `should_keep_distinct_anchor_edges_through_merge`, which checks
+    /// *different*-column anchors survive): two stores each carrying the
+    /// exact same `AnchorsOn` edge (same kind/column/site) on the same
+    /// (proc, table) pair must collapse to exactly one edge after `merge`,
+    /// not two.
+    #[test]
+    fn should_dedupe_identical_anchor_edge_across_stores() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_a = graph_a.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_a = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_a.add_edge(
+            proc_a,
+            table_a,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        // store_b: identical proc/table node keys and the identical
+        // AnchorsOn edge — after node-key merge this resolves to the same
+        // (proc, table) pair as store_a's.
+        let mut graph_b = CodeGraph::new();
+        let proc_b = graph_b.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_b = graph_b.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        graph_b.add_edge(
+            proc_b,
+            table_b,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let anchor_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "identical AnchorsOn edges from two stores on the same (proc, table) \
+             pair must collapse to exactly 1 edge, got {:?}",
+            anchor_edges
         );
     }
 

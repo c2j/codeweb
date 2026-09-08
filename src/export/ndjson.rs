@@ -197,6 +197,7 @@ fn edge_json_type(edge: &Edge) -> &str {
         Edge::UsesSequence { .. } => "uses_sequence",
         Edge::IndexesTable { .. } => "indexes_table",
         Edge::AliasesObject { .. } => "aliases_object",
+        Edge::AnchorsOn { .. } => "anchors_on",
         Edge::CustomEdge { type_name, .. } => type_name.as_str(),
     }
 }
