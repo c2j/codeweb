@@ -1809,6 +1809,18 @@ fn pick_richer_node(a: &Node, idx_a: NodeIndex, b: &Node, idx_b: NodeIndex) -> N
                 location: Some(_), ..
             },
         ) => idx_b,
+        (
+            Node::Sequence {
+                location: Some(_), ..
+            },
+            Node::Sequence { location: None, .. },
+        ) => idx_a,
+        (
+            Node::Sequence { location: None, .. },
+            Node::Sequence {
+                location: Some(_), ..
+            },
+        ) => idx_b,
         _ => idx_a,
     }
 }
@@ -2085,6 +2097,29 @@ mod tests {
     fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
         let prepared = crate::sql_match::PreparedQuery::new(query_lower);
         prepared.matches(sql_text)
+    }
+
+    #[test]
+    fn pick_richer_node_prefers_located_sequence() {
+        let inferred = Node::Sequence {
+            schema: None,
+            name: "my_seq".to_string(),
+            explicit: false,
+            location: None,
+        };
+        let located = Node::Sequence {
+            schema: None,
+            name: "my_seq".to_string(),
+            explicit: true,
+            location: Some(crate::graph::SourceLocation {
+                file: Arc::new(PathBuf::from("sequence.sql")),
+                line: 1,
+            }),
+        };
+        let idx_a = NodeIndex::new(0);
+        let idx_b = NodeIndex::new(1);
+
+        assert_eq!(pick_richer_node(&inferred, idx_a, &located, idx_b), idx_b);
     }
 
     #[test]
