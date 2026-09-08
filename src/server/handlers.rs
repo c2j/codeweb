@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use crate::graph::key::NodeKey;
 use crate::graph::node_sub_type_tag;
 use crate::graph::query::spec::QuerySpec;
+use crate::graph::store::GraphStore;
 use crate::graph::traverse::{self, MatchRank, TreeNode};
 use crate::graph::{CodeGraph, Edge, Node};
 use crate::sql_match::PreparedQuery;
@@ -31,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/nodes/:id/callees", get(node_callees))
         .route("/api/v1/nodes/search-sql", get(search_sql))
         .route("/api/v1/trace", get(trace))
+        .route("/api/v1/columns", get(columns))
+        .route("/api/v1/lineage", get(lineage))
         .route("/api/v1/query", post(execute_query))
         .route("/api/v1/export", get(export))
         .route("/api/v1/graph", get(graph_data))
@@ -476,6 +479,183 @@ async fn trace(
     });
 
     Ok(Json(result))
+}
+
+/// Resolve `name` (substring match, same as `trace`/CLI `columns`/`lineage`) to a single
+/// node — shared by the `columns` and `lineage` handlers.
+fn resolve_node(store: &GraphStore, name: &str) -> Option<NodeIndex> {
+    match store.resolve_single_node(
+        name,
+        crate::graph::search::MatchMode::Substring,
+        false,
+        false,
+    ) {
+        crate::graph::search::ResolveResult::Single(idx, _) => Some(idx),
+        _ => None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ColumnsQuery {
+    procedure: Option<String>,
+    package: Option<String>,
+    table: Option<String>,
+}
+
+async fn columns(
+    State(state): State<AppState>,
+    Query(query): Query<ColumnsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if query.procedure.is_some() == query.package.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "exactly one of 'procedure' or 'package' query parameters is required".to_string(),
+        ));
+    }
+
+    let store = state.store();
+    let graph = state.graph();
+    let table_filter = query.table.as_deref();
+
+    let result = if let Some(name) = &query.procedure {
+        let idx = resolve_node(store, name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No nodes matching '{}'", name),
+            )
+        })?;
+        if !matches!(&graph[idx], Node::Procedure { .. } | Node::Function { .. }) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("'{}' is not a procedure or function", name),
+            ));
+        }
+        crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
+    } else {
+        let name = query.package.as_ref().expect("checked exactly-one above");
+        let idx = resolve_node(store, name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No nodes matching '{}'", name),
+            )
+        })?;
+        if !matches!(&graph[idx], Node::Package { .. }) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("'{}' is not a package", name),
+            ));
+        }
+        crate::graph::columns::column_analysis_of_package(graph, idx, table_filter)
+    };
+
+    match result {
+        Some(analysis) => Ok(Json(analysis)),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to aggregate column analysis".to_string(),
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LineageQuery {
+    target: String,
+    direction: Option<String>,
+    depth: Option<usize>,
+}
+
+async fn lineage(
+    State(state): State<AppState>,
+    Query(query): Query<LineageQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.graph();
+    let store = state.store();
+    let depth = query.depth.unwrap_or(5);
+    let direction = query.direction.as_deref().unwrap_or("both");
+
+    let dir_spec = match direction.to_lowercase().as_str() {
+        "upstream" => Some(crate::graph::lineage::LineageDirection::Upstream),
+        "downstream" => Some(crate::graph::lineage::LineageDirection::Downstream),
+        "both" => None,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown direction: {}. Use 'upstream', 'downstream' or 'both'",
+                    direction
+                ),
+            ));
+        }
+    };
+
+    let parsed = crate::graph::lineage::parse_lineage_target(graph, &query.target)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    match parsed {
+        crate::graph::lineage::ParsedLineageTarget::Column(table, column) => {
+            let render = |dir: crate::graph::lineage::LineageDirection| {
+                let node =
+                    crate::graph::lineage::lineage_column(graph, &table, &column, dir, depth);
+                crate::graph::lineage::format_column_lineage_json(&node, graph)
+            };
+            let json = match dir_spec {
+                Some(dir) => render(dir),
+                None => serde_json::json!({
+                    "upstream": render(crate::graph::lineage::LineageDirection::Upstream),
+                    "downstream": render(crate::graph::lineage::LineageDirection::Downstream),
+                }),
+            };
+            Ok(Json(json))
+        }
+        crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
+            let table_idx = resolve_node(store, &table_name).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("No table found matching '{}'", table_name),
+                )
+            })?;
+            if !matches!(&graph[table_idx], Node::Table { .. } | Node::View { .. }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("'{}' is not a table or view", table_name),
+                ));
+            }
+
+            let cfg = crate::graph::lineage::LineageConfig::default();
+            let opts = crate::graph::lineage::DisplayOptions::new(
+                crate::graph::lineage::LineageView::Tree,
+                false,
+            );
+            let json = match dir_spec {
+                Some(dir) => {
+                    let node =
+                        crate::graph::lineage::lineage_table(graph, table_idx, dir, depth, &cfg);
+                    crate::graph::lineage::format_lineage_json(&node, graph, &opts)
+                }
+                None => {
+                    let up = crate::graph::lineage::lineage_table(
+                        graph,
+                        table_idx,
+                        crate::graph::lineage::LineageDirection::Upstream,
+                        depth,
+                        &cfg,
+                    );
+                    let down = crate::graph::lineage::lineage_table(
+                        graph,
+                        table_idx,
+                        crate::graph::lineage::LineageDirection::Downstream,
+                        depth,
+                        &cfg,
+                    );
+                    serde_json::json!({
+                        "upstream": crate::graph::lineage::format_lineage_json(&up, graph, &opts),
+                        "downstream": crate::graph::lineage::format_lineage_json(&down, graph, &opts),
+                    })
+                }
+            };
+            Ok(Json(json))
+        }
+    }
 }
 
 async fn execute_query(
