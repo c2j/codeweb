@@ -1819,6 +1819,7 @@ impl GraphBuilder {
         return_type: Option<&str>,
         block: Option<&ogsql_parser::ast::plpgsql::PlBlock>,
         pkg_cursor_names: &[String],
+        pkg_var_type_names: &[String],
         file: Arc<PathBuf>,
         line: usize,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
@@ -1853,6 +1854,12 @@ impl GraphBuilder {
         let mut anchor_extractor = AnchorExtractor::new();
         for cname in pkg_cursor_names {
             anchor_extractor.register_cursor_name(cname);
+        }
+        for vname in pkg_var_type_names {
+            anchor_extractor.register_var_name(vname);
+        }
+        for param in parameters {
+            anchor_extractor.register_var_name(&param.name);
         }
         walk_pl_block(&mut anchor_extractor, block);
         for a in &anchor_extractor.anchors {
@@ -1940,6 +1947,7 @@ impl GraphBuilder {
                                 None,
                                 p.block.as_ref(),
                                 &[],
+                                &[],
                                 file_arc.clone(),
                                 info.start_line,
                                 table_index,
@@ -2022,6 +2030,7 @@ impl GraphBuilder {
                                 f.return_type.as_deref(),
                                 f.block.as_ref(),
                                 &[],
+                                &[],
                                 file_arc.clone(),
                                 info.start_line,
                                 table_index,
@@ -2095,13 +2104,29 @@ impl GraphBuilder {
             })
             .collect();
 
+        // Package-level variable and TYPE names guard %TYPE anchors for
+        // package-level variables below (a variable can shadow an earlier
+        // sibling variable or a package-level TYPE, not just a cursor), and
+        // are injected into every member routine's AnchorExtractor the same
+        // way pkg_cursor_names is (PR #164 review).
+        let pkg_var_type_names: Vec<String> = pkg_items
+            .iter()
+            .filter_map(|item| match item {
+                PackageItem::Variable(v) => Some(v.name.to_lowercase()),
+                PackageItem::Type(t) => Some(crate::parser::pl_type_decl_name(t).to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
         for item in pkg_items {
             if let PackageItem::Variable(v) = item {
                 if let Some((object, column, kind)) =
                     crate::parser::anchor_from_pl_data_type(&v.data_type)
                 {
                     let obj_lower = object.to_lowercase();
-                    if !pkg_cursor_names.contains(&obj_lower) {
+                    if !pkg_cursor_names.contains(&obj_lower)
+                        && !pkg_var_type_names.contains(&obj_lower)
+                    {
                         let qualified = pkg_qualified_key(pkg_name);
                         if let Some(&pkg_idx) = package_index.get(&qualified) {
                             let anchor = crate::parser::AnchorRef {
@@ -2161,6 +2186,7 @@ impl GraphBuilder {
                 return_type.map(|s| s.as_str()),
                 block.as_ref(),
                 &pkg_cursor_names,
+                &pkg_var_type_names,
                 file_path.clone(),
                 info.start_line,
                 table_index,
@@ -5085,6 +5111,136 @@ mod tests {
         assert!(
             cursor_node.is_none(),
             "the cursor name 'c' must never become a table node"
+        );
+    }
+
+    /// PR #164 review: a routine parameter is never a `PlDeclaration` inside
+    /// the block, so the body-walking `AnchorExtractor` cannot see it
+    /// without explicit injection. A `%TYPE` anchored to a parameter name
+    /// must be guarded like any other local variable — not resolved into a
+    /// fake inferred table.
+    #[test]
+    fn should_skip_type_anchored_to_param_name() {
+        let sql = r#"
+            CREATE OR REPLACE PROCEDURE proc_param_guard(p_emp VARCHAR2)
+            IS
+                v p_emp.empno%TYPE;
+            BEGIN
+                NULL;
+            END;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let proc_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Procedure { id, .. } if id.name.eq_ignore_ascii_case("proc_param_guard")))
+            .expect("procedure node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(proc_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "parameter name p_emp must guard the %TYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("p_emp")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "parameter name p_emp must never become a table node"
+        );
+    }
+
+    /// PR #164 review: the package-level variable guard previously checked
+    /// only cursor names. A package-level `%TYPE` anchored to an *earlier*
+    /// package-level variable name must also be guarded, while a real
+    /// table anchor on another package variable is unaffected.
+    #[test]
+    fn should_skip_package_var_anchored_to_earlier_package_var() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_var_guard AS
+                v_emp employees%ROWTYPE;
+                v_id v_emp.empno%TYPE;
+            END pkg_var_guard;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_var_guard"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp -> employees); v_id must be guarded, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("v_emp")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package variable name v_emp must never become a table node"
+        );
+    }
+
+    /// PR #164 review: a package-level `TYPE ... IS RECORD (...)` name is
+    /// visible to every member routine in the package (like a package-level
+    /// cursor). A `%TYPE` inside a member routine's body anchored to that
+    /// package-level TYPE name must be guarded, not resolved into a fake
+    /// inferred table.
+    #[test]
+    fn should_skip_type_anchored_to_package_level_record() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_rec_guard AS
+                TYPE pkg_rec_t IS RECORD (col1 INTEGER);
+
+                FUNCTION f RETURN INT IS
+                    v pkg_rec_t.col1%TYPE;
+                BEGIN
+                    RETURN NULL;
+                END;
+            END pkg_rec_guard;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| matches!(&graph[*e], Edge::AnchorsOn { .. }))
+            .collect();
+        assert!(
+            anchor_edges.is_empty(),
+            "package-level TYPE name pkg_rec_t must guard the member routine's %TYPE anchor, got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+
+        let fake_table = graph.node_indices().find(
+            |i| matches!(&graph[*i], Node::Table { name, .. } if name.eq_ignore_ascii_case("pkg_rec_t")),
+        );
+        assert!(
+            fake_table.is_none(),
+            "package-level TYPE name pkg_rec_t must never become a table node"
         );
     }
 

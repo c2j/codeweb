@@ -1128,6 +1128,17 @@ impl AnchorExtractor {
         }
     }
 
+    /// Inject a local variable / type / parameter name declared outside
+    /// this extractor's own walk (routine parameters and package-level
+    /// names are not `PlDeclaration`s inside the block) so `%TYPE` /
+    /// `%ROWTYPE` anchored to them is guarded the same way a routine-local
+    /// declaration would be (PR #164 review).
+    pub fn register_var_name(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.var_names.insert(name.to_lowercase());
+        }
+    }
+
     fn push_anchor(
         &mut self,
         object: String,
