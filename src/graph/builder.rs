@@ -1621,19 +1621,7 @@ impl GraphBuilder {
 
         let known_types: HashSet<String> = type_index.keys().cloned().collect();
 
-        // Index package SPEC items by lowercased qualified package name so a
-        // package BODY can inherit the spec's public Variable/Type declarations
-        // into its call-edge extraction scope. Spec and body are parsed as
-        // independent statements; without this linkage, a spec-declared symbol
-        // (e.g. `vchar_array`) used in a body procedure is misread as a call.
-        let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
-        for file in files {
-            for info in &file.statements {
-                if let Statement::CreatePackage(pkg) = &info.statement {
-                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
-                }
-            }
-        }
+        let spec_items_by_pkg = build_spec_items_index(files);
 
         for file in files {
             let file_sw = std::time::Instant::now();
@@ -1910,18 +1898,7 @@ impl GraphBuilder {
         package_index: &HashMap<String, petgraph::graph::NodeIndex>,
         table_index: &mut HashMap<String, petgraph::graph::NodeIndex>,
     ) {
-        // Index package SPEC items by lowercased qualified package name so a
-        // package BODY's anchor guards (cursor/variable/TYPE names) inherit
-        // the SPEC's public declarations — mirrors the call-edge extraction
-        // path's `spec_items_by_pkg` (create_sql_edges).
-        let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
-        for file in files {
-            for info in &file.statements {
-                if let Statement::CreatePackage(pkg) = &info.statement {
-                    spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
-                }
-            }
-        }
+        let spec_items_by_pkg = build_spec_items_index(files);
 
         for file in files {
             let file_arc: Arc<PathBuf> = Arc::new(file.path.clone());
@@ -4782,6 +4759,25 @@ fn pkg_qualified_key(name: &ogsql_parser::ast::ObjectName) -> String {
     } else {
         pkg_part
     }
+}
+
+// Index package SPEC items by lowercased qualified package name so a package
+// BODY can inherit the SPEC's public Cursor/Variable/Type declarations into
+// both the call-edge extraction scope (`create_sql_edges`) and the anchor
+// guard scope (`create_object_ref_edges`). SPEC and BODY are parsed as
+// independent statements; without this linkage, a spec-declared symbol used
+// in a body procedure is misread as a call, or a spec-declared name shadows
+// a real table without guarding a BODY member routine's anchor to it.
+fn build_spec_items_index(files: &[ParsedFile]) -> HashMap<String, &[PackageItem]> {
+    let mut spec_items_by_pkg: HashMap<String, &[PackageItem]> = HashMap::new();
+    for file in files {
+        for info in &file.statements {
+            if let Statement::CreatePackage(pkg) = &info.statement {
+                spec_items_by_pkg.insert(pkg_qualified_key(&pkg.name), &pkg.items);
+            }
+        }
+    }
+    spec_items_by_pkg
 }
 
 fn edge_call_scope(

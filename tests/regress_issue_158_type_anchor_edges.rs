@@ -600,8 +600,8 @@ fn issue_158_spec_body_inherited_guards_end_to_end() {
     let json = analyze_json(sql);
 
     // Fake tables that must never appear: the cursor name, the
-    // package-level TYPE name, and the sibling-guarded reference name.
-    for fake in ["c", "rec_t"] {
+    // package-level TYPE name, and the SPEC-inherited variable name.
+    for fake in ["c", "rec_t", "v_emp"] {
         assert!(
             node_id_by_name(&json, fake).is_none(),
             "'{fake}' must never surface as a graph node, json: {json}"
@@ -650,8 +650,8 @@ fn issue_158_spec_body_inherited_guards_end_to_end() {
         "expected an anchors_on edge with site=variable, got {spec_edges:?}"
     );
 
-    // No anchors_on edge anywhere may target 'c' or 'rec_t' — the fake
-    // table names themselves are already checked above, but this also
+    // No anchors_on edge anywhere may target 'c' / 'rec_t' / 'v_emp' — the
+    // fake node names themselves are already checked above, but this also
     // rules out an anchor pointing at them via schema-qualification or any
     // other resolution path.
     let anchor_edges: Vec<_> = json["edges"]
@@ -662,7 +662,7 @@ fn issue_158_spec_body_inherited_guards_end_to_end() {
         .collect();
     for edge in &anchor_edges {
         let target_id = edge["target"].as_u64();
-        for fake in ["c", "rec_t"] {
+        for fake in ["c", "rec_t", "v_emp"] {
             assert_ne!(
                 target_id,
                 node_id_by_name(&json, fake).map(|id| id as u64),
