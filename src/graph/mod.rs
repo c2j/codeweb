@@ -569,7 +569,13 @@ pub enum Node {
     Sequence {
         schema: Option<String>,
         name: String,
-        location: SourceLocation,
+        /// true when sequence has a DDL definition (CREATE SEQUENCE), false when
+        /// only inferred from seq.nextval / currval / setval references.
+        #[serde(default)]
+        explicit: bool,
+        /// None when sequence node was created implicitly (referenced but not parsed from DDL).
+        #[serde(default)]
+        location: Option<SourceLocation>,
     },
     /// A database INDEX.
     Index {
@@ -678,6 +684,9 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::Package { .. } => "pkg",
         Node::Trigger { .. } => "trigger",
         Node::Type { .. } => "type",
+        Node::Sequence {
+            explicit: false, ..
+        } => "seq*",
         Node::Sequence { .. } => "seq",
         Node::Index { .. } => "index",
         Node::MaterializedView { .. } => "mview",
@@ -867,7 +876,10 @@ impl Node {
             Node::Package { location, .. } => &location.file,
             Node::Trigger { location, .. } => &location.file,
             Node::Type { location, .. } => &location.file,
-            Node::Sequence { location, .. } => &location.file,
+            Node::Sequence { location, .. } => location
+                .as_ref()
+                .map(|l| l.file.as_path())
+                .unwrap_or(Path::new("")),
             Node::Index { location, .. } => &location.file,
             Node::MaterializedView { location, .. } => &location.file,
             Node::Synonym { location, .. } => &location.file,
@@ -1173,7 +1185,8 @@ mod tests {
         let seq_node = Node::Sequence {
             schema: Some("public".to_string()),
             name: "my_seq".to_string(),
-            location: loc.clone(),
+            explicit: true,
+            location: Some(loc.clone()),
         };
         assert_eq!(seq_node.file(), Path::new("test.sql"));
 
@@ -1215,6 +1228,29 @@ mod tests {
             location: loc.clone(),
         };
         assert_eq!(event_node.file(), Path::new("test.sql"));
+    }
+
+    #[test]
+    fn node_type_tag_inferred_sequence_is_seq_star() {
+        let inferred = Node::Sequence {
+            schema: None,
+            name: "inferred_seq".to_string(),
+            explicit: false,
+            location: None,
+        };
+        let explicit = Node::Sequence {
+            schema: None,
+            name: "explicit_seq".to_string(),
+            explicit: true,
+            location: Some(SourceLocation {
+                file: Arc::new(PathBuf::from("sequence.sql")),
+                line: 1,
+            }),
+        };
+
+        assert_eq!(node_type_tag(&inferred), "seq*");
+        assert_eq!(inferred.file(), Path::new(""));
+        assert_eq!(node_type_tag(&explicit), "seq");
     }
 
     #[test]
@@ -1575,7 +1611,8 @@ mod tests {
             Node::Sequence {
                 name: "seq".to_string(),
                 schema: Some("public".to_string()),
-                location: loc.clone(),
+                explicit: true,
+                location: Some(loc.clone()),
             },
             Node::Index {
                 name: Some("idx".to_string()),

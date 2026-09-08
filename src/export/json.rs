@@ -172,8 +172,12 @@ enum NodeKindJson {
     Sequence {
         name: String,
         schema: Option<String>,
-        file: String,
-        line: usize,
+        #[serde(skip_serializing_if = "is_false")]
+        explicit: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
     },
     Index {
         name: Option<String>,
@@ -527,14 +531,18 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
             Node::Sequence {
                 schema,
                 name,
+                explicit,
                 location,
             } => NodeJson {
                 id: idx.index(),
                 kind: NodeKindJson::Sequence {
                     name: name.clone(),
                     schema: schema.clone(),
-                    file: location.file.to_string_lossy().to_string(),
-                    line: location.line,
+                    explicit: *explicit,
+                    file: location
+                        .as_ref()
+                        .map(|l| l.file.to_string_lossy().to_string()),
+                    line: location.as_ref().map(|l| l.line),
                 },
             },
             Node::Index {

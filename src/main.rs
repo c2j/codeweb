@@ -1903,6 +1903,9 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
         Node::Package { .. } => std::borrow::Cow::Borrowed("pkg"),
         Node::Trigger { .. } => std::borrow::Cow::Borrowed("trigger"),
         Node::Type { .. } => std::borrow::Cow::Borrowed("type"),
+        Node::Sequence {
+            explicit: false, ..
+        } => std::borrow::Cow::Borrowed("seq*"),
         Node::Sequence { .. } => std::borrow::Cow::Borrowed("seq"),
         Node::Index { .. } => std::borrow::Cow::Borrowed("index"),
         Node::MaterializedView { .. } => std::borrow::Cow::Borrowed("mview"),
@@ -2072,6 +2075,9 @@ fn is_inferred_node(node: &Node) -> bool {
             explicit: false,
             ..
         } | Node::View {
+            explicit: false,
+            ..
+        } | Node::Sequence {
             explicit: false,
             ..
         }

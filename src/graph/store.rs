@@ -19,7 +19,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// GraphStore on-disk format version. Bump when the serialized struct layout
 /// changes. Validated in the file header (post-header era files) and again in
 /// `GraphStore.version` after deserialize (legacy files + belt-and-suspenders).
-const STORE_VERSION: u32 = 8;
+const STORE_VERSION: u32 = 9;
 
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1736,7 +1736,7 @@ pub fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::Package { location, .. } => Some(location.file.to_path_buf()),
         Node::Trigger { location, .. } => Some(location.file.to_path_buf()),
         Node::Type { location, .. } => Some(location.file.to_path_buf()),
-        Node::Sequence { location, .. } => Some(location.file.to_path_buf()),
+        Node::Sequence { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
         Node::Index { location, .. } => Some(location.file.to_path_buf()),
         Node::MaterializedView { location, .. } => Some(location.file.to_path_buf()),
         Node::Synonym { location, .. } => Some(location.file.to_path_buf()),
@@ -1806,6 +1806,18 @@ fn pick_richer_node(a: &Node, idx_a: NodeIndex, b: &Node, idx_b: NodeIndex) -> N
         (
             Node::Table { location: None, .. },
             Node::Table {
+                location: Some(_), ..
+            },
+        ) => idx_b,
+        (
+            Node::Sequence {
+                location: Some(_), ..
+            },
+            Node::Sequence { location: None, .. },
+        ) => idx_a,
+        (
+            Node::Sequence { location: None, .. },
+            Node::Sequence {
                 location: Some(_), ..
             },
         ) => idx_b,
@@ -2085,6 +2097,29 @@ mod tests {
     fn sql_text_matches(sql_text: &str, query_lower: &str) -> bool {
         let prepared = crate::sql_match::PreparedQuery::new(query_lower);
         prepared.matches(sql_text)
+    }
+
+    #[test]
+    fn pick_richer_node_prefers_located_sequence() {
+        let inferred = Node::Sequence {
+            schema: None,
+            name: "my_seq".to_string(),
+            explicit: false,
+            location: None,
+        };
+        let located = Node::Sequence {
+            schema: None,
+            name: "my_seq".to_string(),
+            explicit: true,
+            location: Some(crate::graph::SourceLocation {
+                file: Arc::new(PathBuf::from("sequence.sql")),
+                line: 1,
+            }),
+        };
+        let idx_a = NodeIndex::new(0);
+        let idx_b = NodeIndex::new(1);
+
+        assert_eq!(pick_richer_node(&inferred, idx_a, &located, idx_b), idx_b);
     }
 
     #[test]
@@ -2383,6 +2418,30 @@ mod tests {
             err_msg.contains("unsupported cache version"),
             "error should mention the version gate: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn load_bincode_rejects_pre_issue_159_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v8.bincode");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&STORE_MAGIC);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = GraphStore::load_bincode(&path);
+        assert!(result.is_err(), "pre-issue-159 cache must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported cache version"),
+            "error should mention the version gate: {}",
+            err_msg
+        );
+        assert!(
+            !GraphStore::file_is_current(&path),
+            "pre-issue-159 cache must be treated as stale"
         );
     }
 
