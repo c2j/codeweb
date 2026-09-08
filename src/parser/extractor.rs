@@ -1075,6 +1075,10 @@ pub fn anchor_from_pl_data_type(
     use ogsql_parser::ast::plpgsql::PlDataType;
     match dt {
         PlDataType::PercentType { table, column } => {
+            if column.trim().is_empty() {
+                // `v1%TYPE` 单标识符形态：变量到变量锚定，不是表列引用（PR #164 review）
+                return None;
+            }
             Some((table.clone(), Some(column.clone()), AnchorKind::PercentType))
         }
         PlDataType::PercentRowType(name) => Some((name.clone(), None, AnchorKind::PercentRowType)),
@@ -4662,6 +4666,40 @@ mod tests {
             out.extend(ex.anchors);
         }
         out
+    }
+
+    #[test]
+    fn should_reject_empty_column_percent_type_from_ast() {
+        use ogsql_parser::ast::plpgsql::PlDataType;
+        // ogsql-parser v0.10.0: `v1%TYPE` 编码为单标识符 + 空 column —— 不是表锚
+        let single = PlDataType::PercentType {
+            table: "v1".into(),
+            column: String::new(),
+        };
+        assert!(
+            anchor_from_pl_data_type(&single).is_none(),
+            "empty-column PercentType is a variable anchor, not a table anchor"
+        );
+        let blank = PlDataType::PercentType {
+            table: "v1".into(),
+            column: "  ".into(),
+        };
+        assert!(anchor_from_pl_data_type(&blank).is_none());
+        // 正常表列锚不受影响
+        let normal = PlDataType::PercentType {
+            table: "t".into(),
+            column: "c".into(),
+        };
+        assert_eq!(
+            anchor_from_pl_data_type(&normal),
+            Some(("t".into(), Some("c".into()), AnchorKind::PercentType))
+        );
+        // PercentRowType 无列语义，不受影响
+        let row = PlDataType::PercentRowType("t".into());
+        assert_eq!(
+            anchor_from_pl_data_type(&row),
+            Some(("t".into(), None, AnchorKind::PercentRowType))
+        );
     }
 
     #[test]
