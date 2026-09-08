@@ -482,3 +482,76 @@ fn issue_158_detail_labels_show_both_r_and_t() {
          ever happens on it): {anchor_only_line}"
     );
 }
+
+// ── PR #164 review fixes: parameter-name guard + package-level nested TYPE ──
+
+/// PR #164 review Issue 1/2: a routine parameter name is not a
+/// `PlDeclaration` inside the block, so without explicit injection the
+/// `%TYPE` anchor `v p_emp.empno%TYPE` would resolve `p_emp` into a fake
+/// inferred table. End-to-end through the JSON export: no `p_emp` node, no
+/// `anchors_on` edge anywhere in the graph.
+#[test]
+fn issue_158_param_name_anchor_suppressed_end_to_end() {
+    let sql = r#"
+        CREATE OR REPLACE PROCEDURE proc_param_guard_e2e(p_emp VARCHAR2)
+        IS
+            v p_emp.empno%TYPE;
+        BEGIN
+            NULL;
+        END;
+    "#;
+    let json = analyze_json(sql);
+
+    assert!(
+        node_id_by_name(&json, "p_emp").is_none(),
+        "parameter name p_emp must never surface as a graph node: {json}"
+    );
+
+    let anchor_edges: Vec<_> = json["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("anchors_on"))
+        .collect();
+    assert!(
+        anchor_edges.is_empty(),
+        "parameter name guard must suppress this anchor entirely, got {anchor_edges:?}"
+    );
+}
+
+/// PR #164 review Issue 3: a package-level nested `TYPE ... IS TABLE OF
+/// tbl.col%TYPE` must produce an `anchors_on` edge from the **package**
+/// node to the anchored table, verified through the JSON export (the same
+/// public surface an actual user inspects).
+#[test]
+fn issue_158_package_nested_type_anchor_end_to_end() {
+    let sql = r#"
+        CREATE OR REPLACE PACKAGE BODY pkg_nested_type_e2e AS
+            TYPE t_list_e2e IS TABLE OF some_table_e2e.some_col_e2e%TYPE;
+        END pkg_nested_type_e2e;
+    "#;
+    let json = analyze_json(sql);
+
+    let edges = edges_between(&json, "pkg_nested_type_e2e", "some_table_e2e");
+    assert!(
+        !edges.is_empty(),
+        "expected an anchors_on edge pkg_nested_type_e2e -> some_table_e2e, got json: {json}"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|e| e["type"].as_str() == Some("anchors_on")),
+        "package -> table edge must be anchors_on (site=nested_type), got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e["site"].as_str() == Some("nested_type")),
+        "expected an anchors_on edge with site=nested_type, got {edges:?}"
+    );
+
+    assert!(
+        node_id_by_name(&json, "t_list_e2e").is_none(),
+        "package-level TYPE name t_list_e2e must never surface as a graph node"
+    );
+}
