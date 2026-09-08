@@ -1920,7 +1920,7 @@ fn cmd_columns(
             &name,
             crate::graph::search::MatchMode::Substring,
             false,
-            false,
+            true,
         );
         let idx = match resolved {
             crate::graph::search::ResolveResult::Single(idx, _) => idx,
