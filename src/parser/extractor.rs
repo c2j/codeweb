@@ -17,7 +17,7 @@ pub struct ProcedureBodySql {
     pub line: Option<usize>,
     /// The parsed statement AST from the ORIGINAL procedure-body parse, when the source
     /// was a typed SQL statement. Walking this (instead of re-parsing `sql_text`) keeps
-    /// procedure context such as declared-variable classification (issue #147).
+    /// procedure context such as declared-variable classification.
     pub statement: Option<Statement>,
 }
 
@@ -1146,7 +1146,7 @@ impl TableAccessExtractor {
     /// Walk the expression-bearing fields of a `SELECT` (targets, WHERE,
     /// HAVING, GROUP BY, ORDER BY, …) and extract reads from any subqueries
     /// found inside them. This captures subquery table references regardless
-    /// of the outer statement kind (#140) — before this, only UPDATE/DELETE
+    /// of the outer statement kind; previously only UPDATE/DELETE
     /// contexts descended into WHERE expressions, so tables referenced in
     /// SELECT/INSERT subqueries were silently dropped.
     ///
@@ -1654,7 +1654,7 @@ impl Visitor for TableAccessExtractor {
 
         // Subqueries in expression positions (WHERE / HAVING / SELECT list /
         // GROUP BY / ORDER BY / …) must be walked while this select's CTE scope
-        // is still active, or their table references are silently dropped (#140).
+        // is still active, or their table references are silently dropped.
         self.walk_select_expr_subqueries(select);
 
         self.pop_cte_scope();
@@ -1690,7 +1690,7 @@ impl Visitor for TableAccessExtractor {
 
         // Non-SELECT sources can still carry subqueries in their expressions
         // (e.g. `INSERT INTO t VALUES ((SELECT …))`); walk them while this
-        // insert's CTE scope is active (#140).
+        // insert's CTE scope is active.
         match &insert.source {
             ogsql_parser::ast::InsertSource::Values(rows) => {
                 for row in rows {
@@ -1786,12 +1786,12 @@ pub struct ColumnAnalysis {
     /// Per-column data flow: which sources feed each written column.
     #[serde(default)]
     pub column_mappings: Vec<ColumnMapping>,
-    /// Names of the OTHER tables touched by the same statement as this edge (issue #147).
+    /// Names of the other tables touched by the same statement as this edge.
     /// Populated by the builder on every TableAccess edge of a statement; it is what lets
     /// lineage restrict hops to tables read in the same statement as a write, instead of
     /// connecting all of a routine's reads to all of its writes.
     ///
-    /// `None` = not populated (store built before #147) — lineage falls back to
+    /// `None` means not populated by an older store, so lineage falls back to
     /// connecting all of a routine's reads/writes. `Some(vec![])` = populated and the
     /// statement genuinely touches no other table (e.g. a bare `UPDATE t SET ...`) — a
     /// legitimate empty hop set, NOT a reason to fall back.
@@ -1924,7 +1924,7 @@ pub enum JoinType {
 pub enum JoinConditionSource {
     ImplicitWhere,
     ExplicitOn,
-    /// #168: one side is a `%ROWTYPE` record field resolved to its underlying cursor
+    /// One side is a `%ROWTYPE` record field resolved to its underlying cursor
     /// source column (via `resolve_record_field`), not a plain SQL table alias. Kept
     /// distinct from `ImplicitWhere`/`ExplicitOn` so downstream consumers can weigh the
     /// confidence of a derived cross-table key differently from a literal equi-join.
@@ -1933,13 +1933,7 @@ pub enum JoinConditionSource {
 
 /// WHERE clause hard-coded filter.
 ///
-/// `Serialize` is hand-written (not derived) for `transform`: this struct is persisted
-/// via bincode (GraphStore, non-self-describing — every field must occupy a fixed byte
-/// position) AND exported via JSON (self-describing). `#[serde(skip_serializing_if)]`
-/// would omit the field's bytes on bincode writes whenever `transform` is `None`,
-/// desyncing every subsequent field on read (`bincode deserialize: io error`). Branching
-/// on `Serializer::is_human_readable()` keeps bincode's field count fixed while still
-/// omitting `transform` from JSON when absent, per issue #169's schema.
+/// Serialization branches by format because bincode requires a fixed field count.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
 pub struct HardFilter {
     pub table: Option<String>,
@@ -1970,7 +1964,7 @@ impl serde::Serialize for HardFilter {
     }
 }
 
-/// #169: descriptor of a whitelisted pure column transform in a filter.
+/// Descriptor of a whitelisted pure column transform in a filter.
 /// Serialized as {"fn": "substr", "args": [1, 2]} per issue schema.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FilterTransform {
@@ -2037,7 +2031,7 @@ pub struct UpdateColumnInfo {
 }
 
 /// Procedure-level variable context collected by a pre-pass and seeded into per-statement
-/// walks (issue #147): cursor sources, FETCH chains, `%ROWTYPE` records and `%TYPE`
+/// walks: cursor sources, FETCH chains, `%ROWTYPE` records and `%TYPE`
 /// anchors. Per-statement walks would otherwise lose these cross-statement bindings
 /// (a cursor is declared in DECLARE, fetched in one statement, consumed in another).
 #[derive(Debug, Clone, Default)]
@@ -2117,7 +2111,7 @@ impl ColumnAccessExtractor {
     }
 
     /// Build an extractor pre-seeded with procedure variable context collected by a
-    /// procedure-level pass (issue #147): a per-statement walk would otherwise lose the
+    /// procedure-level pass because a per-statement walk would otherwise lose the
     /// cross-statement cursor → FETCH → INSERT chain and `%ROWTYPE`/`%TYPE` anchors.
     pub fn new_with_context(ctx: &ProcedureVarContext) -> Self {
         let mut ext = Self::new();
@@ -2423,7 +2417,7 @@ impl ColumnAccessExtractor {
                                 join_type,
                                 is_explicit_on,
                             );
-                            // #168: a `%ROWTYPE` record field also parses as a
+                            // A `%ROWTYPE` record field also parses as a
                             // multi-part ColumnRef, so `extract_join_condition` above
                             // silently no-ops on it (its alias prefix fails
                             // `resolve_alias`, a plain-table-alias lookup). Retry via
@@ -2681,7 +2675,7 @@ impl ColumnAccessExtractor {
         }
     }
 
-    /// #168: an equi-comparison where exactly one side is a `%ROWTYPE` record field
+    /// An equi-comparison where exactly one side is a `%ROWTYPE` record field
     /// (resolved via `resolve_record_field`) and the other a plain table column produces
     /// a cross-table `JoinCondition` tagged `JoinConditionSource::RecordField`. Symmetric
     /// in `left_names`/`right_names` — the record may appear on either side — so a single
@@ -2753,7 +2747,7 @@ impl ColumnAccessExtractor {
         self.add_hard_filter_with_transform(col_names, op, val, None);
     }
 
-    /// #169: like `add_hard_filter`, but also records the whitelisted column transform
+    /// Like `add_hard_filter`, but also records the whitelisted column transform
     /// (`substr`/`nvl`/`trim`/`upper`/`lower`) the column was wrapped in, if any.
     fn add_hard_filter_with_transform(
         &mut self,
@@ -2852,7 +2846,7 @@ impl Visitor for ColumnAccessExtractor {
             PlDeclaration::Variable(v) => {
                 use ogsql_parser::ast::plpgsql::PlDataType;
                 // `rec cursor_name%ROWTYPE`: record fields resolve via the cursor's
-                // SELECT sources (issue #147 L2). `%TYPE` anchors are deliberately NOT
+                // SELECT sources. `%TYPE` anchors are deliberately not
                 // resolved: typing a variable as `t.col%TYPE` says nothing about where
                 // its value comes from, so resolving it would fabricate data edges.
                 if let PlDataType::PercentRowType(cursor) = &v.data_type {
@@ -2868,7 +2862,7 @@ impl Visitor for ColumnAccessExtractor {
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
         match stmt {
             // Track literal-string assignments so `OPEN c FOR v_sql` can resolve the
-            // dynamic cursor's SELECT sources (issue #147).
+            // dynamic cursor's SELECT sources.
             PlStatement::Assignment {
                 target: Expr::PlVariable(names),
                 expression,
@@ -2916,7 +2910,7 @@ impl Visitor for ColumnAccessExtractor {
                 };
                 let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
                 self.record_fetch(&cursor_name, vars.clone());
-                // Review #3: the record's data comes from the FETCHing cursor, not
+                // The record's data comes from the FETCHing cursor, not
                 // its declared %ROWTYPE type anchor — rebind so `column_source`
                 // resolves through the cursor's SELECT sources.
                 if !cursor_name.is_empty() && vars.len() == 1 {
@@ -2999,7 +2993,7 @@ impl Visitor for ColumnAccessExtractor {
                 }
             }
             // `FOR rec IN (SELECT ...)` — the loop variable is an implicit %ROWTYPE
-            // record over the inline query's sources (issue #147 L2).
+            // record over the inline query's sources.
             PlStatement::For(spanned) => {
                 use ogsql_parser::ast::plpgsql::PlForKind;
                 if let PlForKind::Query {
@@ -3321,12 +3315,12 @@ impl Visitor for ColumnAccessExtractor {
             }
             // Subqueries carry their own scope; the generic walker would otherwise
             // recurse into their SELECT and leak its alias/join/filter state into
-            // this statement's analysis (review #153-2). Exists/Subquery have no
+            // this statement's analysis. Exists/Subquery have no
             // left operand, so skipping is complete.
             Expr::Subquery(_) | Expr::Exists(_) => return VisitorResult::SkipChildren,
             // InSubquery/ScalarSublink DO have a left operand (`t.x > ANY (...)`,
             // `t.id IN (...)`): collect its column references first, then skip the
-            // nested SELECT (review 5136742683).
+            // nested SELECT.
             Expr::InSubquery { expr, .. } | Expr::ScalarSublink { expr, .. } => {
                 self.walk_expr_for_column_refs(expr);
                 return VisitorResult::SkipChildren;
@@ -3348,7 +3342,7 @@ impl ColumnAccessExtractor {
     fn column_source(&self, names: &[ogsql_parser::Ident]) -> ColumnSource {
         let (alias_prefix, column) = split_alias_column(names);
 
-        // `%ROWTYPE` record field (issue #147 L2): `rec.id` where rec is a record
+        // A `%ROWTYPE` record field such as `rec.id`
         // resolves to the cursor's source column by output name.
         if let Some(record) = &alias_prefix {
             if let Some(source) = self.record_field_source(record, &column) {
@@ -3363,8 +3357,8 @@ impl ColumnAccessExtractor {
         ColumnSource::Column { table, column }
     }
 
-    /// Shared record-field resolution rules (issue #142/#147), factored out of
-    /// `column_source` so `resolve_record_field` (issue #168: WHERE/JOIN ON join
+    /// Shared record-field resolution rules, factored out of
+    /// `column_source` so WHERE/JOIN record-field
     /// extraction) can reuse the exact same three rules without duplicating them:
     /// (1) cursor-anchored record whose SELECT output name matches `column` exactly →
     /// the cursor's source column; (2) a single catch-all cursor source (`SELECT *` /
@@ -3394,7 +3388,7 @@ impl ColumnAccessExtractor {
                 });
             }
         }
-        // #142: a single catch-all cursor source (empty output name — `SELECT *`
+        // A single catch-all cursor source (empty output name from `SELECT *`
         // cursor, or dynamic-SQL attribution) covers every record field: the exact
         // column is unknown, attribute to the cursor's table under the field's own
         // name (same philosophy as `resolve_cursor_flows`).
@@ -3411,7 +3405,7 @@ impl ColumnAccessExtractor {
         None
     }
 
-    /// #168: resolve a `%ROWTYPE` record field appearing in a WHERE/JOIN ON
+    /// Resolve a `%ROWTYPE` record field appearing in a WHERE/JOIN ON
     /// equi-comparison to its underlying `(table, column)` pair, via `record_field_source`.
     /// Returns `None` for anything that is not a resolvable record field: a plain table
     /// column, a procedure parameter/PL variable, or a record variable with no registered
@@ -4129,12 +4123,10 @@ pub(crate) fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {
     }
 }
 
-/// #169: functions whose result is a pure transform of a single column argument —
-/// eligible for a HardFilter `transform` descriptor when compared to a literal. D5
-/// (closed set; no arbitrary function is accepted).
+/// Closed set of pure single-column transforms eligible for filter metadata.
 const FILTER_TRANSFORM_WHITELIST: &[&str] = &["substr", "nvl", "trim", "upper", "lower"];
 
-/// #169: detect a whitelisted pure column transform (`substr(col, 1, 2)`, `nvl(col, 0)`,
+/// Detect a whitelisted pure column transform (`substr(col, 1, 2)`, `nvl(col, 0)`,
 /// keyword-syntax `substring(col FROM 1 FOR 2)`, ...) wrapping exactly one column
 /// reference, with every other argument a literal. Handles both `Expr::FunctionCall`
 /// (comma syntax) and `Expr::SpecialFunction` (keyword syntax) per D5. Returns the
@@ -4163,7 +4155,10 @@ pub(crate) fn column_transform_of(
     let mut target: Option<Vec<ogsql_parser::Ident>> = None;
     let mut other_args: Vec<FilterValue> = Vec::new();
     for arg in args {
-        if let Some(col_names) = as_column_ref(arg) {
+        if let Some(col_names) = as_column_ref(arg).or_else(|| match arg {
+            Expr::PlVariable(names) => Some(names.clone()),
+            _ => None,
+        }) {
             if target.is_some() {
                 return None;
             }
@@ -4640,7 +4635,7 @@ mod tests {
         );
     }
 
-    // ── #140: subquery table references must be extracted regardless of the
+    // ── Subquery table references must be extracted regardless of the
     // outer statement kind (SELECT / INSERT), not just UPDATE / DELETE. ──
 
     #[test]
@@ -4783,7 +4778,7 @@ mod tests {
 
     /// The CTE scope must stay active while expression subqueries are walked:
     /// a subquery referencing the statement's own CTE must not produce a
-    /// spurious table edge (#140 regression guard).
+    /// spurious table edge.
     #[test]
     fn subquery_referencing_cte_is_filtered() {
         let sql = "WITH cte AS (SELECT id FROM t_parent) SELECT COUNT(1) FROM t_main m WHERE m.id IN (SELECT id FROM cte)";
@@ -5102,7 +5097,7 @@ mod column_tests {
         results
     }
 
-    /// #168: like `extract_column_analysis`, but seeded with a procedure variable
+    /// Like `extract_column_analysis`, but seeded with a procedure variable
     /// context (cursor/record bindings that in real procedures come from the DECLARE
     /// block) — needed for tests exercising record-field WHERE/JOIN ON resolution.
     fn extract_column_analysis_with_context(
@@ -5170,9 +5165,9 @@ mod column_tests {
         assert_eq!(&hf.value, &FilterValue::String("active".to_string()));
     }
 
-    // ── Record-field cross-table joins (#168) ──────────────────────────────
+    // ── Record-field cross-table joins ─────────────────────────────────────
 
-    /// #168: a record field on the right of a WHERE equi-comparison resolves through
+    /// A record field on the right of a WHERE equi-comparison resolves through
     /// the cursor's SELECT source, producing a cross-table `JoinCondition` tagged
     /// `RecordField` (par_sys_purchase.security_id ↔ mid_yjqs_detail.security_id).
     #[test]
@@ -5218,7 +5213,7 @@ mod column_tests {
         assert_eq!(jc.right_column, "security_id");
     }
 
-    /// #168: the record field may appear on either side of `=`; the resolved join must
+    /// The record field may appear on either side of `=`; the resolved join must
     /// be the same regardless of source order.
     #[test]
     fn record_field_join_works_in_both_orientations() {
@@ -5256,7 +5251,7 @@ mod column_tests {
         assert_eq!(jc.right_column, "fund_code");
     }
 
-    /// #168: a plain `ON a.id = b.id` equi-join must regress unchanged — no
+    /// A plain `ON a.id = b.id` equi-join remains unchanged, with no
     /// `RecordField` rows sneak in when neither side is a record.
     #[test]
     fn plain_on_equi_join_unchanged() {
@@ -5274,7 +5269,7 @@ mod column_tests {
         assert_eq!(jc.source, JoinConditionSource::ExplicitOn);
     }
 
-    /// #168: a record vs. a procedure parameter/PL variable, and a record vs. an
+    /// A record vs. a procedure parameter/PL variable, and a record vs. an
     /// unregistered record variable, must both produce no join — never guess a table.
     #[test]
     fn record_vs_param_or_unregistered_produces_no_join() {
@@ -5310,7 +5305,7 @@ mod column_tests {
         );
     }
 
-    /// #168: table-anchored `%ROWTYPE` (no `cursor_sources` entry — the record's type
+    /// Table-anchored `%ROWTYPE` (no `cursor_sources` entry) resolves from its type
     /// is a table, not a cursor) resolves through the WHERE/JOIN path too.
     #[test]
     fn table_anchored_rowtype_resolves_in_where() {
@@ -5337,7 +5332,7 @@ mod column_tests {
         assert_eq!(jc.right_column, "id");
     }
 
-    /// #168: a `SELECT *` cursor's single catch-all source (empty output name)
+    /// A `SELECT *` cursor's single catch-all source (empty output name)
     /// resolves through the WHERE/JOIN path too, attributing to the cursor's table
     /// under the field's own name.
     #[test]
@@ -5605,9 +5600,9 @@ mod column_tests {
         );
     }
 
-    // ── #169: function-wrapped column filters (whitelist + transform) ────────
+    // ── Function-wrapped column filters ─────────────────────────────────────
 
-    /// #169: a whitelisted pure column transform compared against a literal yields a
+    /// A whitelisted pure column transform compared against a literal yields a
     /// HardFilter on the underlying column, with a transform descriptor.
     #[test]
     fn substr_wrapped_column_literal_becomes_hard_filter_with_transform() {
@@ -5628,7 +5623,7 @@ mod column_tests {
         );
     }
 
-    /// #169: the STEP3 mixed-cursor case — transformed and plain filters coexist.
+    /// Transformed and plain filters coexist in mixed cursor conditions.
     #[test]
     fn step3_cursor_mixed_filters_all_captured() {
         let sql = "SELECT qs.stock_kind FROM t_quote_snapshot qs WHERE substr(qs.stock_kind,1,2)='05' AND qs.stock_kind <> '0509' AND qs.scdm = '001' AND qs.cjsl > 0";
@@ -5661,7 +5656,7 @@ mod column_tests {
         assert_eq!(neq_filters[0].transform, None);
     }
 
-    /// #169: non-literal extra args exclude the filter (PL variable in args).
+    /// Non-literal extra arguments exclude the filter.
     #[test]
     fn substr_with_variable_length_arg_is_excluded() {
         let sql = "SELECT col FROM t WHERE substr(col, 1, v_len) = '05'";
@@ -5675,7 +5670,7 @@ mod column_tests {
         );
     }
 
-    /// #169: non-whitelisted function or func-vs-func comparisons stay excluded.
+    /// Non-whitelisted functions and function-to-function comparisons stay excluded.
     #[test]
     fn non_whitelisted_or_double_sided_function_is_excluded() {
         let sql1 = "SELECT col FROM t WHERE fnc_x(col) = '1'";
@@ -5693,7 +5688,7 @@ mod column_tests {
         );
     }
 
-    /// #169: SpecialFunction (keyword syntax) is covered too.
+    /// Keyword-style special functions use the same transform handling.
     #[test]
     fn substr_keyword_syntax_produces_transform() {
         let sql = "SELECT col FROM t WHERE substring(col FROM 1 FOR 2) = '05'";
@@ -5710,7 +5705,7 @@ mod column_tests {
         );
     }
 
-    /// #169: nvl transform includes its default-value argument.
+    /// An `nvl` transform includes its default-value argument.
     #[test]
     fn nvl_transform_includes_default_arg() {
         let sql = "SELECT col FROM t WHERE nvl(col, '0') = '1'";
@@ -5727,7 +5722,7 @@ mod column_tests {
         );
     }
 
-    /// #169: plain filters must NOT carry a `transform` key in JSON (skip_serializing_if).
+    /// Plain filters omit the `transform` key in JSON.
     #[test]
     fn plain_filter_json_has_no_transform_key_but_transformed_filter_does() {
         let plain = HardFilter {
@@ -5762,7 +5757,7 @@ mod column_tests {
         );
     }
 
-    // ── Column mappings (#136) ────────────────────────────────────────────────
+    // ── Column mappings ─────────────────────────────────────────────────────
 
     fn column_mappings_of(sql: &str) -> Vec<ColumnMapping> {
         extract_column_analysis(sql)
@@ -5771,7 +5766,7 @@ mod column_tests {
             .collect()
     }
 
-    /// Column mappings with a seeded procedure variable context (#142): lets a
+    /// Column mappings with a seeded procedure variable context let a
     /// standalone INSERT walk see cursor/record bindings that in real procedures
     /// come from the DECLARE block.
     fn column_mappings_of_with_context(sql: &str, ctx: &ProcedureVarContext) -> Vec<ColumnMapping> {
@@ -5967,7 +5962,7 @@ mod column_tests {
         );
     }
 
-    /// #142: a scalar subquery as an INSERT..SELECT target contributes the inner
+    /// A scalar subquery as an INSERT..SELECT target contributes the inner
     /// select's FIRST expression as the source, resolved in the subquery's own FROM
     /// scope. Correlated refs (`s.id` in WHERE) must NOT leak as sources.
     #[test]
@@ -5981,7 +5976,7 @@ mod column_tests {
         assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
     }
 
-    /// #142: the choke point is push_column_mapping, so INSERT..VALUES subqueries
+    /// The choke point is `push_column_mapping`, so INSERT..VALUES subqueries
     /// resolve too.
     #[test]
     fn scalar_subquery_in_insert_values_resolves() {
@@ -5994,7 +5989,7 @@ mod column_tests {
         );
     }
 
-    /// Review #1: a scalar subquery whose first expression is a TRANSFORMED column
+    /// A scalar subquery whose first expression is a transformed column
     /// (`UPPER`, `+1`, `NVL`, `CAST`, …) must classify as Derived and keep the
     /// expression text — not masquerade as a Direct copy.
     #[test]
@@ -6013,7 +6008,7 @@ mod column_tests {
         );
     }
 
-    /// Review #1: a literal-only scalar subquery is a constant → Direct + Literal
+    /// A literal-only scalar subquery is a constant source.
     /// source, consistent with how `classify_value_expr` treats a bare literal.
     #[test]
     fn literal_only_scalar_subquery_classifies_direct() {
@@ -6028,7 +6023,7 @@ mod column_tests {
         );
     }
 
-    /// Review (5136742683): a multi-column subquery applied to a multi-column
+    /// A multi-column subquery applied to a multi-column
     /// UPDATE SET target must align each target column to its OWN select-list
     /// position — not copy the first expression into every column.
     #[test]
@@ -6045,7 +6040,7 @@ mod column_tests {
         );
     }
 
-    /// Review #2: a JOIN inside the scalar subquery's FROM must not leak its
+    /// A join inside the scalar subquery's FROM must not leak its
     /// join/filter state into the enclosing statement's analysis — the subquery
     /// carries its own scope.
     #[test]
@@ -6063,7 +6058,7 @@ mod column_tests {
         );
     }
 
-    /// Review (5136742683): `t.x > ANY (SELECT ...)` — the left operand `t.x` is a
+    /// In `t.x > ANY (SELECT ...)`, the left operand is a
     /// real column reference of the enclosing query and must still be collected;
     /// only the nested SELECT's own scope must be skipped.
     #[test]
@@ -6085,7 +6080,7 @@ mod column_tests {
         assert_eq!(x_refs[0].resolved_table.as_deref(), Some("t"));
     }
 
-    /// Review (5136742683): the left operand of `IN (SELECT ...)` in an ON clause
+    /// The left operand of `IN (SELECT ...)` in an ON clause
     /// must still be collected (the generic walker was its only collector).
     #[test]
     fn in_subquery_left_operand_in_join_condition_is_collected() {
@@ -6105,7 +6100,7 @@ mod column_tests {
         );
     }
 
-    /// #142: a `rec t%ROWTYPE` record (anchor is a TABLE, not a registered cursor)
+    /// A `rec t%ROWTYPE` record anchored to a table
     /// resolves its fields to that table's columns.
     #[test]
     fn table_rowtype_record_field_resolves_to_table_column() {
@@ -6126,7 +6121,7 @@ mod column_tests {
         );
     }
 
-    /// #142: a `SELECT *` cursor produces a single catch-all cursor source (empty
+    /// A `SELECT *` cursor produces a single catch-all cursor source (empty
     /// output name, table attributed). Record fields over it attribute to the
     /// cursor's table under the field's own name.
     #[test]
@@ -6156,7 +6151,7 @@ mod column_tests {
         );
     }
 
-    /// #142: `INSERT INTO t (a, b) VALUES r` with a cursor-anchored %ROWTYPE record
+    /// `INSERT INTO t (a, b) VALUES r` with a cursor-anchored `%ROWTYPE` record
     /// expands the record's fields positionally through the cursor's SELECT sources.
     #[test]
     fn whole_record_insert_expands_cursor_rowtype_fields() {
@@ -6189,7 +6184,7 @@ mod column_tests {
         );
     }
 
-    /// Review #5: whole-record insert from a `SELECT *` cursor has no exact column
+    /// Whole-record insert from a `SELECT *` cursor has no exact column
     /// names — attributing each INSERT column under its own name would silently
     /// misattribute a reordered column list. Leave such mappings unmapped instead.
     #[test]
@@ -6212,7 +6207,7 @@ mod column_tests {
         );
     }
 
-    /// Review #3: a `%ROWTYPE` record's data comes from the FETCH that fills it.
+    /// A `%ROWTYPE` record's data comes from the FETCH that fills it.
     /// `r t_type%ROWTYPE` + `FETCH cur INTO r` (cur reads t_other) must resolve
     /// `r.id` to t_other.id, not the declared type table.
     #[test]
@@ -6234,7 +6229,7 @@ mod column_tests {
         );
     }
 
-    /// Review #4: a %ROWTYPE record field as a scalar subquery's first expression
+    /// A `%ROWTYPE` record field as a scalar subquery's first expression
     /// penetrates through record_cursors to the cursor's source column — ogsql-parser
     /// parses `rec.field` as a dotted ColumnRef, which column_source already resolves.
     #[test]

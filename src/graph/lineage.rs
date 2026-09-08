@@ -1908,13 +1908,6 @@ pub(crate) enum ParsedLineageTarget {
     Column(String, String),
 }
 
-/// #165 P1: parse a lineage `target` string the same way `cmd_lineage` (CLI) does, for
-/// the MCP `codeweb_lineage` tool and HTTP `GET /api/v1/lineage` handler. This is a pure
-/// subset of `cmd_lineage`'s inline parsing (main.rs) — it returns a `Result` instead of
-/// `eprintln!`-ing and returning `Ok(())`, so each caller controls how the error surfaces
-/// (MCP: JSON `{"error": ...}`; HTTP: 400/404). `cmd_lineage` itself is intentionally left
-/// untouched (its own inline copy) to avoid any risk of regressing `tests/regress_lineage_*`.
-///
 /// Handles the same three grammars as the CLI: a node-key (`table:schema.table`, left
 /// alone — table-level), `table.column` (column-level, but only once the table half is
 /// confirmed to exist unambiguously), and a bare table name (table-level).
