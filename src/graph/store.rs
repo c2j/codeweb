@@ -3,6 +3,7 @@ use crate::graph::node_type_tag;
 use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
+use crate::parser::{AnchorKind, AnchorSite};
 use crate::sql_match;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -1307,6 +1308,39 @@ impl GraphStore {
         self.updated_at = timestamp_ms();
     }
 
+    /// Dedup key for `merge`'s per-edge duplicate check. `AnchorsOn` edges
+    /// extend the base `(src, dst, tag)` key with `(kind, lowercased
+    /// column, site)` — mirrors `dedup()`'s `(kind, column, site)` key
+    /// (see `should_keep_distinct_anchor_edges_through_dedup`) so two
+    /// params anchoring the same table on different columns survive a
+    /// `merge` the same way they survive a `dedup`. Non-`AnchorsOn` edges
+    /// get `None` in the extension fields, leaving their key unchanged.
+    fn edge_dedup_key(
+        src: &NodeKey,
+        dst: &NodeKey,
+        tag: &str,
+        edge: &crate::graph::Edge,
+    ) -> EdgeDedupKey {
+        let (kind, column, site) = match edge {
+            crate::graph::Edge::AnchorsOn {
+                kind, column, site, ..
+            } => (
+                Some(*kind),
+                column.clone().map(|c| c.to_lowercase()),
+                Some(*site),
+            ),
+            _ => (None, None, None),
+        };
+        (
+            src.clone(),
+            dst.clone(),
+            tag.to_string(),
+            kind,
+            column,
+            site,
+        )
+    }
+
     /// Merge multiple stores into one, deduplicating shared nodes by NodeKey.
     /// Edges pointing to the same semantic entity are consolidated.
     ///
@@ -1317,6 +1351,11 @@ impl GraphStore {
     /// but CGEF import produces `proc:pkg_foo.sp` (no schema).
     pub fn merge(stores: Vec<Self>, merged_name: &str) -> Self {
         let mut merged = GraphStore::new(merged_name);
+        // Declared once for the whole merge, not per store: an edge from a
+        // later store that duplicates one already copied from an earlier
+        // store must still collapse — the accumulator's prior edges need
+        // the same dedup key check as edges within a single store.
+        let mut seen_edges: HashSet<EdgeDedupKey> = HashSet::new();
 
         for store in &stores {
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
@@ -1360,7 +1399,6 @@ impl GraphStore {
                 idx_map.insert(old_idx, new_idx);
             }
 
-            let mut seen_edges: HashSet<(NodeKey, NodeKey, String)> = HashSet::new();
             let mut table_access_merge_map: HashMap<
                 (NodeKey, NodeKey),
                 petgraph::graph::EdgeIndex,
@@ -1371,7 +1409,12 @@ impl GraphStore {
                 let dst_key = NodeKey::from_node(&store.graph[dst]);
                 let edge_type = edge_type_tag(&store.graph[old_edge_idx]);
 
-                let dedup_key = (src_key.clone(), dst_key.clone(), edge_type.clone());
+                let dedup_key = Self::edge_dedup_key(
+                    &src_key,
+                    &dst_key,
+                    &edge_type,
+                    &store.graph[old_edge_idx],
+                );
                 if !seen_edges.insert(dedup_key) {
                     continue;
                 }
@@ -1757,6 +1800,17 @@ fn timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// See [`GraphStore::edge_dedup_key`] for why `AnchorsOn` edges need the
+/// three trailing fields while every other edge type leaves them `None`.
+type EdgeDedupKey = (
+    NodeKey,
+    NodeKey,
+    String,
+    Option<AnchorKind>,
+    Option<String>,
+    Option<AnchorSite>,
+);
 
 fn edge_type_tag(edge: &crate::graph::Edge) -> String {
     match edge {
@@ -3646,6 +3700,106 @@ mod tests {
             merged.graph().node_count(),
             2,
             "different procedures should remain separate"
+        );
+    }
+
+    /// PR #164 review round 3 (#158): `merge`'s edge dedup key is
+    /// `(src, dst, edge_type_tag)` only — parallel to the generic
+    /// same-(src,dst,tag) collapse that `dedup()` was fixed to exclude
+    /// `AnchorsOn` from (`should_keep_distinct_anchor_edges_through_dedup`).
+    /// Two params anchoring the *same* table on *different* columns
+    /// (`p1 emp.id%TYPE`, `p2 emp.name%TYPE`) must survive a `merge` the
+    /// same way they survive a `dedup` — only an exact
+    /// `(kind, column, site)` duplicate collapses.
+    #[test]
+    fn should_keep_distinct_anchor_edges_through_merge() {
+        use crate::parser::{AnchorKind, AnchorSite};
+
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let mut graph_a = CodeGraph::new();
+        let proc_idx = graph_a.add_node(crate::graph::Node::Procedure {
+            id: crate::graph::RoutineId {
+                schema: None,
+                package: None,
+                name: "proc_emp".to_string(),
+                kind: crate::graph::RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: Vec::new(),
+        });
+        let table_idx = graph_a.add_node(crate::graph::Node::Table {
+            schema: None,
+            name: "emp".to_string(),
+            explicit: false,
+            system: false,
+            location: None,
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        // p1 emp.id%TYPE
+        graph_a.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("id".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        // p2 emp.name%TYPE
+        graph_a.add_edge(
+            proc_idx,
+            table_idx,
+            crate::graph::Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("name".to_string()),
+                site: AnchorSite::Param,
+                location: loc.clone(),
+            },
+        );
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        // An unrelated second store — merge must still produce both distinct
+        // anchor edges from store_a untouched.
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(None, Some("pkg_other"), "proc_unrelated"));
+        let store_b = GraphStore::from_graph("b", graph_b);
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+
+        let anchor_edges: Vec<_> = merged
+            .graph()
+            .edge_weights()
+            .filter(|e| matches!(e, crate::graph::Edge::AnchorsOn { .. }))
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            2,
+            "expected 2 distinct AnchorsOn edges (id, name) to survive merge, got {:?}",
+            anchor_edges
+        );
+        let mut columns: Vec<Option<String>> = anchor_edges
+            .iter()
+            .map(|e| match e {
+                crate::graph::Edge::AnchorsOn { column, .. } => column.clone(),
+                other => panic!("expected Edge::AnchorsOn, got {:?}", other),
+            })
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![Some("id".to_string()), Some("name".to_string())]
         );
     }
 
