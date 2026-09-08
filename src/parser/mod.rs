@@ -10,6 +10,7 @@ pub mod jsp_preprocessor;
 #[cfg(feature = "jsp")]
 pub mod jsp_types;
 mod loader;
+mod predicates;
 pub mod scanner;
 pub mod snippet;
 
@@ -17,10 +18,10 @@ pub mod snippet;
 pub use extractor::{
     extract_body_sql, pl_type_decl_name, CallEdge, CallExtractor, ColumnAccessExtractor,
     ColumnAnalysis, ColumnContext, ColumnMapping, ColumnRef, ColumnSource, CursorColumn,
-    EnumMapping, FilterOperator, FilterValue, HardFilter, InsertColumnInfo, JoinCondition,
-    JoinConditionSource, JoinType, MappingKind, ProcedureBodySql, ProcedureSqlExtractor,
-    ProcedureVarContext, SelectIntoMapping, SequenceRef, SequenceRefVia, TableAccessExtractor,
-    TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
+    EnumMapping, FilterOperator, FilterTransform, FilterValue, HardFilter, InsertColumnInfo,
+    JoinCondition, JoinConditionSource, JoinType, MappingKind, ProcedureBodySql,
+    ProcedureSqlExtractor, ProcedureVarContext, SelectIntoMapping, SequenceRef, SequenceRefVia,
+    TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
 };
 #[allow(unused_imports)]
 pub use ibatis_loader::{
@@ -37,5 +38,10 @@ pub use java_method::{
     JavaParseResult, MethodCallInfo,
 };
 pub use loader::{load_all_files, load_sql_files, parse_sql_files, AllParsedFiles, ParsedFile};
+#[allow(unused_imports)]
+pub use predicates::{
+    extract_predicates, Confidence, ParamTableHint, PlPredicate, PredicateClause,
+    PredicateExtractor, PredicateKind, TablePredicate,
+};
 #[allow(unused_imports)]
 pub use scanner::{build_exclude_matcher, scan_directory, ScannedFiles};
