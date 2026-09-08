@@ -2174,6 +2174,26 @@ impl GraphBuilder {
             })
             .collect();
 
+        // Package-level item anchoring (Variable/Type below) uses an
+        // incremental "declared earlier" set rather than the full
+        // `pkg_var_type_names` above: a package-level declaration's own
+        // name must never guard its own anchor (PR #164 review round 2
+        // issue 3 — same insert-after-visit principle as the extractor,
+        // applied to this loop's iteration order), while a *later* sibling
+        // referencing an *earlier* one is still guarded. Seeded from the
+        // SPEC's inherited var/type names (already fully declared before
+        // this BODY starts); cursor names stay on the full `pkg_cursor_names`
+        // set above — cursor earlier-only ordering is a documented
+        // non-goal.
+        let mut declared_earlier: HashSet<String> = inherited_items
+            .iter()
+            .filter_map(|item| match item {
+                PackageItem::Variable(v) => Some(v.name.to_lowercase()),
+                PackageItem::Type(t) => Some(crate::parser::pl_type_decl_name(t).to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
         for item in pkg_items {
             if let PackageItem::Variable(v) = item {
                 if let Some((object, column, kind)) =
@@ -2181,7 +2201,7 @@ impl GraphBuilder {
                 {
                     let obj_lower = object.to_lowercase();
                     if !pkg_cursor_names.contains(&obj_lower)
-                        && !pkg_var_type_names.contains(&obj_lower)
+                        && !declared_earlier.contains(&obj_lower)
                     {
                         let qualified = pkg_qualified_key(pkg_name);
                         if let Some(&pkg_idx) = package_index.get(&qualified) {
@@ -2202,6 +2222,7 @@ impl GraphBuilder {
                         }
                     }
                 }
+                declared_earlier.insert(v.name.to_lowercase());
                 continue;
             }
 
@@ -2213,7 +2234,7 @@ impl GraphBuilder {
                 for (object, column, kind) in crate::parser::anchor_targets_in_pl_type_decl(t) {
                     let obj_lower = object.to_lowercase();
                     if pkg_cursor_names.contains(&obj_lower)
-                        || pkg_var_type_names.contains(&obj_lower)
+                        || declared_earlier.contains(&obj_lower)
                     {
                         continue;
                     }
@@ -2235,6 +2256,7 @@ impl GraphBuilder {
                         );
                     }
                 }
+                declared_earlier.insert(crate::parser::pl_type_decl_name(t).to_lowercase());
                 continue;
             }
 
@@ -5615,6 +5637,54 @@ mod tests {
         match &graph[target] {
             Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "employees"),
             other => panic!("expected Node::Table, got {:?}", other),
+        }
+    }
+
+    /// PR #164 review round 2 issue 3 (#158): the self-naming idiom applies
+    /// to package-level variable declarations too — `v_emp v_emp%ROWTYPE`
+    /// at package scope must anchor to the real `v_emp` table (insert-
+    /// after-visit in the extractor), while a sibling variable anchored to
+    /// that same, now *earlier*-declared package variable (`v_id
+    /// v_emp.empno%TYPE`) is still guarded by the earlier-only set.
+    #[test]
+    fn should_anchor_package_var_self_named_after_table() {
+        let sql = r#"
+            CREATE OR REPLACE PACKAGE BODY pkg_self_named AS
+                v_emp v_emp%ROWTYPE;
+                v_id v_emp.empno%TYPE;
+            END pkg_self_named;
+        "#;
+        let graph = build_from_sql(sql);
+
+        let pkg_idx = graph
+            .node_indices()
+            .find(|i| matches!(&graph[*i], Node::Package { name, .. } if name == "pkg_self_named"))
+            .expect("package node should exist");
+
+        let anchor_edges: Vec<_> = graph
+            .edge_indices()
+            .filter(|e| {
+                graph.edge_endpoints(*e).map(|(s, _)| s) == Some(pkg_idx)
+                    && matches!(&graph[*e], Edge::AnchorsOn { .. })
+            })
+            .collect();
+        assert_eq!(
+            anchor_edges.len(),
+            1,
+            "expected exactly 1 AnchorsOn edge (v_emp->v_emp table, self-named); v_id \
+             must still be guarded (v_emp declared earlier), got {:?}",
+            anchor_edges.iter().map(|e| &graph[*e]).collect::<Vec<_>>()
+        );
+        let (_, target) = graph.edge_endpoints(anchor_edges[0]).unwrap();
+        match &graph[target] {
+            Node::Table { name, .. } => assert_eq!(name.to_lowercase(), "v_emp"),
+            other => panic!("expected Node::Table, got {:?}", other),
+        }
+        match &graph[anchor_edges[0]] {
+            Edge::AnchorsOn { site, .. } => {
+                assert!(matches!(site, crate::parser::AnchorSite::Variable));
+            }
+            other => panic!("expected Edge::AnchorsOn, got {:?}", other),
         }
     }
 

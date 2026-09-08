@@ -1141,15 +1141,19 @@ pub fn anchor_targets_in_pl_type_decl(t: &PlTypeDecl) -> Vec<(String, Option<Str
 ///   `PlDeclaration::Cursor`/`Variable` must be visited before any anchor
 ///   that shadows it is evaluated). This matches PL/SQL's own declaration
 ///   order semantics, so out-of-order shadowing is not a real-world case.
-/// - When a local identifier (variable or cursor) shadows a same-named real
-///   table, anchors targeting that name are conservatively skipped rather
-///   than resolved to the table. This is intentional: PL/SQL identifier
-///   shadowing means the name resolves to the local declaration, not the
-///   table, at the point of use. The skip set also includes routine
-///   parameter names injected via [`register_var_name`](AnchorExtractor::register_var_name)
-///   (parameters are not `PlDeclaration`s inside the block), so a
-///   parameter literally named `par_sys_purchase` shadowing the real table
-///   of that name is this same documented behavior, not an accident.
+/// - A declaration's own name registers only *after* its `%ROWTYPE`/`%TYPE`
+///   target is visited (insert-after-visit), so a self-referential
+///   declaration like `emp emp%ROWTYPE` — the standard Oracle idiom for a
+///   record variable shaped like, and named after, a table — resolves to
+///   the real `emp` table rather than shadowing itself (PR #164 review
+///   round 2). When a *different*, already-declared local (an earlier
+///   sibling variable/TYPE, or a routine parameter name injected via
+///   [`register_var_name`](AnchorExtractor::register_var_name); parameters
+///   are not `PlDeclaration`s inside the block, so they carry no
+///   self-exclusion here) shares the anchor's target name, the anchor is
+///   still conservatively skipped: that shadowing is a genuine local
+///   reference, not self-declaration, so it resolves to the local, not the
+///   table, at the point of use.
 pub struct AnchorExtractor {
     pub anchors: Vec<AnchorRef>,
     cursor_names: HashSet<String>,
@@ -1231,17 +1235,17 @@ impl Visitor for AnchorExtractor {
                 self.cursor_names.insert(c.name.to_lowercase());
             }
             PlDeclaration::Variable(v) => {
-                self.var_names.insert(v.name.to_lowercase());
                 self.visit_pl_data_type(&v.data_type, AnchorSite::Variable);
+                self.var_names.insert(v.name.to_lowercase());
             }
             PlDeclaration::Record(r) => {
                 self.var_names.insert(r.name.to_lowercase());
             }
             PlDeclaration::Type(t) => {
-                self.var_names.insert(pl_type_decl_name(t).to_lowercase());
                 for (object, column, kind) in anchor_targets_in_pl_type_decl(t) {
                     self.push_anchor(object, column, kind, AnchorSite::NestedType);
                 }
+                self.var_names.insert(pl_type_decl_name(t).to_lowercase());
             }
             _ => {}
         }
@@ -4791,6 +4795,25 @@ mod tests {
             "variable%TYPE must not become a table anchor: {:?}",
             anchors
         );
+    }
+
+    /// PR #164 review round 2 issue 3 (#158): `emp emp%ROWTYPE` is the
+    /// standard Oracle idiom for declaring a record variable shaped like
+    /// table `emp` and named after it. The declared variable's own name
+    /// must register only *after* its `%ROWTYPE` is resolved — insert-
+    /// before-visit would make the variable shadow itself and wrongly skip
+    /// the anchor.
+    #[test]
+    fn should_anchor_variable_self_named_after_table() {
+        let sql = "CREATE FUNCTION f() RETURN INTEGER AS $$ \
+            DECLARE emp emp%ROWTYPE; \
+            BEGIN NULL; END; $$;";
+        let anchors = extract_anchors(sql);
+        assert_eq!(anchors.len(), 1, "got: {:?}", anchors);
+        assert_eq!(anchors[0].object, "emp");
+        assert_eq!(anchors[0].column, None);
+        assert!(matches!(anchors[0].kind, AnchorKind::PercentRowType));
+        assert!(matches!(anchors[0].site, AnchorSite::Variable));
     }
 
     #[test]
