@@ -207,6 +207,35 @@ fn should_report_clean_error_for_unknown_nodekey_target() {
 }
 
 #[test]
+fn should_hint_column_level_requires_table_when_target_missing() {
+    let tmp = TempDir::new().unwrap();
+    let root = project_with_sql(&tmp, FIXTURE_SQL);
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "lineage",
+            "missing_table.some_col",
+            "-p",
+            root.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success());
+    assert!(
+        stderr.contains("interpreting"),
+        "existing fallback note must remain, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the table must exist"),
+        "missing-table fallback must explain the column-level prerequisite, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No table found matching"),
+        "final table-resolution error must still surface, stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn should_say_ambiguous_when_table_half_is_ambiguous() {
     let tmp = TempDir::new().unwrap();
     let root = project_with_sql(
