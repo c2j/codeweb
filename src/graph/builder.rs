@@ -1805,12 +1805,15 @@ impl GraphBuilder {
     /// Collect every `AnchorsOn` edge for a single routine: signature
     /// (`Param`/`ReturnType`) anchors from a flat type string, plus
     /// variable/nested-type anchors from walking `block` with a fresh
-    /// `AnchorExtractor` (issue #158). `pkg_cursor_names` is empty for a
-    /// top-level `CreateProcedure`/`CreateFunction`; a package member routine
-    /// passes its package's cursor names so `rec pkg_cursor%ROWTYPE` inside
-    /// the body is guarded the same way a routine-local cursor would be.
-    /// Shared across the three call sites (top-level procedure, top-level
-    /// function, package member) that previously duplicated this sequence.
+    /// `AnchorExtractor` (issue #158). `pkg_cursor_names` and
+    /// `pkg_var_type_names` are empty for a top-level
+    /// `CreateProcedure`/`CreateFunction`; a package member routine passes
+    /// its package's cursor and variable/TYPE names so that `%ROWTYPE`/
+    /// `%TYPE` anchored to any of them inside the body is guarded the same
+    /// way a routine-local declaration would be — package-level
+    /// declarations live outside the routine's own `PlBlock`, so the walker
+    /// cannot see them without this injection. Shared across the three call
+    /// sites: top-level procedure, top-level function, package member.
     #[allow(clippy::too_many_arguments)]
     fn collect_routine_anchor_edges(
         graph: &mut CodeGraph,
@@ -5191,10 +5194,9 @@ mod tests {
         );
     }
 
-    /// PR #164 review: the package-level variable guard previously checked
-    /// only cursor names. A package-level `%TYPE` anchored to an *earlier*
-    /// package-level variable name must also be guarded, while a real
-    /// table anchor on another package variable is unaffected.
+    /// PR #164 review: a package-level `%TYPE` anchored to an *earlier*
+    /// package-level variable name must be guarded (not just cursor names),
+    /// while a real table anchor on another package variable is unaffected.
     #[test]
     fn should_skip_package_var_anchored_to_earlier_package_var() {
         let sql = r#"
