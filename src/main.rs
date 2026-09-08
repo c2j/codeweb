@@ -1600,7 +1600,7 @@ fn cmd_lineage(
             }
             graph::lineage::TableLookup::Missing => {
                 eprintln!(
-                    "note: no table '{}' found — interpreting '{}' as a table reference",
+                    "note: no table '{}' found — interpreting '{}' as a table reference (for column-level lineage, the table must exist)",
                     table_name, target
                 );
                 (target, None)

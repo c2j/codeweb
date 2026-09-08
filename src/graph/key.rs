@@ -92,7 +92,8 @@ pub enum NodeKey {
 
 /// Node-key type tags exactly as emitted by the [`fmt::Display`] implementation below.
 /// Keep in sync with its match arms; `should_detect_every_display_tag_roundtrip` pins
-/// the fixed tags (the custom and unresolved formats are intentionally excluded).
+/// non-JSP tags always and JSP tags under `cfg(feature = "jsp")` (the custom and
+/// unresolved formats are intentionally excluded).
 const TYPE_TAG_PREFIXES: &[&str] = &[
     "proc", "func", "mapper", "method", "class", "table", "view", "pkg", "trigger", "type", "seq",
     "idx", "mview", "syn", "event", "builtin", "javasql", "jsp", "jspsql",
@@ -528,6 +529,32 @@ mod tests {
                 split_type_prefix(key).is_some(),
                 "tag not detected for Display key: {key}"
             );
+        }
+
+        #[cfg(feature = "jsp")]
+        {
+            let jsp_cases = [
+                format!(
+                    "{}",
+                    NodeKey::JspPage {
+                        path: "WEB-INF/a.jsp".into()
+                    }
+                ),
+                format!(
+                    "{}",
+                    NodeKey::JspSql {
+                        file: "WEB-INF/a.jsp".into(),
+                        line: 7,
+                        sql_hash: "abc123".into()
+                    }
+                ),
+            ];
+            for key in &jsp_cases {
+                assert!(
+                    split_type_prefix(key).is_some(),
+                    "tag not detected for Display key: {key}"
+                );
+            }
         }
     }
 }
