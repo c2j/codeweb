@@ -355,6 +355,238 @@ END;
     );
 }
 
+/// #142: a scalar subquery in the INSERT..SELECT target list must resolve to the
+/// subquery's source column, not report "No column lineage".
+#[test]
+fn scalar_subquery_in_insert_select_target_resolves() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_ref(id NUMBER, code VARCHAR2(10));
+CREATE TABLE t_out(id NUMBER, code VARCHAR2(10));
+CREATE PROCEDURE p_copy_subquery AS BEGIN
+  INSERT INTO t_out (id, code)
+  SELECT s.id, (SELECT r.code FROM t_ref r WHERE r.id = s.id) FROM t_src s;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_out.code", "upstream", "tree");
+    assert!(
+        !out.contains("No column lineage"),
+        "scalar subquery target must resolve:\n{out}"
+    );
+    assert!(
+        out.contains("t_ref.code"),
+        "subquery source column missing:\n{out}"
+    );
+}
+
+/// #142: a table-anchored %ROWTYPE record (`r t_src%ROWTYPE`) written via
+/// `VALUES (r.id, r.amt)` must resolve to t_src columns, not "?.id".
+#[test]
+fn table_rowtype_record_insert_values_resolves_to_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_table_rowtype AS
+  r t_src%ROWTYPE;
+  CURSOR cur IS SELECT id, amt FROM t_src;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_src.id"),
+        "table-anchored record field must resolve:\n{out}"
+    );
+    assert!(
+        !out.contains("?.id"),
+        "table-anchored record field must not stay unattributed:\n{out}"
+    );
+}
+
+/// #142: `SELECT *` cursor + `%ROWTYPE` record fields must resolve to the
+/// cursor's table (columns attributed under the field names), not "?.id".
+#[test]
+fn star_cursor_rowtype_record_resolves_to_cursor_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_star_cursor AS
+  CURSOR cur IS SELECT * FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_src.id"),
+        "star-cursor record field must resolve:\n{out}"
+    );
+    assert!(
+        !out.contains("?.id"),
+        "star-cursor record field must not stay unattributed:\n{out}"
+    );
+}
+
+/// #142: whole-record insert `INSERT INTO t_dst (id, amt) VALUES r` (cursor-anchored
+/// %ROWTYPE) must resolve positionally through the cursor's sources.
+#[test]
+fn whole_record_insert_values_r_resolves_through_cursor() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_rec_insert AS
+  CURSOR cur IS SELECT id, amt FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES r;
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        out.contains("t_src.amt"),
+        "whole-record insert must resolve through the cursor:\n{out}"
+    );
+}
+
+/// Review #5: whole-record insert over a `SELECT *` cursor with a REORDERED
+/// column list must not silently misattribute — leave unmapped rather than
+/// guess names.
+#[test]
+fn star_cursor_whole_record_insert_does_not_misattribute_reordered_columns() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(amt NUMBER, id NUMBER);
+CREATE PROCEDURE p_rec_reorder AS
+  CURSOR cur IS SELECT * FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (amt, id) VALUES r;
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    // Positionally t_src.id (cursor col 0) fills t_dst.amt, but the SELECT *
+    // catch-all cannot prove that — emitting `t_dst.amt ← t_src.amt` would be a
+    // silent lie. Unmapped is correct.
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        !out.contains("t_src.amt"),
+        "reordered whole-record insert must not fabricate a name match:\n{out}"
+    );
+}
+
+/// Review #3: FETCH fills the record, so `r t_type%ROWTYPE` + `FETCH cur INTO r`
+/// (cur reads t_other) must resolve to t_other, not the declared type table.
+#[test]
+fn fetch_rebinding_overrides_rowtype_type_table() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_other(id NUMBER, amt NUMBER);
+CREATE TABLE t_type(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_fetch_mismatch AS
+  r t_type%ROWTYPE;
+  CURSOR cur IS SELECT id, amt FROM t_other;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.id", "upstream", "tree");
+    assert!(
+        out.contains("t_other.id"),
+        "record filled by FETCH must resolve to the cursor's source:\n{out}"
+    );
+    assert!(
+        !out.contains("t_type.id"),
+        "declared %ROWTYPE type table must not be the data source:\n{out}"
+    );
+}
+
+/// #142 characteristic test: cursor-anchored %ROWTYPE record written via
+/// `VALUES (r.id, r.amt)` resolves to the cursor's source columns (fixed by #148;
+/// this locks the behavior so later extraction changes cannot regress it).
+#[test]
+fn cursor_rowtype_record_insert_values_resolves_to_cursor_source() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE t_src(id NUMBER, amt NUMBER);
+CREATE TABLE t_dst(id NUMBER, amt NUMBER);
+CREATE PROCEDURE p_copy_cursor AS
+  CURSOR cur IS SELECT id, amt FROM t_src;
+  r cur%ROWTYPE;
+BEGIN
+  OPEN cur;
+  LOOP
+    FETCH cur INTO r;
+    EXIT WHEN cur%NOTFOUND;
+    INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);
+  END LOOP;
+  CLOSE cur;
+END;
+"#,
+    );
+    let out = lineage(&root, "t_dst.amt", "upstream", "tree");
+    assert!(
+        out.contains("t_src.amt"),
+        "cursor %ROWTYPE record field must resolve:\n{out}"
+    );
+}
+
 /// Regression: a cursor declared with `SELECT *` resolves to zero source columns, so a
 /// later `FETCH` used to panic in `resolve_cursor_flows` — `bool::then_some` evaluates
 /// its argument eagerly, indexing `&cols[0]` on the empty list

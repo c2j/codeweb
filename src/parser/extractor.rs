@@ -2716,7 +2716,18 @@ impl Visitor for ColumnAccessExtractor {
                     _ => String::new(),
                 };
                 let vars: Vec<String> = fetch.node.into.iter().map(expr_var_name).collect();
-                self.record_fetch(&cursor_name, vars);
+                self.record_fetch(&cursor_name, vars.clone());
+                // Review #3: the record's data comes from the FETCHing cursor, not
+                // its declared %ROWTYPE type anchor — rebind so `column_source`
+                // resolves through the cursor's SELECT sources.
+                if !cursor_name.is_empty() && vars.len() == 1 {
+                    if let Some(var) = vars.first() {
+                        let key = var.to_lowercase();
+                        if self.record_cursors.contains_key(&key) {
+                            self.record_cursors.insert(key, cursor_name.to_lowercase());
+                        }
+                    }
+                }
             }
             // `OPEN c_fxj FOR v_sql_txt` / `FOR EXECUTE expr`: resolve the dynamic SQL to
             // the cursor's SELECT sources so FETCH-variable chains keep resolving.
@@ -2925,11 +2936,52 @@ impl Visitor for ColumnAccessExtractor {
                         }
                     }
                 }
-                // DEFAULT VALUES has no sources; `SET` is handled as assignments; a
-                // record variable needs the variable's own type to expand.
+                // DEFAULT VALUES has no sources; `SET` is handled as assignments.
                 ogsql_parser::ast::InsertSource::DefaultValues
-                | ogsql_parser::ast::InsertSource::Set(_)
-                | ogsql_parser::ast::InsertSource::RecordVariable(_) => {}
+                | ogsql_parser::ast::InsertSource::Set(_) => {}
+                // `INSERT INTO t (a, b) VALUES r` expands positionally through the
+                // record's %ROWTYPE cursor sources. Whole-record inserts cannot be
+                // aligned without the target DDL column order.
+                ogsql_parser::ast::InsertSource::RecordVariable(expr) => {
+                    if let Expr::ColumnRef(names) | Expr::PlVariable(names) =
+                        peel_parenthesized(expr)
+                    {
+                        let rec = names.join(".").to_lowercase();
+                        if let Some(anchor) = self.record_cursors.get(&rec) {
+                            if let Some(cols) = self.cursor_sources.get(anchor) {
+                                for (position, column) in insert.columns.iter().enumerate() {
+                                    let col = cols.get(position).or(match cols.as_slice() {
+                                        [single] if single.output_name.is_empty() => Some(single),
+                                        _ => None,
+                                    });
+                                    let source = col.and_then(|c| {
+                                        if !c.source_col.is_empty() {
+                                            Some(ColumnSource::Column {
+                                                table: c.source_table.clone(),
+                                                column: c.source_col.clone(),
+                                            })
+                                        } else {
+                                            // A catch-all (`SELECT *`) cursor has no
+                                            // exact column; guessing under the target
+                                            // name would misattribute reordered lists.
+                                            None
+                                        }
+                                    });
+                                    if let Some(source) = source {
+                                        self.column_mappings.push(ColumnMapping {
+                                            target_table: Some(table_name.clone()),
+                                            target_column: column.clone(),
+                                            position: Some(position),
+                                            sources: vec![source],
+                                            kind: MappingKind::Direct,
+                                            expression: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if let ogsql_parser::ast::InsertSource::Select(select) = &insert.source {
             // No column list: name the target columns from the SELECT output (the first
@@ -3068,6 +3120,18 @@ impl Visitor for ColumnAccessExtractor {
                     }
                 }
             }
+            // Subqueries carry their own scope; the generic walker would otherwise
+            // recurse into their SELECT and leak its alias/join/filter state into
+            // this statement's analysis (review #153-2). Exists/Subquery have no
+            // left operand, so skipping is complete.
+            Expr::Subquery(_) | Expr::Exists(_) => return VisitorResult::SkipChildren,
+            // InSubquery/ScalarSublink DO have a left operand (`t.x > ANY (...)`,
+            // `t.id IN (...)`): collect its column references first, then skip the
+            // nested SELECT (review 5136742683).
+            Expr::InSubquery { expr, .. } | Expr::ScalarSublink { expr, .. } => {
+                self.walk_expr_for_column_refs(expr);
+                return VisitorResult::SkipChildren;
+            }
             _ => {}
         }
         VisitorResult::Continue
@@ -3101,6 +3165,28 @@ impl ColumnAccessExtractor {
                             };
                         }
                     }
+                    // #142: a single catch-all cursor source (empty output name —
+                    // `SELECT *` cursor, or dynamic-SQL attribution) covers every
+                    // record field: the exact column is unknown, attribute to the
+                    // cursor's table under the field's own name (same philosophy as
+                    // `resolve_cursor_flows`).
+                    if let [single] = cols.as_slice() {
+                        if single.output_name.is_empty() {
+                            if let Some(ref t) = single.source_table {
+                                return ColumnSource::Column {
+                                    table: Some(t.clone()),
+                                    column: column.clone(),
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    // A table-anchored %ROWTYPE record has no cursor_sources entry;
+                    // its fields are the anchor table's columns.
+                    return ColumnSource::Column {
+                        table: Some(cursor.clone()),
+                        column: column.clone(),
+                    };
                 }
             }
         }
@@ -3287,7 +3373,70 @@ impl ColumnAccessExtractor {
         position: Option<usize>,
         value: &Expr,
     ) {
+        // A scalar subquery as a value carries its own FROM scope; resolve its first
+        // output expression there rather than against the enclosing statement.
+        if let Expr::Subquery(select) = peel_parenthesized(value) {
+            self.push_subquery_column_mapping(target_table, target_column, position, select);
+            return;
+        }
         let (sources, kind, expression) = self.classify_value_expr(value);
+        self.column_mappings.push(ColumnMapping {
+            target_table,
+            target_column,
+            position,
+            sources,
+            kind,
+            expression,
+        });
+    }
+
+    /// Column mapping for `target = (SELECT ... FROM ...)`: map the written column
+    /// to the subquery's select expression — a scalar subquery's single output, or
+    /// — for a multi-column subquery shared by an UPDATE SET list — the output at
+    /// the written column's position. Resolves against the subquery's own FROM
+    /// aliases, then restores the enclosing statement's scope. Correlated
+    /// references (`s.id` in the subquery's WHERE) are not value sources and are
+    /// intentionally not collected.
+    fn push_subquery_column_mapping(
+        &mut self,
+        target_table: Option<String>,
+        target_column: String,
+        position: Option<usize>,
+        select: &SelectStatement,
+    ) {
+        // The first select-list expression is the value; classify it under the
+        // subquery's own FROM scope, then restore the enclosing scope. Alias
+        // collection doubles as join/filter extraction, so snapshot the
+        // statement-level accumulators too — a subquery JOIN must not leak into
+        // the parent analysis.
+        let saved_alias_map = self.alias_map.clone();
+        let saved_joins = self.join_conditions.len();
+        let saved_filters = self.hard_filters.len();
+        let saved_refs = self.column_refs.len();
+        self.collect_aliases_from_table_refs(&select.from);
+        let new_scope = self.scope_sole_table_of(&select.from);
+        let saved_scope = std::mem::replace(&mut self.scope_sole_table, new_scope);
+
+        let target = if select.targets.len() <= 1 {
+            select.targets.first()
+        } else {
+            position.and_then(|p| select.targets.get(p))
+        };
+        let (sources, kind, expression) = match target {
+            Some(SelectTarget::Expr(first, _)) => {
+                self.classify_value_expr(peel_parenthesized(first))
+            }
+            // A `SELECT *` target cannot be resolved to a column list without a
+            // schema; leave the mapping without sources.
+            _ => (Vec::new(), MappingKind::Derived, None),
+        };
+
+        self.scope_sole_table = saved_scope;
+        self.alias_map = saved_alias_map;
+        self.join_conditions.truncate(saved_joins);
+        self.hard_filters.truncate(saved_filters);
+        self.column_refs.truncate(saved_refs);
+
         self.column_mappings.push(ColumnMapping {
             target_table,
             target_column,
@@ -4928,6 +5077,22 @@ mod column_tests {
             .collect()
     }
 
+    /// Column mappings with a seeded procedure variable context (#142): lets a
+    /// standalone INSERT walk see cursor/record bindings that in real procedures
+    /// come from the DECLARE block.
+    fn column_mappings_of_with_context(sql: &str, ctx: &ProcedureVarContext) -> Vec<ColumnMapping> {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let stmts = parser.parse_with_text();
+        let mut result = Vec::new();
+        for info in &stmts {
+            let mut extractor = ColumnAccessExtractor::new_with_context(ctx);
+            walk_statement(&mut extractor, &info.statement);
+            result.extend(extractor.finish().column_mappings);
+        }
+        result
+    }
+
     /// Column mappings of a view body, via the explicit `CREATE VIEW` entry point.
     fn view_column_mappings(view: &str, declared: &[&str], select_sql: &str) -> Vec<ColumnMapping> {
         let tokens = Tokenizer::new(select_sql).tokenize().unwrap();
@@ -5105,6 +5270,301 @@ mod column_tests {
             vec![ColumnSource::Literal {
                 value: "42".to_string()
             }]
+        );
+    }
+
+    /// #142: a scalar subquery as an INSERT..SELECT target contributes the inner
+    /// select's FIRST expression as the source, resolved in the subquery's own FROM
+    /// scope. Correlated refs (`s.id` in WHERE) must NOT leak as sources.
+    #[test]
+    fn scalar_subquery_target_resolves_its_first_column() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (id, code) \
+             SELECT s.id, (SELECT r.code FROM t_ref r WHERE r.id = s.id) FROM t_src s",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Direct);
+        assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
+    }
+
+    /// #142: the choke point is push_column_mapping, so INSERT..VALUES subqueries
+    /// resolve too.
+    #[test]
+    fn scalar_subquery_in_insert_values_resolves() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) VALUES ((SELECT r.code FROM t_ref r WHERE r.id = 1))",
+        );
+        assert_eq!(
+            find_mapping(&maps, "code").sources,
+            vec![col(Some("t_ref"), "code")]
+        );
+    }
+
+    /// Review #1: a scalar subquery whose first expression is a TRANSFORMED column
+    /// (`UPPER`, `+1`, `NVL`, `CAST`, …) must classify as Derived and keep the
+    /// expression text — not masquerade as a Direct copy.
+    #[test]
+    fn scalar_subquery_with_transformed_first_expr_is_derived() {
+        let maps = column_mappings_of(
+            "INSERT INTO t_out (code) \
+             SELECT (SELECT UPPER(r.code) FROM t_ref r WHERE r.id = 1)",
+        );
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Derived);
+        assert_eq!(m.sources, vec![col(Some("t_ref"), "code")]);
+        assert!(
+            m.expression.as_deref().unwrap_or("").contains("UPPER"),
+            "expression text must survive: {:?}",
+            m.expression
+        );
+    }
+
+    /// Review #1: a literal-only scalar subquery is a constant → Direct + Literal
+    /// source, consistent with how `classify_value_expr` treats a bare literal.
+    #[test]
+    fn literal_only_scalar_subquery_classifies_direct() {
+        let maps = column_mappings_of("INSERT INTO t_out (code) VALUES ((SELECT 'x' FROM dual))");
+        let m = find_mapping(&maps, "code");
+        assert_eq!(m.kind, MappingKind::Direct);
+        assert_eq!(
+            m.sources,
+            vec![ColumnSource::Literal {
+                value: "'x'".to_string()
+            }]
+        );
+    }
+
+    /// Review (5136742683): a multi-column subquery applied to a multi-column
+    /// UPDATE SET target must align each target column to its OWN select-list
+    /// position — not copy the first expression into every column.
+    #[test]
+    fn multi_column_set_subquery_aligns_by_position() {
+        let maps = column_mappings_of("UPDATE u_dst SET (a, b) = (SELECT x, y FROM u_src)");
+        assert_eq!(
+            find_mapping(&maps, "a").sources,
+            vec![col(Some("u_src"), "x")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "b").sources,
+            vec![col(Some("u_src"), "y")],
+            "each SET column must pair with its own subquery output, not copy the first"
+        );
+    }
+
+    /// Review #2: a JOIN inside the scalar subquery's FROM must not leak its
+    /// join/filter state into the enclosing statement's analysis — the subquery
+    /// carries its own scope.
+    #[test]
+    fn scalar_subquery_join_does_not_leak_into_parent_analysis() {
+        let analyses = extract_column_analysis(
+            "INSERT INTO t_out (code) \
+             SELECT (SELECT r.code FROM t_ref r JOIN t_other o ON r.id = o.id WHERE r.id = 1)",
+        );
+        assert_eq!(analyses.len(), 1);
+        let a = &analyses[0];
+        assert!(
+            a.join_conditions.is_empty(),
+            "subquery JOIN must not leak into the parent analysis: {:?}",
+            a.join_conditions
+        );
+    }
+
+    /// Review (5136742683): `t.x > ANY (SELECT ...)` — the left operand `t.x` is a
+    /// real column reference of the enclosing query and must still be collected;
+    /// only the nested SELECT's own scope must be skipped.
+    #[test]
+    fn scalar_sublink_left_operand_column_is_collected() {
+        let analyses =
+            extract_column_analysis("SELECT * FROM t WHERE t.x > ANY (SELECT y FROM t2)");
+        assert_eq!(analyses.len(), 1);
+        let x_refs: Vec<&ColumnRef> = analyses[0]
+            .column_refs
+            .iter()
+            .filter(|r| r.column == "x")
+            .collect();
+        assert_eq!(
+            x_refs.len(),
+            1,
+            "left operand of ANY/ALL must be collected, got: {:?}",
+            analyses[0].column_refs
+        );
+        assert_eq!(x_refs[0].resolved_table.as_deref(), Some("t"));
+    }
+
+    /// Review (5136742683): the left operand of `IN (SELECT ...)` in an ON clause
+    /// must still be collected (the generic walker was its only collector).
+    #[test]
+    fn in_subquery_left_operand_in_join_condition_is_collected() {
+        let analyses =
+            extract_column_analysis("SELECT * FROM t1 JOIN t2 ON t1.id IN (SELECT id FROM t3)");
+        assert_eq!(analyses.len(), 1);
+        let id_refs: Vec<&ColumnRef> = analyses[0]
+            .column_refs
+            .iter()
+            .filter(|r| r.column == "id" && r.alias_prefix.as_deref() == Some("t1"))
+            .collect();
+        assert_eq!(
+            id_refs.len(),
+            1,
+            "t1.id left operand of IN-subquery must be collected, got: {:?}",
+            analyses[0].column_refs
+        );
+    }
+
+    /// #142: a `rec t%ROWTYPE` record (anchor is a TABLE, not a registered cursor)
+    /// resolves its fields to that table's columns.
+    #[test]
+    fn table_rowtype_record_field_resolves_to_table_column() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.record_cursors
+            .insert("r".to_string(), "t_src".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: a `SELECT *` cursor produces a single catch-all cursor source (empty
+    /// output name, table attributed). Record fields over it attribute to the
+    /// cursor's table under the field's own name.
+    #[test]
+    fn star_cursor_rowtype_record_field_attributes_to_cursor_table() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt)",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// #142: `INSERT INTO t (a, b) VALUES r` with a cursor-anchored %ROWTYPE record
+    /// expands the record's fields positionally through the cursor's SELECT sources.
+    #[test]
+    fn whole_record_insert_expands_cursor_rowtype_fields() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![
+                CursorColumn {
+                    output_name: "id".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "id".to_string(),
+                },
+                CursorColumn {
+                    output_name: "amt".to_string(),
+                    source_table: Some("t_src".to_string()),
+                    source_col: "amt".to_string(),
+                },
+            ],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context("INSERT INTO t_dst (id, amt) VALUES r", &ctx);
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_src"), "id")]
+        );
+        assert_eq!(
+            find_mapping(&maps, "amt").sources,
+            vec![col(Some("t_src"), "amt")]
+        );
+    }
+
+    /// Review #5: whole-record insert from a `SELECT *` cursor has no exact column
+    /// names — attributing each INSERT column under its own name would silently
+    /// misattribute a reordered column list. Leave such mappings unmapped instead.
+    #[test]
+    fn whole_record_insert_from_star_cursor_yields_no_guessed_mappings() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: String::new(),
+                source_table: Some("t_src".to_string()),
+                source_col: String::new(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("r".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context("INSERT INTO t_dst (id, amt) VALUES r", &ctx);
+        assert!(
+            maps.is_empty(),
+            "a SELECT * catch-all must not fabricate column names: {maps:#?}"
+        );
+    }
+
+    /// Review #3: a `%ROWTYPE` record's data comes from the FETCH that fills it.
+    /// `r t_type%ROWTYPE` + `FETCH cur INTO r` (cur reads t_other) must resolve
+    /// `r.id` to t_other.id, not the declared type table.
+    #[test]
+    fn fetch_rebinds_rowtype_record_to_the_fetching_cursor() {
+        let maps = column_mappings_of(
+            "CREATE OR REPLACE PROCEDURE p AS\n\
+             \x20 r t_type%ROWTYPE;\n\
+             \x20 CURSOR cur IS SELECT id, amt FROM t_other;\n\
+             BEGIN\n\
+             \x20 OPEN cur;\n\
+             \x20 FETCH cur INTO r;\n\
+             \x20 INSERT INTO t_dst (id, amt) VALUES (r.id, r.amt);\n\
+             END",
+        );
+        assert_eq!(
+            find_mapping(&maps, "id").sources,
+            vec![col(Some("t_other"), "id")],
+            "record field must resolve to the FETCHing cursor's source, not the type table"
+        );
+    }
+
+    /// Review #4: a %ROWTYPE record field as a scalar subquery's first expression
+    /// penetrates through record_cursors to the cursor's source column — ogsql-parser
+    /// parses `rec.field` as a dotted ColumnRef, which column_source already resolves.
+    #[test]
+    fn record_field_in_scalar_subquery_resolves_to_column() {
+        let mut ctx = ProcedureVarContext::default();
+        ctx.cursor_sources.insert(
+            "cur".to_string(),
+            vec![CursorColumn {
+                output_name: "CLIENT_ACNT_ID".to_string(),
+                source_table: Some("v_src".to_string()),
+                source_col: "CLIENT_ACNT_ID".to_string(),
+            }],
+        );
+        ctx.record_cursors
+            .insert("v_fund_acnt_all".to_string(), "cur".to_string());
+        let maps = column_mappings_of_with_context(
+            "INSERT INTO v_dst (acnt) \
+             SELECT (SELECT v_fund_acnt_all.CLIENT_ACNT_ID FROM dual) FROM dual",
+            &ctx,
+        );
+        assert_eq!(
+            find_mapping(&maps, "acnt").sources,
+            vec![col(Some("v_src"), "CLIENT_ACNT_ID")],
+            "record field in a scalar subquery must resolve to the cursor's column"
         );
     }
 
