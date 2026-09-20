@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use petgraph::graph::NodeIndex;
@@ -758,3 +759,96 @@ use rmcp::ServerHandler;
         codeweb_lineage for table/column-level lineage tracing."
 )]
 impl ServerHandler for McpState {}
+
+// ── Write confinement ──
+//
+// MCP may *read* user-specified source paths, but every write must stay inside
+// the permitted root (the project directory the server was started for).
+
+/// Lexically normalize a path: drop `.`, resolve `..` by popping, keep the root.
+fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `pop` on the filesystem root is a no-op, so `/..` stays `/`.
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `candidate` against `root` and accept it only if it stays inside.
+///
+/// `root` is expected to be absolute (the MCP server canonicalizes it at
+/// startup). Resolution is lexical, so a symlink *inside* the root pointing
+/// outside is not caught here.
+fn confine_to_root(root: &Path, candidate: &Path) -> Result<std::path::PathBuf, String> {
+    let root_norm = normalize_lexically(root);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root_norm.join(candidate)
+    };
+    let normalized = normalize_lexically(&joined);
+
+    if normalized.starts_with(&root_norm) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "path '{}' escapes the permitted project root '{}'",
+            candidate.display(),
+            root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn confine_accepts_path_inside_root() {
+        let root = Path::new("/srv/proj");
+        let confined = confine_to_root(root, Path::new(".codeweb/store.bincode")).unwrap();
+        assert_eq!(confined, PathBuf::from("/srv/proj/.codeweb/store.bincode"));
+
+        // Redundant `.` components and absolute candidates inside the root are fine.
+        let abs = confine_to_root(root, Path::new("/srv/proj/.codeweb/./store.bincode")).unwrap();
+        assert_eq!(abs, PathBuf::from("/srv/proj/.codeweb/store.bincode"));
+    }
+
+    #[test]
+    fn confine_accepts_root_itself() {
+        let root = Path::new("/srv/proj");
+        assert_eq!(confine_to_root(root, Path::new(".")).unwrap(), root);
+    }
+
+    #[test]
+    fn confine_rejects_parent_escape() {
+        let root = Path::new("/srv/proj");
+        for candidate in [
+            "../escape.bincode",
+            ".codeweb/../../escape.bincode",
+            "/srv/other/store.bincode",
+            "/etc/passwd",
+        ] {
+            assert!(
+                confine_to_root(root, Path::new(candidate)).is_err(),
+                "'{candidate}' must be rejected as escaping {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn confine_rejects_sibling_with_shared_prefix() {
+        // `/srv/proj-evil` must not pass the `/srv/proj` prefix check.
+        let root = Path::new("/srv/proj");
+        assert!(confine_to_root(root, Path::new("/srv/proj-evil/store")).is_err());
+    }
+}
