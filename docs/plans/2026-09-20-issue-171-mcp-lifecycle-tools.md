@@ -132,6 +132,7 @@ cargo fmt --all -- --check
 - 分支：`feat/issue-171-mcp-lifecycle-tools`
 - PR：https://github.com/c2j/codeweb/pull/172
 - 门禁结果：`cargo build --features full` 通过；`cargo test --features full -- --skip test_path_mapping_applied --skip test_serve_` 全绿（`mcp_test` 13 passed）；`cargo clippy --features full -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；GitHub CI（Lint / Test ubuntu full）通过。
+- 相邻发现（非本次改动引入，已另行开 issue #175）：同一输入下 `analyze` 边数在 274/275 之间波动，CLI 路径同样复现，已定位为 `process_orders → orders (table_access)` 重复边有时未合并。
 - 后续加固（PR #174）：`confine_to_root` 增加 canonicalize 祖先校验，堵住符号链接逃逸；新增 corrupt store 自愈、请求流水线、`--project` 指向不存在目录、`init_at` 路径分支等验证用例。
 - 已知遗留：默认（非 mcp）构建下 `node_sub_type_tag`、`TreeNode::has_more/more_count` 报 dead_code，为既有 mcp-gated 代码，与本次改动无关。
 - `tests/mcp_test.rs::test_mcp_tools_list` 期望工具集 8 → 11 为 feature 必然结果，保持精确集合断言。
@@ -145,6 +146,11 @@ cargo fmt --all -- --check
 - `codeweb_init`（paths 为外部目录）→ `stats` 变 `empty`（证明未自动分析）→ `codeweb_analyze` 全量构建 10 nodes / 7 edges → 同一进程内 `stats`/`trace`/`nodes`/`search_sql` 立即看到新图（热替换，无重启）。
 - 写边界：外部 `src` 目录内未出现 `.codeweb/` 或 `codeweb.toml`，store 落在服务目录 `.codeweb/store.bincode`。
 - 变更检测：在外部目录新增文件 → `codeweb_diff` 报 `changed` 且列出该文件 → `codeweb_analyze` 增量构建（`is_full_build:false`，`files_added:1`，nodes 10→11）→ `diff` 回到 `up_to_date` → 再次 analyze 报 `is_up_to_date:true` 且仍给出真实 nodes/edges。
+
+规模验证（同一 stdio 会话，分析路径指向仓库内 `tests/regress`，177 个文件中 126 个可分析）：
+
+- `codeweb_init` + `codeweb_analyze` → 307 nodes / 275 edges，工具调用耗时 0.05s；`stats`/`nodes`（分页）/`search_sql` 正常。
+- 无变更时再次 `codeweb_analyze` 返回 `is_up_to_date:true`，仍报告 307 nodes；外部源码树未被写入。
 
 集成边界回归：
 

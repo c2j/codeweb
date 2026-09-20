@@ -133,6 +133,28 @@ impl Default for LineageConfig {
     }
 }
 
+/// Escape `value` so it can be embedded in a TOML basic string (`"..."`).
+///
+/// The project name and analysis paths come from user/LLM input, so an
+/// unescaped quote or backslash would produce an unparseable `codeweb.toml`.
+fn escape_toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl ProjectConfig {
     pub fn load(toml_content: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(toml_content)
@@ -145,10 +167,7 @@ impl ProjectConfig {
     pub fn template_with_paths(name: &str, paths: &[String]) -> String {
         let paths_toml = paths
             .iter()
-            .map(|p| {
-                let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
-            })
+            .map(|p| format!("\"{}\"", escape_toml_basic_string(p)))
             .collect::<Vec<_>>()
             .join(", ");
         format!(
@@ -173,7 +192,8 @@ format = "bincode"
 # flow_min_ratio = 0.15
 # ignore_columns = []
 "#,
-            name, paths_toml
+            escape_toml_basic_string(name),
+            paths_toml
         )
     }
 }

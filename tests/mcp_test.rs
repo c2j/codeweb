@@ -686,6 +686,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_mcp_analyze_rejects_symlinked_store_dir() {
         // Lexical path checks cannot see symlinks: `.codeweb` looks like it is
@@ -739,6 +740,164 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "nothing may be written through the symlink, found: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_init_escapes_project_name() {
+        // The name is model-supplied; quotes/backslashes must not produce a
+        // broken codeweb.toml that makes later runs fail to load the project.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().to_path_buf();
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"weird \"quoted\" \\ name","paths":["."]}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("init text");
+        let init: serde_json::Value = serde_json::from_str(text).expect("init JSON");
+
+        assert_eq!(init["status"], "initialized", "got: {init}");
+        assert_eq!(init["project"], "weird \"quoted\" \\ name", "got: {init}");
+
+        // The decisive check: a fresh server started on the same directory must
+        // be able to load the project it just wrote.
+        drop(mcp);
+        let mut restarted = McpChild::start(&project);
+        handshake(&mut restarted);
+        restarted.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = restarted.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(
+            stats["status"], "empty",
+            "the project written with a special-character name must load on restart, got: {stats}"
+        );
+        assert_eq!(stats["project"], "weird \"quoted\" \\ name", "got: {stats}");
+    }
+
+    #[test]
+    fn test_mcp_diff_reports_modified_and_deleted() {
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        // Bring a second file into the graph so it can later be deleted.
+        let extra = project.join("sql").join("extra.sql");
+        std::fs::write(&extra, "SELECT 2;").expect("write extra sql");
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let _ = mcp.recv_response(2);
+
+        // Now touch all three change kinds at once.
+        let sample = project.join("sql").join("sample.sql");
+        let mut content = std::fs::read_to_string(&sample).expect("read sample");
+        content.push_str("\n-- modified by test\n");
+        std::fs::write(&sample, content).expect("modify sample");
+        std::fs::remove_file(&extra).expect("delete extra");
+        std::fs::write(project.join("sql").join("fresh.sql"), "SELECT 3;").expect("write fresh");
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_diff","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("diff text");
+        let diff: serde_json::Value = serde_json::from_str(text).expect("diff JSON");
+
+        assert_eq!(diff["status"], "changed", "got: {diff}");
+        let names = |key: &str| -> Vec<String> {
+            diff[key]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            names("modified").iter().any(|p| p.ends_with("sample.sql")),
+            "modified must contain sample.sql, got: {diff}"
+        );
+        assert!(
+            names("deleted").iter().any(|p| p.ends_with("extra.sql")),
+            "deleted must contain extra.sql, got: {diff}"
+        );
+        assert!(
+            names("added").iter().any(|p| p.ends_with("fresh.sql")),
+            "added must contain fresh.sql, got: {diff}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_analyze_heals_stale_store_version() {
+        // A store written by an incompatible binary: right magic, wrong version.
+        // The server must degrade to "empty" and codeweb_analyze must rebuild.
+        let (_tmpdir, project) = create_analyzed_project();
+        let store_path = project.join(".codeweb").join("store.bincode");
+
+        let mut stale: Vec<u8> = Vec::new();
+        stale.extend_from_slice(b"CWEBSTORE");
+        stale.extend_from_slice(&u32::MAX.to_le_bytes()); // never a valid version
+        stale.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&store_path, &stale).expect("write stale store");
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+        assert_eq!(stats["status"], "empty", "got: {stats}");
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+        assert!(
+            analyzed["nodes"].as_u64().unwrap_or(0) > 0,
+            "analyze must regenerate an incompatible store, got: {analyzed}"
+        );
+
+        // Self-healed: the on-disk store is loadable again by a fresh server.
+        drop(mcp);
+        let mut restarted = McpChild::start(&project);
+        handshake(&mut restarted);
+        restarted.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = restarted.recv_response(4);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let healed: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+        assert_eq!(
+            healed["status"], "ready",
+            "the regenerated store must load on restart, got: {healed}"
         );
     }
 

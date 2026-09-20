@@ -1167,6 +1167,7 @@ mod tests {
         assert!(confine_to_root(root, Path::new("/srv/proj-evil/store")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn confine_rejects_symlinked_subdir_escaping_root() {
         // Lexical normalization alone accepts this: `.codeweb` looks like it is
@@ -1189,6 +1190,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn confine_accepts_real_dirs_and_symlinked_root() {
         let tmpdir = tempfile::tempdir().unwrap();

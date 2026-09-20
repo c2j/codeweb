@@ -744,6 +744,32 @@ mod tests {
     }
 
     #[test]
+    fn init_at_escapes_special_characters_in_project_name() {
+        // The name comes from user/LLM input (`codeweb_init`), so it must not be
+        // able to break the generated TOML (and brick the project on reload).
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("workspace");
+        let name = "weird \"quoted\" \\ back\\slash";
+
+        let proj = Project::init_at(&root, &[], name).unwrap();
+
+        assert_eq!(
+            proj.name(),
+            name,
+            "the project name must survive the round trip verbatim"
+        );
+        let written = fs::read_to_string(root.join(CODEWEB_TOML)).unwrap();
+        assert!(
+            written.contains(r#"name = "weird \"quoted\" \\ back\\slash""#),
+            "the written config must escape the name, got:\n{written}"
+        );
+
+        // The critical consequence: the project must be loadable again.
+        let reloaded = Project::find(&root).unwrap();
+        assert_eq!(reloaded.name(), name);
+    }
+
+    #[test]
     fn scan_with_fingerprints_deduplicates_overlapping_paths() {
         let tmpdir = tempfile::tempdir().unwrap();
         let src_dir = tmpdir.path().join("src");
