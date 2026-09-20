@@ -234,6 +234,8 @@ If `--features full` has **pre-existing** failures unrelated to the change, docu
 
 **NEVER push directly to `main`.** All changes must go through a pull request.
 
+**NEVER merge a PR yourself.** 这是一条硬性规则：agent 不得执行任何 merge 操作——包括 `gh pr merge`（任何参数组合，含 squash/rebase/merge）、直接 push 到 `main`、以及 force-push `main`。CI 绿灯**不等于**获得合并许可。merge 必须得到人类的**明确许可**。
+
 1. Create a feature branch from `main`:
    ```sh
    git checkout -b <branch-name>
@@ -244,7 +246,9 @@ If `--features full` has **pre-existing** failures unrelated to the change, docu
    git push -u origin <branch-name>
    gh pr create --title "..." --body-file /tmp/pr-body.md
    ```
-4. Merge via PR (squash or rebase preferred). Delete the feature branch after merge.
+4. **STOP — 向人类汇报 PR 链接并等待许可。** 汇报 PR 链接后即停下，除非人类明确回复同意合并，否则不得执行 merge。得到许可后：merge via PR (squash or rebase preferred)，再删除 feature 分支并同步本地 `main`。
+
+如果发现 `main` 与你的工作冲突或需要 rebase 远端分支，push 前可以先询问；但 merge/删除分支永远必须等许可。
 
 ## Commands
 
