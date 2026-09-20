@@ -275,6 +275,70 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_init_creates_project_without_auto_analyze() {
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().to_path_buf();
+        std::fs::create_dir_all(project.join("sql")).expect("create sql dir");
+        std::fs::write(project.join("sql").join("a.sql"), "SELECT 1;").expect("write sql");
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"demo","paths":["sql"]}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("init text");
+        let init: serde_json::Value = serde_json::from_str(text).expect("init JSON");
+
+        assert_eq!(init["status"], "initialized", "got: {init}");
+        assert_eq!(init["project"], "demo", "got: {init}");
+        assert!(
+            project.join("codeweb.toml").exists(),
+            "codeweb_init must write codeweb.toml under the served directory"
+        );
+
+        // `codeweb_init` must not analyze: the graph stays empty until the caller
+        // explicitly asks for `codeweb_analyze`.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(
+            stats["status"], "empty",
+            "after init but before analyze the graph must be empty (not uninitialized), got: {stats}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_init_is_idempotent_error() {
+        let (_tmpdir, project) = create_test_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"again"}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("init text");
+        let init: serde_json::Value = serde_json::from_str(text).expect("init JSON");
+
+        assert_eq!(
+            init["status"], "already_initialized",
+            "re-initializing an existing project must be reported, got: {init}"
+        );
+    }
+
+    #[test]
     fn test_mcp_call_stats() {
         let (_tmpdir, project) = create_test_project();
         let mut mcp = McpChild::start(&project);

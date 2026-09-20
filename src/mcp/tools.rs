@@ -69,6 +69,14 @@ impl McpState {
         self.inner.graph.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn graph_snapshot_mut(&self) -> std::sync::RwLockWriteGuard<'_, GraphSnapshot> {
+        self.inner.graph.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn project_slot(&self) -> std::sync::MutexGuard<'_, Option<Project>> {
+        self.inner.project.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Clone the current store handle and drop the lock immediately, so long
     /// queries never block a concurrent `codeweb_analyze`.
     fn store_arc(&self) -> Arc<GraphStore> {
@@ -168,6 +176,17 @@ pub struct LineageParams {
     pub depth: Option<usize>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InitParams {
+    /// Project name. Defaults to the served directory's name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source directories to analyze (relative to the project root, or absolute).
+    /// Defaults to `["."]`. Reads are unrestricted; only writes are confined.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 // ── Helper functions ──
 
 fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<serde_json::Value> {
@@ -192,6 +211,65 @@ fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<se
 
 #[tool_router]
 impl McpState {
+    /// Initialize a codeweb project in the served directory
+    #[tool(
+        description = "Initialize a codeweb project in the directory this MCP server was started for: writes codeweb.toml and .codeweb/. Does NOT build the graph — call codeweb_analyze afterwards. Use this when codeweb_stats reports status='uninitialized'."
+    )]
+    fn codeweb_init(&self, Parameters(params): Parameters<InitParams>) -> String {
+        let mut slot = self.project_slot();
+        if let Some(existing) = slot.as_ref() {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "already_initialized",
+                "project": existing.name(),
+                "root": existing.root(),
+                "hint": "Call codeweb_analyze to (re)build the graph, or codeweb_diff to inspect changes.",
+            }))
+            .unwrap_or_default();
+        }
+
+        let root = self.inner.permitted_root.clone();
+        let name = params
+            .name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string()
+            });
+        let dirs: Vec<PathBuf> = if params.paths.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            params.paths.iter().map(PathBuf::from).collect()
+        };
+
+        match Project::init_at(&root, &dirs, &name) {
+            Ok(project) => {
+                let project_name = project.name().to_string();
+                *slot = Some(project);
+
+                let mut snapshot = self.graph_snapshot_mut();
+                snapshot.uninitialized = false;
+                snapshot.project_name = project_name.clone();
+                snapshot.empty_reason = None;
+
+                serde_json::to_string(&serde_json::json!({
+                    "status": "initialized",
+                    "project": project_name,
+                    "root": root,
+                    "paths": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+                    "hint": "Project configured but the graph is still empty. Call codeweb_analyze to build it.",
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "error": e.to_string(),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
     /// Get project statistics
     #[tool(
         description = "Get project statistics including node counts by type and edge count. Always call this first to check graph status."
