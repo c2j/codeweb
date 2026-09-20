@@ -1068,11 +1068,24 @@ pub(super) fn normalize_lexically(path: &Path) -> std::path::PathBuf {
     out
 }
 
+/// Canonicalize `path`, or if it does not exist yet, its deepest existing ancestor.
+fn canonicalize_existing_ancestor(path: &Path) -> Option<std::path::PathBuf> {
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            return Some(canonical);
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Resolve `candidate` against `root` and accept it only if it stays inside.
 ///
-/// `root` is expected to be absolute (the MCP server canonicalizes it at
-/// startup). Resolution is lexical, so a symlink *inside* the root pointing
-/// outside is not caught here.
+/// `root` is expected to be absolute (the MCP server absolutizes and normalizes
+/// it at startup). Two checks run: a lexical one that catches `..` escapes even
+/// for paths that do not exist yet, and a symlink-aware one that canonicalizes
+/// the deepest existing ancestor of the target (so `.codeweb` being a symlink to
+/// a directory outside the root is rejected).
 fn confine_to_root(root: &Path, candidate: &Path) -> Result<std::path::PathBuf, String> {
     let root_norm = normalize_lexically(root);
     let joined = if candidate.is_absolute() {
@@ -1082,15 +1095,31 @@ fn confine_to_root(root: &Path, candidate: &Path) -> Result<std::path::PathBuf, 
     };
     let normalized = normalize_lexically(&joined);
 
-    if normalized.starts_with(&root_norm) {
-        Ok(normalized)
-    } else {
-        Err(format!(
+    if !normalized.starts_with(&root_norm) {
+        return Err(format!(
             "path '{}' escapes the permitted project root '{}'",
             candidate.display(),
             root.display()
-        ))
+        ));
     }
+
+    // Lexical checks cannot see symlinks: a `.codeweb` symlink inside the root
+    // would still look like an in-root path. Compare canonicalized forms so the
+    // write cannot be redirected outside the permitted directory.
+    if let (Ok(root_canon), Some(target_canon)) = (
+        std::fs::canonicalize(&root_norm),
+        canonicalize_existing_ancestor(&normalized),
+    ) {
+        if !target_canon.starts_with(&root_canon) {
+            return Err(format!(
+                "path '{}' resolves outside the permitted project root '{}'",
+                candidate.display(),
+                root.display()
+            ));
+        }
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -1136,5 +1165,46 @@ mod tests {
         // `/srv/proj-evil` must not pass the `/srv/proj` prefix check.
         let root = Path::new("/srv/proj");
         assert!(confine_to_root(root, Path::new("/srv/proj-evil/store")).is_err());
+    }
+
+    #[test]
+    fn confine_rejects_symlinked_subdir_escaping_root() {
+        // Lexical normalization alone accepts this: `.codeweb` looks like it is
+        // inside the root, but it is a symlink pointing outside. The store write
+        // would land outside the permitted directory.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("proj");
+        let outside = tmpdir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".codeweb")).unwrap();
+
+        let result = confine_to_root(&root, &root.join(".codeweb").join("store.bincode"));
+
+        assert!(
+            result.is_err(),
+            "a symlinked subdirectory must not be able to redirect writes outside {:?}, got {:?}",
+            root,
+            result
+        );
+    }
+
+    #[test]
+    fn confine_accepts_real_dirs_and_symlinked_root() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let real_root = tmpdir.path().join("real");
+        std::fs::create_dir_all(&real_root).unwrap();
+
+        // A real nested directory inside the root is fine even though the root
+        // itself sits under a symlinked path (e.g. /tmp on macOS).
+        let link_root = tmpdir.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+        let nested = link_root.join(".codeweb").join("store.bincode");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+
+        assert!(
+            confine_to_root(&link_root, &nested).is_ok(),
+            "reaching the same directory through a symlinked root must be accepted"
+        );
     }
 }

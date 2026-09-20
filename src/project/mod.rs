@@ -712,6 +712,38 @@ mod tests {
     }
 
     #[test]
+    fn init_at_defaults_to_root_when_no_source_dirs_given() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("workspace");
+
+        let proj = Project::init_at(&root, &[], "empty-dirs").unwrap();
+
+        assert_eq!(
+            proj.config().analysis.paths,
+            vec![".".to_string()],
+            "an empty dir list must fall back to the project root"
+        );
+    }
+
+    #[test]
+    fn init_at_keeps_absolute_source_dirs_absolute() {
+        // MCP callers pass absolute paths, including directories outside the
+        // project root (reads are unrestricted; only writes are confined).
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("workspace");
+        let external = tmpdir.path().join("external-src");
+        std::fs::create_dir_all(&external).unwrap();
+
+        let proj = Project::init_at(&root, std::slice::from_ref(&external), "abs-paths").unwrap();
+
+        assert_eq!(
+            proj.config().analysis.paths,
+            vec![external.to_string_lossy().to_string()],
+            "absolute source dirs must be preserved verbatim"
+        );
+    }
+
+    #[test]
     fn scan_with_fingerprints_deduplicates_overlapping_paths() {
         let tmpdir = tempfile::tempdir().unwrap();
         let src_dir = tmpdir.path().join("src");
