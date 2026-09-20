@@ -86,6 +86,10 @@ MCP 的 stdout 是 JSON-RPC 通道。analyze 进度条（indicatif）与报告�
 | 5 | `codeweb_analyze` 构建图谱并热替换，随后 stats 返回 ready | 集成 |
 | 6 | `codeweb_diff` 返回变更文件分类 | 集成 |
 | 7 | `store.path` 逃逸许可目录时 analyze 返回错误且不写盘 | 集成 |
+| 8 | 已分析且无变更的项目调用 analyze 报 `is_up_to_date:true` 且给出真实 nodes/edges（而非 up-to-date 短路返回的 0） | 集成 |
+
+循环 7 的 Red 通过临时禁用 `confine_to_root` 验证：无守卫时 analyze 返回 `ready` 并在服务目录外写出文件。
+循环 8 的 Red 通过临时改用 `report.nodes/edges` 验证：此时报告为 `0 nodes`，测试失败。
 
 测试权限：`test_mcp_tools_list` 的期望工具数由 8 变 11 是本次 feature 的必然结果，
 更新时保持「精确集合」断言而非放宽为子集断言，并在提交信息中说明。
@@ -113,3 +117,11 @@ cargo test --features full -- --skip test_path_mapping_applied --skip test_serve
 cargo clippy --features full -- -D warnings
 cargo fmt --all -- --check
 ```
+
+## 交付状态
+
+- 分支：`feat/issue-171-mcp-lifecycle-tools`
+- PR：https://github.com/c2j/codeweb/pull/172
+- 门禁结果：`cargo build --features full` 通过；`cargo test --features full -- --skip test_path_mapping_applied --skip test_serve_` 全绿（`mcp_test` 13 passed）；`cargo clippy --features full -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；GitHub CI（Lint / Test ubuntu full）通过。
+- 已知遗留：默认（非 mcp）构建下 `node_sub_type_tag`、`TreeNode::has_more/more_count` 报 dead_code，为既有 mcp-gated 代码，与本次改动无关。
+- `tests/mcp_test.rs::test_mcp_tools_list` 期望工具集 8 → 11 为 feature 必然结果，保持精确集合断言。
