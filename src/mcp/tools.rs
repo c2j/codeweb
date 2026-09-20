@@ -188,6 +188,53 @@ impl Inner {
         }))
         .unwrap_or_default()
     }
+
+    /// Compare the scanned source tree against the last analysis manifest.
+    ///
+    /// Blocking (scans the filesystem): callers must run this on `spawn_blocking`.
+    fn run_diff(&self) -> String {
+        let mut slot = self.project.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(project) = slot.as_mut() else {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "uninitialized",
+                "message": "No codeweb project here yet.",
+                "hint": "Call the codeweb_init tool first.",
+            }))
+            .unwrap_or_default();
+        };
+
+        let root = project.root().to_path_buf();
+        let relative = |p: &PathBuf| {
+            pathdiff::diff_paths(p, &root)
+                .unwrap_or_else(|| p.clone())
+                .display()
+                .to_string()
+        };
+
+        match project.diff() {
+            Ok(changes) => {
+                let up_to_date = changes.is_empty();
+                serde_json::to_string(&serde_json::json!({
+                    "status": if up_to_date { "up_to_date" } else { "changed" },
+                    "modified": changes.modified.iter().map(&relative).collect::<Vec<_>>(),
+                    "added": changes.added.iter().map(&relative).collect::<Vec<_>>(),
+                    "deleted": changes.deleted.iter().map(&relative).collect::<Vec<_>>(),
+                    "unchanged": changes.unchanged.len(),
+                    "hint": if up_to_date {
+                        "The graph is in sync with the sources."
+                    } else {
+                        "Call codeweb_analyze to fold these changes into the graph."
+                    },
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+            }))
+            .unwrap_or_default(),
+        }
+    }
 }
 
 // ── Parameter structs ──
@@ -353,6 +400,22 @@ impl McpState {
             Err(e) => serde_json::to_string(&serde_json::json!({
                 "status": "error",
                 "error": format!("analysis task failed: {}", e),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
+    /// Show source changes since the last analysis
+    #[tool(
+        description = "List source files changed since the last codeweb_analyze: added / modified / deleted, relative to the project root. Use it to decide whether the graph is stale before trusting query results."
+    )]
+    async fn codeweb_diff(&self) -> String {
+        let inner = self.inner.clone();
+        match tokio::task::spawn_blocking(move || inner.run_diff()).await {
+            Ok(response) => response,
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": format!("diff task failed: {}", e),
             }))
             .unwrap_or_default(),
         }

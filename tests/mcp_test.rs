@@ -413,6 +413,51 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_diff_reports_changes_since_last_analyze() {
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        // Right after analysis there is nothing to report.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_diff","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("diff text");
+        let clean: serde_json::Value = serde_json::from_str(text).expect("diff JSON");
+        assert_eq!(clean["status"], "up_to_date", "got: {clean}");
+        assert_eq!(
+            clean["added"].as_array().map(Vec::len),
+            Some(0),
+            "got: {clean}"
+        );
+
+        // A new source file must show up as added.
+        std::fs::write(project.join("sql").join("brand_new.sql"), "SELECT 42;")
+            .expect("write new sql file");
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_diff","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("diff text");
+        let changed: serde_json::Value = serde_json::from_str(text).expect("diff JSON");
+
+        assert_eq!(changed["status"], "changed", "got: {changed}");
+        let added = changed["added"].as_array().expect("added array");
+        assert!(
+            added
+                .iter()
+                .any(|p| p.as_str().is_some_and(|s| s.contains("brand_new.sql"))),
+            "added must contain brand_new.sql, got: {changed}"
+        );
+    }
+
+    #[test]
     fn test_mcp_call_stats() {
         let (_tmpdir, project) = create_test_project();
         let mut mcp = McpChild::start(&project);
