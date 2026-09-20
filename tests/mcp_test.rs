@@ -460,6 +460,54 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_analyze_refreshes_already_analyzed_project() {
+        // The CLI analyzed this project before the server started, so
+        // `Project::analyze` takes its up-to-date short-circuit and leaves the
+        // store unloaded. The tool must still report the real graph (not the
+        // short-circuit's zero counts) and keep it queryable.
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+        assert_eq!(
+            analyzed["is_up_to_date"], true,
+            "an unchanged, already-analyzed project must report is_up_to_date, got: {analyzed}"
+        );
+        assert!(
+            analyzed["nodes"].as_u64().unwrap_or(0) > 0
+                && analyzed["edges"].as_u64().unwrap_or(0) > 0,
+            "the up-to-date path must still report the real graph, got: {analyzed}"
+        );
+
+        // The graph stays queryable after the refresh.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(stats["status"], "ready", "got: {stats}");
+        assert_eq!(
+            stats["edges"].as_u64(),
+            analyzed["edges"].as_u64(),
+            "stats must agree with the refresh report"
+        );
+    }
+
+    #[test]
     fn test_mcp_diff_reports_changes_since_last_analyze() {
         let (_tmpdir, project) = create_analyzed_project();
         let mut mcp = McpChild::start(&project);
