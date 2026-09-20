@@ -246,6 +246,35 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_uninitialized_project_stays_alive() {
+        // A directory with no codeweb.toml anywhere above it: the server used to
+        // exit before answering `initialize`. It must now stay up and report the
+        // project as uninitialized instead of dying.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().to_path_buf();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(
+            stats["status"], "uninitialized",
+            "an uninitialized project must report status=uninitialized, got: {stats}"
+        );
+        assert!(
+            stats["hint"].as_str().is_some_and(|h| h.contains("codeweb_init")),
+            "hint should point at codeweb_init, got: {stats}"
+        );
+    }
+
+    #[test]
     fn test_mcp_call_stats() {
         let (_tmpdir, project) = create_test_project();
         let mut mcp = McpChild::start(&project);

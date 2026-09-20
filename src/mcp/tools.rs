@@ -1,5 +1,5 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -16,45 +16,94 @@ use crate::graph::query::spec::QuerySpec;
 use crate::graph::store::GraphStore;
 use crate::graph::traverse;
 use crate::graph::{CodeGraph, Node};
+use crate::project::Project;
 
 // ── Shared state ──
 
-pub struct McpState {
+/// Graph snapshot swapped atomically by lifecycle tools (`codeweb_analyze`).
+struct GraphSnapshot {
     store: Arc<GraphStore>,
     project_name: String,
     empty_reason: Option<String>,
+    /// No `codeweb.toml` has been found or created yet.
+    uninitialized: bool,
+}
+
+pub struct McpState {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// Absolute directory tree this server is allowed to write into.
+    permitted_root: PathBuf,
+    /// Loaded project — absent until `codeweb_init`, or found at startup.
+    project: Mutex<Option<Project>>,
+    /// Query-facing view of the graph, replaced by lifecycle tools.
+    graph: RwLock<GraphSnapshot>,
 }
 
 impl McpState {
-    pub fn new(store: GraphStore, project_name: String, empty_reason: Option<String>) -> Self {
+    pub fn new(
+        permitted_root: PathBuf,
+        project: Option<Project>,
+        store: GraphStore,
+        project_name: String,
+        empty_reason: Option<String>,
+    ) -> Self {
+        let uninitialized = project.is_none();
         Self {
-            store: Arc::new(store),
-            project_name,
-            empty_reason,
+            inner: Arc::new(Inner {
+                permitted_root,
+                project: Mutex::new(project),
+                graph: RwLock::new(GraphSnapshot {
+                    store: Arc::new(store),
+                    project_name,
+                    empty_reason,
+                    uninitialized,
+                }),
+            }),
         }
     }
 
-    fn store(&self) -> &GraphStore {
-        &self.store
+    fn graph_snapshot(&self) -> std::sync::RwLockReadGuard<'_, GraphSnapshot> {
+        self.inner.graph.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn graph(&self) -> &CodeGraph {
-        self.store.graph()
+    /// Clone the current store handle and drop the lock immediately, so long
+    /// queries never block a concurrent `codeweb_analyze`.
+    fn store_arc(&self) -> Arc<GraphStore> {
+        self.graph_snapshot().store.clone()
+    }
+
+    fn project_name(&self) -> String {
+        self.graph_snapshot().project_name.clone()
     }
 
     fn graph_empty(&self) -> bool {
-        self.store.graph().node_count() == 0
+        self.store_arc().graph().node_count() == 0
     }
 
     fn empty_graph_response(&self) -> String {
-        let message = self.empty_reason.clone().unwrap_or_else(|| {
+        let snapshot = self.graph_snapshot();
+        let message = snapshot.empty_reason.clone().unwrap_or_else(|| {
             "Code graph has 0 nodes — the project contains no analyzable source files.".to_string()
         });
+        let (status, hint) = if snapshot.uninitialized {
+            (
+                "uninitialized",
+                "No codeweb project here yet. Call the codeweb_init tool, then codeweb_analyze.",
+            )
+        } else {
+            (
+                "empty",
+                "Call the codeweb_analyze tool to build the code graph.",
+            )
+        };
         serde_json::to_string(&serde_json::json!({
-            "status": "empty",
-            "project": &self.project_name,
+            "status": status,
+            "project": &snapshot.project_name,
             "message": message,
-            "hint": "Run `codeweb analyze` in the project directory, then restart the MCP server.",
+            "hint": hint,
         }))
         .unwrap_or_default()
     }
@@ -151,10 +200,12 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let stats = self.store().stats();
+        let store = self.store_arc();
+        let stats = store.stats();
+        let project_name = self.project_name();
         let result = serde_json::json!({
             "status": "ready",
-            "project": &self.project_name,
+            "project": project_name,
             "procedures": stats.procedures,
             "functions": stats.functions,
             "unresolved": stats.unresolved,
@@ -188,7 +239,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let summaries = self.store().node_summaries();
+        let store = self.store_arc();
+        let summaries = store.node_summaries();
         let search_lower = params.search.map(|s| s.to_lowercase());
         let type_filter = params.node_type.map(|t| t.to_lowercase());
 
@@ -257,7 +309,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let depth = params.depth.unwrap_or(1);
         let mut results: Vec<serde_json::Value> = Vec::new();
 
@@ -439,8 +492,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let store = self.store();
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let matches = store.search_nodes(&params.from);
 
         if matches.is_empty() {
@@ -477,8 +530,9 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
-        let results = self.store().search_by_sql(&params.sql);
+        let store = self.store_arc();
+        let graph = store.graph();
+        let results = store.search_by_sql(&params.sql);
         let nodes: Vec<serde_json::Value> = results
             .into_iter()
             .map(|(idx, display_key, score)| {
@@ -541,7 +595,8 @@ impl McpState {
             }
         };
 
-        match spec.execute(self.store.as_ref()) {
+        let store = self.store_arc();
+        match spec.execute(store.as_ref()) {
             Ok(result) => serde_json::to_string(&result).unwrap_or_default(),
             Err(e) => {
                 let err = serde_json::json!({"error": e});
@@ -568,12 +623,12 @@ impl McpState {
             return serde_json::to_string(&err).unwrap_or_default();
         }
 
-        let store = self.store();
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let table_filter = params.table.as_deref();
 
         let result = if let Some(name) = &params.procedure {
-            let idx = match resolve_node(store, name, true) {
+            let idx = match resolve_node(store.as_ref(), name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -586,7 +641,7 @@ impl McpState {
             crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
         } else {
             let name = params.package.as_ref().expect("checked exactly-one above");
-            let idx = match resolve_node(store, name, true) {
+            let idx = match resolve_node(store.as_ref(), name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -614,8 +669,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
-        let store = self.store();
+        let store = self.store_arc();
+        let graph = store.graph();
         let depth = params.depth.unwrap_or(5);
         let direction = params.direction.as_deref().unwrap_or("both");
 
@@ -659,7 +714,7 @@ impl McpState {
                 serde_json::to_string(&json).unwrap_or_default()
             }
             crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
-                let table_idx = match resolve_node(store, &table_name, false) {
+                let table_idx = match resolve_node(store.as_ref(), &table_name, false) {
                     Ok(idx) => idx,
                     Err(msg) => return msg,
                 };
