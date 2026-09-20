@@ -391,7 +391,7 @@ codeweb 提供四种 MCP/外部集成方式：
 - 查询工具读取 `Arc<GraphStore>` 快照后立即释放锁，长查询不会阻塞 `codeweb_analyze`。
 - `codeweb_analyze` 在 `tokio::task::spawn_blocking` 中运行 `Project::analyze`（CPU 密集、同步），完成后把新 store 换入快照。
 - 未初始化目录不再导致进程退出：查询返回 `status: "uninitialized"`，引导调用 `codeweb_init`。
-- 写守卫 `confine_to_root` 做词法归一化后校验路径在 `permitted_root` 内；`store.path` 逃逸时 analyze 直接返回错误。
+- 写守卫 `confine_to_root` 双层校验：词法归一化拦住 `..` 逃逸；再对最深已存在祖先做 `canonicalize` 比较，拦住 `.codeweb` 指向目录外的符号链接。`store.path` 逃逸时 analyze 直接返回错误，且不产生任何写入。
 - stdout 只用于 JSON-RPC：进度条与报告一律走 stderr，且 MCP 不调用 CLI 的 `print_analyze_report`。
 
 ### 程序化 API 示例

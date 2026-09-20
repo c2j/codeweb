@@ -35,8 +35,15 @@
 - 未初始化：`--project` 参数指向的目录（canonicalize 后）。
 
 所有写操作（`codeweb.toml`、`.codeweb/`、store、manifest、`parse.log`）都必须落在该目录树内。
-`confine_to_root(root, candidate)` 做词法归一化（处理 `.` / `..`）后校验 `starts_with(root)`，防止
-`store.path = "../../escape.bincode"` 这类配置把写操作带出许可目录。读路径不校验。
+`confine_to_root(root, candidate)` 做两层校验：
+
+1. 词法归一化（处理 `.` / `..`）后校验 `starts_with(root)`，拦住 `store.path = "../../escape.bincode"`
+   以及尚未存在的路径；
+2. 对**最深已存在祖先**做 `canonicalize` 后再比较，拦住 `.codeweb` 是指向目录外符号链接的情况
+   （纯词法检查看不见符号链接）。比较双方都取 canonical 形式，因此经过符号链接到达同一目录的
+   合法路径（如 macOS 上经 `/tmp`）不会被误拒。
+
+读路径不校验。
 
 ### 2. 状态改为可变，查询走快照
 
@@ -87,9 +94,11 @@ MCP 的 stdout 是 JSON-RPC 通道。analyze 进度条（indicatif）与报告�
 | 6 | `codeweb_diff` 返回变更文件分类 | 集成 |
 | 7 | `store.path` 逃逸许可目录时 analyze 返回错误且不写盘 | 集成 |
 | 8 | 已分析且无变更的项目调用 analyze 报 `is_up_to_date:true` 且给出真实 nodes/edges（而非 up-to-date 短路返回的 0） | 集成 |
+| 9 | `.codeweb` 为指向目录外的符号链接时 analyze 拒绝且目标目录无写入 | 单元 + 集成 |
 
 循环 7 的 Red 通过临时禁用 `confine_to_root` 验证：无守卫时 analyze 返回 `ready` 并在服务目录外写出文件。
 循环 8 的 Red 通过临时改用 `report.nodes/edges` 验证：此时报告为 `0 nodes`，测试失败。
+循环 9 的 Red 是真实缺口：加固前 `confine_rejects_symlinked_subdir_escaping_root` 直接失败（词法检查通过）。
 
 测试权限：`test_mcp_tools_list` 的期望工具数由 8 变 11 是本次 feature 的必然结果，
 更新时保持「精确集合」断言而非放宽为子集断言，并在提交信息中说明。
@@ -123,6 +132,7 @@ cargo fmt --all -- --check
 - 分支：`feat/issue-171-mcp-lifecycle-tools`
 - PR：https://github.com/c2j/codeweb/pull/172
 - 门禁结果：`cargo build --features full` 通过；`cargo test --features full -- --skip test_path_mapping_applied --skip test_serve_` 全绿（`mcp_test` 13 passed）；`cargo clippy --features full -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；GitHub CI（Lint / Test ubuntu full）通过。
+- 后续加固（PR #174）：`confine_to_root` 增加 canonicalize 祖先校验，堵住符号链接逃逸；新增 corrupt store 自愈、请求流水线、`--project` 指向不存在目录、`init_at` 路径分支等验证用例。
 - 已知遗留：默认（非 mcp）构建下 `node_sub_type_tag`、`TreeNode::has_more/more_count` 报 dead_code，为既有 mcp-gated 代码，与本次改动无关。
 - `tests/mcp_test.rs::test_mcp_tools_list` 期望工具集 8 → 11 为 feature 必然结果，保持精确集合断言。
 

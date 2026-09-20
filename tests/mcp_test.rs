@@ -553,6 +553,196 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_analyze_heals_corrupt_store() {
+        // A store left behind by a crashed/older binary must not brick the server:
+        // queries report the problem, and codeweb_analyze rebuilds from scratch.
+        let (_tmpdir, project) = create_analyzed_project();
+        let store_path = project.join(".codeweb").join("store.bincode");
+        assert!(store_path.exists(), "fixture should have produced a store");
+        std::fs::write(&store_path, b"not a valid codeweb store").expect("corrupt the store");
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(
+            stats["status"], "empty",
+            "a corrupt store is an initialized-but-empty graph, not uninitialized, got: {stats}"
+        );
+        assert!(
+            stats["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("could not be loaded")),
+            "the corrupt store must be reported explicitly, got: {stats}"
+        );
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+        assert!(
+            analyzed["nodes"].as_u64().unwrap_or(0) > 0,
+            "analyze must rebuild a corrupted store, got: {analyzed}"
+        );
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(4);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let healed: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+        assert_eq!(healed["status"], "ready", "got: {healed}");
+    }
+
+    #[test]
+    fn test_mcp_handles_pipelined_requests() {
+        // Requests are written back-to-back without waiting. Two analyzes in a
+        // row plus a read must all answer (no deadlock between the project mutex
+        // and the graph lock) and agree on the final state.
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+
+        let mut seen = std::collections::BTreeMap::new();
+        // Notifications may be interleaved; keep reading until all three ids land.
+        for _ in 0..12 {
+            if seen.len() == 3 {
+                break;
+            }
+            let line = mcp
+                .read_line()
+                .expect("stdout closed while handling pipelined requests");
+            let json: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+            if let Some(id) = json["id"].as_i64() {
+                seen.insert(id, json);
+            }
+        }
+
+        for id in [2, 3, 4] {
+            let resp = seen
+                .get(&id)
+                .unwrap_or_else(|| panic!("no response for id {id}: {seen:?}"));
+            let text = resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool response text");
+            let body: serde_json::Value = serde_json::from_str(text).expect("tool response JSON");
+            assert_eq!(body["status"], "ready", "id {id} returned: {body}");
+            assert!(
+                body["edges"].as_u64().unwrap_or(0) > 0,
+                "id {id} returned an empty graph: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_init_creates_missing_project_directory() {
+        // `--project` may point at a directory that does not exist yet.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().join("new").join("nested");
+        assert!(!project.exists());
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"fresh","paths":["."]}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("init text");
+        let init: serde_json::Value = serde_json::from_str(text).expect("init JSON");
+
+        assert_eq!(init["status"], "initialized", "got: {init}");
+        assert!(
+            project.join("codeweb.toml").exists(),
+            "init must create the served directory and its config"
+        );
+    }
+
+    #[test]
+    fn test_mcp_analyze_rejects_symlinked_store_dir() {
+        // Lexical path checks cannot see symlinks: `.codeweb` looks like it is
+        // inside the project, but it points outside. The write guard must still
+        // refuse, and nothing may be written into the symlink target.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().join("proj");
+        let outside = tmpdir.path().join("outside");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        copy_serve_demo_fixture(&project);
+
+        let toml = "[project]\n\
+                    name = \"symlink\"\n\
+                    \n\
+                    [analysis]\n\
+                    paths = [\"sql\"]\n\
+                    \n\
+                    [store]\n\
+                    path = \".codeweb/store.bincode\"\n\
+                    format = \"bincode\"\n";
+        std::fs::write(project.join("codeweb.toml"), toml).expect("write codeweb.toml");
+        std::os::unix::fs::symlink(&outside, project.join(".codeweb")).expect("symlink .codeweb");
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let result: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(
+            result["status"], "error",
+            "a symlinked store directory must be refused, got: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("outside")),
+            "the error should say the path resolves outside the root, got: {result}"
+        );
+        let leaked: Vec<String> = std::fs::read_dir(&outside)
+            .expect("read outside dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "nothing may be written through the symlink, found: {leaked:?}"
+        );
+    }
+
+    #[test]
     fn test_mcp_call_stats() {
         let (_tmpdir, project) = create_test_project();
         let mut mcp = McpChild::start(&project);
