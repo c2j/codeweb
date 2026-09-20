@@ -57,8 +57,21 @@ impl Project {
 
     pub fn init(source_dirs: &[PathBuf], name: &str) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_default();
+        Self::init_at(&cwd, source_dirs, name)
+    }
 
-        let toml_path = cwd.join(CODEWEB_TOML);
+    /// Initialize a project rooted at `root` instead of the process cwd.
+    ///
+    /// Writes `codeweb.toml` and `.codeweb/` under `root` and stores relative
+    /// analysis paths relative to `root`. Callers that must not write outside a
+    /// permitted directory (e.g. the MCP server) pass that directory as `root`.
+    pub fn init_at(root: &Path, source_dirs: &[PathBuf], name: &str) -> Result<Self> {
+        std::fs::create_dir_all(root).map_err(|e| CodeWebError::FileRead {
+            path: root.to_path_buf(),
+            source: e,
+        })?;
+
+        let toml_path = root.join(CODEWEB_TOML);
         if toml_path.exists() {
             return Err(CodeWebError::ProjectAlreadyExists { path: toml_path });
         }
@@ -72,7 +85,7 @@ impl Project {
                     if d.is_absolute() {
                         d.to_string_lossy().to_string()
                     } else {
-                        let relative = pathdiff::diff_paths(d, &cwd).unwrap_or_else(|| d.clone());
+                        let relative = pathdiff::diff_paths(d, root).unwrap_or_else(|| d.clone());
                         relative.to_string_lossy().to_string()
                     }
                 })
@@ -85,7 +98,7 @@ impl Project {
             source: e,
         })?;
 
-        let codeweb_dir = cwd.join(".codeweb");
+        let codeweb_dir = root.join(".codeweb");
         std::fs::create_dir_all(&codeweb_dir).map_err(|e| CodeWebError::FileRead {
             path: codeweb_dir,
             source: e,
@@ -645,6 +658,56 @@ mod tests {
             healed.is_ok(),
             "re-analyze must rewrite the store in the current layout: {:?}",
             healed.err().map(|e| e.to_string())
+        );
+    }
+
+    #[test]
+    fn init_at_creates_config_under_given_root_not_cwd() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("workspace");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("a.sql"), "SELECT 1;").unwrap();
+
+        let proj = Project::init_at(&root, &[PathBuf::from("src")], "demo").unwrap();
+
+        assert_eq!(
+            proj.root(),
+            root,
+            "init_at must anchor the project at the given root"
+        );
+        assert_eq!(proj.name(), "demo");
+        assert!(
+            root.join(CODEWEB_TOML).exists(),
+            "codeweb.toml must be written under the given root"
+        );
+        assert!(
+            root.join(".codeweb").is_dir(),
+            ".codeweb/ must be created under the given root"
+        );
+        assert_eq!(
+            proj.config().analysis.paths,
+            vec!["src".to_string()],
+            "relative analysis paths must be stored relative to the given root"
+        );
+        assert!(
+            !tmpdir.path().join(CODEWEB_TOML).exists(),
+            "init_at must not write to the process cwd"
+        );
+    }
+
+    #[test]
+    fn init_at_rejects_existing_project_root() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+
+        Project::init_at(&root, &[PathBuf::from(".")], "first").unwrap();
+        let second = Project::init_at(&root, &[PathBuf::from(".")], "second");
+
+        assert!(
+            matches!(second, Err(CodeWebError::ProjectAlreadyExists { .. })),
+            "a second init_at on the same root must be rejected, got {:?}",
+            second.err().map(|e| e.to_string())
         );
     }
 

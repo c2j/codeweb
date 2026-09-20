@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -15,52 +16,228 @@ use crate::graph::query::spec::QuerySpec;
 use crate::graph::store::GraphStore;
 use crate::graph::traverse;
 use crate::graph::{CodeGraph, Node};
+use crate::project::Project;
 
 // ── Shared state ──
 
-pub struct McpState {
+/// Graph snapshot swapped atomically by lifecycle tools (`codeweb_analyze`).
+struct GraphSnapshot {
     store: Arc<GraphStore>,
     project_name: String,
     empty_reason: Option<String>,
+    /// No `codeweb.toml` has been found or created yet.
+    uninitialized: bool,
+}
+
+pub struct McpState {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// Absolute directory tree this server is allowed to write into.
+    permitted_root: PathBuf,
+    /// Loaded project — absent until `codeweb_init`, or found at startup.
+    project: Mutex<Option<Project>>,
+    /// Query-facing view of the graph, replaced by lifecycle tools.
+    graph: RwLock<GraphSnapshot>,
 }
 
 impl McpState {
-    pub fn new(store: GraphStore, project_name: String, empty_reason: Option<String>) -> Self {
+    pub fn new(
+        permitted_root: PathBuf,
+        project: Option<Project>,
+        store: GraphStore,
+        project_name: String,
+        empty_reason: Option<String>,
+    ) -> Self {
+        let uninitialized = project.is_none();
         Self {
-            store: Arc::new(store),
-            project_name,
-            empty_reason,
+            inner: Arc::new(Inner {
+                permitted_root,
+                project: Mutex::new(project),
+                graph: RwLock::new(GraphSnapshot {
+                    store: Arc::new(store),
+                    project_name,
+                    empty_reason,
+                    uninitialized,
+                }),
+            }),
         }
     }
 
-    fn store(&self) -> &GraphStore {
-        &self.store
+    fn graph_snapshot(&self) -> std::sync::RwLockReadGuard<'_, GraphSnapshot> {
+        self.inner.graph.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn graph(&self) -> &CodeGraph {
-        self.store.graph()
+    fn graph_snapshot_mut(&self) -> std::sync::RwLockWriteGuard<'_, GraphSnapshot> {
+        self.inner.graph.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn project_slot(&self) -> std::sync::MutexGuard<'_, Option<Project>> {
+        self.inner.project.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Clone the current store handle and drop the lock immediately, so long
+    /// queries never block a concurrent `codeweb_analyze`.
+    fn store_arc(&self) -> Arc<GraphStore> {
+        self.graph_snapshot().store.clone()
+    }
+
+    fn project_name(&self) -> String {
+        self.graph_snapshot().project_name.clone()
     }
 
     fn graph_empty(&self) -> bool {
-        self.store.graph().node_count() == 0
+        self.store_arc().graph().node_count() == 0
     }
 
     fn empty_graph_response(&self) -> String {
-        let message = self.empty_reason.clone().unwrap_or_else(|| {
+        let snapshot = self.graph_snapshot();
+        let message = snapshot.empty_reason.clone().unwrap_or_else(|| {
             "Code graph has 0 nodes — the project contains no analyzable source files.".to_string()
         });
+        let (status, hint) = if snapshot.uninitialized {
+            (
+                "uninitialized",
+                "No codeweb project here yet. Call the codeweb_init tool, then codeweb_analyze.",
+            )
+        } else {
+            (
+                "empty",
+                "Call the codeweb_analyze tool to build the code graph.",
+            )
+        };
         serde_json::to_string(&serde_json::json!({
-            "status": "empty",
-            "project": &self.project_name,
+            "status": status,
+            "project": &snapshot.project_name,
             "message": message,
-            "hint": "Run `codeweb analyze` in the project directory, then restart the MCP server.",
+            "hint": hint,
         }))
         .unwrap_or_default()
     }
 }
 
-// ── Parameter structs ──
+impl Inner {
+    /// Build (or incrementally refresh) the graph and swap it into the snapshot.
+    ///
+    /// Blocking: callers must run this on `spawn_blocking`, never directly on a
+    /// runtime worker.
+    fn run_analyze(&self) -> String {
+        let mut slot = self.project.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(project) = slot.as_mut() else {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "uninitialized",
+                "message": "No codeweb project here yet.",
+                "hint": "Call the codeweb_init tool first.",
+            }))
+            .unwrap_or_default();
+        };
 
+        // Writes must stay inside the permitted root, so a tampered `store.path`
+        // cannot redirect the store outside the directory the server was given.
+        if let Err(message) = confine_to_root(&self.permitted_root, &project.store_path()) {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": message,
+            }))
+            .unwrap_or_default();
+        }
+
+        let report = match project.analyze() {
+            Ok(report) => report,
+            Err(e) => {
+                return serde_json::to_string(&serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                }))
+                .unwrap_or_default();
+            }
+        };
+
+        // `analyze` short-circuits when everything is up to date and leaves the
+        // store unloaded; read it back from disk so the snapshot stays accurate.
+        if project.store().is_none() {
+            let _ = project.load_store();
+        }
+
+        let mut snapshot = self.graph.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut store) = project.take_store() {
+            store.ensure_consistency_with_progress();
+            snapshot.store = Arc::new(store);
+        }
+        snapshot.uninitialized = false;
+        snapshot.empty_reason = None;
+
+        // Report the graph actually in memory, not the up-to-date short-circuit's zeros.
+        let nodes = snapshot.store.graph().node_count();
+        let edges = snapshot.store.graph().edge_count();
+
+        serde_json::to_string(&serde_json::json!({
+            "status": "ready",
+            "project": project.name(),
+            "files_scanned": report.files_scanned,
+            "files_unchanged": report.files_unchanged,
+            "files_changed": report.files_changed,
+            "files_added": report.files_added,
+            "files_deleted": report.files_deleted,
+            "nodes": nodes,
+            "edges": edges,
+            "is_full_build": report.is_full_build,
+            "is_up_to_date": report.is_up_to_date,
+            "elapsed_ms": report.elapsed_ms,
+        }))
+        .unwrap_or_default()
+    }
+
+    /// Compare the scanned source tree against the last analysis manifest.
+    ///
+    /// Blocking (scans the filesystem): callers must run this on `spawn_blocking`.
+    fn run_diff(&self) -> String {
+        let mut slot = self.project.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(project) = slot.as_mut() else {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "uninitialized",
+                "message": "No codeweb project here yet.",
+                "hint": "Call the codeweb_init tool first.",
+            }))
+            .unwrap_or_default();
+        };
+
+        let root = project.root().to_path_buf();
+        let relative = |p: &PathBuf| {
+            pathdiff::diff_paths(p, &root)
+                .unwrap_or_else(|| p.clone())
+                .display()
+                .to_string()
+        };
+
+        match project.diff() {
+            Ok(changes) => {
+                let up_to_date = changes.is_empty();
+                serde_json::to_string(&serde_json::json!({
+                    "status": if up_to_date { "up_to_date" } else { "changed" },
+                    "modified": changes.modified.iter().map(&relative).collect::<Vec<_>>(),
+                    "added": changes.added.iter().map(&relative).collect::<Vec<_>>(),
+                    "deleted": changes.deleted.iter().map(&relative).collect::<Vec<_>>(),
+                    "unchanged": changes.unchanged.len(),
+                    "hint": if up_to_date {
+                        "The graph is in sync with the sources."
+                    } else {
+                        "Call codeweb_analyze to fold these changes into the graph."
+                    },
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+}
+
+// ── Parameter structs ──
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct NodesParams {
     #[serde(default)]
@@ -118,6 +295,17 @@ pub struct LineageParams {
     pub depth: Option<usize>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct InitParams {
+    /// Project name. Defaults to the served directory's name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source directories to analyze (relative to the project root, or absolute).
+    /// Defaults to `["."]`. Reads are unrestricted; only writes are confined.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 // ── Helper functions ──
 
 fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<serde_json::Value> {
@@ -142,6 +330,97 @@ fn tree_nodes_to_json(nodes: &[traverse::TreeNode], graph: &CodeGraph) -> Vec<se
 
 #[tool_router]
 impl McpState {
+    /// Initialize a codeweb project in the served directory
+    #[tool(
+        description = "Initialize a codeweb project in the directory this MCP server was started for: writes codeweb.toml and .codeweb/. Does NOT build the graph — call codeweb_analyze afterwards. Use this when codeweb_stats reports status='uninitialized'."
+    )]
+    fn codeweb_init(&self, Parameters(params): Parameters<InitParams>) -> String {
+        let mut slot = self.project_slot();
+        if let Some(existing) = slot.as_ref() {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "already_initialized",
+                "project": existing.name(),
+                "root": existing.root(),
+                "hint": "Call codeweb_analyze to (re)build the graph, or codeweb_diff to inspect changes.",
+            }))
+            .unwrap_or_default();
+        }
+
+        let root = self.inner.permitted_root.clone();
+        let name = params
+            .name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string()
+            });
+        let dirs: Vec<PathBuf> = if params.paths.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            params.paths.iter().map(PathBuf::from).collect()
+        };
+
+        match Project::init_at(&root, &dirs, &name) {
+            Ok(project) => {
+                let project_name = project.name().to_string();
+                *slot = Some(project);
+
+                let mut snapshot = self.graph_snapshot_mut();
+                snapshot.uninitialized = false;
+                snapshot.project_name = project_name.clone();
+                snapshot.empty_reason = None;
+
+                serde_json::to_string(&serde_json::json!({
+                    "status": "initialized",
+                    "project": project_name,
+                    "root": root,
+                    "paths": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+                    "hint": "Project configured but the graph is still empty. Call codeweb_analyze to build it.",
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "error": e.to_string(),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
+    /// Build or refresh the code graph
+    #[tool(
+        description = "Build (or incrementally refresh) the code graph for the initialized project and hot-swap it into this server, so later queries see the new graph without a restart. Call codeweb_init first when codeweb_stats reports status='uninitialized'. May take a while on large projects."
+    )]
+    async fn codeweb_analyze(&self) -> String {
+        let inner = self.inner.clone();
+        match tokio::task::spawn_blocking(move || inner.run_analyze()).await {
+            Ok(response) => response,
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": format!("analysis task failed: {}", e),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
+    /// Show source changes since the last analysis
+    #[tool(
+        description = "List source files changed since the last codeweb_analyze: added / modified / deleted, relative to the project root. Use it to decide whether the graph is stale before trusting query results."
+    )]
+    async fn codeweb_diff(&self) -> String {
+        let inner = self.inner.clone();
+        match tokio::task::spawn_blocking(move || inner.run_diff()).await {
+            Ok(response) => response,
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": format!("diff task failed: {}", e),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
     /// Get project statistics
     #[tool(
         description = "Get project statistics including node counts by type and edge count. Always call this first to check graph status."
@@ -150,10 +429,12 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let stats = self.store().stats();
+        let store = self.store_arc();
+        let stats = store.stats();
+        let project_name = self.project_name();
         let result = serde_json::json!({
             "status": "ready",
-            "project": &self.project_name,
+            "project": project_name,
             "procedures": stats.procedures,
             "functions": stats.functions,
             "unresolved": stats.unresolved,
@@ -187,7 +468,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let summaries = self.store().node_summaries();
+        let store = self.store_arc();
+        let summaries = store.node_summaries();
         let search_lower = params.search.map(|s| s.to_lowercase());
         let type_filter = params.node_type.map(|t| t.to_lowercase());
 
@@ -256,7 +538,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let depth = params.depth.unwrap_or(1);
         let mut results: Vec<serde_json::Value> = Vec::new();
 
@@ -438,8 +721,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let store = self.store();
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let matches = store.search_nodes(&params.from);
 
         if matches.is_empty() {
@@ -476,8 +759,9 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
-        let results = self.store().search_by_sql(&params.sql);
+        let store = self.store_arc();
+        let graph = store.graph();
+        let results = store.search_by_sql(&params.sql);
         let nodes: Vec<serde_json::Value> = results
             .into_iter()
             .map(|(idx, display_key, score)| {
@@ -540,7 +824,8 @@ impl McpState {
             }
         };
 
-        match spec.execute(self.store.as_ref()) {
+        let store = self.store_arc();
+        match spec.execute(store.as_ref()) {
             Ok(result) => serde_json::to_string(&result).unwrap_or_default(),
             Err(e) => {
                 let err = serde_json::json!({"error": e});
@@ -567,12 +852,12 @@ impl McpState {
             return serde_json::to_string(&err).unwrap_or_default();
         }
 
-        let store = self.store();
-        let graph = self.graph();
+        let store = self.store_arc();
+        let graph = store.graph();
         let table_filter = params.table.as_deref();
 
         let result = if let Some(name) = &params.procedure {
-            let idx = match resolve_node(store, name, true) {
+            let idx = match resolve_node(store.as_ref(), name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -585,7 +870,7 @@ impl McpState {
             crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
         } else {
             let name = params.package.as_ref().expect("checked exactly-one above");
-            let idx = match resolve_node(store, name, true) {
+            let idx = match resolve_node(store.as_ref(), name, true) {
                 Ok(idx) => idx,
                 Err(msg) => return msg,
             };
@@ -613,8 +898,8 @@ impl McpState {
         if self.graph_empty() {
             return self.empty_graph_response();
         }
-        let graph = self.graph();
-        let store = self.store();
+        let store = self.store_arc();
+        let graph = store.graph();
         let depth = params.depth.unwrap_or(5);
         let direction = params.direction.as_deref().unwrap_or("both");
 
@@ -658,7 +943,7 @@ impl McpState {
                 serde_json::to_string(&json).unwrap_or_default()
             }
             crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
-                let table_idx = match resolve_node(store, &table_name, false) {
+                let table_idx = match resolve_node(store.as_ref(), &table_name, false) {
                     Ok(idx) => idx,
                     Err(msg) => return msg,
                 };
@@ -748,7 +1033,9 @@ use rmcp::ServerHandler;
 #[tool_handler(
     name = "codeweb",
     instructions = "Code graph analysis tools. ALWAYS call codeweb_stats first. \
-        If it returns status='empty', the graph has not been built — tell the user to run `codeweb analyze` in the project directory then restart this MCP server, and stop. \
+        If it returns status='uninitialized', call codeweb_init (it only writes config, never analyzes), then codeweb_analyze. \
+        If it returns status='empty', call codeweb_analyze to build the graph. \
+        After changing source files, call codeweb_diff to check staleness and codeweb_analyze to refresh the in-memory graph (no restart needed). \
         If status='ready': use codeweb_nodes to find nodes (search + type filter), \
         codeweb_trace to follow call chains bidirectionally, \
         codeweb_search_sql to find SQL by text content, \
@@ -758,3 +1045,96 @@ use rmcp::ServerHandler;
         codeweb_lineage for table/column-level lineage tracing."
 )]
 impl ServerHandler for McpState {}
+
+// ── Write confinement ──
+//
+// MCP may *read* user-specified source paths, but every write must stay inside
+// the permitted root (the project directory the server was started for).
+
+/// Lexically normalize a path: drop `.`, resolve `..` by popping, keep the root.
+pub(super) fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `pop` on the filesystem root is a no-op, so `/..` stays `/`.
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `candidate` against `root` and accept it only if it stays inside.
+///
+/// `root` is expected to be absolute (the MCP server canonicalizes it at
+/// startup). Resolution is lexical, so a symlink *inside* the root pointing
+/// outside is not caught here.
+fn confine_to_root(root: &Path, candidate: &Path) -> Result<std::path::PathBuf, String> {
+    let root_norm = normalize_lexically(root);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root_norm.join(candidate)
+    };
+    let normalized = normalize_lexically(&joined);
+
+    if normalized.starts_with(&root_norm) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "path '{}' escapes the permitted project root '{}'",
+            candidate.display(),
+            root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn confine_accepts_path_inside_root() {
+        let root = Path::new("/srv/proj");
+        let confined = confine_to_root(root, Path::new(".codeweb/store.bincode")).unwrap();
+        assert_eq!(confined, PathBuf::from("/srv/proj/.codeweb/store.bincode"));
+
+        // Redundant `.` components and absolute candidates inside the root are fine.
+        let abs = confine_to_root(root, Path::new("/srv/proj/.codeweb/./store.bincode")).unwrap();
+        assert_eq!(abs, PathBuf::from("/srv/proj/.codeweb/store.bincode"));
+    }
+
+    #[test]
+    fn confine_accepts_root_itself() {
+        let root = Path::new("/srv/proj");
+        assert_eq!(confine_to_root(root, Path::new(".")).unwrap(), root);
+    }
+
+    #[test]
+    fn confine_rejects_parent_escape() {
+        let root = Path::new("/srv/proj");
+        for candidate in [
+            "../escape.bincode",
+            ".codeweb/../../escape.bincode",
+            "/srv/other/store.bincode",
+            "/etc/passwd",
+        ] {
+            assert!(
+                confine_to_root(root, Path::new(candidate)).is_err(),
+                "'{candidate}' must be rejected as escaping {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn confine_rejects_sibling_with_shared_prefix() {
+        // `/srv/proj-evil` must not pass the `/srv/proj` prefix check.
+        let root = Path::new("/srv/proj");
+        assert!(confine_to_root(root, Path::new("/srv/proj-evil/store")).is_err());
+    }
+}
