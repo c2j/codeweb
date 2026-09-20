@@ -10,21 +10,18 @@ use super::tools::McpState;
 
 /// Resolve the directory the server may write into (issue #171).
 ///
-/// Uses `canonicalize` so `..` segments and symlinks are resolved; if the
-/// directory does not exist yet the parent is canonicalized and the final
-/// component re-attached, so `codeweb_init` can create it.
+/// Absolutizes against the cwd and normalizes `..` lexically. Deliberately
+/// does not `canonicalize`: the permitted root must stay lexically identical
+/// to `Project::root()` so the write guard can compare the two.
 fn resolve_workspace(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    match (std::fs::canonicalize(parent), path.file_name()) {
-        (Ok(parent), Some(name)) => parent.join(name),
-        _ => path.to_path_buf(),
-    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+    };
+    super::tools::normalize_lexically(&absolute)
 }
 
 pub fn run(project_path: &Path) -> Result<()> {

@@ -338,6 +338,80 @@ mod tests {
         );
     }
 
+    /// Shared with `create_analyzed_project`: a small SQL fixture with procedures/tables.
+    fn copy_serve_demo_fixture(project: &std::path::Path) {
+        let fixture_sql =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/serve_demo/sample.sql");
+        let sql_dir = project.join("sql");
+        std::fs::create_dir_all(&sql_dir).expect("create sql dir");
+        std::fs::copy(&fixture_sql, sql_dir.join("sample.sql")).expect("copy fixture sql");
+    }
+
+    #[test]
+    fn test_mcp_analyze_builds_graph_and_hot_swaps() {
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().to_path_buf();
+        copy_serve_demo_fixture(&project);
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        // Before init, analyze must guide the caller to codeweb_init.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let before: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+        assert_eq!(
+            before["status"], "uninitialized",
+            "analyze on an uninitialized project must guide to codeweb_init, got: {before}"
+        );
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"mcp-analyze","paths":["sql"]}}}"#,
+        );
+        let _ = mcp.recv_response(3);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(4);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+        assert!(
+            analyzed["nodes"].as_u64().unwrap_or(0) > 0,
+            "analyze must build a non-empty graph, got: {analyzed}"
+        );
+        assert!(
+            project.join(".codeweb").join("store.bincode").exists(),
+            "analyze must persist the store under the served directory"
+        );
+
+        // Hot swap: the very next query sees the new graph, no restart.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(5);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(stats["status"], "ready", "got: {stats}");
+        assert_eq!(
+            stats["edges"].as_u64(),
+            analyzed["edges"].as_u64(),
+            "stats must reflect the freshly built graph without a server restart"
+        );
+    }
+
     #[test]
     fn test_mcp_call_stats() {
         let (_tmpdir, project) = create_test_project();

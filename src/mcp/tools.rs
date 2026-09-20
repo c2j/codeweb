@@ -117,8 +117,80 @@ impl McpState {
     }
 }
 
-// ── Parameter structs ──
+impl Inner {
+    /// Build (or incrementally refresh) the graph and swap it into the snapshot.
+    ///
+    /// Blocking: callers must run this on `spawn_blocking`, never directly on a
+    /// runtime worker.
+    fn run_analyze(&self) -> String {
+        let mut slot = self.project.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(project) = slot.as_mut() else {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "uninitialized",
+                "message": "No codeweb project here yet.",
+                "hint": "Call the codeweb_init tool first.",
+            }))
+            .unwrap_or_default();
+        };
 
+        // Writes must stay inside the permitted root, so a tampered `store.path`
+        // cannot redirect the store outside the directory the server was given.
+        if let Err(message) = confine_to_root(&self.permitted_root, &project.store_path()) {
+            return serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": message,
+            }))
+            .unwrap_or_default();
+        }
+
+        let report = match project.analyze() {
+            Ok(report) => report,
+            Err(e) => {
+                return serde_json::to_string(&serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                }))
+                .unwrap_or_default();
+            }
+        };
+
+        // `analyze` short-circuits when everything is up to date and leaves the
+        // store unloaded; read it back from disk so the snapshot stays accurate.
+        if project.store().is_none() {
+            let _ = project.load_store();
+        }
+
+        let mut snapshot = self.graph.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut store) = project.take_store() {
+            store.ensure_consistency_with_progress();
+            snapshot.store = Arc::new(store);
+        }
+        snapshot.uninitialized = false;
+        snapshot.empty_reason = None;
+
+        // Report the graph actually in memory, not the up-to-date short-circuit's zeros.
+        let nodes = snapshot.store.graph().node_count();
+        let edges = snapshot.store.graph().edge_count();
+
+        serde_json::to_string(&serde_json::json!({
+            "status": "ready",
+            "project": project.name(),
+            "files_scanned": report.files_scanned,
+            "files_unchanged": report.files_unchanged,
+            "files_changed": report.files_changed,
+            "files_added": report.files_added,
+            "files_deleted": report.files_deleted,
+            "nodes": nodes,
+            "edges": edges,
+            "is_full_build": report.is_full_build,
+            "is_up_to_date": report.is_up_to_date,
+            "elapsed_ms": report.elapsed_ms,
+        }))
+        .unwrap_or_default()
+    }
+}
+
+// ── Parameter structs ──
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct NodesParams {
     #[serde(default)]
@@ -265,6 +337,22 @@ impl McpState {
             }
             Err(e) => serde_json::to_string(&serde_json::json!({
                 "error": e.to_string(),
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
+    /// Build or refresh the code graph
+    #[tool(
+        description = "Build (or incrementally refresh) the code graph for the initialized project and hot-swap it into this server, so later queries see the new graph without a restart. Call codeweb_init first when codeweb_stats reports status='uninitialized'. May take a while on large projects."
+    )]
+    async fn codeweb_analyze(&self) -> String {
+        let inner = self.inner.clone();
+        match tokio::task::spawn_blocking(move || inner.run_analyze()).await {
+            Ok(response) => response,
+            Err(e) => serde_json::to_string(&serde_json::json!({
+                "status": "error",
+                "error": format!("analysis task failed: {}", e),
             }))
             .unwrap_or_default(),
         }
@@ -899,7 +987,7 @@ impl ServerHandler for McpState {}
 // the permitted root (the project directory the server was started for).
 
 /// Lexically normalize a path: drop `.`, resolve `..` by popping, keep the root.
-fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+pub(super) fn normalize_lexically(path: &Path) -> std::path::PathBuf {
     use std::path::Component;
     let mut out = std::path::PathBuf::new();
     for component in path.components() {
