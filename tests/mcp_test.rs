@@ -220,6 +220,9 @@ mod tests {
             .collect();
 
         let expected = [
+            "codeweb_init",
+            "codeweb_analyze",
+            "codeweb_diff",
             "codeweb_stats",
             "codeweb_nodes",
             "codeweb_node_detail",
@@ -269,7 +272,9 @@ mod tests {
             "an uninitialized project must report status=uninitialized, got: {stats}"
         );
         assert!(
-            stats["hint"].as_str().is_some_and(|h| h.contains("codeweb_init")),
+            stats["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("codeweb_init")),
             "hint should point at codeweb_init, got: {stats}"
         );
     }

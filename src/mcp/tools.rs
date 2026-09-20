@@ -1033,7 +1033,9 @@ use rmcp::ServerHandler;
 #[tool_handler(
     name = "codeweb",
     instructions = "Code graph analysis tools. ALWAYS call codeweb_stats first. \
-        If it returns status='empty', the graph has not been built — tell the user to run `codeweb analyze` in the project directory then restart this MCP server, and stop. \
+        If it returns status='uninitialized', call codeweb_init (it only writes config, never analyzes), then codeweb_analyze. \
+        If it returns status='empty', call codeweb_analyze to build the graph. \
+        After changing source files, call codeweb_diff to check staleness and codeweb_analyze to refresh the in-memory graph (no restart needed). \
         If status='ready': use codeweb_nodes to find nodes (search + type filter), \
         codeweb_trace to follow call chains bidirectionally, \
         codeweb_search_sql to find SQL by text content, \

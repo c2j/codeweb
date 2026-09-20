@@ -354,6 +354,9 @@ codeweb 提供四种 MCP/外部集成方式：
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
+| `codeweb_init` | `name`, `paths` | 在服务目录创建 `codeweb.toml` + `.codeweb/`（不触发分析） |
+| `codeweb_analyze` | 无 | 构建/刷新图谱并热替换内存快照（`spawn_blocking`） |
+| `codeweb_diff` | 无 | 列出相对上次分析变更的文件 |
 | `codeweb_stats` | 无 | 项目统计（各类节点/边/文件数量） |
 | `codeweb_nodes` | `search`, `node_type`, `limit`, `offset` | 节点列表（搜索、类型过滤、分页） |
 | `codeweb_node_detail` | `id` (usize) | 节点详情：属性 + callers + callees |
@@ -381,6 +384,15 @@ codeweb 提供四种 MCP/外部集成方式：
 - `src/mcp/tools.rs` — MCP 工具定义（`#[tool_router]` + `#[tool_handler]`）
 - `src/mcp/server.rs` — 服务入口（加载 GraphStore → 启动 tokio runtime → stdio 传输）
 - 复用 `GraphStore` 的全部索引和查询能力，与 HTTP API 共享后端
+
+**状态模型（issue #171）：**
+
+- `McpState` 持有 `Arc<Inner>`：`permitted_root`（唯一可写目录）、`Mutex<Option<Project>>`（生命周期工具）、`RwLock<GraphSnapshot>`（查询工具）。
+- 查询工具读取 `Arc<GraphStore>` 快照后立即释放锁，长查询不会阻塞 `codeweb_analyze`。
+- `codeweb_analyze` 在 `tokio::task::spawn_blocking` 中运行 `Project::analyze`（CPU 密集、同步），完成后把新 store 换入快照。
+- 未初始化目录不再导致进程退出：查询返回 `status: "uninitialized"`，引导调用 `codeweb_init`。
+- 写守卫 `confine_to_root` 做词法归一化后校验路径在 `permitted_root` 内；`store.path` 逃逸时 analyze 直接返回错误。
+- stdout 只用于 JSON-RPC：进度条与报告一律走 stderr，且 MCP 不调用 CLI 的 `print_analyze_report`。
 
 ### 程序化 API 示例
 

@@ -17,9 +17,7 @@ fn resolve_workspace(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(path)
+        std::env::current_dir().unwrap_or_default().join(path)
     };
     super::tools::normalize_lexically(&absolute)
 }
@@ -79,7 +77,9 @@ pub fn run(project_path: &Path) -> Result<()> {
                 workspace.display()
             );
             eprintln!("codeweb mcp: {}", reason);
-            eprintln!("  → Call the `codeweb_init` MCP tool to create one (this server will not exit).");
+            eprintln!(
+                "  → Call the `codeweb_init` MCP tool to create one (this server will not exit)."
+            );
             (workspace, GraphStore::new(&name), name, Some(reason))
         }
     };

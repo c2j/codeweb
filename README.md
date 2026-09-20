@@ -262,6 +262,9 @@ Add to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
+| `codeweb_init` | Create `codeweb.toml` + `.codeweb/` in the served directory (no analysis) |
+| `codeweb_analyze` | Build/refresh the graph and hot-swap it in (no restart needed) |
+| `codeweb_diff` | List files changed since the last analysis |
 | `codeweb_stats` | Project statistics (node/edge/file counts by type) |
 | `codeweb_nodes` | List nodes with search, type filter, pagination |
 | `codeweb_node_detail` | Node properties, callers, and callees by ID |
@@ -270,6 +273,20 @@ Add to `claude_desktop_config.json`:
 | `codeweb_query` | Execute declarative JSON QuerySpec for complex traversals |
 | `codeweb_column_analysis` | Aggregate column-analysis for a procedure/package |
 | `codeweb_lineage` | Table-level and column-level lineage analysis |
+
+### Lifecycle (init / analyze / diff)
+
+The server starts even when the directory has no `codeweb.toml` yet: queries then
+return `status: "uninitialized"` instead of the process exiting.
+
+1. `codeweb_init` — writes `codeweb.toml` + `.codeweb/` under the served directory.
+   It never analyzes on its own.
+2. `codeweb_analyze` — builds or incrementally refreshes the graph and hot-swaps it
+   into the running server, so later queries see it without a restart.
+3. `codeweb_diff` — lists files changed since the last analysis.
+
+Reads may point at any directory (`analysis.paths`), but every write is confined to
+the served directory: a tampered `store.path` that escapes it is rejected.
 
 ## Project Structure
 
@@ -607,6 +624,9 @@ codeweb mcp --project /path/to/your/project
 
 | 工具 | 说明 |
 |------|------|
+| `codeweb_init` | 在服务目录创建 `codeweb.toml` + `.codeweb/`（不触发分析） |
+| `codeweb_analyze` | 构建/刷新图谱并热替换到内存（无需重启） |
+| `codeweb_diff` | 列出相对上次分析变更的文件 |
 | `codeweb_stats` | 项目统计（各类型节点/边/文件数量） |
 | `codeweb_nodes` | 节点列表（搜索、类型过滤、分页） |
 | `codeweb_node_detail` | 节点详情：属性 + 上游调用方 + 下游被调用方 |
@@ -615,6 +635,18 @@ codeweb mcp --project /path/to/your/project
 | `codeweb_query` | 执行声明式 JSON QuerySpec，支持复杂多步遍历 |
 | `codeweb_column_analysis` | 按过程/包聚合列级分析结果 |
 | `codeweb_lineage` | 表级与列级血缘分析 |
+
+### 生命周期工具（init / analyze / diff）
+
+即使目录里还没有 `codeweb.toml`，服务也会正常启动：查询返回
+`status: "uninitialized"`，而不是进程直接退出。
+
+1. `codeweb_init` —— 在服务目录写入 `codeweb.toml` + `.codeweb/`，**不会**自动分析。
+2. `codeweb_analyze` —— 构建或增量刷新图谱，并热替换到运行中的服务，后续查询无需重启即可看到。
+3. `codeweb_diff` —— 列出相对上次分析变更的文件。
+
+读取可以指向任意目录（`analysis.paths`），但所有写入都被限制在服务目录内：
+`store.path` 若被改成逃逸出该目录会被拒绝。
 
 ## 项目结构
 
