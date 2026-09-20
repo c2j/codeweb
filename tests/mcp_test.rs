@@ -413,6 +413,48 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_analyze_rejects_store_path_escaping_root() {
+        // `store.path` is user-controlled config: a tampered value must not be
+        // able to redirect the store write outside the served directory.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().join("proj");
+        copy_serve_demo_fixture(&project);
+
+        let escaped_store = tmpdir.path().join("outside.bincode");
+        let toml = "[project]\n\
+                    name = \"escape\"\n\
+                    \n\
+                    [analysis]\n\
+                    paths = [\"sql\"]\n\
+                    \n\
+                    [store]\n\
+                    path = \"../outside.bincode\"\n\
+                    format = \"bincode\"\n";
+        std::fs::write(project.join("codeweb.toml"), toml).expect("write codeweb.toml");
+
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let result: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+
+        assert_eq!(
+            result["status"], "error",
+            "an escaping store.path must be refused, got: {result}"
+        );
+        assert!(
+            !escaped_store.exists(),
+            "analysis must not write outside the served directory"
+        );
+    }
+
+    #[test]
     fn test_mcp_diff_reports_changes_since_last_analyze() {
         let (_tmpdir, project) = create_analyzed_project();
         let mut mcp = McpChild::start(&project);
