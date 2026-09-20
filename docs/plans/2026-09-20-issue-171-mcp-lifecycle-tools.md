@@ -125,3 +125,19 @@ cargo fmt --all -- --check
 - 门禁结果：`cargo build --features full` 通过；`cargo test --features full -- --skip test_path_mapping_applied --skip test_serve_` 全绿（`mcp_test` 13 passed）；`cargo clippy --features full -- -D warnings` 干净；`cargo fmt --all -- --check` 干净；GitHub CI（Lint / Test ubuntu full）通过。
 - 已知遗留：默认（非 mcp）构建下 `node_sub_type_tag`、`TreeNode::has_more/more_count` 报 dead_code，为既有 mcp-gated 代码，与本次改动无关。
 - `tests/mcp_test.rs::test_mcp_tools_list` 期望工具集 8 → 11 为 feature 必然结果，保持精确集合断言。
+
+## 验收证据（真实公共接口）
+
+用真实二进制 + 真实 stdio JSON-RPC（非测试桩）跑了一轮端到端会话，共 40 项断言全通过：
+
+- 场景：服务目录 `proj`（初始无 `codeweb.toml`），分析路径指向**服务目录之外**的 `src`（含 SQL 存储过程调用链 + iBatis mapper + Java DAO）。
+- `initialize` / `tools/list`（11 个工具，新工具带可用描述）→ 未初始化时 `stats` 返回 `uninitialized`，`analyze`/`diff` 引导到 `codeweb_init`。
+- `codeweb_init`（paths 为外部目录）→ `stats` 变 `empty`（证明未自动分析）→ `codeweb_analyze` 全量构建 10 nodes / 7 edges → 同一进程内 `stats`/`trace`/`nodes`/`search_sql` 立即看到新图（热替换，无重启）。
+- 写边界：外部 `src` 目录内未出现 `.codeweb/` 或 `codeweb.toml`，store 落在服务目录 `.codeweb/store.bincode`。
+- 变更检测：在外部目录新增文件 → `codeweb_diff` 报 `changed` 且列出该文件 → `codeweb_analyze` 增量构建（`is_full_build:false`，`files_added:1`，nodes 10→11）→ `diff` 回到 `up_to_date` → 再次 analyze 报 `is_up_to_date:true` 且仍给出真实 nodes/edges。
+
+集成边界回归：
+
+- `cargo build --features mcp`（不启用 serve/tui/jsp）单独构建的二进制同样通过上述全部断言。
+- CLI 路径未受影响：`codeweb init` / `analyze` / `diff` / `stats` / `files` 在外部分析目录下行为一致，外部目录无写入。
+- HTTP 路径未受影响：`codeweb serve` 的 `/api/v1/stats`、`/api/v1/nodes`、`/api/v1/graph` 正常返回（5 nodes / 4 edges）。
