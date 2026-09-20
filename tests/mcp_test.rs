@@ -91,13 +91,24 @@ mod tests {
     }
 
     impl McpChild {
-        fn start(project: &PathBuf) -> Self {
-            let mut child = Command::new(codeweb_bin())
+        fn start(project: &std::path::Path) -> Self {
+            Self::start_with(project.as_os_str(), None)
+        }
+
+        /// Start the server with an explicit working directory and project
+        /// argument, so relative (`--project .`) invocations can be exercised.
+        fn start_with(project: &std::ffi::OsStr, cwd: Option<&std::path::Path>) -> Self {
+            let mut command = Command::new(codeweb_bin());
+            command
                 .args(["mcp", "--project"])
                 .arg(project)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            if let Some(dir) = cwd {
+                command.current_dir(dir);
+            }
+            let mut child = command
                 .spawn()
                 .unwrap_or_else(|e| panic!("failed to spawn codeweb mcp: {e}"));
 
@@ -898,6 +909,122 @@ mod tests {
         assert_eq!(
             healed["status"], "ready",
             "the regenerated store must load on restart, got: {healed}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_default_relative_project_argument() {
+        // The README's invocation is `codeweb mcp` with the cwd at the project,
+        // i.e. the default `--project .`. Every other test passes an absolute path.
+        let (_tmpdir, project) = create_analyzed_project();
+        let mut mcp = McpChild::start_with(std::ffi::OsStr::new("."), Some(&project));
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+
+        assert_eq!(stats["status"], "ready", "got: {stats}");
+        assert_eq!(
+            stats["project"], "mcp-test",
+            "a relative `--project .` must resolve to the cwd project, got: {stats}"
+        );
+
+        // Writes must still land under the cwd project.
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+    }
+
+    #[test]
+    fn test_mcp_resolves_project_root_from_a_subdirectory() {
+        // `--project` may point below the project root; the server must operate on
+        // the directory that owns codeweb.toml (same as the CLI), not the subdir.
+        let (_tmpdir, project) = create_analyzed_project();
+        let sub = project.join("sql");
+        let mut mcp = McpChild::start_with(sub.as_os_str(), None);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_stats","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(2);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("stats text");
+        let stats: serde_json::Value = serde_json::from_str(text).expect("stats JSON");
+        assert_eq!(
+            stats["project"], "mcp-test",
+            "the project root found from a subdirectory must be used, got: {stats}"
+        );
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_analyze","arguments":{}}}"#,
+        );
+        let resp = mcp.recv_response(3);
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("analyze text");
+        let analyzed: serde_json::Value = serde_json::from_str(text).expect("analyze JSON");
+        assert_eq!(analyzed["status"], "ready", "got: {analyzed}");
+
+        assert!(
+            project.join(".codeweb").join("store.bincode").exists(),
+            "the store must be written to the project root"
+        );
+        assert!(
+            !sub.join(".codeweb").exists(),
+            "the passed subdirectory must not receive its own .codeweb"
+        );
+    }
+
+    #[test]
+    fn test_mcp_pipelined_init_is_serialized() {
+        // A model may retry init; concurrent calls must not both create the project.
+        let tmpdir = TempDir::new().expect("failed to create temp dir");
+        let project = tmpdir.path().to_path_buf();
+        let mut mcp = McpChild::start(&project);
+        handshake(&mut mcp);
+
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"race","paths":["."]}}}"#,
+        );
+        mcp.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codeweb_init","arguments":{"name":"race","paths":["."]}}}"#,
+        );
+
+        let mut statuses = Vec::new();
+        for _ in 0..12 {
+            if statuses.len() == 2 {
+                break;
+            }
+            let line = mcp.read_line().expect("stdout closed");
+            let json: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+            if json["id"] == 2 || json["id"] == 3 {
+                let text = json["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("init text");
+                let body: serde_json::Value = serde_json::from_str(text).expect("init JSON");
+                statuses.push(body["status"].as_str().unwrap_or_default().to_string());
+            }
+        }
+
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec!["already_initialized".to_string(), "initialized".to_string()],
+            "exactly one concurrent init may create the project, got: {statuses:?}"
         );
     }
 

@@ -152,6 +152,14 @@ cargo fmt --all -- --check
 - `codeweb_init` + `codeweb_analyze` → 307 nodes / 275 edges，工具调用耗时 0.05s；`stats`/`nodes`（分页）/`search_sql` 正常。
 - 无变更时再次 `codeweb_analyze` 返回 `is_up_to_date:true`，仍报告 307 nodes；外部源码树未被写入。
 
+调用形态验证（此前所有测试都传绝对路径，README 的实际用法没被覆盖）：
+
+- `codeweb mcp` 默认 `--project .`（cwd 即项目）→ 解析到 cwd 项目，写入仍在项目内。
+- `--project <项目>/sql`（指向子目录）→ 按 `codeweb.toml` 归属解析到项目根，store 落在项目根，被传入的子目录不产生 `.codeweb`。
+- 并发两次 `codeweb_init` → 一个 `initialized`、一个 `already_initialized`（项目锁串行化）。
+
+并发写探测（针对「store 非原子写」这一已知未做项）：MCP `codeweb_analyze` 与 CLI `codeweb analyze` 同时跑 30 轮，每轮后用导出校验节点数，**未观察到**不可加载或不完整的 store。该风险仍按「未做」对待，只是当前规模下未复现。
+
 集成边界回归：
 
 - `cargo build --features mcp`（不启用 serve/tui/jsp）单独构建的二进制同样通过上述全部断言。
