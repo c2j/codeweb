@@ -143,6 +143,37 @@ fn init_root_refuses_populated_target_without_force() {
     assert!(target.join("codeweb.toml").exists());
 }
 
+/// `--root` is a statement about the target, so the guard keys on the flag:
+/// `--root .` inside a populated cwd is checked too, while omitting `--root`
+/// stays byte-identical to the historical behaviour.
+#[test]
+fn init_root_dot_in_populated_cwd_is_checked() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("existing.sql"), "SELECT 1;").unwrap();
+
+    let refused = run_in(&cwd, &["init", "t", "--root", "."]);
+    assert!(
+        !refused.status.success(),
+        "an explicit --root must be checked even when it is the cwd"
+    );
+    assert!(
+        stderr_of(&refused).contains("--force"),
+        "got: {}",
+        stderr_of(&refused)
+    );
+
+    // Omitting --root keeps the legacy behaviour: no check, project in the cwd.
+    let legacy = run_in(&cwd, &["init", "t", "-d", "."]);
+    assert!(
+        legacy.status.success(),
+        "without --root the legacy path must stay unchanged: {}",
+        stderr_of(&legacy)
+    );
+    assert!(cwd.join("codeweb.toml").exists());
+}
+
 #[test]
 fn init_root_resolves_dir_paths_inside_the_root() {
     let tmp = TempDir::new().unwrap();

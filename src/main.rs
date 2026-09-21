@@ -1344,15 +1344,18 @@ fn cmd_conflicts(
 /// tree is not the same as agreeing to drop a project file into it.
 fn cmd_init(name: &str, root: Option<&Path>, dirs: &[PathBuf], force: bool) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let explicit_root = root.is_some();
     let root = match root {
         Some(dir) if dir.is_absolute() => dir.to_path_buf(),
         Some(dir) => cwd.join(dir),
         None => cwd.clone(),
     };
 
-    // Only an explicitly named root can be "the wrong directory"; the cwd is
-    // where the user already is, so it keeps the historical behaviour.
-    if root != cwd && !force {
+    // The guard keys on the flag, not on "differs from the cwd": passing `--root`
+    // is an explicit statement about the target, so a populated one is always
+    // confirmed first. Without `--root` nothing is checked, which is what keeps
+    // the historical cwd-rooted behaviour byte-identical.
+    if explicit_root && !force {
         let populated = std::fs::read_dir(&root)
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false);
