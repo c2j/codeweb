@@ -180,6 +180,26 @@ pub fn write_kind_label(kind: &WriteKind) -> &'static str {
     }
 }
 
+/// Serialize `Edge::TableAccess::write_kinds` in a stable order.
+///
+/// The field is a `HashSet`, so the derived impl emitted its iteration order:
+/// two runs on the same input produced different store bytes and different
+/// `export --format json` output for an identical graph (issue #175). Sorting by
+/// the canonical label keeps the wire format a plain sequence — token spellings
+/// and bincode layout are unchanged — while making it a pure function of the
+/// content.
+fn serialize_sorted_write_kinds<S>(
+    kinds: &std::collections::HashSet<WriteKind>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut sorted: Vec<&WriteKind> = kinds.iter().collect();
+    sorted.sort_by_key(|kind| write_kind_label(kind));
+    sorted.serialize(serializer)
+}
+
 pub fn is_ddl_write_kind(kind: &WriteKind) -> bool {
     matches!(
         kind,
@@ -780,6 +800,8 @@ pub enum Edge {
     TableAccess {
         flow_kind: DataFlowKind,
         modes: AccessMode,
+        /// Sorted on the wire — see [`serialize_sorted_write_kinds`].
+        #[serde(serialize_with = "serialize_sorted_write_kinds")]
         write_kinds: std::collections::HashSet<WriteKind>,
         location: SourceLocation,
         #[serde(default)]
@@ -1032,6 +1054,65 @@ mod tests {
              untouched edges (e0, e2, e3) may survive"
         );
         assert_eq!(graph.edge_count(), 3);
+    }
+
+    #[test]
+    fn write_kinds_serialize_in_a_stable_order() {
+        use std::collections::HashSet;
+
+        // `write_kinds` is a `HashSet`, so a plain derive emitted its iteration
+        // order: two runs on the same input produced different store bytes and
+        // different `export --format json` output for the same graph (issue
+        // #175). The serialized form must be sorted by the canonical label.
+        let kinds: HashSet<WriteKind> = [
+            WriteKind::Update,
+            WriteKind::Insert,
+            WriteKind::Truncate,
+            WriteKind::MergeDelete,
+            WriteKind::Vacuum,
+            WriteKind::Delete,
+        ]
+        .into_iter()
+        .collect();
+        let edge = Edge::TableAccess {
+            flow_kind: DataFlowKind::DmlAccess,
+            modes: AccessMode::Write,
+            write_kinds: kinds.clone(),
+            location: SourceLocation {
+                file: Arc::new(PathBuf::from("t.sql")),
+                line: 1,
+            },
+            column_analysis: None,
+        };
+
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(
+            json.contains(
+                r#""write_kinds":["Delete","Insert","MergeDelete","Truncate","Update","Vacuum"]"#
+            ),
+            "write_kinds must serialize in sorted label order, got: {json}"
+        );
+
+        // Two independent sets with the same content must serialize identically.
+        let reordered: HashSet<WriteKind> = [
+            WriteKind::Vacuum,
+            WriteKind::Delete,
+            WriteKind::MergeDelete,
+            WriteKind::Truncate,
+            WriteKind::Insert,
+            WriteKind::Update,
+        ]
+        .into_iter()
+        .collect();
+        let mut other = edge.clone();
+        if let Edge::TableAccess { write_kinds, .. } = &mut other {
+            *write_kinds = reordered;
+        }
+        assert_eq!(
+            serde_json::to_string(&other).unwrap(),
+            json,
+            "the same write_kinds content must serialize identically regardless of insertion order"
+        );
     }
 
     #[test]

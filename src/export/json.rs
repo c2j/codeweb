@@ -799,11 +799,17 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                 .map(|(_, s)| s.to_string())
                 .collect();
 
-                let wk_strs: Vec<String> = write_kinds
+                // `write_kinds` is a `HashSet`, so iterating it directly made the
+                // emitted array order — and therefore the whole export — depend on
+                // the process's hash seed: two runs on the same input produced
+                // different `export --format json` bytes for an identical graph
+                // (issue #175). `dot.rs` already sorts its labels; do the same here.
+                let mut wk_strs: Vec<String> = write_kinds
                     .iter()
                     .map(crate::graph::write_kind_label)
                     .map(String::from)
                     .collect();
+                wk_strs.sort();
 
                 EdgeJson {
                     source: src.index(),
@@ -928,4 +934,79 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
     serde_json::to_string_pretty(&output).map_err(|e| crate::error::CodeWebError::ExportError {
         message: e.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{
+        AccessMode, DataFlowKind, Edge, Node, RoutineId, RoutineKind, SourceLocation, WriteKind,
+    };
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Issue #175: the emitted `write_kinds` array is part of the export contract,
+    /// so it must not depend on `HashSet` iteration order.
+    #[test]
+    fn table_access_write_kinds_are_emitted_in_a_stable_order() {
+        let loc = SourceLocation {
+            file: Arc::new(PathBuf::from("t.sql")),
+            line: 1,
+        };
+        let mut graph = CodeGraph::new();
+        let proc_idx = graph.add_node(Node::Procedure {
+            id: RoutineId {
+                schema: None,
+                package: None,
+                name: "p".to_string(),
+                kind: RoutineKind::Procedure,
+            },
+            location: loc.clone(),
+            partial: false,
+            body_sql: vec![],
+        });
+        let table_idx = graph.add_node(Node::Table {
+            schema: None,
+            name: "t".to_string(),
+            explicit: true,
+            system: false,
+            location: Some(loc.clone()),
+            columns: Box::new(vec![]),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        });
+        let write_kinds: HashSet<WriteKind> = [
+            WriteKind::Update,
+            WriteKind::Insert,
+            WriteKind::Truncate,
+            WriteKind::Delete,
+            WriteKind::Vacuum,
+        ]
+        .into_iter()
+        .collect();
+        graph.add_edge(
+            proc_idx,
+            table_idx,
+            Edge::TableAccess {
+                flow_kind: DataFlowKind::DmlAccess,
+                modes: AccessMode::Write,
+                write_kinds,
+                location: loc,
+                column_analysis: None,
+            },
+        );
+
+        let json = to_json(&graph).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["edges"][0]["write_kinds"],
+            serde_json::json!(["delete", "insert", "truncate", "update", "vacuum"]),
+            "write_kinds must be emitted in sorted label order, got: {json}"
+        );
+    }
 }
