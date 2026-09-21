@@ -483,6 +483,95 @@ impl GraphBuilder {
         apply_deferred_column_comments(ctx);
         Self::merge_table_access_edges(&mut ctx.graph);
         Self::resolve_unresolved_nodes(&mut ctx.graph);
+        // Must run last: rewiring in the earlier passes can append a second copy
+        // of an edge that already existed.
+        Self::drop_identical_duplicate_edges(&mut ctx.graph);
+    }
+
+    /// Drop edges that are indistinguishable from an earlier one: same endpoints,
+    /// same type and same serialized payload.
+    ///
+    /// Each edge type gets its own merge (`merge_table_access_edges`, the
+    /// `AnchorsOn` key, ...), so a type without one can end up holding two copies
+    /// for the same pair — `contains_routine` when a package spec is declared in
+    /// more than one file, `references_type` when one declaration is collected
+    /// twice. Since no field distinguishes the copies, every consumer (export,
+    /// `detail`, traversal) sees pure duplication: two identical records in the
+    /// export, inflated degree counts, and edge totals that no longer match the
+    /// distinct edges a user can see. Collapsing them therefore loses nothing.
+    ///
+    /// Distinguishable edges are untouched: the payload is part of the key, so
+    /// `AnchorsOn` on different columns/sites and `TableAccess` with different
+    /// `flow_kind` both survive.
+    fn drop_identical_duplicate_edges(graph: &mut CodeGraph) {
+        // Group by endpoints *and edge variant* first, without serializing
+        // anything: only a group with more than one member can contain a
+        // duplicate. Serializing every edge up front cost ~0.5s on an 8k-edge
+        // corpus, because a `table_access` payload carries a whole
+        // `ColumnAnalysis` and all the payload strings had to stay alive at once.
+        type EdgeKey = (
+            petgraph::graph::NodeIndex,
+            petgraph::graph::NodeIndex,
+            std::mem::Discriminant<Edge>,
+        );
+        let key_of = |graph: &CodeGraph, edge_idx: petgraph::graph::EdgeIndex| -> EdgeKey {
+            let (src, dst) = graph
+                .edge_endpoints(edge_idx)
+                .expect("edge_indices yields live edges");
+            (src, dst, std::mem::discriminant(&graph[edge_idx]))
+        };
+
+        // Pass 1: just count. Duplicates need at least two edges between the same
+        // pair with the same variant, so when no key repeats there is nothing to
+        // do — the overwhelmingly common case, which must not allocate a
+        // per-group `Vec` nor serialize a single payload.
+        let mut counts: HashMap<EdgeKey, usize> = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            *counts.entry(key_of(graph, edge_idx)).or_insert(0) += 1;
+        }
+        let repeated: HashSet<EdgeKey> = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(key, _)| key)
+            .collect();
+        if repeated.is_empty() {
+            return;
+        }
+
+        // Pass 2: only the repeated keys, whose members are then compared by
+        // payload.
+        let mut groups: HashMap<EdgeKey, Vec<petgraph::graph::EdgeIndex>> = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            let key = key_of(graph, edge_idx);
+            if repeated.contains(&key) {
+                groups.entry(key).or_default().push(edge_idx);
+            }
+        }
+
+        let mut to_remove: Vec<petgraph::graph::EdgeIndex> = Vec::new();
+        for members in groups.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            // `members` is in ascending edge-index order, so the first copy is
+            // the one that survives regardless of map iteration order.
+            let mut seen_payloads: HashSet<String> = HashSet::new();
+            for &edge_idx in members {
+                // A failed serialization must not make unrelated edges compare
+                // equal, so the fallback key is unique per edge.
+                let payload = serde_json::to_string(&graph[edge_idx])
+                    .unwrap_or_else(|_| format!("\u{0}unserializable-{}", edge_idx.index()));
+                if !seen_payloads.insert(payload) {
+                    to_remove.push(edge_idx);
+                }
+            }
+        }
+
+        // petgraph's `remove_edge` is a swap-remove, so delete descending.
+        to_remove.sort_unstable();
+        for idx in to_remove.into_iter().rev() {
+            graph.remove_edge(idx);
+        }
     }
 
     // ── Pass 1: Create all SQL nodes ─────────────────────────────
@@ -7215,6 +7304,123 @@ mod tests {
             table_nodes.len(),
             1,
             "MY_TABLE and my_table should resolve to a single Table node"
+        );
+    }
+
+    /// The builder merges per edge type (`merge_table_access_edges`, the
+    /// `AnchorsOn` key, ...), so a type without a merge can keep two edges that
+    /// are indistinguishable to every consumer. `tests/regress` has two such
+    /// pairs today (`contains_routine`, `references_type`).
+    #[test]
+    fn identical_duplicate_edges_are_dropped_but_distinguishable_ones_survive() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::graph::{AnchorKind, AnchorSite, CodeGraph as CG, DataFlowKind};
+        use std::sync::Arc;
+
+        let file = Arc::new(PathBuf::from("t.sql"));
+        let loc = |line: usize| crate::graph::SourceLocation {
+            file: file.clone(),
+            line,
+        };
+
+        let mut ctx = GraphBuildContext::new();
+        let proc_idx = ctx.graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("p".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let type_idx = ctx.graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("t".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let other_idx = ctx.graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("q".to_string()),
+            context: Box::new("test".to_string()),
+        });
+
+        // Indistinguishable: same endpoints, same type, same payload.
+        ctx.graph.add_edge(
+            proc_idx,
+            type_idx,
+            Edge::ReferencesType { location: loc(7) },
+        );
+        ctx.graph.add_edge(
+            proc_idx,
+            type_idx,
+            Edge::ReferencesType { location: loc(7) },
+        );
+        // Fieldless duplicates are indistinguishable by construction.
+        ctx.graph
+            .add_edge(proc_idx, other_idx, Edge::ContainsRoutine);
+        ctx.graph
+            .add_edge(proc_idx, other_idx, Edge::ContainsRoutine);
+        // Distinguishable: same endpoints and type, different payloads.
+        ctx.graph.add_edge(
+            proc_idx,
+            other_idx,
+            Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("c".to_string()),
+                site: AnchorSite::ReturnType,
+                location: loc(3),
+            },
+        );
+        ctx.graph.add_edge(
+            proc_idx,
+            other_idx,
+            Edge::AnchorsOn {
+                kind: AnchorKind::PercentType,
+                column: Some("c".to_string()),
+                site: AnchorSite::Variable,
+                location: loc(3),
+            },
+        );
+        ctx.graph.add_edge(
+            proc_idx,
+            other_idx,
+            Edge::TableAccess {
+                flow_kind: DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc(4),
+                column_analysis: None,
+            },
+        );
+        ctx.graph.add_edge(
+            proc_idx,
+            other_idx,
+            Edge::TableAccess {
+                flow_kind: DataFlowKind::DefinitionDependency,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                location: loc(4),
+                column_analysis: None,
+            },
+        );
+
+        GraphBuilder::finalize_graph(&mut ctx);
+        let graph: &CG = &ctx.graph;
+
+        let count =
+            |predicate: fn(&Edge) -> bool| graph.edge_weights().filter(|e| predicate(e)).count();
+        assert_eq!(
+            count(|e| matches!(e, Edge::ReferencesType { .. })),
+            1,
+            "byte-identical references_type edges must collapse to one"
+        );
+        assert_eq!(
+            count(|e| matches!(e, Edge::ContainsRoutine)),
+            1,
+            "byte-identical fieldless edges must collapse to one"
+        );
+        assert_eq!(
+            count(|e| matches!(e, Edge::AnchorsOn { .. })),
+            2,
+            "anchors that differ in site must both survive"
+        );
+        assert_eq!(
+            count(|e| matches!(e, Edge::TableAccess { .. })),
+            2,
+            "table_access edges that differ in flow_kind must both survive"
         );
     }
 
