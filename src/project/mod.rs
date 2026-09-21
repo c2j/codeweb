@@ -9,7 +9,7 @@ use config::ProjectConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const CODEWEB_TOML: &str = "codeweb.toml";
+pub const CODEWEB_TOML: &str = "codeweb.toml";
 
 pub struct Project {
     root: PathBuf,

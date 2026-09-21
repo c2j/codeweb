@@ -286,14 +286,20 @@ codeweb init <项目名> -d <目录1> [-d <目录2> ...]
 |------|------|
 | `<项目名>` | 项目名称，会写入 `codeweb.toml` |
 | `-d, --dir <路径>` | 源代码目录，可多次指定 |
+| `--root <路径>` | 项目根目录：`codeweb.toml` 与 `.codeweb/` 写在该目录，而不是调用时的当前目录。省略时为当前目录。给了 `--root` 后，相对的 `-d` 路径按该根目录解析 |
+| `--force` | 当 `--root` 指向的目录非空且其中没有 `codeweb.toml` 时，必须显式加上才会写入 |
 
 **示例**：
 
 ```bash
+# 在当前目录建项目，分析这几个子目录
 codeweb init erp-system -d src/main/java -d sql/procedures -d sql/functions
+
+# 项目就建在另一个目录里（不在当前目录留下任何文件）
+codeweb init baseline --root /path/to/基线代码
 ```
 
-执行后会在当前目录创建 `codeweb.toml` 并立即进行首次全量分析。
+执行后会在项目根目录创建 `codeweb.toml` 并立即进行首次全量分析。
 
 ---
 
