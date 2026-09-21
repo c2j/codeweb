@@ -38,6 +38,41 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .expect("failed to run codeweb")
 }
 
+/// The NDJSON export must be byte-identical across runs, not merely the same
+/// size. `dedup_table_view_nodes` re-appends rewired edges while iterating a
+/// `HashMap`, so two processes on the same input emitted the same edges at
+/// different positions, which is what makes diffing two exports unusable.
+///
+/// The level is deliberately end-to-end: `HashMap` iteration order only varies
+/// BETWEEN processes, so no in-process unit test can observe this. The corpus is
+/// the one from the issue report (`tests/regress`), which is what surfaced it.
+#[test]
+fn analyze_output_is_byte_identical_across_runs() {
+    let tmp = TempDir::new().unwrap();
+    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("regress");
+
+    let run_a = tmp.path().join("run_a");
+    let run_b = tmp.path().join("run_b");
+    write_project(&run_a, "det", &[&corpus]);
+    write_project(&run_b, "det", &[&corpus]);
+
+    let out_a = analyze_and_export(&run_a);
+    let out_b = analyze_and_export(&run_b);
+
+    assert!(!out_a.is_empty(), "NDJSON export must not be empty");
+    assert!(
+        out_a.lines().count() > 100,
+        "the regress corpus should produce a non-trivial graph, got {} lines",
+        out_a.lines().count()
+    );
+    assert_eq!(
+        out_a, out_b,
+        "two runs on the same input must emit byte-identical NDJSON"
+    );
+}
+
 fn write_project(root: &Path, name: &str, paths: &[&Path]) {
     std::fs::create_dir_all(root).unwrap();
     let mut toml = format!("[project]\nname = \"{name}\"\n\n[analysis]\npaths = [");

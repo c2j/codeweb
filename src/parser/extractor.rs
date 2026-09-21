@@ -184,6 +184,22 @@ pub struct CallEdge {
 /// preserves call-graph correctness.
 pub const MAX_VALUE_SET: usize = 64;
 
+/// Candidate values of one PL variable, in a stable order.
+///
+/// `var_values` stores a `HashSet`, so iterating it directly made the candidate
+/// order — and therefore the order of the dynamic-SQL calls derived from it —
+/// a function of the process's per-`HashMap` hash seed. Two runs on the same
+/// input then emitted the same edges at different positions (issue #175).
+/// Sorting keeps every value while making the order a pure function of the input.
+fn sorted_var_values(var_values: &HashMap<String, HashSet<String>>, var_name: &str) -> Vec<String> {
+    let mut values: Vec<String> = var_values
+        .get(var_name)
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default();
+    values.sort();
+    values
+}
+
 /// All literal strings `expr` can evaluate to (`||` concatenation, variable lookup via
 /// `var_values`, CASE branches), capped to avoid exponential blowup on long chains.
 /// Shared by call-edge and column-analysis dynamic-SQL tracking.
@@ -210,13 +226,7 @@ fn literal_strings(expr: &Expr, var_values: &HashMap<String, HashSet<String>>) -
             }
             result
         }
-        Expr::PlVariable(names) => {
-            let var_name = names.join(".").to_lowercase();
-            var_values
-                .get(&var_name)
-                .map(|set| set.iter().cloned().collect())
-                .unwrap_or_default()
-        }
+        Expr::PlVariable(names) => sorted_var_values(var_values, &names.join(".").to_lowercase()),
         Expr::Case {
             whens, else_expr, ..
         } => {
@@ -652,11 +662,7 @@ impl Visitor for CallExtractor {
                 if let Expr::PlVariable(names) = peeled {
                     let var_name = names.join(".").to_lowercase();
                     // Clone to avoid borrow conflict with extract_call_from_sql_text
-                    let candidates: Vec<String> = self
-                        .var_values
-                        .get(&var_name)
-                        .map(|s| s.iter().cloned().collect())
-                        .unwrap_or_default();
+                    let candidates = sorted_var_values(&self.var_values, &var_name);
                     for sql_text in &candidates {
                         self.extract_call_from_sql_text(sql_text);
                     }
@@ -670,11 +676,7 @@ impl Visitor for CallExtractor {
                     if let Expr::PlVariable(record_name) = object.as_ref() {
                         let compound =
                             format!("{}.{}", record_name.join("."), field).to_lowercase();
-                        let candidates: Vec<String> = self
-                            .var_values
-                            .get(&compound)
-                            .map(|s| s.iter().cloned().collect())
-                            .unwrap_or_default();
+                        let candidates = sorted_var_values(&self.var_values, &compound);
                         for sql_text in &candidates {
                             self.extract_call_from_sql_text(sql_text);
                         }

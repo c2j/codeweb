@@ -3789,6 +3789,14 @@ impl GraphBuilder {
         // (Phase 1 merges are appended first, so they take priority).
         let mut seen_from = std::collections::HashSet::new();
         merges.retain(|(from, _)| seen_from.insert(*from));
+        // Phase 2 collects its pairs by iterating a `HashMap` of bare table
+        // names, so `merges` used to arrive here in an order that varied per
+        // process. Phase A re-appends rewired edges in `merges` order, which
+        // made the graph's edge array (and therefore the exported NDJSON) differ
+        // between two runs on the same input even when every count matched
+        // (issue #175). Sorting by node index makes the append order, and the
+        // leftover array order, a pure function of the input.
+        merges.sort_unstable();
 
         // Phase A: rewire all edges from merged nodes to their targets.
         // This must happen BEFORE any removal because petgraph's Graph uses
@@ -5227,6 +5235,62 @@ mod tests {
     /// report a fluctuating edge count. With several duplicate groups the
     /// buggy order almost never comes out perfectly descending, so this fails
     /// reliably before the fix and is deterministic after it.
+    /// Issue #175: two builds of the same input must produce the same graph, edge
+    /// order included. `HashMap`/`HashSet` iteration order varies per instance, so
+    /// building twice in one process is enough to expose an order-sensitive
+    /// rewrite; the fixture is the dynamic-SQL case that surfaced it (a variable
+    /// whose candidate values are collected from several `IF`/`CASE` branches).
+    #[test]
+    fn building_the_same_input_twice_yields_the_same_edge_order() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::graph::CodeGraph as CG;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regress/execute_immediate_expr/cases/ei_complex_expr.sql");
+        let parsed = crate::parser::parse_sql_files(&[path.clone()]);
+        assert!(!parsed.is_empty(), "fixture must parse: {}", path.display());
+
+        let edge_sequence = |graph: &CG| -> Vec<String> {
+            graph
+                .edge_indices()
+                .map(|e| {
+                    let (src, dst) = graph.edge_endpoints(e).unwrap();
+                    let debug = format!("{:?}", &graph[e]);
+                    let tag: String = debug
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    format!("{}->{}:{}", src.index(), dst.index(), tag)
+                })
+                .collect()
+        };
+        let build_once = || {
+            let mut ctx = GraphBuildContext::new();
+            GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+            GraphBuilder::finalize_graph(&mut ctx);
+            edge_sequence(&ctx.graph)
+        };
+
+        let first = build_once();
+        let second = build_once();
+
+        let divergence = first
+            .iter()
+            .zip(second.iter())
+            .position(|(a, b)| a != b)
+            .map(|i| (i, first[i].clone(), second[i].clone()));
+        assert_eq!(
+            first, second,
+            "the same input must produce the same edge order; first divergence at {:?}",
+            divergence
+        );
+        assert!(
+            first.len() > 10,
+            "fixture should produce a non-trivial graph, got {} edges",
+            first.len()
+        );
+    }
+
     #[test]
     fn merge_table_access_edges_leaves_no_duplicate_across_multiple_groups() {
         use crate::graph::{AccessMode, CodeGraph, DataFlowKind, SourceLocation};
