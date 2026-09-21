@@ -43,9 +43,9 @@ fn run(dir: &Path, args: &[&str]) -> Output {
 /// `HashMap`, so two processes on the same input emitted the same edges at
 /// different positions, which is what makes diffing two exports unusable.
 ///
-/// The level is deliberately end-to-end: `HashMap` iteration order only varies
-/// BETWEEN processes, so no in-process unit test can observe this. The corpus is
-/// the one from the issue report (`tests/regress`), which is what surfaced it.
+/// The level is deliberately end-to-end: it covers the whole `analyze` +
+/// `export` pipeline, including directory scanning order and the NDJSON writer,
+/// on the corpus from the issue report (`tests/regress`).
 #[test]
 fn analyze_output_is_byte_identical_across_runs() {
     let tmp = TempDir::new().unwrap();

@@ -5227,19 +5227,10 @@ mod tests {
         assert_eq!(predicates.len(), 1);
     }
 
-    /// Issue #175: `merge_table_access_edges` collects removals in
-    /// `merge_targets` HashMap iteration order. `petgraph`'s `remove_edge` is a
-    /// swap-remove, so an ascending-ish order turned an intended removal into a
-    /// silent no-op whenever the swapped-in last edge was itself pending,
-    /// leaving a duplicate `table_access` edge behind and making `analyze`
-    /// report a fluctuating edge count. With several duplicate groups the
-    /// buggy order almost never comes out perfectly descending, so this fails
-    /// reliably before the fix and is deterministic after it.
-    /// Issue #175: two builds of the same input must produce the same graph, edge
-    /// order included. `HashMap`/`HashSet` iteration order varies per instance, so
+    /// Two builds of the same input must produce the same graph, edge order
+    /// included. `HashMap`/`HashSet` iteration order varies per instance, so
     /// building twice in one process is enough to expose an order-sensitive
-    /// rewrite; the fixture is the dynamic-SQL case that surfaced it (a variable
-    /// whose candidate values are collected from several `IF`/`CASE` branches).
+    /// rewrite; the fixture is the dynamic-SQL case that surfaced it.
     #[test]
     fn building_the_same_input_twice_yields_the_same_edge_order() {
         use crate::graph::builder::GraphBuildContext;
@@ -5291,6 +5282,11 @@ mod tests {
         );
     }
 
+    /// `merge_table_access_edges` batches removals in `merge_targets` HashMap
+    /// iteration order while `petgraph`'s `remove_edge` is a swap-remove, so the
+    /// batch must be deleted in descending index order or an intended removal
+    /// becomes a no-op. Several duplicate groups make an arbitrary order almost
+    /// never come out perfectly descending.
     #[test]
     fn merge_table_access_edges_leaves_no_duplicate_across_multiple_groups() {
         use crate::graph::{AccessMode, CodeGraph, DataFlowKind, SourceLocation};
