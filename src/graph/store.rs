@@ -2692,18 +2692,29 @@ mod tests {
         );
     }
 
-    /// The repair command must name a real directory even for a relative store
-    /// path (`codeweb merge .codeweb/store.bincode`), where `Path::parent` of
-    /// `.codeweb` is the empty path.
+    /// The repair command must always carry a usable `-p` value, including for a
+    /// relative store path: `Path::parent` of `.codeweb` is the empty path, which
+    /// used to render as `codeweb analyze -p ` with nothing after the flag.
+    /// (Whether the search settles on `.` or on `.codeweb` depends on whether the
+    /// cwd holds a `codeweb.toml`, so this only pins the invariant.)
     #[test]
-    fn stale_store_message_uses_cwd_for_a_relative_store_path() {
-        // `cargo test` runs with the package root as cwd, which has a
-        // `codeweb.toml`, so the upward search must settle on `.`.
-        let message = stale_store_message(Path::new(".codeweb/store.bincode"), 8);
-        assert!(
-            message.contains("codeweb analyze -p '.'"),
-            "the -p value must be the project root, not an empty path: {message}"
-        );
+    fn stale_store_message_never_emits_an_empty_p_value() {
+        for path in [
+            Path::new(".codeweb/store.bincode"),
+            Path::new("store.bincode"),
+            Path::new("/nonexistent/place/store.bincode"),
+        ] {
+            let message = stale_store_message(path, 8);
+            let value = message
+                .split("analyze -p '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or_else(|| panic!("no quoted -p value in: {message}"));
+            assert!(
+                !value.trim().is_empty(),
+                "empty -p value for {path:?}: {message}"
+            );
+        }
     }
 
     /// A root containing spaces must still produce a pasteable command.
