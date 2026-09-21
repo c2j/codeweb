@@ -143,6 +143,40 @@ fn init_root_refuses_populated_target_without_force() {
     assert!(target.join("codeweb.toml").exists());
 }
 
+/// `--root` must accept a relative path (resolved against the cwd), and the
+/// project must be usable afterwards through the plain directory path.
+#[test]
+fn init_root_accepts_a_relative_path_and_stays_usable() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("cwd");
+    let sibling = tmp.path().join("sibling");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+
+    let out = run_in(&cwd, &["init", "rel", "--root", "../sibling"]);
+    assert!(out.status.success(), "got: {}", stderr_of(&out));
+    assert!(
+        sibling.join("codeweb.toml").exists(),
+        "codeweb.toml must land in ../sibling"
+    );
+    assert!(
+        sibling.join(".codeweb").is_dir(),
+        ".codeweb must land there too"
+    );
+    assert!(
+        !cwd.join("codeweb.toml").exists(),
+        "the cwd must stay untouched"
+    );
+
+    // The usual follow-up: address the project by its plain directory path.
+    let stats = run_in(&cwd, &["stats", "-p", sibling.to_str().unwrap()]);
+    assert!(
+        stats.status.success(),
+        "the project created via a relative --root must be usable: {}",
+        stderr_of(&stats)
+    );
+}
+
 /// `--root` is a statement about the target, so the guard keys on the flag:
 /// `--root .` inside a populated cwd is checked too, while omitting `--root`
 /// stays byte-identical to the historical behaviour.
