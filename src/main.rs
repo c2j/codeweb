@@ -1333,15 +1333,10 @@ fn cmd_conflicts(
     Ok(())
 }
 
-/// Issue #180: without `--root` the project is created in the cwd and `-d` only
-/// registers analysis paths (documented behaviour, relied on by the README and
-/// several regression suites). `--root <dir>` is the explicit way to say the
-/// project belongs somewhere else, so `codeweb init baseline --root <tree>`
-/// never scatters `codeweb.toml` into whatever the cwd happens to be.
-///
-/// When the explicit root is a populated directory with no `codeweb.toml`, the
-/// write is refused unless `--force` is given: pointing at an existing source
-/// tree is not the same as agreeing to drop a project file into it.
+/// `-d` keeps its documented meaning (analysis dirs, project rooted at the cwd);
+/// `--root` is the explicit way to name the root instead. The non-empty guard
+/// keys on the flag rather than on "differs from the cwd", so `--root .` is
+/// checked too.
 fn cmd_init(name: &str, root: Option<&Path>, dirs: &[PathBuf], force: bool) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let explicit_root = root.is_some();
@@ -1351,10 +1346,6 @@ fn cmd_init(name: &str, root: Option<&Path>, dirs: &[PathBuf], force: bool) -> R
         None => cwd.clone(),
     };
 
-    // The guard keys on the flag, not on "differs from the cwd": passing `--root`
-    // is an explicit statement about the target, so a populated one is always
-    // confirmed first. Without `--root` nothing is checked, which is what keeps
-    // the historical cwd-rooted behaviour byte-identical.
     if explicit_root && !force {
         let populated = std::fs::read_dir(&root)
             .map(|mut entries| entries.next().is_some())

@@ -4,6 +4,7 @@ use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
 use crate::parser::{AnchorKind, AnchorSite};
+use crate::project::CODEWEB_TOML;
 use crate::sql_match;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -35,30 +36,47 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// anchors (issue #158).
 pub const STORE_VERSION: u32 = 13;
 
-/// Best-effort project root for a store path.
-///
-/// The layout written by `Project::save_store` is `<root>/.codeweb/<store>`, so
-/// the root is the parent of the `.codeweb` directory. A custom `[store] path`
-/// outside that layout falls back to the store file's own directory.
-fn store_project_root(store_path: &Path) -> &Path {
-    let parent = store_path.parent().unwrap_or(Path::new("."));
-    match parent.file_name() {
-        Some(name) if name == ".codeweb" => parent.parent().unwrap_or(parent),
-        _ => parent,
+/// Directory to name in the repair command: the nearest ancestor holding a
+/// `codeweb.toml`, else the store's own directory, else the cwd.
+fn store_project_root(store_path: &Path) -> PathBuf {
+    let start = match store_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // For a single relative component (`.codeweb`) `Path::parent` is the empty
+    // path, so the cwd itself has to be probed separately.
+    let mut starts: Vec<PathBuf> = vec![start.to_path_buf()];
+    if start.is_relative() {
+        starts.push(PathBuf::from("."));
     }
+    for from in &starts {
+        let mut dir = from.clone();
+        loop {
+            if dir.join(CODEWEB_TOML).is_file() {
+                return dir;
+            }
+            match dir.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+    }
+    start.to_path_buf()
 }
 
-/// Issue #180: the version-gate error must be actionable on its own — name the
-/// version found, the version this binary expects, the store file, and a repair
-/// command that works from any cwd. The old wording said only
-/// "run `codeweb analyze` to regenerate", which was executed in the wrong tree
-/// (and could not help when the store sat in a copied/worktree checkout, since
-/// stores are never migrated, only rebuilt).
+/// Single-quote a path so a root containing spaces or quotes can be pasted
+/// straight into a shell.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Version-gate error naming the store, the expected version, and a repair
+/// command that works from any cwd.
 fn stale_store_message(store_path: &Path, found: u32) -> String {
     format!(
         "unsupported cache version {found}, expected {STORE_VERSION}: run `codeweb analyze -p {}` \
          to regenerate (stores are not migrated automatically; {} is unusable)",
-        store_project_root(store_path).display(),
+        shell_quote(&store_project_root(store_path)),
         store_path.display()
     )
 }
@@ -2672,6 +2690,54 @@ mod tests {
             err_msg.contains("not migrated"),
             "must warn that the old store is not migrated automatically: {err_msg}"
         );
+    }
+
+    /// The repair command must name a real directory even for a relative store
+    /// path (`codeweb merge .codeweb/store.bincode`), where `Path::parent` of
+    /// `.codeweb` is the empty path.
+    #[test]
+    fn stale_store_message_uses_cwd_for_a_relative_store_path() {
+        // `cargo test` runs with the package root as cwd, which has a
+        // `codeweb.toml`, so the upward search must settle on `.`.
+        let message = stale_store_message(Path::new(".codeweb/store.bincode"), 8);
+        assert!(
+            message.contains("codeweb analyze -p '.'"),
+            "the -p value must be the project root, not an empty path: {message}"
+        );
+    }
+
+    /// A root containing spaces must still produce a pasteable command.
+    #[test]
+    fn stale_store_message_quotes_the_project_root() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("with space");
+        let store_dir = root.join(".codeweb");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(root.join(CODEWEB_TOML), "[project]\nname = \"t\"\n").unwrap();
+        let path = store_dir.join("store.bincode");
+
+        let message = stale_store_message(&path, 8);
+        assert!(
+            message.contains(&format!("codeweb analyze -p '{}'", root.display())),
+            "the root must be shell-quoted: {message}"
+        );
+    }
+
+    /// The upward search must pick the tree the store actually belongs to, not
+    /// just the store's own directory.
+    #[test]
+    fn store_project_root_prefers_the_nearest_codeweb_toml() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        let store_dir = root.join(".codeweb");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(root.join(CODEWEB_TOML), "[project]\nname = \"t\"\n").unwrap();
+
+        assert_eq!(store_project_root(&store_dir.join("store.bincode")), root);
+        // No codeweb.toml anywhere above: fall back to the store's directory.
+        let orphan = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&orphan).unwrap();
+        assert_eq!(store_project_root(&orphan.join("store.bincode")), orphan);
     }
 
     /// Issue #180: same requirement for the JSON store format — the JSON path

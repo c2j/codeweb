@@ -46,9 +46,10 @@ fn combined(output: &Output) -> String {
     )
 }
 
-/// A project directory holding a store written by an older layout (version 8,
-/// the one from the issue) plus its manifest sidecar, so nothing but the store
-/// itself is stale.
+/// A project directory holding only a v8 store header and no manifest sidecar,
+/// so the tests using it exercise the full-build path. The incremental
+/// "fingerprints unchanged, only the store version is stale" path is covered by
+/// `analyze_reports_rebuild_when_only_the_store_version_is_stale`.
 fn project_with_stale_store(root: &Path) {
     std::fs::create_dir_all(root.join(".codeweb")).unwrap();
     std::fs::write(
@@ -136,6 +137,95 @@ fn analyze_rebuilds_stale_store_and_says_so() {
     assert!(
         stats.status.success(),
         "the rebuilt store must load: {}",
+        combined(&stats)
+    );
+}
+
+/// The rebuild line must also appear on the incremental self-heal path: the
+/// fingerprints are unchanged, only the store version is stale.
+#[test]
+fn analyze_reports_rebuild_when_only_the_store_version_is_stale() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("baseline");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("codeweb.toml"),
+        "[project]\nname = \"baseline\"\n\n[analysis]\npaths = [\".\"]\n\n\
+         [store]\npath = \".codeweb/store.bincode\"\nformat = \"bincode\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("a.sql"), "SELECT 1;\n").unwrap();
+
+    // First run writes a current store plus its manifest sidecar.
+    let first = run_in(&root, &["analyze", "-p", "."]);
+    assert!(first.status.success(), "got: {}", combined(&first));
+
+    // Downgrade only the store header; the sidecar keeps the same fingerprints.
+    let store = root.join(".codeweb/store.bincode");
+    let mut bytes = std::fs::read(&store).unwrap();
+    assert_eq!(&bytes[..9], STORE_MAGIC, "expected a header store");
+    bytes[9..13].copy_from_slice(&8u32.to_le_bytes());
+    std::fs::write(&store, &bytes).unwrap();
+
+    let second = run_in(&root, &["analyze", "-p", "."]);
+    let text = combined(&second);
+    assert!(second.status.success(), "got: {text}");
+    assert!(
+        text.contains("rebuilt store v8"),
+        "the stale store must be reported as rebuilt: {text}"
+    );
+    assert!(
+        text.contains("1 unchanged"),
+        "this must be the incremental path (fingerprints unchanged): {text}"
+    );
+}
+
+/// `[store] format = "json"` is the non-default opt-in, and its version gate is a
+/// separate code path (`json_peek_version` / `load_json`). The fixture is a real
+/// store whose `version` field was downgraded: a hand-written `{"version": 8}`
+/// would only prove that a truncated document fails to deserialize, not that the
+/// version gate fires.
+#[test]
+fn stale_json_store_is_reported_and_rebuilt() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("baseline");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("codeweb.toml"),
+        "[project]\nname = \"baseline\"\n\n[analysis]\npaths = [\".\"]\n\n\
+         [store]\npath = \".codeweb/store.json\"\nformat = \"json\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("a.sql"), "SELECT 1;\n").unwrap();
+
+    let first = run_in(&root, &["analyze", "-p", "."]);
+    assert!(first.status.success(), "got: {}", combined(&first));
+
+    let store_path = root.join(".codeweb/store.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
+    json["version"] = serde_json::Value::from(8u64);
+    std::fs::write(&store_path, serde_json::to_string(&json).unwrap()).unwrap();
+
+    let detail = run_in(&root, &["detail", "anything", "-p", "."]);
+    assert!(!detail.status.success());
+    let text = combined(&detail);
+    assert!(text.contains("version 8"), "got: {text}");
+    assert!(text.contains("codeweb analyze -p"), "got: {text}");
+    assert!(text.contains("not migrated"), "got: {text}");
+
+    let analyze = run_in(&root, &["analyze", "-p", "."]);
+    assert!(analyze.status.success(), "got: {}", combined(&analyze));
+    assert!(
+        combined(&analyze).contains("rebuilt store v8"),
+        "the JSON format must report the rebuild too, got: {}",
+        combined(&analyze)
+    );
+
+    let stats = run_in(&root, &["stats", "-p", "."]);
+    assert!(
+        stats.status.success(),
+        "the rebuilt JSON store must load: {}",
         combined(&stats)
     );
 }

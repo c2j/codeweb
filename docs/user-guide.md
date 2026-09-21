@@ -296,7 +296,11 @@ codeweb init <项目名> -d <目录1> [-d <目录2> ...]
 codeweb init erp-system -d src/main/java -d sql/procedures -d sql/functions
 
 # 项目就建在另一个目录里（不在当前目录留下任何文件）
-codeweb init baseline --root /path/to/基线代码
+# 该目录里已有源码文件，所以必须显式加 --force
+codeweb init baseline --root /path/to/基线代码 --force
+
+# 目标目录为空时可以不加 --force
+codeweb init demo --root /tmp/demo-project
 ```
 
 执行后会在项目根目录创建 `codeweb.toml` 并立即进行首次全量分析。
