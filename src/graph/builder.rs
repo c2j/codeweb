@@ -3962,9 +3962,12 @@ impl GraphBuilder {
             }
             edges_to_remove.extend(edge_indices);
         }
-        for idx in edges_to_remove {
-            graph.remove_edge(idx);
-        }
+        // petgraph's `remove_edge` is a swap-remove: removing the batch in
+        // `merge_targets` HashMap iteration order made an intended removal a
+        // silent no-op whenever the swapped-in edge was itself pending, so a
+        // duplicate `table_access` edge survived nondeterministically (issue
+        // #175). Descending order keeps every pending index valid.
+        crate::graph::remove_edges_descending(graph, edges_to_remove);
     }
 
     /// Post-processing pass: resolve unresolved nodes against the complete graph.
@@ -5214,6 +5217,95 @@ mod tests {
                 )
             });
         assert_eq!(predicates.len(), 1);
+    }
+
+    /// Issue #175: `merge_table_access_edges` collects removals in
+    /// `merge_targets` HashMap iteration order. `petgraph`'s `remove_edge` is a
+    /// swap-remove, so an ascending-ish order turned an intended removal into a
+    /// silent no-op whenever the swapped-in last edge was itself pending,
+    /// leaving a duplicate `table_access` edge behind and making `analyze`
+    /// report a fluctuating edge count. With several duplicate groups the
+    /// buggy order almost never comes out perfectly descending, so this fails
+    /// reliably before the fix and is deterministic after it.
+    #[test]
+    fn merge_table_access_edges_leaves_no_duplicate_across_multiple_groups() {
+        use crate::graph::{AccessMode, CodeGraph, DataFlowKind, SourceLocation};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let file = Arc::new(PathBuf::from("t.sql"));
+        let loc = |line: usize| SourceLocation {
+            file: file.clone(),
+            line,
+        };
+
+        let mut graph = CodeGraph::new();
+        let proc_idx = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("p".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let table_idx: Vec<_> = (0..8)
+            .map(|i| {
+                graph.add_node(Node::Unresolved {
+                    raw_expr: Box::new(format!("t{i}")),
+                    context: Box::new("test".to_string()),
+                })
+            })
+            .collect();
+
+        // All "keep" edges first, then all "remove" edges. The removals then
+        // include the last edge index, the configuration that breaks under an
+        // arbitrary removal order.
+        for (i, &t) in table_idx.iter().enumerate() {
+            graph.add_edge(
+                proc_idx,
+                t,
+                Edge::TableAccess {
+                    flow_kind: DataFlowKind::DmlAccess,
+                    modes: AccessMode::Read,
+                    write_kinds: HashSet::new(),
+                    location: loc(i),
+                    column_analysis: None,
+                },
+            );
+        }
+        for (i, &t) in table_idx.iter().enumerate() {
+            graph.add_edge(
+                proc_idx,
+                t,
+                Edge::TableAccess {
+                    flow_kind: DataFlowKind::DmlAccess,
+                    modes: AccessMode::Write,
+                    write_kinds: HashSet::new(),
+                    location: loc(100 + i),
+                    column_analysis: None,
+                },
+            );
+        }
+        assert_eq!(graph.edge_count(), 16);
+
+        GraphBuilder::merge_table_access_edges(&mut graph);
+
+        let mut seen: HashSet<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> =
+            HashSet::new();
+        for edge_idx in graph.edge_indices() {
+            let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
+            assert!(
+                matches!(&graph[edge_idx], Edge::TableAccess { .. }),
+                "non-TableAccess edge {edge_idx:?} appeared out of nowhere"
+            );
+            assert!(
+                seen.insert((src, dst)),
+                "duplicate table_access edge {src:?}->{dst:?} survived the merge"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            8,
+            "each of the 8 proc->table groups must collapse to exactly 1 edge, got {}",
+            seen.len()
+        );
+        assert_eq!(graph.edge_count(), 8);
     }
 
     /// 方案A (issue #165): merged TableAccess edges must UNION diagnostic fields,

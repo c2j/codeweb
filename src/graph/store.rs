@@ -1777,9 +1777,9 @@ impl GraphStore {
             }
             edges_to_remove.extend(edge_indices);
         }
-        for idx in edges_to_remove {
-            graph.remove_edge(idx);
-        }
+        // Same swap-remove hazard as the single-store path (issue #175):
+        // descending order keeps every pending EdgeIndex valid.
+        crate::graph::remove_edges_descending(graph, edges_to_remove);
     }
 }
 

@@ -826,6 +826,27 @@ pub enum Edge {
 /// The call graph itself.
 pub type CodeGraph = petgraph::Graph<Node, Edge>;
 
+/// Remove a batch of edges by index, leaving no survivors.
+///
+/// `petgraph::Graph::remove_edge` is a swap-remove: it moves the *last* edge
+/// into the freed slot. Removing a batch in arbitrary order therefore turns a
+/// later removal into a silent no-op whenever the swapped-in edge was itself
+/// pending removal, leaving a duplicate behind (issue #175 made `analyze` emit
+/// a fluctuating edge count exactly this way). Removing in descending index
+/// order keeps every pending index valid, since higher indices are gone before
+/// a lower slot can receive one. Same pattern as `resolve_unresolved_nodes`
+/// and `GraphStore::dedup`.
+pub fn remove_edges_descending(
+    graph: &mut CodeGraph,
+    mut indices: Vec<petgraph::graph::EdgeIndex>,
+) {
+    indices.sort_unstable();
+    indices.dedup();
+    for idx in indices.into_iter().rev() {
+        graph.remove_edge(idx);
+    }
+}
+
 impl Edge {
     pub fn category(&self) -> EdgeCategory {
         match self {
@@ -957,6 +978,60 @@ mod tests {
         let json = serde_json::to_string(&modes).unwrap();
         let back: AccessMode = serde_json::from_str(&json).unwrap();
         assert_eq!(modes, back);
+    }
+
+    /// Issue #175: `petgraph::Graph::remove_edge` is a swap-remove: it moves the
+    /// *last* edge into the freed slot. Removing a batch in arbitrary order
+    /// therefore turns a later removal into a silent no-op whenever the
+    /// swapped-in edge was itself pending removal, leaving a duplicate behind
+    /// (that is what made `analyze` emit a fluctuating edge count). Descending
+    /// order keeps every pending index valid, since higher indices are gone
+    /// before a lower slot can receive one.
+    #[test]
+    fn remove_edges_descending_keeps_every_pending_index_valid() {
+        let file = Arc::new(PathBuf::from("t.sql"));
+        let loc = |line: usize| SourceLocation {
+            file: file.clone(),
+            line,
+        };
+
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("a".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let b = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("b".to_string()),
+            context: Box::new("test".to_string()),
+        });
+
+        // 5 edges; `location.line` identifies each survivor.
+        let _e0 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(0) });
+        let e1 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(1) });
+        let _e2 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(2) });
+        let _e3 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(3) });
+        let e4 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(4) });
+
+        // Hand the removals over in non-descending order on purpose, and include
+        // the last edge index: ascending removal would swap e4 into e1's slot and
+        // then no-op on e4, leaving e4 alive.
+        remove_edges_descending(&mut graph, vec![e4, e1]);
+
+        let mut surviving: Vec<usize> = graph
+            .edge_weights()
+            .map(|edge| match edge {
+                Edge::UsesSequence { location } => location.line,
+                other => panic!("unexpected edge weight {other:?}"),
+            })
+            .collect();
+        surviving.sort_unstable();
+        assert_eq!(
+            surviving,
+            vec![0, 2, 3],
+            "every pending removal must be gone (e1=line1, e4=line4) and only \
+             untouched edges (e0, e2, e3) may survive"
+        );
+        assert_eq!(graph.edge_count(), 3);
     }
 
     #[test]
