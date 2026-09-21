@@ -1777,9 +1777,9 @@ impl GraphStore {
             }
             edges_to_remove.extend(edge_indices);
         }
-        for idx in edges_to_remove {
-            graph.remove_edge(idx);
-        }
+        // Same swap-remove hazard as the single-store path (issue #175):
+        // descending order keeps every pending EdgeIndex valid.
+        crate::graph::remove_edges_descending(graph, edges_to_remove);
     }
 }
 
@@ -4147,6 +4147,85 @@ mod tests {
             "identical AnchorsOn edges from two stores on the same (proc, table) \
              pair must collapse to exactly 1 edge, got {:?}",
             anchor_edges
+        );
+    }
+
+    /// Issue #175: the cross-store path (`codeweb merge`) batches its
+    /// `table_access` removals through the same helper, so it is exposed to the
+    /// same swap-remove hazard. A single duplicated `(proc, table)` pair cannot
+    /// expose it (one removal is always safe); with several pairs an arbitrary
+    /// removal order almost never comes out perfectly descending, so this fails
+    /// reliably before the fix and is deterministic after it.
+    #[test]
+    fn merge_leaves_no_duplicate_table_access_across_stores() {
+        let loc = crate::graph::SourceLocation {
+            file: std::sync::Arc::new(std::path::PathBuf::from("a.sql")),
+            line: 1,
+        };
+
+        let build = |name: &str, modes: crate::graph::AccessMode| {
+            let mut graph = CodeGraph::new();
+            let proc_idx = graph.add_node(make_proc(None, Some("pkg_x"), "proc_a"));
+            for i in 0..8 {
+                let table = graph.add_node(crate::graph::Node::Table {
+                    schema: None,
+                    name: format!("t_{i}"),
+                    explicit: false,
+                    system: false,
+                    location: None,
+                    columns: Box::new(vec![]),
+                    partition_by: None,
+                    distribute_by: None,
+                    tablespace: None,
+                    temporary: false,
+                    unlogged: false,
+                    ddl_source: None,
+                });
+                graph.add_edge(
+                    proc_idx,
+                    table,
+                    crate::graph::Edge::TableAccess {
+                        flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                        modes,
+                        write_kinds: std::collections::HashSet::new(),
+                        location: loc.clone(),
+                        column_analysis: None,
+                    },
+                );
+            }
+            GraphStore::from_graph(name, graph)
+        };
+
+        let merged = GraphStore::merge(
+            vec![
+                build("a", crate::graph::AccessMode::Read),
+                build("b", crate::graph::AccessMode::Write),
+            ],
+            "combined",
+        );
+
+        let mut seen: std::collections::HashSet<(NodeIndex, NodeIndex)> =
+            std::collections::HashSet::new();
+        for edge_idx in merged.graph().edge_indices() {
+            let crate::graph::Edge::TableAccess { modes, .. } = &merged.graph()[edge_idx] else {
+                continue;
+            };
+            let (src, dst) = merged.graph().edge_endpoints(edge_idx).unwrap();
+            assert!(
+                seen.insert((src, dst)),
+                "duplicate TableAccess edge {src:?}->{dst:?} survived the merge"
+            );
+            assert!(
+                modes.contains(crate::graph::AccessMode::Read)
+                    && modes.contains(crate::graph::AccessMode::Write),
+                "both stores' access modes must be unioned onto the surviving edge, got {modes:?}"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            8,
+            "each of the 8 proc->table pairs must collapse to exactly 1 edge, got {}",
+            seen.len()
         );
     }
 

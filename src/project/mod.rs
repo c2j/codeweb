@@ -200,6 +200,17 @@ impl Project {
             }
         }
 
+        // Chunk order decides node creation order, so it decides graph indices
+        // and therefore exported NDJSON. `scan_directory` yields WalkDir order,
+        // which is filesystem readdir order and not guaranteed stable, so sort
+        // every list so the same source set always produces the same graph
+        // (issue #175).
+        all_sql_paths.sort();
+        all_java_paths.sort();
+        all_xml_paths.sort();
+        #[cfg(feature = "jsp")]
+        all_jsp_paths.sort();
+
         #[cfg(feature = "jsp")]
         let total =
             all_sql_paths.len() + all_java_paths.len() + all_xml_paths.len() + all_jsp_paths.len();
@@ -225,7 +236,6 @@ impl Project {
             .sql_chunk_size
             .max(1)
             .min(DEFAULT_SQL_CHUNK_SIZE.max(1));
-        all_sql_paths.sort();
         let total_sql = all_sql_paths.len();
         let sql_chunks = total_sql.div_ceil(sql_chunk_size);
 

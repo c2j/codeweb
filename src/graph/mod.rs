@@ -180,6 +180,26 @@ pub fn write_kind_label(kind: &WriteKind) -> &'static str {
     }
 }
 
+/// Serialize `Edge::TableAccess::write_kinds` in a stable order.
+///
+/// The field is a `HashSet`, so the derived impl emitted its iteration order:
+/// two runs on the same input produced different store bytes and different
+/// `export --format json` output for an identical graph (issue #175). Sorting by
+/// the canonical label keeps the wire format a plain sequence — token spellings
+/// and bincode layout are unchanged — while making it a pure function of the
+/// content.
+fn serialize_sorted_write_kinds<S>(
+    kinds: &std::collections::HashSet<WriteKind>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut sorted: Vec<&WriteKind> = kinds.iter().collect();
+    sorted.sort_by_key(|kind| write_kind_label(kind));
+    sorted.serialize(serializer)
+}
+
 pub fn is_ddl_write_kind(kind: &WriteKind) -> bool {
     matches!(
         kind,
@@ -780,6 +800,8 @@ pub enum Edge {
     TableAccess {
         flow_kind: DataFlowKind,
         modes: AccessMode,
+        /// Sorted on the wire — see [`serialize_sorted_write_kinds`].
+        #[serde(serialize_with = "serialize_sorted_write_kinds")]
         write_kinds: std::collections::HashSet<WriteKind>,
         location: SourceLocation,
         #[serde(default)]
@@ -825,6 +847,27 @@ pub enum Edge {
 
 /// The call graph itself.
 pub type CodeGraph = petgraph::Graph<Node, Edge>;
+
+/// Remove a batch of edges by index, leaving no survivors.
+///
+/// `petgraph::Graph::remove_edge` is a swap-remove: it moves the *last* edge
+/// into the freed slot. Removing a batch in arbitrary order therefore turns a
+/// later removal into a silent no-op whenever the swapped-in edge was itself
+/// pending removal, leaving a duplicate behind (issue #175 made `analyze` emit
+/// a fluctuating edge count exactly this way). Removing in descending index
+/// order keeps every pending index valid, since higher indices are gone before
+/// a lower slot can receive one. Same pattern as `resolve_unresolved_nodes`
+/// and `GraphStore::dedup`.
+pub fn remove_edges_descending(
+    graph: &mut CodeGraph,
+    mut indices: Vec<petgraph::graph::EdgeIndex>,
+) {
+    indices.sort_unstable();
+    indices.dedup();
+    for idx in indices.into_iter().rev() {
+        graph.remove_edge(idx);
+    }
+}
 
 impl Edge {
     pub fn category(&self) -> EdgeCategory {
@@ -957,6 +1000,119 @@ mod tests {
         let json = serde_json::to_string(&modes).unwrap();
         let back: AccessMode = serde_json::from_str(&json).unwrap();
         assert_eq!(modes, back);
+    }
+
+    /// Issue #175: `petgraph::Graph::remove_edge` is a swap-remove: it moves the
+    /// *last* edge into the freed slot. Removing a batch in arbitrary order
+    /// therefore turns a later removal into a silent no-op whenever the
+    /// swapped-in edge was itself pending removal, leaving a duplicate behind
+    /// (that is what made `analyze` emit a fluctuating edge count). Descending
+    /// order keeps every pending index valid, since higher indices are gone
+    /// before a lower slot can receive one.
+    #[test]
+    fn remove_edges_descending_keeps_every_pending_index_valid() {
+        let file = Arc::new(PathBuf::from("t.sql"));
+        let loc = |line: usize| SourceLocation {
+            file: file.clone(),
+            line,
+        };
+
+        let mut graph = CodeGraph::new();
+        let a = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("a".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let b = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("b".to_string()),
+            context: Box::new("test".to_string()),
+        });
+
+        // 5 edges; `location.line` identifies each survivor.
+        let _e0 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(0) });
+        let e1 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(1) });
+        let _e2 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(2) });
+        let _e3 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(3) });
+        let e4 = graph.add_edge(a, b, Edge::UsesSequence { location: loc(4) });
+
+        // Hand the removals over in non-descending order on purpose, and include
+        // the last edge index: ascending removal would swap e4 into e1's slot and
+        // then no-op on e4, leaving e4 alive.
+        remove_edges_descending(&mut graph, vec![e4, e1]);
+
+        let mut surviving: Vec<usize> = graph
+            .edge_weights()
+            .map(|edge| match edge {
+                Edge::UsesSequence { location } => location.line,
+                other => panic!("unexpected edge weight {other:?}"),
+            })
+            .collect();
+        surviving.sort_unstable();
+        assert_eq!(
+            surviving,
+            vec![0, 2, 3],
+            "every pending removal must be gone (e1=line1, e4=line4) and only \
+             untouched edges (e0, e2, e3) may survive"
+        );
+        assert_eq!(graph.edge_count(), 3);
+    }
+
+    #[test]
+    fn write_kinds_serialize_in_a_stable_order() {
+        use std::collections::HashSet;
+
+        // `write_kinds` is a `HashSet`, so a plain derive emitted its iteration
+        // order: two runs on the same input produced different store bytes and
+        // different `export --format json` output for the same graph (issue
+        // #175). The serialized form must be sorted by the canonical label.
+        let kinds: HashSet<WriteKind> = [
+            WriteKind::Update,
+            WriteKind::Insert,
+            WriteKind::Truncate,
+            WriteKind::MergeDelete,
+            WriteKind::Vacuum,
+            WriteKind::Delete,
+        ]
+        .into_iter()
+        .collect();
+        let edge = Edge::TableAccess {
+            flow_kind: DataFlowKind::DmlAccess,
+            modes: AccessMode::Write,
+            write_kinds: kinds.clone(),
+            location: SourceLocation {
+                file: Arc::new(PathBuf::from("t.sql")),
+                line: 1,
+            },
+            column_analysis: None,
+        };
+
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(
+            json.contains(
+                r#""write_kinds":["Delete","Insert","MergeDelete","Truncate","Update","Vacuum"]"#
+            ),
+            "write_kinds must serialize in sorted label order, got: {json}"
+        );
+
+        // Two independent sets with the same content must serialize identically.
+        let reordered: HashSet<WriteKind> = [
+            WriteKind::Vacuum,
+            WriteKind::Delete,
+            WriteKind::MergeDelete,
+            WriteKind::Truncate,
+            WriteKind::Insert,
+            WriteKind::Update,
+        ]
+        .into_iter()
+        .collect();
+        let mut other = edge.clone();
+        if let Edge::TableAccess { write_kinds, .. } = &mut other {
+            *write_kinds = reordered;
+        }
+        assert_eq!(
+            serde_json::to_string(&other).unwrap(),
+            json,
+            "the same write_kinds content must serialize identically regardless of insertion order"
+        );
     }
 
     #[test]

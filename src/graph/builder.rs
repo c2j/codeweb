@@ -3789,6 +3789,14 @@ impl GraphBuilder {
         // (Phase 1 merges are appended first, so they take priority).
         let mut seen_from = std::collections::HashSet::new();
         merges.retain(|(from, _)| seen_from.insert(*from));
+        // Phase 2 collects its pairs by iterating a `HashMap` of bare table
+        // names, so `merges` used to arrive here in an order that varied per
+        // process. Phase A re-appends rewired edges in `merges` order, which
+        // made the graph's edge array (and therefore the exported NDJSON) differ
+        // between two runs on the same input even when every count matched
+        // (issue #175). Sorting by node index makes the append order, and the
+        // leftover array order, a pure function of the input.
+        merges.sort_unstable();
 
         // Phase A: rewire all edges from merged nodes to their targets.
         // This must happen BEFORE any removal because petgraph's Graph uses
@@ -3962,9 +3970,12 @@ impl GraphBuilder {
             }
             edges_to_remove.extend(edge_indices);
         }
-        for idx in edges_to_remove {
-            graph.remove_edge(idx);
-        }
+        // petgraph's `remove_edge` is a swap-remove: removing the batch in
+        // `merge_targets` HashMap iteration order made an intended removal a
+        // silent no-op whenever the swapped-in edge was itself pending, so a
+        // duplicate `table_access` edge survived nondeterministically (issue
+        // #175). Descending order keeps every pending index valid.
+        crate::graph::remove_edges_descending(graph, edges_to_remove);
     }
 
     /// Post-processing pass: resolve unresolved nodes against the complete graph.
@@ -5214,6 +5225,147 @@ mod tests {
                 )
             });
         assert_eq!(predicates.len(), 1);
+    }
+
+    /// Two builds of the same input must produce the same graph, edge order
+    /// included. `HashMap`/`HashSet` iteration order varies per instance, so
+    /// building twice in one process is enough to expose an order-sensitive
+    /// rewrite; the fixture is the dynamic-SQL case that surfaced it.
+    #[test]
+    fn building_the_same_input_twice_yields_the_same_edge_order() {
+        use crate::graph::builder::GraphBuildContext;
+        use crate::graph::CodeGraph as CG;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regress/execute_immediate_expr/cases/ei_complex_expr.sql");
+        let parsed = crate::parser::parse_sql_files(&[path.clone()]);
+        assert!(!parsed.is_empty(), "fixture must parse: {}", path.display());
+
+        let edge_sequence = |graph: &CG| -> Vec<String> {
+            graph
+                .edge_indices()
+                .map(|e| {
+                    let (src, dst) = graph.edge_endpoints(e).unwrap();
+                    let debug = format!("{:?}", &graph[e]);
+                    let tag: String = debug
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    format!("{}->{}:{}", src.index(), dst.index(), tag)
+                })
+                .collect()
+        };
+        let build_once = || {
+            let mut ctx = GraphBuildContext::new();
+            GraphBuilder::build_sql_chunk(&mut ctx, &parsed);
+            GraphBuilder::finalize_graph(&mut ctx);
+            edge_sequence(&ctx.graph)
+        };
+
+        let first = build_once();
+        let second = build_once();
+
+        let divergence = first
+            .iter()
+            .zip(second.iter())
+            .position(|(a, b)| a != b)
+            .map(|i| (i, first[i].clone(), second[i].clone()));
+        assert_eq!(
+            first, second,
+            "the same input must produce the same edge order; first divergence at {:?}",
+            divergence
+        );
+        assert!(
+            first.len() > 10,
+            "fixture should produce a non-trivial graph, got {} edges",
+            first.len()
+        );
+    }
+
+    /// `merge_table_access_edges` batches removals in `merge_targets` HashMap
+    /// iteration order while `petgraph`'s `remove_edge` is a swap-remove, so the
+    /// batch must be deleted in descending index order or an intended removal
+    /// becomes a no-op. Several duplicate groups make an arbitrary order almost
+    /// never come out perfectly descending.
+    #[test]
+    fn merge_table_access_edges_leaves_no_duplicate_across_multiple_groups() {
+        use crate::graph::{AccessMode, CodeGraph, DataFlowKind, SourceLocation};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let file = Arc::new(PathBuf::from("t.sql"));
+        let loc = |line: usize| SourceLocation {
+            file: file.clone(),
+            line,
+        };
+
+        let mut graph = CodeGraph::new();
+        let proc_idx = graph.add_node(Node::Unresolved {
+            raw_expr: Box::new("p".to_string()),
+            context: Box::new("test".to_string()),
+        });
+        let table_idx: Vec<_> = (0..8)
+            .map(|i| {
+                graph.add_node(Node::Unresolved {
+                    raw_expr: Box::new(format!("t{i}")),
+                    context: Box::new("test".to_string()),
+                })
+            })
+            .collect();
+
+        // All "keep" edges first, then all "remove" edges. The removals then
+        // include the last edge index, the configuration that breaks under an
+        // arbitrary removal order.
+        for (i, &t) in table_idx.iter().enumerate() {
+            graph.add_edge(
+                proc_idx,
+                t,
+                Edge::TableAccess {
+                    flow_kind: DataFlowKind::DmlAccess,
+                    modes: AccessMode::Read,
+                    write_kinds: HashSet::new(),
+                    location: loc(i),
+                    column_analysis: None,
+                },
+            );
+        }
+        for (i, &t) in table_idx.iter().enumerate() {
+            graph.add_edge(
+                proc_idx,
+                t,
+                Edge::TableAccess {
+                    flow_kind: DataFlowKind::DmlAccess,
+                    modes: AccessMode::Write,
+                    write_kinds: HashSet::new(),
+                    location: loc(100 + i),
+                    column_analysis: None,
+                },
+            );
+        }
+        assert_eq!(graph.edge_count(), 16);
+
+        GraphBuilder::merge_table_access_edges(&mut graph);
+
+        let mut seen: HashSet<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)> =
+            HashSet::new();
+        for edge_idx in graph.edge_indices() {
+            let (src, dst) = graph.edge_endpoints(edge_idx).unwrap();
+            assert!(
+                matches!(&graph[edge_idx], Edge::TableAccess { .. }),
+                "non-TableAccess edge {edge_idx:?} appeared out of nowhere"
+            );
+            assert!(
+                seen.insert((src, dst)),
+                "duplicate table_access edge {src:?}->{dst:?} survived the merge"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            8,
+            "each of the 8 proc->table groups must collapse to exactly 1 edge, got {}",
+            seen.len()
+        );
+        assert_eq!(graph.edge_count(), 8);
     }
 
     /// 方案A (issue #165): merged TableAccess edges must UNION diagnostic fields,
