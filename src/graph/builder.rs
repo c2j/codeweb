@@ -489,26 +489,12 @@ impl GraphBuilder {
     }
 
     /// Drop edges that are indistinguishable from an earlier one: same endpoints,
-    /// same type and same serialized payload.
-    ///
-    /// Each edge type gets its own merge (`merge_table_access_edges`, the
-    /// `AnchorsOn` key, ...), so a type without one can end up holding two copies
-    /// for the same pair — `contains_routine` when a package spec is declared in
-    /// more than one file, `references_type` when one declaration is collected
-    /// twice. Since no field distinguishes the copies, every consumer (export,
-    /// `detail`, traversal) sees pure duplication: two identical records in the
-    /// export, inflated degree counts, and edge totals that no longer match the
-    /// distinct edges a user can see. Collapsing them therefore loses nothing.
-    ///
-    /// Distinguishable edges are untouched: the payload is part of the key, so
-    /// `AnchorsOn` on different columns/sites and `TableAccess` with different
-    /// `flow_kind` both survive.
+    /// same type and same serialized payload. Edges that differ in any payload
+    /// field survive, since the payload is part of the key.
     fn drop_identical_duplicate_edges(graph: &mut CodeGraph) {
-        // Group by endpoints *and edge variant* first, without serializing
-        // anything: only a group with more than one member can contain a
-        // duplicate. Serializing every edge up front cost ~0.5s on an 8k-edge
-        // corpus, because a `table_access` payload carries a whole
-        // `ColumnAnalysis` and all the payload strings had to stay alive at once.
+        // Group by endpoints *and edge variant* first: only a group with more
+        // than one member can hold a duplicate, so payloads are serialized only
+        // for those instead of once per edge.
         type EdgeKey = (
             petgraph::graph::NodeIndex,
             petgraph::graph::NodeIndex,
@@ -521,10 +507,8 @@ impl GraphBuilder {
             (src, dst, std::mem::discriminant(&graph[edge_idx]))
         };
 
-        // Pass 1: just count. Duplicates need at least two edges between the same
-        // pair with the same variant, so when no key repeats there is nothing to
-        // do — the overwhelmingly common case, which must not allocate a
-        // per-group `Vec` nor serialize a single payload.
+        // Pass 1: just count, so the common case (no repeated key) returns
+        // without allocating per-group `Vec`s.
         let mut counts: HashMap<EdgeKey, usize> = HashMap::new();
         for edge_idx in graph.edge_indices() {
             *counts.entry(key_of(graph, edge_idx)).or_insert(0) += 1;
