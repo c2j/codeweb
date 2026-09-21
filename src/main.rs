@@ -251,9 +251,21 @@ enum Commands {
         /// Project name
         name: String,
 
+        /// Directory that becomes the project root: codeweb.toml and .codeweb/
+        /// are written there instead of the current directory (issue #180).
+        /// Defaults to the current directory. Relative -d paths are resolved
+        /// inside this root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+
         /// Source directories to analyze (can specify multiple)
         #[arg(short, long)]
         dir: Vec<PathBuf>,
+
+        /// Allow writing the project into a non-empty --root that has no
+        /// codeweb.toml yet (issue #180)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Analyze project (full or incremental)
@@ -940,7 +952,12 @@ fn run() -> Result<()> {
             }
             cmd_legacy(cli)
         }
-        Some(Commands::Init { name, dir }) => cmd_init(&name, &dir),
+        Some(Commands::Init {
+            name,
+            root,
+            dir,
+            force,
+        }) => cmd_init(&name, root.as_deref(), &dir, force),
         Some(Commands::Analyze { project }) => cmd_analyze(&project),
         Some(Commands::Diff { project }) => cmd_diff(&project),
         Some(Commands::Export {
@@ -1316,8 +1333,33 @@ fn cmd_conflicts(
     Ok(())
 }
 
-fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {
-    let mut proj = project::Project::init(dirs, name)?;
+/// `-d` keeps its documented meaning (analysis dirs, project rooted at the cwd);
+/// `--root` is the explicit way to name the root instead. The non-empty guard
+/// keys on the flag rather than on "differs from the cwd", so `--root .` is
+/// checked too.
+fn cmd_init(name: &str, root: Option<&Path>, dirs: &[PathBuf], force: bool) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let explicit_root = root.is_some();
+    let root = match root {
+        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+        Some(dir) => cwd.join(dir),
+        None => cwd.clone(),
+    };
+
+    if explicit_root && !force {
+        let populated = std::fs::read_dir(&root)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if populated && !root.join(project::CODEWEB_TOML).exists() {
+            return Err(error::CodeWebError::InitTargetNotEmpty { path: root });
+        }
+    }
+
+    let mut proj = if root == cwd {
+        project::Project::init(dirs, name)?
+    } else {
+        project::Project::init_at(&root, dirs, name)?
+    };
     eprintln!(
         "Initialized project '{}' in {}",
         proj.name(),
@@ -1330,8 +1372,20 @@ fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {
 
 fn cmd_analyze(project: &Path) -> Result<()> {
     let mut proj = project::Project::find(project)?;
+    // Issue #180: a stale store is replaced silently otherwise, which leaves the
+    // user guessing whether the old one is still in play.
+    let stale_store = proj.stale_store_version();
     let report = proj.analyze()?;
     print_analyze_report(&report);
+    if let Some(found) = stale_store {
+        if !report.is_up_to_date {
+            eprintln!(
+                "rebuilt store v{} → v{}",
+                found,
+                graph::store::STORE_VERSION
+            );
+        }
+    }
     Ok(())
 }
 

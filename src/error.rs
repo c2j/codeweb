@@ -20,6 +20,12 @@ pub enum CodeWebError {
     #[error("project already exists at {path}")]
     ProjectAlreadyExists { path: PathBuf },
 
+    #[error(
+        "refusing to initialize in {path}: the directory is not empty and has no codeweb.toml \
+         (re-run with --force to write codeweb.toml and .codeweb/ there)"
+    )]
+    InitTargetNotEmpty { path: PathBuf },
+
     #[error("config error: {message}")]
     ConfigError { message: String },
 }

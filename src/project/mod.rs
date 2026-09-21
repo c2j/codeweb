@@ -9,7 +9,7 @@ use config::ProjectConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const CODEWEB_TOML: &str = "codeweb.toml";
+pub const CODEWEB_TOML: &str = "codeweb.toml";
 
 pub struct Project {
     root: PathBuf,
@@ -553,6 +553,21 @@ impl Project {
     pub fn load_manifest_only(&self) -> HashMap<PathBuf, FileRecord> {
         let store_path = self.store_path();
         GraphStore::load_manifest_sidecar(&store_path).unwrap_or_default()
+    }
+
+    /// Version of the on-disk store when it exists but predates the current
+    /// layout, i.e. `analyze` is about to replace it (issue #180). `None` when
+    /// the store is already current, absent, or unreadable/headerless.
+    pub fn stale_store_version(&self) -> Option<u32> {
+        if self.store_is_current() {
+            return None;
+        }
+        let path = self.store_path();
+        let version = match self.config.store.format {
+            config::StoreFormat::Bincode => GraphStore::peek_version(&path),
+            config::StoreFormat::Json => GraphStore::json_peek_version(&path),
+        };
+        version.filter(|found| *found != crate::graph::store::STORE_VERSION)
     }
 
     /// True when the on-disk store carries the current layout version. The
