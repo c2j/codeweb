@@ -171,6 +171,14 @@ fn init_root_resolves_dir_paths_inside_the_root() {
         toml.contains("sql"),
         "with --root, -d is resolved inside the root, got:\n{toml}"
     );
+    // The point of resolving `-d` inside the root is that analysis actually sees
+    // the files; asserting only on the toml text would pass even if the path
+    // resolved somewhere empty.
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("1 files"),
+        "the -d directory inside --root must be analyzed, got: {stderr}"
+    );
     assert!(
         !cwd.join("codeweb.toml").exists(),
         "the cwd must stay untouched"
