@@ -1330,8 +1330,20 @@ fn cmd_init(name: &str, dirs: &[PathBuf]) -> Result<()> {
 
 fn cmd_analyze(project: &Path) -> Result<()> {
     let mut proj = project::Project::find(project)?;
+    // Issue #180: a stale store is replaced silently otherwise, which leaves the
+    // user guessing whether the old one is still in play.
+    let stale_store = proj.stale_store_version();
     let report = proj.analyze()?;
     print_analyze_report(&report);
+    if let Some(found) = stale_store {
+        if !report.is_up_to_date {
+            eprintln!(
+                "rebuilt store v{} → v{}",
+                found,
+                graph::store::STORE_VERSION
+            );
+        }
+    }
     Ok(())
 }
 
