@@ -32,14 +32,34 @@ fn codeweb_bin() -> PathBuf {
     base.join("debug").join(bin_name)
 }
 
+/// Escape `value` so it can be embedded in a TOML basic string (`"..."`).
+///
+/// Integration tests link the binary crate, so the library's
+/// `escape_toml_basic_string` is not reachable here; this mirrors it for the
+/// values we interpolate. Windows `CARGO_MANIFEST_DIR` is e.g.
+/// `D:\a\codeweb\codeweb`, and an unescaped backslash makes TOML parsing fail
+/// with `invalid escape sequence`.
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn write_project(root: &Path, name: &str, source: &Path) {
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(
         root.join("codeweb.toml"),
         format!(
-            "[project]\nname = \"{name}\"\n\n[analysis]\npaths = [\"{}\"]\n\n\
+            "[project]\nname = \"{}\"\n\n[analysis]\npaths = [\"{}\"]\n\n\
              [store]\npath = \".codeweb/store.bincode\"\nformat = \"bincode\"\n",
-            source.display()
+            toml_basic_string(name),
+            toml_basic_string(&source.display().to_string())
         ),
     )
     .unwrap();
@@ -112,6 +132,26 @@ impl Drop for McpChild {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn write_project_escapes_windows_style_paths_so_the_config_parses() {
+    // Regression: on `x86_64-pc-windows-msvc` the source path is
+    // `D:\a\codeweb\codeweb\tests/...`; written raw into a TOML basic string it
+    // fails with `invalid escape sequence`, so `codeweb analyze` never ran.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("win_style");
+    let source = Path::new(r"D:\a\codeweb\codeweb\tests\regress");
+
+    write_project(&root, "entry", source);
+
+    let written = std::fs::read_to_string(root.join("codeweb.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&written).expect("codeweb.toml must parse");
+    assert_eq!(
+        parsed["analysis"]["paths"][0].as_str().unwrap(),
+        source.display().to_string(),
+        "the written path must round-trip through TOML unchanged"
+    );
 }
 
 #[test]
