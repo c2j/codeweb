@@ -148,6 +148,9 @@ pub struct GraphBuildContext {
     /// Branch predicates keyed by the routine's serialized [`NodeKey`]. Kept outside
     /// the graph because predicates are an analysis side-table, not traversable edges.
     pub procedure_predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
+    /// Declared parameters keyed by the routine's serialized [`NodeKey`], the same
+    /// side-table shape as `procedure_predicates` (#181).
+    pub routine_parameters: HashMap<String, Vec<crate::parser::RoutineParameter>>,
     /// Deferred column comments from `COMMENT ON COLUMN` statements.
     /// Collected during `create_sql_nodes` and applied in `finalize_graph`
     /// after all table columns are populated.
@@ -167,6 +170,7 @@ impl GraphBuildContext {
             inferred_sequence_index: HashMap::new(),
             builtin_index: HashMap::new(),
             procedure_predicates: HashMap::new(),
+            routine_parameters: HashMap::new(),
             deferred_column_comments: Vec::new(),
         }
     }
@@ -230,8 +234,10 @@ impl GraphBuilder {
         );
         Self::finalize_graph(&mut ctx);
         let predicates = std::mem::take(&mut ctx.procedure_predicates);
+        let parameters = std::mem::take(&mut ctx.routine_parameters);
         let mut store = GraphStore::from_graph(project_name, ctx.graph);
         store.set_procedure_predicates(predicates);
+        store.set_routine_parameters(parameters);
         store
     }
 
@@ -348,6 +354,128 @@ impl GraphBuilder {
             &mut ctx.table_index,
         );
         Self::collect_procedure_predicates(ctx, sql_files);
+        Self::collect_routine_parameters(ctx, sql_files);
+    }
+
+    /// Record every declared parameter list, keyed by the routine's serialized
+    /// [`NodeKey`]. The key construction must mirror `collect_procedure_predicates`
+    /// (and therefore `NodeKey::from_node`'s normalization) or the side table is
+    /// silently unreachable.
+    fn collect_routine_parameters(ctx: &mut GraphBuildContext, files: &[ParsedFile]) {
+        for file in files {
+            for info in &file.statements {
+                match &info.statement {
+                    Statement::CreateProcedure(procedure) => {
+                        let id =
+                            RoutineId::from_object_name(&procedure.name, RoutineKind::Procedure)
+                                .normalized();
+                        Self::record_routine_parameters(
+                            ctx,
+                            NodeKey::Procedure {
+                                schema: id.schema,
+                                package: id.package,
+                                name: id.name,
+                            }
+                            .to_string(),
+                            &procedure.parameters,
+                        );
+                    }
+                    Statement::CreateFunction(function) => {
+                        let id = RoutineId::from_object_name(&function.name, RoutineKind::Function)
+                            .normalized();
+                        Self::record_routine_parameters(
+                            ctx,
+                            NodeKey::Function {
+                                schema: id.schema,
+                                package: id.package,
+                                name: id.name,
+                            }
+                            .to_string(),
+                            &function.parameters,
+                        );
+                    }
+                    Statement::CreatePackage(package) => {
+                        Self::collect_package_parameters(ctx, &package.name, &package.items)
+                    }
+                    Statement::CreatePackageBody(package) => {
+                        Self::collect_package_parameters(ctx, &package.name, &package.items)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn collect_package_parameters(
+        ctx: &mut GraphBuildContext,
+        name: &ogsql_parser::ast::ObjectName,
+        items: &[PackageItem],
+    ) {
+        // Mirrors `collect_package_predicates`'s RoutineId construction.
+        let schema = (name.len() > 1).then(|| name[..name.len() - 1].join("."));
+        let package_name = name.last().map(ToString::to_string);
+        for item in items {
+            match item {
+                PackageItem::Procedure(procedure) => {
+                    let id = RoutineId {
+                        schema: schema.clone(),
+                        package: package_name.clone(),
+                        name: procedure.name.join("."),
+                        kind: RoutineKind::Procedure,
+                    }
+                    .normalized();
+                    Self::record_routine_parameters(
+                        ctx,
+                        NodeKey::Procedure {
+                            schema: id.schema,
+                            package: id.package,
+                            name: id.name,
+                        }
+                        .to_string(),
+                        &procedure.parameters,
+                    );
+                }
+                PackageItem::Function(function) => {
+                    let id = RoutineId {
+                        schema: schema.clone(),
+                        package: package_name.clone(),
+                        name: function.name.join("."),
+                        kind: RoutineKind::Function,
+                    }
+                    .normalized();
+                    Self::record_routine_parameters(
+                        ctx,
+                        NodeKey::Function {
+                            schema: id.schema,
+                            package: id.package,
+                            name: id.name,
+                        }
+                        .to_string(),
+                        &function.parameters,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A parameterless routine is left out of the side table entirely, so
+    /// "absent" and "declared nothing" are the same state (as with predicates).
+    fn record_routine_parameters(
+        ctx: &mut GraphBuildContext,
+        key: String,
+        parameters: &[ogsql_parser::ast::RoutineParam],
+    ) {
+        if parameters.is_empty() {
+            return;
+        }
+        ctx.routine_parameters.insert(
+            key,
+            parameters
+                .iter()
+                .map(crate::parser::RoutineParameter::from_ast)
+                .collect(),
+        );
     }
 
     fn collect_procedure_predicates(ctx: &mut GraphBuildContext, files: &[ParsedFile]) {

@@ -170,3 +170,48 @@ fn seed_hints_carries_the_hard_filters_that_shape_the_rows() {
         .unwrap_or_else(|| panic!("kind filter missing from {filters:#?}"));
     assert_eq!(kind["value"]["String"], "0509");
 }
+
+/// A procedure whose signature the seed generator has to satisfy (the issue
+/// names `p_i_date` specifically: the date parameter is what a caller has to
+/// pick before any row can be seeded).
+const SEED_PARAM_SQL: &str = r#"
+CREATE TABLE out_orders(order_id VARCHAR(20), kind VARCHAR(10));
+
+CREATE PROCEDURE prc_seed_params(
+  p_i_date VARCHAR2,
+  p_i_bs   VARCHAR2,
+  p_o_cnt  OUT NUMBER
+) AS
+BEGIN
+  INSERT INTO out_orders(order_id, kind) VALUES (p_i_date, p_i_bs);
+END;
+"#;
+
+#[test]
+fn seed_hints_reports_the_declared_signature() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_PARAM_SQL);
+
+    let hints = seed_hints(&root, "prc_seed_params");
+
+    let params = hints["parameters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("parameters array missing from {hints:#?}"));
+    let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["p_i_date", "p_i_bs", "p_o_cnt"],
+        "parameters must keep signature order, got {params:#?}"
+    );
+    // The parser normalizes keyword types to lowercase; the hint reports what the
+    // AST holds rather than re-casing it.
+    assert_eq!(params[0]["data_type"], "varchar2");
+    assert!(
+        params[0]["mode"].is_null(),
+        "a parameter with no mode keyword has no mode, got {}",
+        params[0]["mode"]
+    );
+    assert_eq!(params[2]["mode"], "OUT");
+    assert_eq!(params[2]["data_type"], "number");
+    assert!(params[0]["default_value"].is_null());
+}

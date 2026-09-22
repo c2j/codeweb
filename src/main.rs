@@ -2018,9 +2018,9 @@ fn cmd_columns(
         // keeps its exact schema; this one is shaped for a generator.
         "seed-hints" => {
             let hints = if is_routine {
-                graph::columns::seed_hints_of_routine(graph, idx, table_filter)
+                graph::columns::seed_hints_of_routine(&store, idx, table_filter)
             } else {
-                graph::columns::seed_hints_of_package(graph, idx, table_filter)
+                graph::columns::seed_hints_of_package(&store, idx, table_filter)
             }
             .ok_or_else(|| error::CodeWebError::ExportError {
                 message: format!("failed to aggregate seed hints for '{}'", name),

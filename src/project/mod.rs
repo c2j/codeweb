@@ -440,8 +440,10 @@ impl Project {
 
         // Phase 6: Build store
         let procedure_predicates = std::mem::take(&mut ctx.procedure_predicates);
+        let routine_parameters = std::mem::take(&mut ctx.routine_parameters);
         let mut new_store = GraphStore::from_graph(&self.config.project.name, ctx.graph);
         new_store.set_procedure_predicates(procedure_predicates);
+        new_store.set_routine_parameters(routine_parameters);
         new_store.enrich_fingerprint_index_with_variants(&variant_map);
 
         // Build manifest from collected hashes (no re-reading files)

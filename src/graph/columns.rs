@@ -19,10 +19,12 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
+use crate::graph::key::NodeKey;
+use crate::graph::store::GraphStore;
 use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node};
 use crate::parser::{
-    ColumnMapping, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition, SelectIntoMapping,
-    UpdateColumnInfo,
+    ColumnMapping, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition, RoutineParameter,
+    SelectIntoMapping, UpdateColumnInfo,
 };
 
 /// `codeweb columns` JSON output schema (schema_version=1).
@@ -107,16 +109,6 @@ pub struct TableSeedHint {
     /// [`write_kind_label`](crate::graph::write_kind_label) seen on a
     /// `TableAccess` edge to this table (`insert`, `update`, `delete`, ...).
     pub ops: Vec<String>,
-}
-
-/// A declared routine parameter (`p_i_date VARCHAR2`).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RoutineParameter {
-    pub name: String,
-    /// `IN` / `OUT` / `IN OUT`, when the declaration states one.
-    pub mode: Option<String>,
-    pub data_type: String,
-    pub default_value: Option<String>,
 }
 
 /// An equality between two tables' columns where at least one side is an
@@ -349,6 +341,17 @@ pub fn column_analysis_of_package(
     })
 }
 
+/// Declared parameters of one routine, from the store's side table (empty when the
+/// routine declared none, or when the store predates `routine_parameters`).
+fn parameters_of_routine(store: &GraphStore, routine: NodeIndex) -> Vec<RoutineParameter> {
+    let key = NodeKey::from_node(&store.graph()[routine]).to_string();
+    store
+        .routine_parameters
+        .get(&key)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Children of a package via `Edge::ContainsRoutine` (the same edge `codeweb detail`'s
 /// package summary uses).
 fn package_children(graph: &CodeGraph, package: NodeIndex) -> Vec<NodeIndex> {
@@ -421,10 +424,11 @@ fn table_operations(
 /// not a `Node::Procedure`/`Node::Function`, mirroring
 /// [`column_analysis_of_routine`]'s defensive contract.
 pub fn seed_hints_of_routine(
-    graph: &CodeGraph,
+    store: &GraphStore,
     routine: NodeIndex,
     table_filter: Option<&str>,
 ) -> Option<SeedHints> {
+    let graph = store.graph();
     let (name, package) = match &graph[routine] {
         Node::Procedure { id, .. } | Node::Function { id, .. } => {
             (id.name.clone(), id.package.clone())
@@ -438,7 +442,7 @@ pub fn seed_hints_of_routine(
         schema_version: 1,
         procedure: name,
         package,
-        parameters: Vec::new(),
+        parameters: parameters_of_routine(store, routine),
         tables: table_operations(graph, &[routine], table_filter),
         hard_filters: diag.hard_filters,
         cross_table_equalities: Vec::new(),
@@ -449,10 +453,11 @@ pub fn seed_hints_of_routine(
 /// Seed-data hints for every routine a package contains. Returns `None` when
 /// `package` is not a `Node::Package`.
 pub fn seed_hints_of_package(
-    graph: &CodeGraph,
+    store: &GraphStore,
     package: NodeIndex,
     table_filter: Option<&str>,
 ) -> Option<SeedHints> {
+    let graph = store.graph();
     let pkg_name = match &graph[package] {
         Node::Package { name, .. } => name.clone(),
         _ => return None,
@@ -461,11 +466,16 @@ pub fn seed_hints_of_package(
     let children = package_children(graph, package);
     let diag = collect_diagnostics(graph, &children, table_filter);
 
+    let parameters = children
+        .iter()
+        .flat_map(|&child| parameters_of_routine(store, child))
+        .collect();
+
     Some(SeedHints {
         schema_version: 1,
         procedure: pkg_name.clone(),
         package: Some(pkg_name),
-        parameters: Vec::new(),
+        parameters,
         tables: table_operations(graph, &children, table_filter),
         hard_filters: diag.hard_filters,
         cross_table_equalities: Vec::new(),

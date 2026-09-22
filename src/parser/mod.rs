@@ -11,6 +11,7 @@ pub mod jsp_preprocessor;
 pub mod jsp_types;
 mod loader;
 mod predicates;
+mod routine;
 pub mod scanner;
 pub mod snippet;
 
@@ -45,5 +46,7 @@ pub use predicates::{
     extract_predicates, Confidence, ParamTableHint, PlPredicate, PredicateClause,
     PredicateExtractor, PredicateKind, TablePredicate,
 };
+#[allow(unused_imports)]
+pub use routine::RoutineParameter;
 #[allow(unused_imports)]
 pub use scanner::{build_exclude_matcher, scan_directory, ScannedFiles};

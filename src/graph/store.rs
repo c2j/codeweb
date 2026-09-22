@@ -34,7 +34,8 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// `HardFilter.transform`. Refs #167, #169.
 /// v13: adds the `Edge::AnchorsOn` variant for `%TYPE`/`%ROWTYPE` schema
 /// anchors (issue #158).
-pub const STORE_VERSION: u32 = 13;
+/// v14: adds the `routine_parameters` side-table (declared signatures, #181).
+pub const STORE_VERSION: u32 = 14;
 
 /// Directory to name in the repair command: the nearest ancestor holding a
 /// `codeweb.toml`, else the store's own directory, else the cwd.
@@ -129,6 +130,9 @@ pub struct GraphStore {
     /// Routine NodeKey string (`proc:...` / `func:...`) → PL IF/CASE predicates.
     #[serde(default)]
     pub procedure_predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
+    /// Routine NodeKey string → declared parameters, in signature order (#181).
+    #[serde(default)]
+    pub routine_parameters: HashMap<String, Vec<crate::parser::RoutineParameter>>,
 }
 
 #[allow(dead_code)]
@@ -154,6 +158,7 @@ impl GraphStore {
             sql_fingerprint_index: HashMap::new(),
             lock_clause_index: HashMap::new(),
             procedure_predicates: HashMap::new(),
+            routine_parameters: HashMap::new(),
         }
     }
 
@@ -386,6 +391,7 @@ impl GraphStore {
             sql_fingerprint_index,
             lock_clause_index,
             procedure_predicates: HashMap::new(),
+            routine_parameters: HashMap::new(),
         }
     }
 
@@ -394,6 +400,13 @@ impl GraphStore {
         predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
     ) {
         self.procedure_predicates = predicates;
+    }
+
+    pub fn set_routine_parameters(
+        &mut self,
+        parameters: HashMap<String, Vec<crate::parser::RoutineParameter>>,
+    ) {
+        self.routine_parameters = parameters;
     }
 
     pub fn graph(&self) -> &CodeGraph {
@@ -1427,6 +1440,14 @@ impl GraphStore {
                 for predicate in predicates {
                     if !entry.contains(predicate) {
                         entry.push(predicate.clone());
+                    }
+                }
+            }
+            for (key, parameters) in &store.routine_parameters {
+                let entry = merged.routine_parameters.entry(key.clone()).or_default();
+                for parameter in parameters {
+                    if !entry.contains(parameter) {
+                        entry.push(parameter.clone());
                     }
                 }
             }
@@ -2595,6 +2616,35 @@ mod tests {
         let loaded = GraphStore::load_bincode(&path).unwrap();
 
         assert_eq!(loaded.procedure_predicates, store.procedure_predicates);
+    }
+
+    #[test]
+    fn routine_parameters_survive_bincode_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parameters.bincode");
+        let mut store = GraphStore::from_graph("roundtrip", CodeGraph::new());
+        store.routine_parameters.insert(
+            "proc:pkg_x.p".to_string(),
+            vec![
+                crate::parser::RoutineParameter {
+                    name: "p_i_date".to_string(),
+                    mode: None,
+                    data_type: "varchar2".to_string(),
+                    default_value: None,
+                },
+                crate::parser::RoutineParameter {
+                    name: "p_o_cnt".to_string(),
+                    mode: Some("OUT".to_string()),
+                    data_type: "number".to_string(),
+                    default_value: Some("0".to_string()),
+                },
+            ],
+        );
+
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+
+        assert_eq!(loaded.routine_parameters, store.routine_parameters);
     }
 
     /// A store written by the previous layout (version 7, before `ColumnAnalysis.read_tables`,
