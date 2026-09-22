@@ -450,9 +450,15 @@ enum Commands {
 
         /// Output format: "json" (default, #165 schema) or "seed-hints"
         /// (#181: tables + operations, signature, hard filters, cross-table
-        /// equalities, operation_no values)
+        /// equalities, discriminator values)
         #[arg(long, default_value = "json", value_parser = ["json", "seed-hints"])]
         format: String,
+
+        /// #181: column whose literal values `--format seed-hints` enumerates as
+        /// `discriminator_values` (repeatable). Overrides `[analysis]
+        /// discriminator_columns` from codeweb.toml when given.
+        #[arg(long = "discriminator")]
+        discriminator: Vec<String>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -1018,8 +1024,9 @@ fn run() -> Result<()> {
             package,
             table,
             format,
+            discriminator,
             project,
-        }) => cmd_columns(procedure, package, table, &format, &project),
+        }) => cmd_columns(procedure, package, table, &format, discriminator, &project),
         Some(Commands::Predicates {
             procedure,
             format,
@@ -1917,9 +1924,19 @@ fn cmd_columns(
     package: Option<String>,
     table: Option<String>,
     format: &str,
+    discriminator: Vec<String>,
     project: &Path,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
+    // `--discriminator` overrides the config; read the config before `load_store`
+    // borrows `proj` for the lifetime of the store.
+    let discriminators = if discriminator.is_empty() {
+        proj.config().analysis.discriminator_columns.clone()
+    } else {
+        discriminator
+    };
+    // Provenance paths are reported relative to the project root.
+    let base = proj.root().to_path_buf();
     let store = proj.load_store()?;
     let graph = store.graph();
 
@@ -2018,9 +2035,21 @@ fn cmd_columns(
         // keeps its exact schema; this one is shaped for a generator.
         "seed-hints" => {
             let hints = if is_routine {
-                graph::columns::seed_hints_of_routine(store, idx, table_filter)
+                graph::columns::seed_hints_of_routine(
+                    store,
+                    idx,
+                    table_filter,
+                    &discriminators,
+                    &base,
+                )
             } else {
-                graph::columns::seed_hints_of_package(store, idx, table_filter)
+                graph::columns::seed_hints_of_package(
+                    store,
+                    idx,
+                    table_filter,
+                    &discriminators,
+                    &base,
+                )
             }
             .ok_or_else(|| error::CodeWebError::ExportError {
                 message: format!("failed to aggregate seed hints for '{}'", name),

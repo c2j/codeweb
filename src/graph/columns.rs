@@ -13,7 +13,8 @@
 //! names 1:1 — issue #165 explicitly rules out an extra display-tree wrapper layer —
 //! so the MCP/HTTP surfaces planned for a later task can reuse this struct unchanged.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -21,7 +22,7 @@ use petgraph::Direction;
 
 use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
-use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node};
+use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node, SourceLocation};
 use crate::parser::{
     ColumnMapping, CrossTableEquality, EnumMapping, FilterOperator, FilterValue, HardFilter,
     InsertColumnInfo, JoinCondition, RoutineParameter, SelectIntoMapping, UpdateColumnInfo,
@@ -67,23 +68,52 @@ struct Diagnostics {
     insert_columns: Vec<InsertColumnInfo>,
     update_columns: Vec<UpdateColumnInfo>,
     read_tables: Vec<String>,
+    /// First statement edge each row-level diagnostic was seen on. `seed-hints`
+    /// attaches these as `provenance`; `columns --format json` ignores them, so
+    /// its output is unchanged.
+    hard_filter_provenance: HashMap<HardFilter, SourceLocation>,
+    cross_table_equality_provenance: HashMap<CrossTableEquality, SourceLocation>,
+    enum_mapping_provenance: HashMap<EnumMapping, SourceLocation>,
 }
 
 /// `codeweb columns --format seed-hints` output schema (issue #181).
 ///
+/// This is a **predicate/table requirement inventory**, not a seed specification.
 /// The consumer is a test-data generator, so the document is organized by "what
 /// rows must exist and what shape they need" rather than by statement: the
 /// routine's signature, one entry per table with the operations performed on it,
 /// the literal filters that select the rows, and the cross-table equalities that
-/// tie rows in different tables together. codeweb never emits SQL and never
-/// connects to a database; this is hints, not a script.
+/// tie rows in different tables together.
 ///
-/// Field names for the diagnostic parts are shared with
+/// # Hints are necessary, not sufficient
+///
+/// The inventory is derived statically and is deliberately incomplete:
+///
+/// - Dynamic SQL (`EXECUTE IMMEDIATE`, `OPEN ... FOR`) is not analyzed, so any
+///   predicate it builds is invisible.
+/// - A predicate whose alias or `%ROWTYPE` record cannot be resolved is either
+///   dropped or reported without a `table` (see [`HintConfidence::Low`]).
+/// - Enumerations list values the routine *mentions*, not values that make a
+///   branch *reachable* — picking which value to seed is the caller's decision.
+///
+/// Satisfying every hint therefore does not guarantee the routine runs, and the
+/// output never contains SQL: codeweb does not generate seed data and never
+/// connects to a database. Each hint carries [`Provenance`] (file/line) and a
+/// [`HintConfidence`] so a consumer can weigh it.
+///
+/// Field names for the diagnostic parts stay close to
 /// [`AggregatedColumnAnalysis`] (`hard_filters`, ...) so a consumer that already
-/// reads `columns --format json` reuses its parsing.
+/// reads `columns --format json` reuses its parsing; the hint wrappers add
+/// `provenance` and `confidence`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SeedHints {
     pub schema_version: u32,
+    /// Self-describing document kind. Lets a consumer assert it received the
+    /// inventory rather than some other `columns` payload.
+    pub kind: &'static str,
+    /// One-line statement of the necessary-not-sufficient contract above, in the
+    /// document itself so it travels with the JSON.
+    pub caveat: &'static str,
     /// Resolved procedure/function name in `--procedure` mode, or the resolved
     /// package name in `--package` mode (same identity rule as
     /// [`AggregatedColumnAnalysis::procedure`]).
@@ -93,15 +123,40 @@ pub struct SeedHints {
     pub parameters: Vec<RoutineParameter>,
     /// One entry per table the routine touches, sorted by name.
     pub tables: Vec<TableSeedHint>,
-    pub hard_filters: Vec<HardFilter>,
+    pub hard_filters: Vec<HardFilterHint>,
     /// Equalities between columns of *different* tables whose sides are not plain
     /// column references (e.g. `substr(c.trade_no, -3) = r.check_type`). Plain
     /// `column = column` pairs stay in `columns --format json`'s
     /// `join_conditions`; these are the ones that cannot be expressed there.
-    pub cross_table_equalities: Vec<CrossTableEquality>,
-    /// `operation_no`-style enumerations the routine depends on, with the value
-    /// and where it came from.
-    pub operation_no_values: Vec<OperationNoValue>,
+    pub cross_table_equalities: Vec<CrossTableEqualityHint>,
+    /// Literal values of the columns configured as discriminators
+    /// (`[analysis] discriminator_columns` or `--discriminator`), with where each
+    /// was found. Empty when no discriminator column is configured.
+    pub discriminator_values: Vec<DiscriminatorValue>,
+}
+
+/// `kind` marker for [`SeedHints`].
+pub const SEED_HINTS_KIND: &str = "predicate_inventory";
+/// `caveat` text for [`SeedHints`].
+pub const SEED_HINTS_CAVEAT: &str = "Static hints, not a specification: enumerations may be incomplete \
+     (dynamic SQL and unresolved aliases are not analyzed) and satisfying them does not guarantee the \
+     routine runs. codeweb never generates SQL and never connects to a database.";
+
+/// Where a hint was found: the source file and the 1-based line of the statement
+/// (or predicate) that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Provenance {
+    pub file: String,
+    pub line: usize,
+}
+
+/// How much a hint can be trusted, per the rules documented on each field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HintConfidence {
+    High,
+    Medium,
+    Low,
 }
 
 /// One table plus the operations the routine performs on it.
@@ -114,16 +169,50 @@ pub struct TableSeedHint {
     pub ops: Vec<String>,
 }
 
-/// One value of an `operation_no`-style enumeration and its provenance.
+/// A hard filter plus where it came from.
+///
+/// `confidence` is `high` when the filter was attributed to a `table`, `low` when
+/// it was not (the filter is real but a generator cannot place it without more
+/// context).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct OperationNoValue {
+pub struct HardFilterHint {
+    #[serde(flatten)]
+    pub filter: HardFilter,
+    pub provenance: Provenance,
+    pub confidence: HintConfidence,
+}
+
+/// A cross-table equality plus where it came from.
+///
+/// `confidence` is always `high`: [`CrossTableEquality`] is only produced when
+/// both sides resolve to a concrete table, so an unresolved side never reaches
+/// the output.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossTableEqualityHint {
+    #[serde(flatten)]
+    pub equality: CrossTableEquality,
+    pub provenance: Provenance,
+    pub confidence: HintConfidence,
+}
+
+/// One literal value of a discriminator column and its provenance.
+///
+/// `confidence` is `high` for a `branch_condition` (a concrete `=`/`IN` condition
+/// naming the column) and `medium` for a `cursor_decode` key (a `DECODE`/`CASE`
+/// mapping key, where the trigger is a set of values rather than one condition).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscriminatorValue {
+    /// The configured discriminator column this value belongs to.
+    pub column: String,
     pub value: String,
     /// Where the value was found: `cursor_decode` (a `DECODE`/`CASE` mapping on
-    /// `operation_no`) or `branch_condition` (a PL `=`/`IN` condition naming it).
+    /// the column) or `branch_condition` (a PL `=`/`IN` condition naming it).
     pub source: String,
-    /// The `DECODE`/`CASE` key or `IF` condition that selects this value, when
-    /// the extraction could attribute one.
+    /// The `IF`/`WHEN` condition that selects this value, when the extraction
+    /// could attribute one. `None` for `cursor_decode`.
     pub trigger: Option<String>,
+    pub provenance: Provenance,
+    pub confidence: HintConfidence,
 }
 
 /// Scan every `TableAccess` edge of `routines` (both directions, mirroring
@@ -170,11 +259,17 @@ fn collect_diagnostics(
     let mut update_columns: Vec<UpdateColumnInfo> = Vec::new();
     let mut uc_seen: HashSet<UpdateColumnInfo> = HashSet::new();
 
+    let mut hard_filter_provenance: HashMap<HardFilter, SourceLocation> = HashMap::new();
+    let mut cross_table_equality_provenance: HashMap<CrossTableEquality, SourceLocation> =
+        HashMap::new();
+    let mut enum_mapping_provenance: HashMap<EnumMapping, SourceLocation> = HashMap::new();
+
     for &routine in routines {
         for dir in [Direction::Outgoing, Direction::Incoming] {
             for edge_ref in graph.edges_directed(routine, dir) {
                 let Edge::TableAccess {
                     column_analysis: Some(analysis),
+                    location,
                     ..
                 } = edge_ref.weight()
                 else {
@@ -207,11 +302,17 @@ fn collect_diagnostics(
                 for cte in &analysis.cross_table_equalities {
                     if cte_seen.insert(cte.clone()) {
                         cross_table_equalities.push(cte.clone());
+                        cross_table_equality_provenance
+                            .entry(cte.clone())
+                            .or_insert_with(|| location.clone());
                     }
                 }
                 for hf in &analysis.hard_filters {
                     if hf_seen.insert(hf.clone()) {
                         hard_filters.push(hf.clone());
+                        hard_filter_provenance
+                            .entry(hf.clone())
+                            .or_insert_with(|| location.clone());
                     }
                 }
                 for si in &analysis.select_into {
@@ -222,6 +323,9 @@ fn collect_diagnostics(
                 for em in &analysis.enum_mappings {
                     if em_seen.insert(em.clone()) {
                         enum_mappings.push(em.clone());
+                        enum_mapping_provenance
+                            .entry(em.clone())
+                            .or_insert_with(|| location.clone());
                     }
                 }
                 for cm in &analysis.column_mappings {
@@ -264,6 +368,9 @@ fn collect_diagnostics(
         insert_columns,
         update_columns,
         read_tables,
+        hard_filter_provenance,
+        cross_table_equality_provenance,
+        enum_mapping_provenance,
     }
 }
 
@@ -342,9 +449,6 @@ pub fn column_analysis_of_package(
     })
 }
 
-/// The discriminator column `seed-hints` enumerates (issue #181).
-const OPERATION_NO_COLUMN: &str = "operation_no";
-
 /// String values inside a `FilterValue`, flattening `IN` lists.
 fn filter_value_strings(value: &FilterValue) -> Vec<String> {
     match value {
@@ -356,50 +460,119 @@ fn filter_value_strings(value: &FilterValue) -> Vec<String> {
     }
 }
 
-fn push_operation_no_value(
-    out: &mut Vec<OperationNoValue>,
-    seen: &mut HashSet<(String, String)>,
-    value: String,
-    source: &str,
-    trigger: Option<String>,
-) {
-    if !seen.insert((value.clone(), source.to_string())) {
-        return;
-    }
-    out.push(OperationNoValue {
-        value,
-        source: source.to_string(),
-        trigger,
-    });
+/// The configured discriminator column matching `column` (case-insensitive).
+fn discriminator_for<'a>(discriminators: &'a [String], column: &str) -> Option<&'a String> {
+    discriminators
+        .iter()
+        .find(|d| d.eq_ignore_ascii_case(column))
 }
 
-/// Every `operation_no` value the routine depends on, with its provenance.
+/// [`Provenance`] of a statement edge, with the file made relative to `base`
+/// (the project root) so the hint travels well.
+fn provenance_of(location: &SourceLocation, base: &Path) -> Provenance {
+    let file = location
+        .file
+        .strip_prefix(base)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| location.file.to_path_buf());
+    Provenance {
+        file: file.display().to_string(),
+        line: location.line,
+    }
+}
+
+/// Source file of a routine node, relative to `base`, for predicate-level
+/// provenance.
+fn routine_file(graph: &CodeGraph, routine: NodeIndex, base: &Path) -> String {
+    match &graph[routine] {
+        Node::Procedure { location, .. } | Node::Function { location, .. } => location
+            .file
+            .strip_prefix(base)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| location.file.to_path_buf())
+            .display()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn push_discriminator_value(
+    out: &mut Vec<DiscriminatorValue>,
+    seen: &mut HashSet<(String, String, String)>,
+    entry: DiscriminatorValue,
+) {
+    let key = (
+        entry.column.to_ascii_lowercase(),
+        entry.value.clone(),
+        entry.source.clone(),
+    );
+    if seen.insert(key) {
+        out.push(entry);
+    }
+}
+
+/// Literal values of the configured discriminator columns, with provenance.
 ///
 /// Two sources, both already extracted for other purposes:
 ///
-/// - `cursor_decode`: the keys of a `DECODE`/`CASE` mapping on `operation_no`
-///   (`enum_mappings`, #165/#167).
-/// - `branch_condition`: the literal of an `=`/`IN` branch condition naming
-///   `operation_no` (`procedure_predicates`, #167), where the rendered condition
-///   is the trigger that selects the value.
+/// - `cursor_decode`: the keys of a `DECODE`/`CASE` mapping on a discriminator
+///   column (`enum_mappings`, #165/#167). `confidence` is `medium`: a DECODE key
+///   is one of a set, and the mapping carries no single triggering condition.
+/// - `branch_condition`: the literal of an `=`/`IN` branch condition naming a
+///   discriminator column (`procedure_predicates`, #167), where the rendered
+///   condition is the trigger. `confidence` is `high` for `=` (one value, one
+///   condition) and `medium` for `IN` (the condition selects a set).
 ///
-/// Values are deduplicated per (value, source) and sorted, so the output does not
-/// depend on aggregation order.
-fn operation_no_values(
+/// A clause counts when its resolved column is a discriminator, or when the
+/// rendered condition names one: a `%ROWTYPE` record field resolves to the
+/// cursor's *projected* column, which need not keep the field's name (the
+/// acceptance case's `r_bond_repurchase.operation_no` resolves to `bs`), so the
+/// condition text is the reliable signal there. A predicate that filters several
+/// columns can therefore contribute a non-discriminator literal; the hint is
+/// advisory, not exact.
+///
+/// Values are deduplicated per (column, value, source) and sorted, so the output
+/// does not depend on aggregation order. Returns empty when `discriminators` is
+/// empty: codeweb ships no built-in discriminator column.
+fn discriminator_values(
     store: &GraphStore,
     routines: &[NodeIndex],
     enum_mappings: &[EnumMapping],
-) -> Vec<OperationNoValue> {
-    let mut out: Vec<OperationNoValue> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    enum_provenance: &HashMap<EnumMapping, SourceLocation>,
+    discriminators: &[String],
+    base: &Path,
+) -> Vec<DiscriminatorValue> {
+    let mut out: Vec<DiscriminatorValue> = Vec::new();
+    if discriminators.is_empty() {
+        return out;
+    }
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
 
     for mapping in enum_mappings {
-        if !mapping.column.eq_ignore_ascii_case(OPERATION_NO_COLUMN) {
+        let Some(column) = discriminator_for(discriminators, &mapping.column) else {
             continue;
-        }
+        };
+        let provenance = enum_provenance
+            .get(mapping)
+            .map(|location| provenance_of(location, base))
+            .unwrap_or_else(|| Provenance {
+                file: String::new(),
+                line: 0,
+            });
         for (key, _result) in &mapping.values {
             for value in filter_value_strings(key) {
-                push_operation_no_value(&mut out, &mut seen, value, "cursor_decode", None);
+                push_discriminator_value(
+                    &mut out,
+                    &mut seen,
+                    DiscriminatorValue {
+                        column: column.clone(),
+                        value,
+                        source: "cursor_decode".to_string(),
+                        trigger: None,
+                        provenance: provenance.clone(),
+                        confidence: HintConfidence::Medium,
+                    },
+                );
             }
         }
     }
@@ -409,43 +582,52 @@ fn operation_no_values(
         let Some(predicates) = store.procedure_predicates.get(&key) else {
             continue;
         };
+        let file = routine_file(store.graph(), routine, base);
         for predicate in predicates {
-            let mentions_column = predicate
-                .origin
-                .to_lowercase()
-                .contains(OPERATION_NO_COLUMN)
-                || predicate.table_predicate.as_ref().is_some_and(|table| {
-                    table
-                        .clauses
-                        .iter()
-                        .any(|c| c.column.eq_ignore_ascii_case(OPERATION_NO_COLUMN))
-                });
-            if !mentions_column {
-                continue;
-            }
             let Some(table) = &predicate.table_predicate else {
                 continue;
             };
+            let origin_lower = predicate.origin.to_lowercase();
+            let origin_match = discriminators
+                .iter()
+                .find(|d| origin_lower.contains(&d.to_lowercase()));
             for clause in &table.clauses {
                 // Only the enumeration shapes: `=` and `IN`. A `<>` value is
                 // something to avoid, not a value that selects a branch.
                 if !matches!(clause.op, FilterOperator::Eq | FilterOperator::In) {
                     continue;
                 }
+                let column = discriminator_for(discriminators, &clause.column).or(origin_match);
+                let Some(column) = column else {
+                    continue;
+                };
+                let confidence = if matches!(clause.op, FilterOperator::Eq) {
+                    HintConfidence::High
+                } else {
+                    HintConfidence::Medium
+                };
                 for value in filter_value_strings(&clause.value) {
-                    push_operation_no_value(
+                    push_discriminator_value(
                         &mut out,
                         &mut seen,
-                        value,
-                        "branch_condition",
-                        Some(predicate.origin.clone()),
+                        DiscriminatorValue {
+                            column: column.clone(),
+                            value,
+                            source: "branch_condition".to_string(),
+                            trigger: Some(predicate.origin.clone()),
+                            provenance: Provenance {
+                                file: file.clone(),
+                                line: predicate.line,
+                            },
+                            confidence,
+                        },
                     );
                 }
             }
         }
     }
 
-    out.sort_by(|a, b| (&a.value, &a.source).cmp(&(&b.value, &b.source)));
+    out.sort_by(|a, b| (&a.column, &a.value, &a.source).cmp(&(&b.column, &b.value, &b.source)));
     out
 }
 
@@ -528,6 +710,82 @@ fn table_operations(
         .collect()
 }
 
+/// Wrap aggregated diagnostics with [`Provenance`] and [`HintConfidence`] for
+/// `seed-hints`. Kept separate from [`collect_diagnostics`] so the shared
+/// aggregation path that feeds `columns --format json` stays untouched.
+fn hints_from_diagnostics(
+    diag: Diagnostics,
+    store: &GraphStore,
+    routines: &[NodeIndex],
+    discriminators: &[String],
+    base: &Path,
+) -> (
+    Vec<HardFilterHint>,
+    Vec<CrossTableEqualityHint>,
+    Vec<DiscriminatorValue>,
+) {
+    let Diagnostics {
+        hard_filters,
+        cross_table_equalities,
+        enum_mappings,
+        hard_filter_provenance,
+        cross_table_equality_provenance,
+        enum_mapping_provenance,
+        ..
+    } = diag;
+
+    let missing = || Provenance {
+        file: String::new(),
+        line: 0,
+    };
+
+    let hard_filters = hard_filters
+        .into_iter()
+        .map(|filter| {
+            let provenance = hard_filter_provenance
+                .get(&filter)
+                .map(|location| provenance_of(location, base))
+                .unwrap_or_else(missing);
+            let confidence = if filter.table.is_some() {
+                HintConfidence::High
+            } else {
+                HintConfidence::Low
+            };
+            HardFilterHint {
+                filter,
+                provenance,
+                confidence,
+            }
+        })
+        .collect();
+
+    let cross_table_equalities = cross_table_equalities
+        .into_iter()
+        .map(|equality| {
+            let provenance = cross_table_equality_provenance
+                .get(&equality)
+                .map(|location| provenance_of(location, base))
+                .unwrap_or_else(missing);
+            CrossTableEqualityHint {
+                equality,
+                provenance,
+                confidence: HintConfidence::High,
+            }
+        })
+        .collect();
+
+    let disc_values = discriminator_values(
+        store,
+        routines,
+        &enum_mappings,
+        &enum_mapping_provenance,
+        discriminators,
+        base,
+    );
+
+    (hard_filters, cross_table_equalities, disc_values)
+}
+
 /// Seed-data hints for one routine (issue #181). Returns `None` when `routine` is
 /// not a `Node::Procedure`/`Node::Function`, mirroring
 /// [`column_analysis_of_routine`]'s defensive contract.
@@ -535,6 +793,8 @@ pub fn seed_hints_of_routine(
     store: &GraphStore,
     routine: NodeIndex,
     table_filter: Option<&str>,
+    discriminators: &[String],
+    base: &Path,
 ) -> Option<SeedHints> {
     let graph = store.graph();
     let (name, package) = match &graph[routine] {
@@ -545,16 +805,20 @@ pub fn seed_hints_of_routine(
     };
 
     let diag = collect_diagnostics(graph, &[routine], table_filter);
+    let (hard_filters, cross_table_equalities, disc_values) =
+        hints_from_diagnostics(diag, store, &[routine], discriminators, base);
 
     Some(SeedHints {
         schema_version: 1,
+        kind: SEED_HINTS_KIND,
+        caveat: SEED_HINTS_CAVEAT,
         procedure: name,
         package,
         parameters: parameters_of_routine(store, routine),
         tables: table_operations(graph, &[routine], table_filter),
-        hard_filters: diag.hard_filters,
-        cross_table_equalities: diag.cross_table_equalities,
-        operation_no_values: operation_no_values(store, &[routine], &diag.enum_mappings),
+        hard_filters,
+        cross_table_equalities,
+        discriminator_values: disc_values,
     })
 }
 
@@ -564,6 +828,8 @@ pub fn seed_hints_of_package(
     store: &GraphStore,
     package: NodeIndex,
     table_filter: Option<&str>,
+    discriminators: &[String],
+    base: &Path,
 ) -> Option<SeedHints> {
     let graph = store.graph();
     let pkg_name = match &graph[package] {
@@ -573,6 +839,8 @@ pub fn seed_hints_of_package(
 
     let children = package_children(graph, package);
     let diag = collect_diagnostics(graph, &children, table_filter);
+    let (hard_filters, cross_table_equalities, disc_values) =
+        hints_from_diagnostics(diag, store, &children, discriminators, base);
 
     let parameters = children
         .iter()
@@ -581,13 +849,15 @@ pub fn seed_hints_of_package(
 
     Some(SeedHints {
         schema_version: 1,
+        kind: SEED_HINTS_KIND,
+        caveat: SEED_HINTS_CAVEAT,
         procedure: pkg_name.clone(),
         package: Some(pkg_name),
         parameters,
         tables: table_operations(graph, &children, table_filter),
-        hard_filters: diag.hard_filters,
-        cross_table_equalities: diag.cross_table_equalities,
-        operation_no_values: operation_no_values(store, &children, &diag.enum_mappings),
+        hard_filters,
+        cross_table_equalities,
+        discriminator_values: disc_values,
     })
 }
 

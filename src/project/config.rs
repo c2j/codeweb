@@ -33,6 +33,16 @@ pub struct AnalysisConfig {
     /// Default: 100. Upper bound: 100 (set lower only).
     #[serde(default = "default_sql_chunk_size")]
     pub sql_chunk_size: usize,
+    /// Column names whose literal values `codeweb columns --format seed-hints`
+    /// enumerates as `discriminator_values` (#181). Empty by default: codeweb has
+    /// no built-in domain knowledge, so a project opts in explicitly.
+    ///
+    /// ```toml
+    /// [analysis]
+    /// discriminator_columns = ["operation_no"]
+    /// ```
+    #[serde(default)]
+    pub discriminator_columns: Vec<String>,
 }
 
 fn default_sql_chunk_size() -> usize {
@@ -178,6 +188,9 @@ name = "{}"
 paths = [{}]
 # exclude = ["**/test/**", "**/generated/**"]
 # sql_chunk_size = 100
+# Columns whose literal values `columns --format seed-hints` enumerates as
+# discriminator_values, e.g. discriminator_columns = ["operation_no"]
+# discriminator_columns = []
 
 # [analysis.java]
 # extra_sql_methods = []
@@ -195,5 +208,39 @@ format = "bincode"
             escape_toml_basic_string(name),
             paths_toml
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discriminator_columns_default_to_empty() {
+        let config = ProjectConfig::load("[project]\nname = \"p\"\n").expect("parse");
+        assert!(
+            config.analysis.discriminator_columns.is_empty(),
+            "codeweb ships no built-in discriminator column"
+        );
+    }
+
+    #[test]
+    fn discriminator_columns_are_read_from_analysis() {
+        let config = ProjectConfig::load(
+            "[project]\nname = \"p\"\n\n[analysis]\ndiscriminator_columns = [\"operation_no\", \"biz_type\"]\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            config.analysis.discriminator_columns,
+            vec!["operation_no".to_string(), "biz_type".to_string()]
+        );
+    }
+
+    #[test]
+    fn template_mentions_discriminator_columns() {
+        assert!(
+            ProjectConfig::default_template("p").contains("discriminator_columns"),
+            "the generated codeweb.toml should document the new setting"
+        );
     }
 }

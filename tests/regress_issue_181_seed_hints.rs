@@ -54,25 +54,32 @@ fn project_with_sql(dir: &TempDir, sql: &str) -> PathBuf {
     root
 }
 
-fn seed_hints(root: &Path, procedure: &str) -> serde_json::Value {
-    let out = run_codeweb_in(
-        root,
-        &[
-            "columns",
-            "--procedure",
-            procedure,
-            "--format",
-            "seed-hints",
-            "-p",
-            ".",
-        ],
-    );
+fn seed_hints_with(root: &Path, procedure: &str, discriminators: &[&str]) -> serde_json::Value {
+    let mut args = vec![
+        "columns",
+        "--procedure",
+        procedure,
+        "--format",
+        "seed-hints",
+        "-p",
+        ".",
+    ];
+    for d in discriminators {
+        args.push("--discriminator");
+        args.push(d);
+    }
+    let out = run_codeweb_in(root, &args);
     assert!(
         out.status.success(),
         "columns --format seed-hints failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("seed-hints must be JSON")
+}
+
+/// The issue's own case: `operation_no` is a configured discriminator column.
+fn seed_hints(root: &Path, procedure: &str) -> serde_json::Value {
+    seed_hints_with(root, procedure, &["operation_no"])
 }
 
 /// One procedure touching four tables with four different operations, plus a
@@ -128,6 +135,18 @@ fn seed_hints_lists_every_table_with_its_operations() {
     let hints = seed_hints(&root, "prc_seed_demo");
 
     assert_eq!(hints["schema_version"], 1);
+    assert_eq!(
+        hints["kind"], "predicate_inventory",
+        "the document must self-describe as the predicate inventory"
+    );
+    assert!(
+        hints["caveat"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a specification"),
+        "the caveat must state the necessary-not-sufficient contract, got {}",
+        hints["caveat"]
+    );
     assert_eq!(hints["procedure"], "prc_seed_demo");
     assert!(hints["package"].is_null());
 
@@ -169,6 +188,23 @@ fn seed_hints_carries_the_hard_filters_that_shape_the_rows() {
         .find(|f| f["column"] == "kind")
         .unwrap_or_else(|| panic!("kind filter missing from {filters:#?}"));
     assert_eq!(kind["value"]["String"], "0509");
+    assert_eq!(
+        kind["confidence"], "high",
+        "a filter attributed to a table is high confidence, got {kind}"
+    );
+    assert_eq!(kind["table"], "src_orders");
+    let provenance = &kind["provenance"];
+    assert!(
+        provenance["file"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(".sql"),
+        "provenance must name the source file, got {provenance}"
+    );
+    assert!(
+        provenance["line"].as_u64().unwrap_or(0) > 0,
+        "provenance must carry a 1-based line, got {provenance}"
+    );
 }
 
 /// A procedure whose signature the seed generator has to satisfy (the issue
@@ -267,6 +303,14 @@ fn seed_hints_reports_cross_table_equalities_that_are_expressions() {
     );
     assert_eq!(trade["right"]["table"], "out_trd");
     assert_eq!(trade["right"]["column"], "check_type");
+    assert_eq!(
+        trade["confidence"], "high",
+        "a resolved cross-table equality is high confidence, got {trade}"
+    );
+    assert!(
+        trade["provenance"]["line"].as_u64().unwrap_or(0) > 0,
+        "an equality must carry the statement's line, got {trade}"
+    );
 
     let vol = equality_mentioning(&hints, "vol");
     assert_eq!(vol["left"]["table"], "zgh_temp");
@@ -333,26 +377,26 @@ BEGIN
 END;
 "#;
 
-fn operation_no_entry<'a>(
+fn discriminator_entry<'a>(
     hints: &'a serde_json::Value,
     value: &str,
 ) -> Option<&'a serde_json::Value> {
-    hints["operation_no_values"]
+    hints["discriminator_values"]
         .as_array()
-        .expect("operation_no_values array")
+        .expect("discriminator_values array")
         .iter()
         .find(|v| v["value"].as_str() == Some(value))
 }
 
 #[test]
-fn seed_hints_lists_operation_no_values_with_their_provenance() {
+fn seed_hints_lists_discriminator_values_with_their_provenance() {
     let dir = TempDir::new().unwrap();
     let root = project_with_sql(&dir, SEED_OPERATION_NO_SQL);
 
     let hints = seed_hints(&root, "prc_seed_opno");
-    let values: Vec<&str> = hints["operation_no_values"]
+    let values: Vec<&str> = hints["discriminator_values"]
         .as_array()
-        .expect("operation_no_values array")
+        .expect("discriminator_values array")
         .iter()
         .map(|v| v["value"].as_str().unwrap())
         .collect();
@@ -364,16 +408,26 @@ fn seed_hints_lists_operation_no_values_with_their_provenance() {
         );
     }
 
-    let decoded = operation_no_entry(&hints, "0112004001").unwrap();
+    let decoded = discriminator_entry(&hints, "0112004001").unwrap();
+    assert_eq!(decoded["column"], "operation_no");
     assert_eq!(
         decoded["source"], "cursor_decode",
         "a DECODE mapping value must say so, got {decoded}"
     );
+    assert_eq!(
+        decoded["confidence"], "medium",
+        "a DECODE key is one of a set, so medium confidence, got {decoded}"
+    );
 
-    let branch = operation_no_entry(&hints, "0110999001").unwrap();
+    let branch = discriminator_entry(&hints, "0110999001").unwrap();
+    assert_eq!(branch["column"], "operation_no");
     assert_eq!(
         branch["source"], "branch_condition",
         "an IF condition value must say so, got {branch}"
+    );
+    assert_eq!(
+        branch["confidence"], "high",
+        "an `=` branch condition names exactly one value, got {branch}"
     );
     let trigger = branch["trigger"]
         .as_str()
@@ -381,5 +435,118 @@ fn seed_hints_lists_operation_no_values_with_their_provenance() {
     assert!(
         trigger.contains("operation_no") && trigger.contains("0110999001"),
         "the trigger must name the condition, got {trigger}"
+    );
+    assert!(
+        branch["provenance"]["line"].as_u64().unwrap_or(0) > 0,
+        "a branch condition carries its own line, got {branch}"
+    );
+}
+
+/// An `IN` branch condition is a set of values, so the trigger must render as
+/// SQL (`col IN ('a', 'b')`) rather than leaking the AST Debug form.
+#[test]
+fn seed_hints_renders_in_conditions_as_sql() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE src_op(operation_no VARCHAR(20));
+CREATE TABLE out_op(bs VARCHAR(20));
+
+CREATE PROCEDURE prc_seed_in AS
+  CURSOR c_cur IS
+    SELECT t.operation_no AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  OPEN c_cur;
+  FETCH c_cur INTO r_rec;
+  IF r_rec.operation_no IN ('0110004001', '0111004001') THEN
+    INSERT INTO out_op(bs) VALUES ('hit');
+  END IF;
+  CLOSE c_cur;
+END;
+"#,
+    );
+
+    let hints = seed_hints(&root, "prc_seed_in");
+    let branch = discriminator_entry(&hints, "0110004001").unwrap();
+    assert_eq!(
+        branch["confidence"], "medium",
+        "an IN condition selects a set, so medium confidence, got {branch}"
+    );
+    let trigger = branch["trigger"].as_str().unwrap();
+    assert!(
+        trigger.contains("IN (") && trigger.contains("'0110004001'"),
+        "the trigger must render as SQL, got {trigger}"
+    );
+    assert!(
+        !trigger.contains("InList {"),
+        "the trigger must not leak the AST Debug form, got {trigger}"
+    );
+}
+
+/// Discriminator columns are opt-in: with none configured, the document still
+/// reports tables/filters/equalities but enumerates no discriminator values.
+#[test]
+fn seed_hints_enumerates_no_discriminator_values_without_configuration() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_OPERATION_NO_SQL);
+
+    let hints = seed_hints_with(&root, "prc_seed_opno", &[]);
+
+    assert_eq!(
+        hints["discriminator_values"].as_array().unwrap().len(),
+        0,
+        "codeweb ships no built-in discriminator column, got {:#?}",
+        hints["discriminator_values"]
+    );
+    // The rest of the inventory is unaffected.
+    assert!(!hints["tables"].as_array().unwrap().is_empty());
+}
+
+/// The discriminator is a column *name*, not a hard-coded `operation_no`: any
+/// configured column is enumerated, and each value names its column.
+#[test]
+fn seed_hints_enumerates_any_configured_discriminator_column() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE src_cfg(biz_type VARCHAR(10), operation_no VARCHAR(20));
+CREATE TABLE out_cfg(bs VARCHAR(10));
+
+CREATE PROCEDURE prc_seed_cfg AS
+  CURSOR c_cur IS
+    SELECT t.biz_type AS biz_type, t.operation_no AS operation_no FROM src_cfg t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  OPEN c_cur;
+  FETCH c_cur INTO r_rec;
+  IF r_rec.biz_type = 'A1' THEN
+    INSERT INTO out_cfg(bs) VALUES ('x');
+  END IF;
+  IF r_rec.operation_no = '0110999001' THEN
+    INSERT INTO out_cfg(bs) VALUES ('y');
+  END IF;
+  CLOSE c_cur;
+END;
+"#,
+    );
+
+    let hints = seed_hints_with(&root, "prc_seed_cfg", &["biz_type"]);
+
+    let values: Vec<(&str, &str)> = hints["discriminator_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["column"].as_str().unwrap(), v["value"].as_str().unwrap()))
+        .collect();
+    assert!(
+        values.contains(&("biz_type", "A1")),
+        "the configured column must be enumerated, got {values:?}"
+    );
+    assert!(
+        !values.iter().any(|(c, _)| *c == "operation_no"),
+        "an unconfigured column must not be enumerated, got {values:?}"
     );
 }

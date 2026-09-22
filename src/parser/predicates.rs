@@ -646,6 +646,21 @@ fn format_condition(expr: &Expr) -> String {
             format_expr_short(low),
             format_expr_short(high)
         ),
+        // `format_expr_short` has no `InList` arm and would fall back to the AST
+        // Debug form, which must not reach the rendered predicate origin.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let items: Vec<String> = list.iter().map(format_expr_short).collect();
+            format!(
+                "{} {}IN ({})",
+                format_expr_short(expr),
+                if *negated { "NOT " } else { "" },
+                items.join(", ")
+            )
+        }
         _ => format_expr_short(expr),
     }
 }
@@ -1097,6 +1112,38 @@ END;
         assert_eq!(
             hint.set,
             vec![("kind_id".to_string(), FilterValue::String("1".to_string()))]
+        );
+    }
+
+    /// The rendered origin must be SQL, not the AST Debug form: it is what
+    /// `codeweb predicates` prints and what `columns --format seed-hints` exposes
+    /// as a discriminator value's `trigger`.
+    #[test]
+    fn in_list_condition_renders_as_sql_in_origin() {
+        let sql = r#"
+CREATE PROCEDURE p_inlist AS
+  CURSOR c_cur IS SELECT t.operation_no AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  IF r_rec.operation_no IN ('0110004001', '0111004001') THEN
+    NULL;
+  END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 1);
+        let origin = &predicates[0].origin;
+        assert!(
+            origin.contains("IN ('0110004001', '0111004001')"),
+            "the IN list must render as SQL, got {origin}"
+        );
+        assert!(
+            !origin.contains("InList {"),
+            "the origin must not leak the AST Debug form, got {origin}"
         );
     }
 }
