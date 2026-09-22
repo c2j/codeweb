@@ -153,7 +153,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 
 | Command | Description |
 |---------|-------------|
-| `codeweb init <name> [-d <dirs>] [--root <dir>]` | Initialize and analyze a new project. Without `--root` the project is created in the cwd and `-d` registers analysis paths; `--root <dir>` creates it in `<dir>` instead (refused when that dir is non-empty without a codeweb.toml, unless `--force`) |
+| `codeweb init <name> [-d <dirs>] [--root <dir>]` | Initialize and analyze a new project. Without `--root` the project is created in the cwd and `-d` only registers analysis paths (a `-d` outside the cwd does not move the project there); `--root <dir>` creates it in `<dir>` instead (refused when that dir is non-empty without a codeweb.toml, unless `--force`) |
 | `codeweb analyze` | Analyze project (full or incremental) |
 | `codeweb diff` | Show changes since last analysis |
 | `codeweb export` | Export graph to DOT/JSON/Mermaid |
@@ -515,7 +515,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 
 | 命令 | 说明 |
 |------|------|
-| `codeweb init <name> [-d <dirs>] [--root <dir>]` | 初始化并分析新项目。不给 `--root` 时项目建在当前目录，`-d` 只登记分析路径；给 `--root <dir>` 时项目建在 `<dir>`（该目录非空且无 codeweb.toml 时需 `--force`） |
+| `codeweb init <name> [-d <dirs>] [--root <dir>]` | 初始化并分析新项目。不给 `--root` 时项目建在当前目录，`-d` 只登记分析路径（`-d` 指向当前目录之外也不会把项目建到那边）；给 `--root <dir>` 时项目建在 `<dir>`（该目录非空且无 codeweb.toml 时需 `--force`） |
 | `codeweb analyze` | 分析项目（全量或增量） |
 | `codeweb diff` | 显示自上次分析以来的变更 |
 | `codeweb export` | 导出图谱为 DOT/JSON/Mermaid |

@@ -44,6 +44,94 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// Issue #180's amended contract (2026-09-22) keeps `-d` as "repeatable analysis
+/// directories" and roots the project at the cwd when `--root` is omitted. That
+/// includes `-d` pointing *outside* the cwd: it must still work, even when the
+/// cwd already holds other things, because refusing it would be a different
+/// safety rule the issue explicitly leaves out. The reported accident is fixed
+/// by naming the root (`--root <基线目录> --force`), not by refusing.
+#[test]
+fn init_without_root_keeps_an_outside_dir_as_an_analysis_path() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("workspace");
+    let elsewhere = tmp.path().join("baseline");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    // Populated cwd: the amended contract says that alone is not a reason to refuse.
+    std::fs::write(cwd.join("unrelated.txt"), "not a codeweb project").unwrap();
+    std::fs::write(elsewhere.join("a.sql"), "SELECT 1;").unwrap();
+
+    let out = run_in(&cwd, &["init", "app", "-d", elsewhere.to_str().unwrap()]);
+    assert!(out.status.success(), "init failed: {}", stderr_of(&out));
+
+    assert!(
+        cwd.join("codeweb.toml").exists(),
+        "without --root the project belongs to the cwd"
+    );
+    assert!(
+        !elsewhere.join("codeweb.toml").exists(),
+        "-d must not silently become the project root"
+    );
+    assert!(
+        !elsewhere.join(".codeweb").exists(),
+        "-d must not receive the store either"
+    );
+    let toml = std::fs::read_to_string(cwd.join("codeweb.toml")).unwrap();
+    assert!(
+        toml.contains("baseline"),
+        "the outside dir must be registered as an analysis path, got:\n{toml}"
+    );
+}
+
+/// `--root` pointing at a directory that does not exist yet creates it (amended
+/// acceptance: "`/abs/project` 为空或不存在时成功").
+#[test]
+fn init_root_creates_a_missing_target_directory() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let target = tmp.path().join("not-yet-created");
+
+    let out = run_in(&cwd, &["init", "fresh", "--root", target.to_str().unwrap()]);
+    assert!(out.status.success(), "init failed: {}", stderr_of(&out));
+
+    assert!(target.join("codeweb.toml").exists());
+    assert!(target.join(".codeweb").is_dir());
+    assert!(!cwd.join("codeweb.toml").exists());
+}
+
+/// An existing project is not something `--force` overrides: `--root` must fail
+/// with or without it, and the existing `codeweb.toml` must not be rewritten
+/// (amended acceptance). The repair path for a stale store is `analyze -p`.
+#[test]
+fn init_root_refuses_an_existing_project_even_with_force() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let target = tmp.path().join("baseline");
+    std::fs::create_dir_all(&target).unwrap();
+    let existing = "# hand-written\n[project]\nname = \"kept\"\n";
+    std::fs::write(target.join("codeweb.toml"), existing).unwrap();
+
+    for force in [false, true] {
+        let mut args = vec!["init", "t", "--root", target.to_str().unwrap()];
+        if force {
+            args.push("--force");
+        }
+        let out = run_in(&cwd, &args);
+        assert!(
+            !out.status.success(),
+            "an existing project must be refused (force={force}), stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("codeweb.toml")).unwrap(),
+            existing,
+            "the existing codeweb.toml must not be rewritten (force={force})"
+        );
+    }
+}
+
 #[test]
 fn init_with_root_writes_project_into_that_dir() {
     let tmp = TempDir::new().unwrap();
