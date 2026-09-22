@@ -723,7 +723,8 @@ codeweb columns <--procedure <名称>|--package <名称>> [OPTIONS]
 | `--procedure <名称>` | 要聚合的存储过程或函数名（支持子串匹配） |
 | `--package <名称>` | 要聚合的包名（导出该包下所有过程的并集） |
 | `--table <表名>` | 仅输出与指定表相关的诊断信息（不区分大小写） |
-| `--format <格式>` | 输出格式：`json`（默认）或 `seed-hints`（造数出口，见下） |
+| `--format <格式>` | 输出格式：`json`（默认）或 `seed-hints`（谓词/表需求清单，见下） |
+| `--discriminator <列名>` | 可重复。指定 `seed-hints` 要枚举取值的判别列；给出时覆盖 `[analysis] discriminator_columns` |
 
 **注意**：
 - 该命令需要存储版本 ≥ v10。旧版本 store 仅包含基础血缘，缺少详细的过滤和关联诊断。
@@ -734,28 +735,42 @@ codeweb columns <--procedure <名称>|--package <名称>> [OPTIONS]
 codeweb columns --procedure prc_trd_hz --format json
 ```
 
-#### `--format seed-hints`（造数出口）
+#### `--format seed-hints`（谓词/表需求清单）
 
-面向造数/构造 Mock 数据的机器可读出口：把「哪些表必须有行、每张表要发生什么、哪些谓词决定行内容」整理成一份文档。codeweb 只输出提示，不生成 SQL、也不连库。
+把「哪些表必须有行、每张表要发生什么、哪些谓词决定行内容」整理成一份机器可读的**清单**。codeweb 只输出提示，不生成 SQL、也不连库。
+
+> **清单是必要条件，不是充分条件。** 它由静态分析得出，故意不完整：动态 SQL（`EXECUTE IMMEDIATE` / `OPEN ... FOR`）不参与分析；别名或 `%ROWTYPE` 记录解析不了的谓词会被丢弃或缺失 `table`；枚举列出的是过程**提到**的取值，而不是让分支**可达**的取值。满足全部提示并不保证过程能跑通。文档里的 `caveat` 字段在 JSON 内重申这一点，每条提示都带 `provenance`（file/line）和 `confidence`，供消费方判断可信度。
 
 ```bash
-codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints
+codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints \
+  --discriminator operation_no
 ```
 
 | 字段 | 说明 |
 |------|------|
+| `kind` / `caveat` | 文档自描述：`kind` 恒为 `predicate_inventory`；`caveat` 为「必要条件非充分」的一句话说明 |
 | `parameters` | 过程签名（按声明顺序），含 `name` / `mode`（`IN`/`OUT`/`IN OUT`）/ `data_type` / `default_value`。`data_type` 按解析器归一化输出（关键字类型为小写，如 `varchar2`） |
 | `tables[].ops` | 每张表上的操作，取自图自身的写类型标签并排序去重：`read`、`insert`、`insert_select`、`update`、`delete`、`truncate`…（`insert` 与 `insert_select` 含义不同：后者要求行来自查询） |
-| `hard_filters` | 与 `--format json` 同名的字面量过滤条件 |
-| `cross_table_equalities` | 跨表等式，两侧为 `{table, column, expression}`；仅收录**至少一侧带表达式**的等式（如 `substr(c.trade_no, -3) = r.check_type`、`abs(c.vol * 1000) = abs(r.cjsl)`）。纯 `列 = 列` 仍在 `--format json` 的 `join_conditions` 里 |
-| `operation_no_values` | `operation_no` 的取值枚举及来源：`cursor_decode`（`DECODE`/`CASE` 映射的键）或 `branch_condition`（PL `=`/`IN` 分支条件，`trigger` 为渲染后的条件文本） |
+| `hard_filters[]` | 字面量过滤条件（字段与 `--format json` 同名），外加 `provenance` 与 `confidence`：`high` 表示已归属到某张表，`low` 表示 `table` 为 `null`（条件真实存在但无法定位） |
+| `cross_table_equalities[]` | 跨表等式，两侧为 `{table, column, expression}`；仅收录**至少一侧带表达式**的等式（如 `substr(c.trade_no, -3) = r.check_type`、`abs(c.vol * 1000) = abs(r.cjsl)`）。纯 `列 = 列` 仍在 `--format json` 的 `join_conditions` 里。`confidence` 恒为 `high`（无法解析的一侧会被丢弃，不会出现在结果里） |
+| `discriminator_values[]` | 配置的判别列（`--discriminator` 或 `[analysis] discriminator_columns`）的取值枚举，含 `column` / `value` / `source` / `trigger` / `provenance` / `confidence`。`source` 为 `cursor_decode`（`DECODE`/`CASE` 映射的键，`confidence: medium`）或 `branch_condition`（PL `=`/`IN` 分支条件，`=` 为 `high`、`IN` 为 `medium`，`trigger` 为渲染成 SQL 的条件文本）。未配置判别列时为空数组 |
+
+`provenance.file` 相对项目根目录，`provenance.line` 为 1 起算的行号：语句级提示（`hard_filters`、`cross_table_equalities`、`cursor_decode`）指向语句所在行，分支条件（`branch_condition`）指向 `IF`/`WHEN` 所在行。
+
+判别列是**可配置**的，codeweb 不内置任何领域列名。在 `codeweb.toml` 里声明：
+
+```toml
+[analysis]
+discriminator_columns = ["operation_no"]
+```
 
 `--format json` 的输出结构与默认行为保持不变；需要 ≥ v14 的 store（v14 新增过程签名与跨表等式）。
 
 **示例**：
 ```bash
-# 造数出口：需要哪些表、每张表的操作、签名、跨表等式、operation_no 取值
-codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints
+# 需要哪些表、每张表的操作、签名、跨表等式、operation_no 取值
+codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints \
+  --discriminator operation_no
 ```
 
 ---
