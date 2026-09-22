@@ -34,7 +34,9 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// `HardFilter.transform`. Refs #167, #169.
 /// v13: adds the `Edge::AnchorsOn` variant for `%TYPE`/`%ROWTYPE` schema
 /// anchors (issue #158).
-/// v14: adds the `routine_parameters` side-table (declared signatures, #181).
+/// v14: adds the `routine_parameters` side-table (declared signatures) and
+/// `ColumnAnalysis.cross_table_equalities` (expression-keyed cross-table
+/// equalities), both #181.
 pub const STORE_VERSION: u32 = 14;
 
 /// Directory to name in the repair command: the nearest ancestor holding a

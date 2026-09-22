@@ -23,8 +23,8 @@ use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
 use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node};
 use crate::parser::{
-    ColumnMapping, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition, RoutineParameter,
-    SelectIntoMapping, UpdateColumnInfo,
+    ColumnMapping, CrossTableEquality, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition,
+    RoutineParameter, SelectIntoMapping, UpdateColumnInfo,
 };
 
 /// `codeweb columns` JSON output schema (schema_version=1).
@@ -59,6 +59,7 @@ pub struct AggregatedColumnAnalysis {
 struct Diagnostics {
     tables: Vec<String>,
     join_conditions: Vec<JoinCondition>,
+    cross_table_equalities: Vec<CrossTableEquality>,
     hard_filters: Vec<HardFilter>,
     select_into: Vec<SelectIntoMapping>,
     enum_mappings: Vec<EnumMapping>,
@@ -94,7 +95,9 @@ pub struct SeedHints {
     pub tables: Vec<TableSeedHint>,
     pub hard_filters: Vec<HardFilter>,
     /// Equalities between columns of *different* tables whose sides are not plain
-    /// column references (e.g. `substr(c.trade_no, -3) = r.check_type`).
+    /// column references (e.g. `substr(c.trade_no, -3) = r.check_type`). Plain
+    /// `column = column` pairs stay in `columns --format json`'s
+    /// `join_conditions`; these are the ones that cannot be expressed there.
     pub cross_table_equalities: Vec<CrossTableEquality>,
     /// `operation_no`-style enumerations the routine depends on, with the value
     /// and where it came from.
@@ -109,16 +112,6 @@ pub struct TableSeedHint {
     /// [`write_kind_label`](crate::graph::write_kind_label) seen on a
     /// `TableAccess` edge to this table (`insert`, `update`, `delete`, ...).
     pub ops: Vec<String>,
-}
-
-/// An equality between two tables' columns where at least one side is an
-/// expression rather than a bare column reference.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CrossTableEquality {
-    pub left_table: String,
-    pub left_expression: String,
-    pub right_table: String,
-    pub right_expression: String,
 }
 
 /// One value of an `operation_no`-style enumeration and its provenance.
@@ -162,6 +155,8 @@ fn collect_diagnostics(
 
     let mut join_conditions: Vec<JoinCondition> = Vec::new();
     let mut jc_seen: HashSet<JoinCondition> = HashSet::new();
+    let mut cross_table_equalities: Vec<CrossTableEquality> = Vec::new();
+    let mut cte_seen: HashSet<CrossTableEquality> = HashSet::new();
     let mut hard_filters: Vec<HardFilter> = Vec::new();
     let mut hf_seen: HashSet<HardFilter> = HashSet::new();
     let mut select_into: Vec<SelectIntoMapping> = Vec::new();
@@ -207,6 +202,11 @@ fn collect_diagnostics(
                 for jc in &analysis.join_conditions {
                     if jc_seen.insert(jc.clone()) {
                         join_conditions.push(jc.clone());
+                    }
+                }
+                for cte in &analysis.cross_table_equalities {
+                    if cte_seen.insert(cte.clone()) {
+                        cross_table_equalities.push(cte.clone());
                     }
                 }
                 for hf in &analysis.hard_filters {
@@ -256,6 +256,7 @@ fn collect_diagnostics(
     Diagnostics {
         tables,
         join_conditions,
+        cross_table_equalities,
         hard_filters,
         select_into,
         enum_mappings,
@@ -445,7 +446,7 @@ pub fn seed_hints_of_routine(
         parameters: parameters_of_routine(store, routine),
         tables: table_operations(graph, &[routine], table_filter),
         hard_filters: diag.hard_filters,
-        cross_table_equalities: Vec::new(),
+        cross_table_equalities: diag.cross_table_equalities,
         operation_no_values: Vec::new(),
     })
 }
@@ -478,7 +479,7 @@ pub fn seed_hints_of_package(
         parameters,
         tables: table_operations(graph, &children, table_filter),
         hard_filters: diag.hard_filters,
-        cross_table_equalities: Vec::new(),
+        cross_table_equalities: diag.cross_table_equalities,
         operation_no_values: Vec::new(),
     })
 }
@@ -504,6 +505,7 @@ mod tests {
             alias_map: BTreeMap::new(),
             column_refs: Vec::new(),
             join_conditions: Vec::new(),
+            cross_table_equalities: Vec::new(),
             hard_filters: Vec::new(),
             enum_mappings: Vec::new(),
             select_into: Vec::new(),

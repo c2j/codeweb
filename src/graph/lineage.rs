@@ -2166,6 +2166,7 @@ mod tests {
                     alias_map: BTreeMap::new(),
                     column_refs: Vec::new(),
                     join_conditions: Vec::new(),
+                    cross_table_equalities: Vec::new(),
                     hard_filters: Vec::new(),
                     enum_mappings: Vec::new(),
                     select_into: Vec::new(),

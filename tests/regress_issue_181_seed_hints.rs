@@ -215,3 +215,95 @@ fn seed_hints_reports_the_declared_signature() {
     assert_eq!(params[2]["data_type"], "number");
     assert!(params[0]["default_value"].is_null());
 }
+
+/// The two cross-table equalities the issue calls out by name: a function-wrapped
+/// key (`substr(c.trade_no, -3) = r.check_type`) and an arithmetic one
+/// (`abs(c.vol * 1000) = abs(r.cjsl)`). Neither is a plain `column = column`
+/// pair, so neither shows up in `join_conditions`, yet a seed generator has to
+/// satisfy both.
+const SEED_EQUALITY_SQL: &str = r#"
+CREATE TABLE zgh_temp(trade_no VARCHAR(30), vol NUMBER);
+CREATE TABLE out_trd(check_type VARCHAR(10), cjsl NUMBER);
+
+CREATE PROCEDURE prc_seed_eq AS
+BEGIN
+  INSERT INTO out_trd(check_type, cjsl)
+  SELECT substr(c.trade_no, -3), abs(c.vol * 1000)
+  FROM zgh_temp c, out_trd r
+  WHERE substr(c.trade_no, decode(sign(length(c.trade_no) - 3), -1, 0, -3)) = r.check_type
+    AND abs(c.vol * 1000) = abs(r.cjsl);
+END;
+"#;
+
+fn equality_mentioning<'a>(hints: &'a serde_json::Value, needle: &str) -> &'a serde_json::Value {
+    hints["cross_table_equalities"]
+        .as_array()
+        .expect("cross_table_equalities array")
+        .iter()
+        .find(|e| {
+            let left = e["left"]["expression"].as_str().unwrap_or_default();
+            let right = e["right"]["expression"].as_str().unwrap_or_default();
+            left.contains(needle) || right.contains(needle)
+        })
+        .unwrap_or_else(|| panic!("no equality mentioning {needle} in {:#?}", hints))
+}
+
+#[test]
+fn seed_hints_reports_cross_table_equalities_that_are_expressions() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_EQUALITY_SQL);
+
+    let hints = seed_hints(&root, "prc_seed_eq");
+
+    let trade = equality_mentioning(&hints, "trade_no");
+    assert_eq!(trade["left"]["table"], "zgh_temp");
+    assert_eq!(trade["left"]["column"], "trade_no");
+    assert!(
+        trade["left"]["expression"]
+            .as_str()
+            .unwrap()
+            .starts_with("substr("),
+        "the wrapper must be preserved, got {trade}"
+    );
+    assert_eq!(trade["right"]["table"], "out_trd");
+    assert_eq!(trade["right"]["column"], "check_type");
+
+    let vol = equality_mentioning(&hints, "vol");
+    assert_eq!(vol["left"]["table"], "zgh_temp");
+    assert_eq!(vol["left"]["column"], "vol");
+    assert!(
+        vol["left"]["expression"].as_str().unwrap().contains("1000"),
+        "the arithmetic wrapper must be preserved, got {vol}"
+    );
+    assert_eq!(vol["right"]["table"], "out_trd");
+    assert_eq!(vol["right"]["column"], "cjsl");
+}
+
+/// A plain `column = column` pair is already a join condition; it must not be
+/// duplicated into the expression list.
+#[test]
+fn seed_hints_does_not_duplicate_plain_join_columns_as_equalities() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE a_tbl(k VARCHAR(10), v NUMBER);
+CREATE TABLE b_tbl(k VARCHAR(10), v NUMBER);
+
+CREATE PROCEDURE prc_seed_plain AS
+BEGIN
+  INSERT INTO b_tbl(k, v)
+  SELECT a.k, a.v FROM a_tbl a, b_tbl b WHERE a.k = b.k;
+END;
+"#,
+    );
+
+    let hints = seed_hints(&root, "prc_seed_plain");
+
+    assert_eq!(
+        hints["cross_table_equalities"].as_array().unwrap().len(),
+        0,
+        "a plain column = column pair belongs to join_conditions, got {:#?}",
+        hints["cross_table_equalities"]
+    );
+}

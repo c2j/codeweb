@@ -4141,6 +4141,10 @@ impl GraphBuilder {
                                     _ => {}
                                 }
                                 Self::union_dedup_vec(&mut m.join_conditions, &ca.join_conditions);
+                                Self::union_dedup_vec(
+                                    &mut m.cross_table_equalities,
+                                    &ca.cross_table_equalities,
+                                );
                                 Self::union_dedup_vec(&mut m.hard_filters, &ca.hard_filters);
                                 Self::union_dedup_vec(&mut m.enum_mappings, &ca.enum_mappings);
                                 Self::union_dedup_vec(&mut m.select_into, &ca.select_into);

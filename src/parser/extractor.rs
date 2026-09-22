@@ -2115,6 +2115,13 @@ pub struct ColumnAnalysis {
     /// legitimate empty hop set, NOT a reason to fall back.
     #[serde(default)]
     pub read_tables: Option<Vec<String>>,
+    /// Cross-table equalities whose sides are expressions rather than bare column
+    /// references (`substr(c.trade_no, -3) = r.check_type`,
+    /// `abs(c.vol * 1000) = abs(r.cjsl)`). Plain `column = column` pairs stay in
+    /// [`Self::join_conditions`]; this is the remainder a seed generator still has
+    /// to satisfy (#181).
+    #[serde(default)]
+    pub cross_table_equalities: Vec<CrossTableEquality>,
 }
 
 /// One written column and the sources its value is built from.
@@ -2236,6 +2243,23 @@ pub enum JoinType {
     Right,
     Full,
     Cross,
+}
+
+/// One side of a cross-table equality: the table/column it keys on plus the
+/// expression text as written (`substr(c.trade_no, decode(...))`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct EqualitySide {
+    pub table: String,
+    pub column: String,
+    pub expression: String,
+}
+
+/// An equality between two different tables where at least one side is an
+/// expression, not a bare column reference (#181).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CrossTableEquality {
+    pub left: EqualitySide,
+    pub right: EqualitySide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -2377,6 +2401,7 @@ pub struct ColumnAccessExtractor {
     alias_map: BTreeMap<String, TableAlias>,
     column_refs: Vec<ColumnRef>,
     join_conditions: Vec<JoinCondition>,
+    cross_table_equalities: Vec<CrossTableEquality>,
     hard_filters: Vec<HardFilter>,
     enum_mappings: Vec<EnumMapping>,
     select_into: Vec<SelectIntoMapping>,
@@ -2410,6 +2435,7 @@ impl ColumnAccessExtractor {
             alias_map: BTreeMap::new(),
             column_refs: Vec::new(),
             join_conditions: Vec::new(),
+            cross_table_equalities: Vec::new(),
             hard_filters: Vec::new(),
             enum_mappings: Vec::new(),
             select_into: Vec::new(),
@@ -2459,6 +2485,7 @@ impl ColumnAccessExtractor {
             column_refs: dedup_column_refs(self.column_refs),
             alias_map: self.alias_map,
             join_conditions: self.join_conditions,
+            cross_table_equalities: self.cross_table_equalities,
             hard_filters: self.hard_filters,
             enum_mappings: self.enum_mappings,
             select_into: self.select_into,
@@ -2719,6 +2746,14 @@ impl ColumnAccessExtractor {
                 let op_trimmed = op.trim();
                 match op_trimmed {
                     "=" => {
+                        // #181: recorded up front because the branches below are
+                        // "column vs column" / "column vs literal" shaped and one of
+                        // them matches as soon as *either* side is a bare column
+                        // reference (`substr(a.k, 1, 2) = b.k`), which would swallow
+                        // the expression case. The call itself is a no-op unless both
+                        // sides resolve to a table, the tables differ, and at least
+                        // one side is wrapped in an expression.
+                        self.extract_cross_table_equality(left, right);
                         if let (Some(l_names), Some(r_names)) =
                             (as_column_ref(left), as_column_ref(right))
                         {
@@ -2937,6 +2972,72 @@ impl ColumnAccessExtractor {
             }
             _ => {}
         }
+    }
+
+    /// Record `left = right` as a cross-table equality when both sides resolve to
+    /// a table and at least one side is wrapped in an expression. Sides are
+    /// resolved through the alias map, so an unresolvable alias (a PL record, a
+    /// correlated name) simply produces nothing.
+    fn extract_cross_table_equality(&mut self, left_expr: &Expr, right_expr: &Expr) {
+        let (Some(left), Some(right)) = (
+            self.equality_side(left_expr),
+            self.equality_side(right_expr),
+        ) else {
+            return;
+        };
+        if left.table.is_empty()
+            || right.table.is_empty()
+            || left.table.eq_ignore_ascii_case(&right.table)
+        {
+            return;
+        }
+        // Both sides bare columns: `extract_join_condition` already recorded it, and
+        // `join_conditions` is where a plain pair belongs (comparing rendered text
+        // would not do: a bare side renders as `alias.column`).
+        let is_bare =
+            |expr: &Expr| matches!(expr, Expr::ColumnRef(_) | Expr::ColumnRefOuterJoin(_));
+        if is_bare(left_expr) && is_bare(right_expr) {
+            return;
+        }
+
+        let candidate = CrossTableEquality { left, right };
+        if self.cross_table_equalities.contains(&candidate) {
+            return;
+        }
+        self.cross_table_equalities.push(candidate);
+    }
+
+    /// Resolve one equality side to its table, its single underlying column, and the
+    /// expression text. Returns `None` when the side holds no column reference or
+    /// more than one distinct one (then no single table owns it).
+    fn equality_side(&self, expr: &Expr) -> Option<EqualitySide> {
+        let mut columns: Vec<Vec<ogsql_parser::Ident>> = Vec::new();
+        collect_distinct_column_refs(expr, &mut columns);
+        if columns.len() != 1 {
+            return None;
+        }
+        let (alias, column) = split_alias_column(&columns[0]);
+        let (table, column) = match alias
+            .as_ref()
+            .and_then(|a| self.resolve_alias(a))
+            .map(|ta| ta.table.clone())
+        {
+            Some(table) => (table, column),
+            // A `%ROWTYPE` record field also parses as a multi-part column ref, but
+            // its prefix is a record variable, not a table alias — resolve it to the
+            // cursor's source table instead (the shape the acceptance case uses:
+            // `substr(c.trade_no, ...) = r_bond_repurchase.check_type`).
+            None => match self.resolve_record_field(&columns[0]) {
+                Some((table, column)) => (table, column),
+                None => (String::new(), column),
+            },
+        };
+
+        Some(EqualitySide {
+            table,
+            column,
+            expression: format_expr_short(expr),
+        })
     }
 
     fn extract_join_condition(
@@ -4434,6 +4535,63 @@ fn split_schema_table(name: &ObjectName) -> (Option<String>, String) {
 }
 
 /// Check if an expression is a ColumnRef and return the names.
+/// Distinct column references inside `expr`, in first-appearance order.
+///
+/// "Distinct" is case-insensitive by dotted name: `substr(c.trade_no, length(c.trade_no))`
+/// mentions one column twice and must count as one, or every such expression would
+/// look like it spans two tables.
+fn collect_distinct_column_refs(expr: &Expr, out: &mut Vec<Vec<ogsql_parser::Ident>>) {
+    let mut push = |names: &Vec<ogsql_parser::Ident>| {
+        let normalized = names.join(".").to_lowercase();
+        if !out
+            .iter()
+            .any(|existing| existing.join(".").to_lowercase() == normalized)
+        {
+            out.push(names.clone());
+        }
+    };
+    match expr {
+        Expr::ColumnRef(names) | Expr::ColumnRefOuterJoin(names) => push(names),
+        Expr::Parenthesized(inner) => collect_distinct_column_refs(inner, out),
+        Expr::UnaryOp { expr, .. } => collect_distinct_column_refs(expr, out),
+        Expr::TypeCast { expr, .. } => collect_distinct_column_refs(expr, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_distinct_column_refs(left, out);
+            collect_distinct_column_refs(right, out);
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            for arg in args {
+                collect_distinct_column_refs(arg, out);
+            }
+            if let Some(filter) = filter {
+                collect_distinct_column_refs(filter, out);
+            }
+        }
+        Expr::SpecialFunction { args, .. } => {
+            for arg in args {
+                collect_distinct_column_refs(arg, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_distinct_column_refs(operand, out);
+            }
+            for when in whens {
+                collect_distinct_column_refs(&when.condition, out);
+                collect_distinct_column_refs(&when.result, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_distinct_column_refs(else_expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {
     match expr {
         Expr::ColumnRef(names) => Some(names.clone()),
