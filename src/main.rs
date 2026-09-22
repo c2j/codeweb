@@ -1987,30 +1987,27 @@ fn cmd_columns(
         // clap's `columns_target` ArgGroup (required, mutually exclusive) guarantees
         // exactly one of `procedure`/`package` is `Some` by the time we get here.
         let name = package.expect("clap group guarantees procedure or package is set");
-        let resolved = store.resolve_single_node(
-            &name,
-            crate::graph::search::MatchMode::Substring,
-            false,
-            true,
-        );
-        let idx = match resolved {
-            crate::graph::search::ResolveResult::Single(idx, _) => idx,
-            crate::graph::search::ResolveResult::Empty => {
+        // Resolve against Package nodes only: a package's routine nodes are named
+        // `<package>.<routine>`, so a substring match on the package name would
+        // otherwise be ambiguous with its own procedures.
+        let matches: Vec<_> = store
+            .search_nodes_with_mode(&name, crate::graph::search::MatchMode::Substring)
+            .into_iter()
+            .filter(|(idx, _)| matches!(&graph[*idx], graph::Node::Package { .. }))
+            .collect();
+        let idx = match matches.as_slice() {
+            [] => {
                 return Err(error::CodeWebError::ExportError {
                     message: format!("No package found matching '{}'", name),
                 });
             }
+            [(idx, _)] => *idx,
             _ => {
                 return Err(error::CodeWebError::ExportError {
                     message: format!("Ambiguous match for '{}'", name),
                 });
             }
         };
-        if !matches!(&graph[idx], graph::Node::Package { .. }) {
-            return Err(error::CodeWebError::ExportError {
-                message: format!("'{}' is not a package", name),
-            });
-        }
         (idx, false, name)
     };
 

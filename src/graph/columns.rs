@@ -119,8 +119,12 @@ pub struct SeedHints {
     /// [`AggregatedColumnAnalysis::procedure`]).
     pub procedure: String,
     pub package: Option<String>,
-    /// Declared parameters, in signature order.
-    pub parameters: Vec<RoutineParameter>,
+    /// Declared signatures, one entry per routine, sorted by routine name. A
+    /// `--procedure` query has exactly one entry; a `--package` query has one per
+    /// sub-routine. Each signature keeps its own routine name so a package with
+    /// several routines (or repeated parameter names) is not flattened into one
+    /// synthetic signature.
+    pub routines: Vec<RoutineSignature>,
     /// One entry per table the routine touches, sorted by name.
     pub tables: Vec<TableSeedHint>,
     pub hard_filters: Vec<HardFilterHint>,
@@ -169,6 +173,16 @@ pub struct TableSeedHint {
     pub ops: Vec<String>,
 }
 
+/// One routine's declared signature.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoutineSignature {
+    /// The routine's name (the resolved name in `--procedure` mode, or each
+    /// sub-routine's name in `--package` mode).
+    pub routine: String,
+    /// Declared parameters, in signature order.
+    pub parameters: Vec<RoutineParameter>,
+}
+
 /// A hard filter plus where it came from.
 ///
 /// `confidence` is `high` when the filter was attributed to a `table`, `low` when
@@ -178,7 +192,8 @@ pub struct TableSeedHint {
 pub struct HardFilterHint {
     #[serde(flatten)]
     pub filter: HardFilter,
-    pub provenance: Provenance,
+    /// `None` when no reliable location is known (never a placeholder line 0).
+    pub provenance: Option<Provenance>,
     pub confidence: HintConfidence,
 }
 
@@ -191,15 +206,16 @@ pub struct HardFilterHint {
 pub struct CrossTableEqualityHint {
     #[serde(flatten)]
     pub equality: CrossTableEquality,
-    pub provenance: Provenance,
+    /// `None` when no reliable location is known (never a placeholder line 0).
+    pub provenance: Option<Provenance>,
     pub confidence: HintConfidence,
 }
 
 /// One literal value of a discriminator column and its provenance.
 ///
-/// `confidence` is `high` for a `branch_condition` (a concrete `=`/`IN` condition
-/// naming the column) and `medium` for a `cursor_decode` key (a `DECODE`/`CASE`
-/// mapping key, where the trigger is a set of values rather than one condition).
+/// `confidence` is `high` for an `=` branch condition (one value, one condition)
+/// and `medium` for an `IN` condition or a `cursor_decode` key (a set of values,
+/// with no single triggering condition).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DiscriminatorValue {
     /// The configured discriminator column this value belongs to.
@@ -211,7 +227,8 @@ pub struct DiscriminatorValue {
     /// The `IF`/`WHEN` condition that selects this value, when the extraction
     /// could attribute one. `None` for `cursor_decode`.
     pub trigger: Option<String>,
-    pub provenance: Provenance,
+    /// `None` when no reliable location is known (never a placeholder line 0).
+    pub provenance: Option<Provenance>,
     pub confidence: HintConfidence,
 }
 
@@ -518,18 +535,17 @@ fn push_discriminator_value(
 /// - `cursor_decode`: the keys of a `DECODE`/`CASE` mapping on a discriminator
 ///   column (`enum_mappings`, #165/#167). `confidence` is `medium`: a DECODE key
 ///   is one of a set, and the mapping carries no single triggering condition.
-/// - `branch_condition`: the literal of an `=`/`IN` branch condition naming a
+/// - `branch_condition`: the literal of an `=`/`IN` branch condition on a
 ///   discriminator column (`procedure_predicates`, #167), where the rendered
 ///   condition is the trigger. `confidence` is `high` for `=` (one value, one
 ///   condition) and `medium` for `IN` (the condition selects a set).
 ///
-/// A clause counts when its resolved column is a discriminator, or when the
-/// rendered condition names one: a `%ROWTYPE` record field resolves to the
-/// cursor's *projected* column, which need not keep the field's name (the
-/// acceptance case's `r_bond_repurchase.operation_no` resolves to `bs`), so the
-/// condition text is the reliable signal there. A predicate that filters several
-/// columns can therefore contribute a non-discriminator literal; the hint is
-/// advisory, not exact.
+/// A clause is enumerated only when *that clause* names a discriminator, matched
+/// by full case-insensitive name against its resolved column or, for a
+/// `%ROWTYPE` record field that resolved to the cursor's projected column
+/// (`r.operation_no` → `bs`), against the field name as written. A predicate is
+/// never matched as a whole: a sibling clause on another column (`status = 'OK'`)
+/// is not attributed to the discriminator, and `<>` clauses are skipped.
 ///
 /// Values are deduplicated per (column, value, source) and sorted, so the output
 /// does not depend on aggregation order. Returns empty when `discriminators` is
@@ -554,11 +570,7 @@ fn discriminator_values(
         };
         let provenance = enum_provenance
             .get(mapping)
-            .map(|location| provenance_of(location, base))
-            .unwrap_or_else(|| Provenance {
-                file: String::new(),
-                line: 0,
-            });
+            .map(|location| provenance_of(location, base));
         for (key, _result) in &mapping.values {
             for value in filter_value_strings(key) {
                 push_discriminator_value(
@@ -587,17 +599,26 @@ fn discriminator_values(
             let Some(table) = &predicate.table_predicate else {
                 continue;
             };
-            let origin_lower = predicate.origin.to_lowercase();
-            let origin_match = discriminators
-                .iter()
-                .find(|d| origin_lower.contains(&d.to_lowercase()));
+            // A branch condition with no line of its own is not a usable location;
+            // omit provenance rather than emitting a placeholder 0.
+            let provenance = (predicate.line > 0).then(|| Provenance {
+                file: file.clone(),
+                line: predicate.line,
+            });
             for clause in &table.clauses {
                 // Only the enumeration shapes: `=` and `IN`. A `<>` value is
                 // something to avoid, not a value that selects a branch.
                 if !matches!(clause.op, FilterOperator::Eq | FilterOperator::In) {
                     continue;
                 }
-                let column = discriminator_for(discriminators, &clause.column).or(origin_match);
+                // Match this clause only: its resolved column, or the field name as
+                // written (a `%ROWTYPE` field resolves to the projected column).
+                let column = discriminator_for(discriminators, &clause.column).or_else(|| {
+                    clause
+                        .raw_column
+                        .as_deref()
+                        .and_then(|raw| discriminator_for(discriminators, raw))
+                });
                 let Some(column) = column else {
                     continue;
                 };
@@ -615,10 +636,7 @@ fn discriminator_values(
                             value,
                             source: "branch_condition".to_string(),
                             trigger: Some(predicate.origin.clone()),
-                            provenance: Provenance {
-                                file: file.clone(),
-                                line: predicate.line,
-                            },
+                            provenance: provenance.clone(),
                             confidence,
                         },
                     );
@@ -640,6 +658,23 @@ fn parameters_of_routine(store: &GraphStore, routine: NodeIndex) -> Vec<RoutineP
         .get(&key)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Name of a routine node (`id.name`; the package-qualified name is in
+/// [`RoutineSignature`]'s context, not here).
+fn routine_name(graph: &CodeGraph, routine: NodeIndex) -> String {
+    match &graph[routine] {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => id.name.clone(),
+        _ => String::new(),
+    }
+}
+
+/// One routine's declared signature, for the `routines` list.
+fn routine_signature(store: &GraphStore, routine: NodeIndex) -> RoutineSignature {
+    RoutineSignature {
+        routine: routine_name(store.graph(), routine),
+        parameters: parameters_of_routine(store, routine),
+    }
 }
 
 /// Children of a package via `Edge::ContainsRoutine` (the same edge `codeweb detail`'s
@@ -734,18 +769,12 @@ fn hints_from_diagnostics(
         ..
     } = diag;
 
-    let missing = || Provenance {
-        file: String::new(),
-        line: 0,
-    };
-
     let hard_filters = hard_filters
         .into_iter()
         .map(|filter| {
             let provenance = hard_filter_provenance
                 .get(&filter)
-                .map(|location| provenance_of(location, base))
-                .unwrap_or_else(missing);
+                .map(|location| provenance_of(location, base));
             let confidence = if filter.table.is_some() {
                 HintConfidence::High
             } else {
@@ -764,8 +793,7 @@ fn hints_from_diagnostics(
         .map(|equality| {
             let provenance = cross_table_equality_provenance
                 .get(&equality)
-                .map(|location| provenance_of(location, base))
-                .unwrap_or_else(missing);
+                .map(|location| provenance_of(location, base));
             CrossTableEqualityHint {
                 equality,
                 provenance,
@@ -814,7 +842,7 @@ pub fn seed_hints_of_routine(
         caveat: SEED_HINTS_CAVEAT,
         procedure: name,
         package,
-        parameters: parameters_of_routine(store, routine),
+        routines: vec![routine_signature(store, routine)],
         tables: table_operations(graph, &[routine], table_filter),
         hard_filters,
         cross_table_equalities,
@@ -842,10 +870,13 @@ pub fn seed_hints_of_package(
     let (hard_filters, cross_table_equalities, disc_values) =
         hints_from_diagnostics(diag, store, &children, discriminators, base);
 
-    let parameters = children
+    // One signature per sub-routine, sorted by name: never a single synthesized
+    // signature that belongs to no declaration.
+    let mut routines: Vec<RoutineSignature> = children
         .iter()
-        .flat_map(|&child| parameters_of_routine(store, child))
+        .map(|&child| routine_signature(store, child))
         .collect();
+    routines.sort_by(|a, b| a.routine.cmp(&b.routine));
 
     Some(SeedHints {
         schema_version: 1,
@@ -853,7 +884,7 @@ pub fn seed_hints_of_package(
         caveat: SEED_HINTS_CAVEAT,
         procedure: pkg_name.clone(),
         package: Some(pkg_name),
-        parameters,
+        routines,
         tables: table_operations(graph, &children, table_filter),
         hard_filters,
         cross_table_equalities,

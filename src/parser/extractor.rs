@@ -2985,11 +2985,19 @@ impl ColumnAccessExtractor {
         ) else {
             return;
         };
-        if left.table.is_empty()
-            || right.table.is_empty()
-            || left.table.eq_ignore_ascii_case(&right.table)
-        {
+        if left.table.is_empty() || right.table.is_empty() {
             return;
+        }
+        // Two sides written through the *same* alias are one table instance, not a
+        // cross-table key. Compare aliases rather than resolved table names: a
+        // self-join uses two aliases for one physical table and must survive.
+        if let (Some(l), Some(r)) = (
+            single_column_alias(left_expr),
+            single_column_alias(right_expr),
+        ) {
+            if l.eq_ignore_ascii_case(&r) {
+                return;
+            }
         }
         // Both sides bare columns: `extract_join_condition` already recorded it, and
         // `join_conditions` is where a plain pair belongs (comparing rendered text
@@ -3029,7 +3037,21 @@ impl ColumnAccessExtractor {
             // `substr(c.trade_no, ...) = r_bond_repurchase.check_type`).
             None => match self.resolve_record_field(&columns[0]) {
                 Some((table, column)) => (table, column),
-                None => (String::new(), column),
+                // A schema-qualified `schema.table.column` has no alias:
+                // `split_alias_column` took `schema` as the alias, so resolution
+                // failed. Fall back to the segment before the column as the table
+                // name rather than dropping the equality. Only for three or more
+                // parts: a two-part `prefix.column` whose prefix is an unresolved
+                // record/variable must stay unresolved, not be mistaken for a
+                // table named after the variable.
+                None => {
+                    let names = &columns[0];
+                    if names.len() >= 3 {
+                        (names[names.len() - 2].to_string(), column)
+                    } else {
+                        (String::new(), column)
+                    }
+                }
             },
         };
 
@@ -4590,6 +4612,18 @@ fn collect_distinct_column_refs(expr: &Expr, out: &mut Vec<Vec<ogsql_parser::Ide
         }
         _ => {}
     }
+}
+
+/// The qualifier of the single column reference in `expr` (its first segment),
+/// when `expr` holds exactly one distinct column ref. Used to tell a self-join
+/// (two aliases, one table) from a same-table reference.
+fn single_column_alias(expr: &Expr) -> Option<String> {
+    let mut columns: Vec<Vec<ogsql_parser::Ident>> = Vec::new();
+    collect_distinct_column_refs(expr, &mut columns);
+    if columns.len() != 1 {
+        return None;
+    }
+    split_alias_column(&columns[0]).0
 }
 
 pub(crate) fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {

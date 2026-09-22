@@ -37,7 +37,9 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// v14: adds the `routine_parameters` side-table (declared signatures) and
 /// `ColumnAnalysis.cross_table_equalities` (expression-keyed cross-table
 /// equalities), both #181.
-pub const STORE_VERSION: u32 = 14;
+/// v15: `PredicateClause.raw_column` (the written field name when it differs from
+/// the resolved column) and first-declaration-wins `routine_parameters`, both #181.
+pub const STORE_VERSION: u32 = 15;
 
 /// Directory to name in the repair command: the nearest ancestor holding a
 /// `codeweb.toml`, else the store's own directory, else the cwd.
@@ -2591,6 +2593,7 @@ mod tests {
                             op: crate::parser::FilterOperator::Eq,
                             value: crate::parser::FilterValue::String("1".to_string()),
                             transform: None,
+                            raw_column: None,
                         },
                         // #167/#169: a transform-carrying clause must also survive the
                         // bincode round-trip via the hand-written `is_human_readable`
@@ -2606,6 +2609,7 @@ mod tests {
                                     crate::parser::FilterValue::Integer(2),
                                 ],
                             }),
+                            raw_column: None,
                         },
                     ],
                 }),

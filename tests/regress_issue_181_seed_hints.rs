@@ -230,9 +230,19 @@ fn seed_hints_reports_the_declared_signature() {
 
     let hints = seed_hints(&root, "prc_seed_params");
 
-    let params = hints["parameters"]
+    let routines = hints["routines"]
         .as_array()
-        .unwrap_or_else(|| panic!("parameters array missing from {hints:#?}"));
+        .unwrap_or_else(|| panic!("routines array missing from {hints:#?}"));
+    assert_eq!(
+        routines.len(),
+        1,
+        "one procedure, one signature: {routines:#?}"
+    );
+    assert_eq!(routines[0]["routine"], "prc_seed_params");
+
+    let params = routines[0]["parameters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("parameters array missing from {routines:#?}"));
     let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
@@ -250,6 +260,73 @@ fn seed_hints_reports_the_declared_signature() {
     assert_eq!(params[2]["mode"], "OUT");
     assert_eq!(params[2]["data_type"], "number");
     assert!(params[0]["default_value"].is_null());
+}
+
+/// Package mode must keep one signature per sub-routine, each named, rather than
+/// flat-merging every parameter into one synthetic signature. Two routines that
+/// both declare `p_i_date` would otherwise be indistinguishable.
+const SEED_PACKAGE_SQL: &str = r#"
+CREATE TABLE out_orders(order_id VARCHAR(20), kind VARCHAR(10));
+
+CREATE PACKAGE pkg_seed AS
+  PROCEDURE prc_a(p_i_date VARCHAR2);
+  PROCEDURE prc_b(p_i_date VARCHAR2, p_i_kind VARCHAR2);
+END pkg_seed;
+/
+
+CREATE PACKAGE BODY pkg_seed AS
+  PROCEDURE prc_a(p_i_date VARCHAR2) AS
+  BEGIN
+    INSERT INTO out_orders(order_id, kind) VALUES (p_i_date, 'A');
+  END;
+
+  PROCEDURE prc_b(p_i_date VARCHAR2, p_i_kind VARCHAR2) AS
+  BEGIN
+    INSERT INTO out_orders(order_id, kind) VALUES (p_i_date, p_i_kind);
+  END;
+END pkg_seed;
+"#;
+
+#[test]
+fn seed_hints_keeps_one_signature_per_routine_in_package_mode() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_PACKAGE_SQL);
+
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "columns",
+            "--package",
+            "pkg_seed",
+            "--format",
+            "seed-hints",
+            "-p",
+            ".",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "package seed-hints failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hints: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("seed-hints must be JSON");
+
+    let routines = hints["routines"]
+        .as_array()
+        .unwrap_or_else(|| panic!("routines array missing from {hints:#?}"));
+    let names: Vec<&str> = routines
+        .iter()
+        .map(|r| r["routine"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["prc_a", "prc_b"],
+        "each sub-routine keeps its own named signature, sorted, got {routines:#?}"
+    );
+    // prc_a declares one parameter, prc_b two: they must not be merged.
+    assert_eq!(routines[0]["parameters"].as_array().unwrap().len(), 1);
+    assert_eq!(routines[1]["parameters"].as_array().unwrap().len(), 2);
 }
 
 /// The two cross-table equalities the issue calls out by name: a function-wrapped
@@ -323,6 +400,45 @@ fn seed_hints_reports_cross_table_equalities_that_are_expressions() {
     assert_eq!(vol["right"]["column"], "cjsl");
 }
 
+/// The acceptance shape resolves one side through a `%ROWTYPE` record
+/// (`r_bond_repurchase.check_type`), not a plain table alias. Lock that path: an
+/// alias-only fixture would still pass if record-field resolution broke.
+const SEED_EQUALITY_RECORD_SQL: &str = r#"
+CREATE TABLE zgh_temp(trade_no VARCHAR(30), vol NUMBER);
+CREATE TABLE dat_fund_cjqs(check_type VARCHAR(10), cjsl NUMBER);
+
+CREATE PROCEDURE prc_seed_eq_rec AS
+  CURSOR c_cur IS
+    SELECT d.check_type AS check_type, d.cjsl AS cjsl FROM dat_fund_cjqs d;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  OPEN c_cur;
+  FETCH c_cur INTO r_rec;
+  INSERT INTO zgh_temp(trade_no, vol)
+  SELECT c.trade_no, c.vol FROM zgh_temp c
+  WHERE substr(c.trade_no, decode(sign(length(c.trade_no) - 3), -1, 0, -3)) = r_rec.check_type
+    AND abs(c.vol * 1000) = abs(r_rec.cjsl);
+  CLOSE c_cur;
+END;
+"#;
+
+#[test]
+fn seed_hints_resolves_a_record_field_equality_side() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_EQUALITY_RECORD_SQL);
+
+    let hints = seed_hints(&root, "prc_seed_eq_rec");
+
+    let trade = equality_mentioning(&hints, "trade_no");
+    assert_eq!(trade["left"]["table"], "zgh_temp");
+    assert_eq!(trade["left"]["column"], "trade_no");
+    assert_eq!(
+        trade["right"]["table"], "dat_fund_cjqs",
+        "the record field must resolve to its cursor's source table, got {trade}"
+    );
+    assert_eq!(trade["right"]["column"], "check_type");
+}
+
 /// A plain `column = column` pair is already a join condition; it must not be
 /// duplicated into the expression list.
 #[test]
@@ -386,6 +502,63 @@ fn discriminator_entry<'a>(
         .expect("discriminator_values array")
         .iter()
         .find(|v| v["value"].as_str() == Some(value))
+}
+
+/// A `%ROWTYPE` field whose cursor *projects* it under a different name must
+/// still be matched by the field name — and a sibling clause on another column,
+/// or a `<>` comparison, must not be attributed to the discriminator.
+const SEED_DISCRIMINATOR_RENAME_SQL: &str = r#"
+CREATE TABLE src_op(bs VARCHAR(20), stock_kind VARCHAR(10));
+CREATE TABLE out_op(x VARCHAR(20));
+
+CREATE PROCEDURE prc_seed_rename AS
+  CURSOR c_cur IS
+    SELECT t.bs AS operation_no, t.stock_kind AS stock_kind FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  OPEN c_cur;
+  FETCH c_cur INTO r_rec;
+  IF r_rec.operation_no <> 'BAD' AND r_rec.stock_kind = 'OK' THEN
+    INSERT INTO out_op(x) VALUES ('a');
+  END IF;
+  IF r_rec.operation_no = '0110999001' THEN
+    INSERT INTO out_op(x) VALUES ('b');
+  END IF;
+  CLOSE c_cur;
+END;
+"#;
+
+#[test]
+fn seed_hints_matches_the_record_field_name_not_the_projected_column() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_DISCRIMINATOR_RENAME_SQL);
+
+    let hints = seed_hints(&root, "prc_seed_rename");
+    let values: Vec<&str> = hints["discriminator_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["value"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        values.contains(&"0110999001"),
+        "the field name must match even though the cursor projects it as `bs`, got {values:?}"
+    );
+    assert!(
+        !values.contains(&"OK"),
+        "a sibling clause on another column must not be attributed to the discriminator, got {values:?}"
+    );
+    assert!(
+        !values.contains(&"BAD"),
+        "a `<>` value must not be enumerated, got {values:?}"
+    );
+
+    let entry = discriminator_entry(&hints, "0110999001").unwrap();
+    assert!(
+        entry["provenance"]["line"].as_u64().unwrap_or(0) > 0,
+        "the matched branch must carry a real line, got {entry}"
+    );
 }
 
 #[test]
@@ -549,4 +722,100 @@ END;
         !values.iter().any(|(c, _)| *c == "operation_no"),
         "an unconfigured column must not be enumerated, got {values:?}"
     );
+}
+
+/// Two overloads with bodies: the routine node keeps the *first* declaration
+/// (`or_insert_with`), so the reported parameters must come from that same
+/// declaration rather than the last one seen.
+const SEED_OVERLOAD_SQL: &str = r#"
+CREATE TABLE out_orders(order_id VARCHAR(20), kind VARCHAR(10));
+
+CREATE PACKAGE pkg_over AS
+  PROCEDURE prc_p(a NUMBER);
+  PROCEDURE prc_p(a NUMBER, b NUMBER);
+END pkg_over;
+/
+
+CREATE PACKAGE BODY pkg_over AS
+  PROCEDURE prc_p(a NUMBER) AS
+  BEGIN
+    INSERT INTO out_orders(order_id, kind) VALUES ('a', 'A');
+  END;
+
+  PROCEDURE prc_p(a NUMBER, b NUMBER) AS
+  BEGIN
+    INSERT INTO out_orders(order_id, kind) VALUES ('b', 'B');
+  END;
+END pkg_over;
+"#;
+
+#[test]
+fn seed_hints_signature_matches_the_surviving_overload() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_OVERLOAD_SQL);
+
+    let hints = seed_hints(&root, "prc_p");
+
+    let routines = hints["routines"].as_array().unwrap();
+    assert_eq!(routines.len(), 1, "one node, one signature: {routines:#?}");
+    let params = routines[0]["parameters"].as_array().unwrap();
+    assert_eq!(
+        params.len(),
+        1,
+        "the first declaration (one parameter) owns the node, so its signature \
+         must be the one reported, got {params:#?}"
+    );
+    assert_eq!(params[0]["name"], "a");
+}
+
+/// Two aliases over the *same* physical table are a self-join, not a same-table
+/// reference: the equality must survive. Dropping it (because both sides resolve
+/// to the same table name) would lose a real constraint.
+#[test]
+fn seed_hints_keeps_a_self_join_equality() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE pair_tbl(k VARCHAR(10), v NUMBER);
+
+CREATE PROCEDURE prc_self_join AS
+BEGIN
+  INSERT INTO pair_tbl(k, v)
+  SELECT a.k, a.v FROM pair_tbl a, pair_tbl b
+  WHERE abs(a.v * 10) = abs(b.v);
+END;
+"#,
+    );
+
+    let hints = seed_hints(&root, "prc_self_join");
+    let eq = equality_mentioning(&hints, "10");
+    assert_eq!(eq["left"]["table"], "pair_tbl");
+    assert_eq!(eq["right"]["table"], "pair_tbl");
+}
+
+/// A schema-qualified `schema.table.column` has no alias: the table name must be
+/// taken from the segment before the column rather than dropping the equality.
+#[test]
+fn seed_hints_keeps_a_schema_qualified_equality() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE s1.a_tbl(k VARCHAR(10), v NUMBER);
+CREATE TABLE b_tbl(k VARCHAR(10), v NUMBER);
+
+CREATE PROCEDURE prc_schema_eq AS
+BEGIN
+  INSERT INTO b_tbl(k, v)
+  SELECT s1.a_tbl.k, s1.a_tbl.v FROM s1.a_tbl, b_tbl
+  WHERE abs(s1.a_tbl.v * 10) = abs(b_tbl.v);
+END;
+"#,
+    );
+
+    let hints = seed_hints(&root, "prc_schema_eq");
+    let eq = equality_mentioning(&hints, "10");
+    assert_eq!(eq["left"]["table"], "a_tbl");
+    assert_eq!(eq["right"]["table"], "b_tbl");
 }

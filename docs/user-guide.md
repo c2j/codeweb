@@ -749,13 +749,13 @@ codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints \
 | 字段 | 说明 |
 |------|------|
 | `kind` / `caveat` | 文档自描述：`kind` 恒为 `predicate_inventory`；`caveat` 为「必要条件非充分」的一句话说明 |
-| `parameters` | 过程签名（按声明顺序），含 `name` / `mode`（`IN`/`OUT`/`IN OUT`）/ `data_type` / `default_value`。`data_type` 按解析器归一化输出（关键字类型为小写，如 `varchar2`） |
+| `routines[]` | 每个过程/函数一条签名：`routine`（过程名）+ `parameters`（按声明顺序，含 `name` / `mode`（`IN`/`OUT`/`IN OUT`）/ `data_type` / `default_value`）。`--procedure` 恰有一条；`--package` 每个子过程一条，按名字排序。`data_type` 按解析器归一化输出（关键字类型为小写，如 `varchar2`） |
 | `tables[].ops` | 每张表上的操作，取自图自身的写类型标签并排序去重：`read`、`insert`、`insert_select`、`update`、`delete`、`truncate`…（`insert` 与 `insert_select` 含义不同：后者要求行来自查询） |
 | `hard_filters[]` | 字面量过滤条件（字段与 `--format json` 同名），外加 `provenance` 与 `confidence`：`high` 表示已归属到某张表，`low` 表示 `table` 为 `null`（条件真实存在但无法定位） |
 | `cross_table_equalities[]` | 跨表等式，两侧为 `{table, column, expression}`；仅收录**至少一侧带表达式**的等式（如 `substr(c.trade_no, -3) = r.check_type`、`abs(c.vol * 1000) = abs(r.cjsl)`）。纯 `列 = 列` 仍在 `--format json` 的 `join_conditions` 里。`confidence` 恒为 `high`（无法解析的一侧会被丢弃，不会出现在结果里） |
 | `discriminator_values[]` | 配置的判别列（`--discriminator` 或 `[analysis] discriminator_columns`）的取值枚举，含 `column` / `value` / `source` / `trigger` / `provenance` / `confidence`。`source` 为 `cursor_decode`（`DECODE`/`CASE` 映射的键，`confidence: medium`）或 `branch_condition`（PL `=`/`IN` 分支条件，`=` 为 `high`、`IN` 为 `medium`，`trigger` 为渲染成 SQL 的条件文本）。未配置判别列时为空数组 |
 
-`provenance.file` 相对项目根目录，`provenance.line` 为 1 起算的行号：语句级提示（`hard_filters`、`cross_table_equalities`、`cursor_decode`）指向语句所在行，分支条件（`branch_condition`）指向 `IF`/`WHEN` 所在行。
+`provenance.file` 相对项目根目录，`provenance.line` 为 1 起算的行号：语句级提示（`hard_filters`、`cross_table_equalities`、`cursor_decode`）指向语句所在行，分支条件（`branch_condition`）指向 `IF`/`WHEN` 所在行（`ELSIF` 没有独立行号，回退到所属 `IF`）。无法确定位置时 `provenance` 为 `null`，不会给出 `line: 0` 这种占位。
 
 判别列是**可配置**的，codeweb 不内置任何领域列名。在 `codeweb.toml` 里声明：
 
@@ -764,7 +764,7 @@ codeweb columns --procedure prc_deal_bond_repurchase_inst --format seed-hints \
 discriminator_columns = ["operation_no"]
 ```
 
-`--format json` 的输出结构与默认行为保持不变；需要 ≥ v14 的 store（v14 新增过程签名与跨表等式）。
+`--format json` 的输出结构与默认行为保持不变；需要 ≥ v15 的 store。
 
 **示例**：
 ```bash

@@ -417,6 +417,13 @@ impl GraphBuilder {
         for item in items {
             match item {
                 PackageItem::Procedure(procedure) => {
+                    // `create_package_nodes` only creates a routine node for an item
+                    // with a body, so a spec-only declaration is skipped here too —
+                    // otherwise its parameters could be attributed to a node built
+                    // from a different (body) declaration.
+                    if procedure.block.is_none() {
+                        continue;
+                    }
                     let id = RoutineId {
                         schema: schema.clone(),
                         package: package_name.clone(),
@@ -436,6 +443,9 @@ impl GraphBuilder {
                     );
                 }
                 PackageItem::Function(function) => {
+                    if function.block.is_none() {
+                        continue;
+                    }
                     let id = RoutineId {
                         schema: schema.clone(),
                         package: package_name.clone(),
@@ -459,23 +469,23 @@ impl GraphBuilder {
         }
     }
 
-    /// A parameterless routine is left out of the side table entirely, so
-    /// "absent" and "declared nothing" are the same state (as with predicates).
+    /// Record a declaration's parameters under `key`, first declaration wins.
+    ///
+    /// Mirrors how the routine node itself is kept (`or_insert_with`): an overload
+    /// pair must not end up with the first body and the last signature. An empty
+    /// list is recorded as empty rather than skipped, so a parameterless first
+    /// declaration is not silently replaced by a later overload's parameters.
     fn record_routine_parameters(
         ctx: &mut GraphBuildContext,
         key: String,
         parameters: &[ogsql_parser::ast::RoutineParam],
     ) {
-        if parameters.is_empty() {
-            return;
-        }
-        ctx.routine_parameters.insert(
-            key,
+        ctx.routine_parameters.entry(key).or_insert_with(|| {
             parameters
                 .iter()
                 .map(crate::parser::RoutineParameter::from_ast)
-                .collect(),
-        );
+                .collect()
+        });
     }
 
     fn collect_procedure_predicates(ctx: &mut GraphBuildContext, files: &[ParsedFile]) {
