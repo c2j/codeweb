@@ -13,13 +13,13 @@
 //! names 1:1 — issue #165 explicitly rules out an extra display-tree wrapper layer —
 //! so the MCP/HTTP surfaces planned for a later task can reuse this struct unchanged.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
-use crate::graph::{CodeGraph, Edge, Node};
+use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node};
 use crate::parser::{
     ColumnMapping, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition, SelectIntoMapping,
     UpdateColumnInfo,
@@ -64,6 +64,81 @@ struct Diagnostics {
     insert_columns: Vec<InsertColumnInfo>,
     update_columns: Vec<UpdateColumnInfo>,
     read_tables: Vec<String>,
+}
+
+/// `codeweb columns --format seed-hints` output schema (issue #181).
+///
+/// The consumer is a test-data generator, so the document is organized by "what
+/// rows must exist and what shape they need" rather than by statement: the
+/// routine's signature, one entry per table with the operations performed on it,
+/// the literal filters that select the rows, and the cross-table equalities that
+/// tie rows in different tables together. codeweb never emits SQL and never
+/// connects to a database; this is hints, not a script.
+///
+/// Field names for the diagnostic parts are shared with
+/// [`AggregatedColumnAnalysis`] (`hard_filters`, ...) so a consumer that already
+/// reads `columns --format json` reuses its parsing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SeedHints {
+    pub schema_version: u32,
+    /// Resolved procedure/function name in `--procedure` mode, or the resolved
+    /// package name in `--package` mode (same identity rule as
+    /// [`AggregatedColumnAnalysis::procedure`]).
+    pub procedure: String,
+    pub package: Option<String>,
+    /// Declared parameters, in signature order.
+    pub parameters: Vec<RoutineParameter>,
+    /// One entry per table the routine touches, sorted by name.
+    pub tables: Vec<TableSeedHint>,
+    pub hard_filters: Vec<HardFilter>,
+    /// Equalities between columns of *different* tables whose sides are not plain
+    /// column references (e.g. `substr(c.trade_no, -3) = r.check_type`).
+    pub cross_table_equalities: Vec<CrossTableEquality>,
+    /// `operation_no`-style enumerations the routine depends on, with the value
+    /// and where it came from.
+    pub operation_no_values: Vec<OperationNoValue>,
+}
+
+/// One table plus the operations the routine performs on it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableSeedHint {
+    pub name: String,
+    /// Sorted, deduplicated operation labels: `read` plus every
+    /// [`write_kind_label`](crate::graph::write_kind_label) seen on a
+    /// `TableAccess` edge to this table (`insert`, `update`, `delete`, ...).
+    pub ops: Vec<String>,
+}
+
+/// A declared routine parameter (`p_i_date VARCHAR2`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoutineParameter {
+    pub name: String,
+    /// `IN` / `OUT` / `IN OUT`, when the declaration states one.
+    pub mode: Option<String>,
+    pub data_type: String,
+    pub default_value: Option<String>,
+}
+
+/// An equality between two tables' columns where at least one side is an
+/// expression rather than a bare column reference.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossTableEquality {
+    pub left_table: String,
+    pub left_expression: String,
+    pub right_table: String,
+    pub right_expression: String,
+}
+
+/// One value of an `operation_no`-style enumeration and its provenance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperationNoValue {
+    pub value: String,
+    /// Where the value was found: `cursor_decode`, `callee_return`, or
+    /// `comparison`.
+    pub source: String,
+    /// The `DECODE`/`CASE` key or `IF` condition that selects this value, when
+    /// the extraction could attribute one.
+    pub trigger: Option<String>,
 }
 
 /// Scan every `TableAccess` edge of `routines` (both directions, mirroring
@@ -254,11 +329,7 @@ pub fn column_analysis_of_package(
         _ => return None,
     };
 
-    let children: Vec<NodeIndex> = graph
-        .edges_directed(package, Direction::Outgoing)
-        .filter(|e| matches!(e.weight(), Edge::ContainsRoutine))
-        .map(|e| e.target())
-        .collect();
+    let children = package_children(graph, package);
 
     let diag = collect_diagnostics(graph, &children, table_filter);
 
@@ -275,6 +346,130 @@ pub fn column_analysis_of_package(
         insert_columns: diag.insert_columns,
         update_columns: diag.update_columns,
         read_tables: diag.read_tables,
+    })
+}
+
+/// Children of a package via `Edge::ContainsRoutine` (the same edge `codeweb detail`'s
+/// package summary uses).
+fn package_children(graph: &CodeGraph, package: NodeIndex) -> Vec<NodeIndex> {
+    graph
+        .edges_directed(package, Direction::Outgoing)
+        .filter(|e| matches!(e.weight(), Edge::ContainsRoutine))
+        .map(|e| e.target())
+        .collect()
+}
+
+/// Per-table operation labels for `routines`, sorted and deduplicated.
+///
+/// Deliberately separate from [`collect_diagnostics`]: that walk skips edges
+/// without a [`ColumnAnalysis`](crate::parser::ColumnAnalysis), while an operation
+/// (e.g. `DELETE`, whose column analysis is empty) still has to show up in the
+/// seed hints. Keeping the two walks apart also leaves `columns --format json`'s
+/// `tables` list byte-identical.
+fn table_operations(
+    graph: &CodeGraph,
+    routines: &[NodeIndex],
+    table_filter: Option<&str>,
+) -> Vec<TableSeedHint> {
+    let filter_lower = table_filter.map(|t| t.to_lowercase());
+    let mut ops: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+
+    for &routine in routines {
+        for dir in [Direction::Outgoing, Direction::Incoming] {
+            for edge_ref in graph.edges_directed(routine, dir) {
+                let Edge::TableAccess {
+                    modes, write_kinds, ..
+                } = edge_ref.weight()
+                else {
+                    continue;
+                };
+                let other = if dir == Direction::Outgoing {
+                    edge_ref.target()
+                } else {
+                    edge_ref.source()
+                };
+                let table_name = match &graph[other] {
+                    Node::Table { name, .. } | Node::View { name, .. } => name,
+                    _ => continue,
+                };
+                if let Some(filt) = &filter_lower {
+                    if table_name.to_lowercase() != *filt {
+                        continue;
+                    }
+                }
+
+                let entry = ops.entry(table_name.clone()).or_default();
+                if modes.contains(AccessMode::Read) {
+                    entry.insert("read");
+                }
+                for kind in write_kinds {
+                    entry.insert(write_kind_label(kind));
+                }
+            }
+        }
+    }
+
+    ops.into_iter()
+        .map(|(name, ops)| TableSeedHint {
+            name,
+            ops: ops.into_iter().map(|o| o.to_string()).collect(),
+        })
+        .collect()
+}
+
+/// Seed-data hints for one routine (issue #181). Returns `None` when `routine` is
+/// not a `Node::Procedure`/`Node::Function`, mirroring
+/// [`column_analysis_of_routine`]'s defensive contract.
+pub fn seed_hints_of_routine(
+    graph: &CodeGraph,
+    routine: NodeIndex,
+    table_filter: Option<&str>,
+) -> Option<SeedHints> {
+    let (name, package) = match &graph[routine] {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => {
+            (id.name.clone(), id.package.clone())
+        }
+        _ => return None,
+    };
+
+    let diag = collect_diagnostics(graph, &[routine], table_filter);
+
+    Some(SeedHints {
+        schema_version: 1,
+        procedure: name,
+        package,
+        parameters: Vec::new(),
+        tables: table_operations(graph, &[routine], table_filter),
+        hard_filters: diag.hard_filters,
+        cross_table_equalities: Vec::new(),
+        operation_no_values: Vec::new(),
+    })
+}
+
+/// Seed-data hints for every routine a package contains. Returns `None` when
+/// `package` is not a `Node::Package`.
+pub fn seed_hints_of_package(
+    graph: &CodeGraph,
+    package: NodeIndex,
+    table_filter: Option<&str>,
+) -> Option<SeedHints> {
+    let pkg_name = match &graph[package] {
+        Node::Package { name, .. } => name.clone(),
+        _ => return None,
+    };
+
+    let children = package_children(graph, package);
+    let diag = collect_diagnostics(graph, &children, table_filter);
+
+    Some(SeedHints {
+        schema_version: 1,
+        procedure: pkg_name.clone(),
+        package: Some(pkg_name),
+        parameters: Vec::new(),
+        tables: table_operations(graph, &children, table_filter),
+        hard_filters: diag.hard_filters,
+        cross_table_equalities: Vec::new(),
+        operation_no_values: Vec::new(),
     })
 }
 

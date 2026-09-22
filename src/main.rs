@@ -448,8 +448,10 @@ enum Commands {
         #[arg(long)]
         table: Option<String>,
 
-        /// Output format (only "json" is supported today)
-        #[arg(long, default_value = "json", value_parser = ["json"])]
+        /// Output format: "json" (default, #165 schema) or "seed-hints"
+        /// (#181: tables + operations, signature, hard filters, cross-table
+        /// equalities, operation_no values)
+        #[arg(long, default_value = "json", value_parser = ["json", "seed-hints"])]
         format: String,
 
         /// Project directory (default: current directory)
@@ -1933,7 +1935,9 @@ fn cmd_columns(
 
     let table_filter = table.as_deref();
 
-    let result = if let Some(name) = procedure {
+    // Resolve the target once: both output formats read the same node, and the
+    // error contract (non-zero exit + message on stderr) is identical for both.
+    let (idx, is_routine, name) = if let Some(name) = procedure {
         let resolved = store.resolve_single_node(
             &name,
             crate::graph::search::MatchMode::Substring,
@@ -1961,11 +1965,7 @@ fn cmd_columns(
                 message: format!("'{}' is not a procedure or function", name),
             });
         }
-        graph::columns::column_analysis_of_routine(graph, idx, table_filter).ok_or_else(|| {
-            error::CodeWebError::ExportError {
-                message: format!("failed to aggregate column analysis for '{}'", name),
-            }
-        })?
+        (idx, true, name)
     } else {
         // clap's `columns_target` ArgGroup (required, mutually exclusive) guarantees
         // exactly one of `procedure`/`package` is `Some` by the time we get here.
@@ -1994,16 +1994,38 @@ fn cmd_columns(
                 message: format!("'{}' is not a package", name),
             });
         }
-        graph::columns::column_analysis_of_package(graph, idx, table_filter).ok_or_else(|| {
-            error::CodeWebError::ExportError {
-                message: format!("failed to aggregate column analysis for package '{}'", name),
-            }
-        })?
+        (idx, false, name)
     };
 
     match format {
         "json" => {
+            let result = if is_routine {
+                graph::columns::column_analysis_of_routine(graph, idx, table_filter)
+            } else {
+                graph::columns::column_analysis_of_package(graph, idx, table_filter)
+            }
+            .ok_or_else(|| error::CodeWebError::ExportError {
+                message: format!("failed to aggregate column analysis for '{}'", name),
+            })?;
             let json_str = serde_json::to_string_pretty(&result).map_err(|e| {
+                error::CodeWebError::ExportError {
+                    message: format!("Failed to format JSON: {}", e),
+                }
+            })?;
+            println_stdout!("{}", json_str);
+        }
+        // #181: the seed-data entry point. `json` above stays the default and
+        // keeps its exact schema; this one is shaped for a generator.
+        "seed-hints" => {
+            let hints = if is_routine {
+                graph::columns::seed_hints_of_routine(graph, idx, table_filter)
+            } else {
+                graph::columns::seed_hints_of_package(graph, idx, table_filter)
+            }
+            .ok_or_else(|| error::CodeWebError::ExportError {
+                message: format!("failed to aggregate seed hints for '{}'", name),
+            })?;
+            let json_str = serde_json::to_string_pretty(&hints).map_err(|e| {
                 error::CodeWebError::ExportError {
                     message: format!("Failed to format JSON: {}", e),
                 }
@@ -2012,7 +2034,7 @@ fn cmd_columns(
         }
         other => {
             return Err(error::CodeWebError::ExportError {
-                message: format!("Unknown format: {}. Use 'json'", other),
+                message: format!("Unknown format: {}. Use 'json' or 'seed-hints'", other),
             });
         }
     }
