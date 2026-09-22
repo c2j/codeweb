@@ -23,8 +23,8 @@ use crate::graph::key::NodeKey;
 use crate::graph::store::GraphStore;
 use crate::graph::{write_kind_label, AccessMode, CodeGraph, Edge, Node};
 use crate::parser::{
-    ColumnMapping, CrossTableEquality, EnumMapping, HardFilter, InsertColumnInfo, JoinCondition,
-    RoutineParameter, SelectIntoMapping, UpdateColumnInfo,
+    ColumnMapping, CrossTableEquality, EnumMapping, FilterOperator, FilterValue, HardFilter,
+    InsertColumnInfo, JoinCondition, RoutineParameter, SelectIntoMapping, UpdateColumnInfo,
 };
 
 /// `codeweb columns` JSON output schema (schema_version=1).
@@ -118,8 +118,8 @@ pub struct TableSeedHint {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OperationNoValue {
     pub value: String,
-    /// Where the value was found: `cursor_decode`, `callee_return`, or
-    /// `comparison`.
+    /// Where the value was found: `cursor_decode` (a `DECODE`/`CASE` mapping on
+    /// `operation_no`) or `branch_condition` (a PL `=`/`IN` condition naming it).
     pub source: String,
     /// The `DECODE`/`CASE` key or `IF` condition that selects this value, when
     /// the extraction could attribute one.
@@ -342,6 +342,113 @@ pub fn column_analysis_of_package(
     })
 }
 
+/// The discriminator column `seed-hints` enumerates (issue #181).
+const OPERATION_NO_COLUMN: &str = "operation_no";
+
+/// String values inside a `FilterValue`, flattening `IN` lists.
+fn filter_value_strings(value: &FilterValue) -> Vec<String> {
+    match value {
+        FilterValue::String(s) => vec![s.clone()],
+        FilterValue::Integer(i) => vec![i.to_string()],
+        FilterValue::Float(f) => vec![f.clone()],
+        FilterValue::List(items) => items.iter().flat_map(filter_value_strings).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn push_operation_no_value(
+    out: &mut Vec<OperationNoValue>,
+    seen: &mut HashSet<(String, String)>,
+    value: String,
+    source: &str,
+    trigger: Option<String>,
+) {
+    if !seen.insert((value.clone(), source.to_string())) {
+        return;
+    }
+    out.push(OperationNoValue {
+        value,
+        source: source.to_string(),
+        trigger,
+    });
+}
+
+/// Every `operation_no` value the routine depends on, with its provenance.
+///
+/// Two sources, both already extracted for other purposes:
+///
+/// - `cursor_decode`: the keys of a `DECODE`/`CASE` mapping on `operation_no`
+///   (`enum_mappings`, #165/#167).
+/// - `branch_condition`: the literal of an `=`/`IN` branch condition naming
+///   `operation_no` (`procedure_predicates`, #167), where the rendered condition
+///   is the trigger that selects the value.
+///
+/// Values are deduplicated per (value, source) and sorted, so the output does not
+/// depend on aggregation order.
+fn operation_no_values(
+    store: &GraphStore,
+    routines: &[NodeIndex],
+    enum_mappings: &[EnumMapping],
+) -> Vec<OperationNoValue> {
+    let mut out: Vec<OperationNoValue> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    for mapping in enum_mappings {
+        if !mapping.column.eq_ignore_ascii_case(OPERATION_NO_COLUMN) {
+            continue;
+        }
+        for (key, _result) in &mapping.values {
+            for value in filter_value_strings(key) {
+                push_operation_no_value(&mut out, &mut seen, value, "cursor_decode", None);
+            }
+        }
+    }
+
+    for &routine in routines {
+        let key = NodeKey::from_node(&store.graph()[routine]).to_string();
+        let Some(predicates) = store.procedure_predicates.get(&key) else {
+            continue;
+        };
+        for predicate in predicates {
+            let mentions_column = predicate
+                .origin
+                .to_lowercase()
+                .contains(OPERATION_NO_COLUMN)
+                || predicate.table_predicate.as_ref().is_some_and(|table| {
+                    table
+                        .clauses
+                        .iter()
+                        .any(|c| c.column.eq_ignore_ascii_case(OPERATION_NO_COLUMN))
+                });
+            if !mentions_column {
+                continue;
+            }
+            let Some(table) = &predicate.table_predicate else {
+                continue;
+            };
+            for clause in &table.clauses {
+                // Only the enumeration shapes: `=` and `IN`. A `<>` value is
+                // something to avoid, not a value that selects a branch.
+                if !matches!(clause.op, FilterOperator::Eq | FilterOperator::In) {
+                    continue;
+                }
+                for value in filter_value_strings(&clause.value) {
+                    push_operation_no_value(
+                        &mut out,
+                        &mut seen,
+                        value,
+                        "branch_condition",
+                        Some(predicate.origin.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| (&a.value, &a.source).cmp(&(&b.value, &b.source)));
+    out
+}
+
 /// Declared parameters of one routine, from the store's side table (empty when the
 /// routine declared none, or when the store predates `routine_parameters`).
 fn parameters_of_routine(store: &GraphStore, routine: NodeIndex) -> Vec<RoutineParameter> {
@@ -447,7 +554,7 @@ pub fn seed_hints_of_routine(
         tables: table_operations(graph, &[routine], table_filter),
         hard_filters: diag.hard_filters,
         cross_table_equalities: diag.cross_table_equalities,
-        operation_no_values: Vec::new(),
+        operation_no_values: operation_no_values(store, &[routine], &diag.enum_mappings),
     })
 }
 
@@ -480,7 +587,7 @@ pub fn seed_hints_of_package(
         tables: table_operations(graph, &children, table_filter),
         hard_filters: diag.hard_filters,
         cross_table_equalities: diag.cross_table_equalities,
-        operation_no_values: Vec::new(),
+        operation_no_values: operation_no_values(store, &children, &diag.enum_mappings),
     })
 }
 

@@ -164,7 +164,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb nodes` | List graph nodes with filtering |
 | `codeweb trace-sql <sql>` | Search by SQL fragment and trace to Java methods |
 | `codeweb lineage <target>` | Table-level and column-level lineage analysis |
-| `codeweb columns --procedure <name>` | Aggregate column-analysis for a procedure/package (JSON) |
+| `codeweb columns --procedure <name>` | Aggregate column-analysis for a procedure/package (`--format json`, or `seed-hints` for the seed-data entry point: signature, per-table ops, cross-table equalities, `operation_no` values) |
 | `codeweb predicates --procedure <name>` | PL IF/CASE predicates resolved to table columns (JSON) |
 | `codeweb query` | Execute declarative JSON QuerySpec |
 | `codeweb import` | Import CGEF JSON graph file |
@@ -526,7 +526,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb nodes` | 列出图节点（支持过滤） |
 | `codeweb trace-sql <sql>` | 按 SQL 片段搜索并追踪到 Java 方法 |
 | `codeweb lineage <target>` | 表级与列级血缘分析 |
-| `codeweb columns --procedure <name>` | 按过程/包聚合列级分析结果 (JSON) |
+| `codeweb columns --procedure <name>` | 按过程/包聚合列级分析结果（`--format json`；`--format seed-hints` 为造数出口：签名、每表操作、跨表等式、`operation_no` 取值） |
 | `codeweb predicates --procedure <name>` | 解析 PL IF/CASE 条件为表列谓词 (JSON) |
 | `codeweb query` | 执行声明式 JSON QuerySpec |
 | `codeweb import` | 导入 CGEF JSON 图谱文件 |

@@ -307,3 +307,79 @@ END;
         hints["cross_table_equalities"]
     );
 }
+
+/// `operation_no` is the discriminator the issue's migration hinged on: a seed
+/// generator has to pick a value that walks the branch it wants. The values come
+/// from two places — a `DECODE` mapping (the cursor's enum) and a PL branch
+/// condition — and the second one carries the trigger.
+const SEED_OPERATION_NO_SQL: &str = r#"
+CREATE TABLE src_op(operation_no VARCHAR(20), amount NUMBER);
+CREATE TABLE out_op(bs VARCHAR(20));
+
+CREATE PROCEDURE prc_seed_opno AS
+  CURSOR c_cur IS
+    SELECT t.operation_no AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  INSERT INTO out_op(bs)
+  SELECT DECODE(operation_no, '0112004001', 'A', '0111004001', 'B', 'Z') FROM src_op;
+
+  OPEN c_cur;
+  FETCH c_cur INTO r_rec;
+  IF r_rec.operation_no = '0110999001' THEN
+    INSERT INTO out_op(bs) VALUES ('hit');
+  END IF;
+  CLOSE c_cur;
+END;
+"#;
+
+fn operation_no_entry<'a>(
+    hints: &'a serde_json::Value,
+    value: &str,
+) -> Option<&'a serde_json::Value> {
+    hints["operation_no_values"]
+        .as_array()
+        .expect("operation_no_values array")
+        .iter()
+        .find(|v| v["value"].as_str() == Some(value))
+}
+
+#[test]
+fn seed_hints_lists_operation_no_values_with_their_provenance() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(&dir, SEED_OPERATION_NO_SQL);
+
+    let hints = seed_hints(&root, "prc_seed_opno");
+    let values: Vec<&str> = hints["operation_no_values"]
+        .as_array()
+        .expect("operation_no_values array")
+        .iter()
+        .map(|v| v["value"].as_str().unwrap())
+        .collect();
+
+    for expected in ["0112004001", "0111004001", "0110999001"] {
+        assert!(
+            values.contains(&expected),
+            "operation_no value {expected} missing from {values:?}"
+        );
+    }
+
+    let decoded = operation_no_entry(&hints, "0112004001").unwrap();
+    assert_eq!(
+        decoded["source"], "cursor_decode",
+        "a DECODE mapping value must say so, got {decoded}"
+    );
+
+    let branch = operation_no_entry(&hints, "0110999001").unwrap();
+    assert_eq!(
+        branch["source"], "branch_condition",
+        "an IF condition value must say so, got {branch}"
+    );
+    let trigger = branch["trigger"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the branch condition must carry its trigger: {branch}"));
+    assert!(
+        trigger.contains("operation_no") && trigger.contains("0110999001"),
+        "the trigger must name the condition, got {trigger}"
+    );
+}
