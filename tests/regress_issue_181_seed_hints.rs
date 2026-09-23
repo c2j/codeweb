@@ -819,3 +819,30 @@ END;
     assert_eq!(eq["left"]["table"], "a_tbl");
     assert_eq!(eq["right"]["table"], "b_tbl");
 }
+
+/// Both sides schema-qualified under the *same* schema but different tables: the
+/// shared first segment (`s1`) is the schema, not an alias, so this is not the
+/// same instance and must survive.
+#[test]
+fn seed_hints_keeps_two_schema_qualified_tables_under_one_schema() {
+    let dir = TempDir::new().unwrap();
+    let root = project_with_sql(
+        &dir,
+        r#"
+CREATE TABLE s1.a_tbl(k VARCHAR(10), v NUMBER);
+CREATE TABLE s1.b_tbl(k VARCHAR(10), v NUMBER);
+
+CREATE PROCEDURE prc_schema_two AS
+BEGIN
+  INSERT INTO s1.a_tbl(k, v)
+  SELECT s1.b_tbl.k, s1.b_tbl.v FROM s1.b_tbl
+  WHERE abs(s1.a_tbl.v * 10) = abs(s1.b_tbl.v);
+END;
+"#,
+    );
+
+    let hints = seed_hints(&root, "prc_schema_two");
+    let eq = equality_mentioning(&hints, "10");
+    assert_eq!(eq["left"]["table"], "a_tbl");
+    assert_eq!(eq["right"]["table"], "b_tbl");
+}

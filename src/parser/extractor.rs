@@ -2751,8 +2751,9 @@ impl ColumnAccessExtractor {
                         // them matches as soon as *either* side is a bare column
                         // reference (`substr(a.k, 1, 2) = b.k`), which would swallow
                         // the expression case. The call itself is a no-op unless both
-                        // sides resolve to a table, the tables differ, and at least
-                        // one side is wrapped in an expression.
+                        // sides resolve to a table, their qualifier prefixes differ
+                        // (so a two-alias self-join is kept), and at least one side
+                        // is wrapped in an expression.
                         self.extract_cross_table_equality(left, right);
                         if let (Some(l_names), Some(r_names)) =
                             (as_column_ref(left), as_column_ref(right))
@@ -2988,12 +2989,14 @@ impl ColumnAccessExtractor {
         if left.table.is_empty() || right.table.is_empty() {
             return;
         }
-        // Two sides written through the *same* alias are one table instance, not a
-        // cross-table key. Compare aliases rather than resolved table names: a
-        // self-join uses two aliases for one physical table and must survive.
+        // Two sides written through the *same* qualifier prefix are one table
+        // instance, not a cross-table key. Compare the full prefix rather than the
+        // resolved table name: a self-join uses two aliases for one physical table
+        // and must survive, while a schema-qualified `s1.a_tbl` / `s1.b_tbl` pair
+        // must not be mistaken for one instance just because the schema matches.
         if let (Some(l), Some(r)) = (
-            single_column_alias(left_expr),
-            single_column_alias(right_expr),
+            single_column_prefix(left_expr),
+            single_column_prefix(right_expr),
         ) {
             if l.eq_ignore_ascii_case(&r) {
                 return;
@@ -4614,16 +4617,29 @@ fn collect_distinct_column_refs(expr: &Expr, out: &mut Vec<Vec<ogsql_parser::Ide
     }
 }
 
-/// The qualifier of the single column reference in `expr` (its first segment),
-/// when `expr` holds exactly one distinct column ref. Used to tell a self-join
-/// (two aliases, one table) from a same-table reference.
-fn single_column_alias(expr: &Expr) -> Option<String> {
+/// The full qualifier prefix of the single column reference in `expr` (every
+/// ident except the final column name), when `expr` holds exactly one distinct
+/// column ref.
+///
+/// Used to tell a self-join (two aliases over one table) from a reference to the
+/// same instance: `c.x` and `c.y` share the prefix `c`, while `a.x`/`b.y` and
+/// `s1.a_tbl.v`/`s1.b_tbl.v` do not. The *whole* prefix is compared, not just its
+/// first segment: a schema-qualified name's first segment is the schema, so
+/// `s1.a_tbl` and `s1.b_tbl` must not look like the same instance.
+fn single_column_prefix(expr: &Expr) -> Option<String> {
     let mut columns: Vec<Vec<ogsql_parser::Ident>> = Vec::new();
     collect_distinct_column_refs(expr, &mut columns);
-    if columns.len() != 1 {
+    if columns.len() != 1 || columns[0].len() < 2 {
         return None;
     }
-    split_alias_column(&columns[0]).0
+    let names = &columns[0];
+    Some(
+        names[..names.len() - 1]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 pub(crate) fn as_column_ref(expr: &Expr) -> Option<Vec<ogsql_parser::Ident>> {

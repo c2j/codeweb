@@ -1448,12 +1448,14 @@ impl GraphStore {
                 }
             }
             for (key, parameters) in &store.routine_parameters {
-                let entry = merged.routine_parameters.entry(key.clone()).or_default();
-                for parameter in parameters {
-                    if !entry.contains(parameter) {
-                        entry.push(parameter.clone());
-                    }
-                }
+                // Keep the first store's declaration whole, mirroring node merge
+                // (an existing key is never replaced, so the surviving body is the
+                // first one) and single-build first-wins. Appending parameter by
+                // parameter would synthesize a signature no declaration has.
+                merged
+                    .routine_parameters
+                    .entry(key.clone())
+                    .or_insert_with(|| parameters.clone());
             }
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
@@ -3918,6 +3920,15 @@ mod tests {
         }
     }
 
+    fn param(name: &str) -> crate::parser::RoutineParameter {
+        crate::parser::RoutineParameter {
+            name: name.to_string(),
+            mode: None,
+            data_type: "number".to_string(),
+            default_value: None,
+        }
+    }
+
     #[test]
     fn merge_relaxed_match_schema_vs_no_schema() {
         // Store A: SQL analysis produces procedures WITH schema
@@ -4034,6 +4045,45 @@ mod tests {
             1,
             "same procedure with different case should deduplicate to 1 node"
         );
+    }
+
+    /// Merging stores that declare the same routine with *different* signatures
+    /// must keep the first store's declaration whole. Appending parameter by
+    /// parameter would synthesize a signature no declaration has, while the
+    /// surviving body is the first store's.
+    #[test]
+    fn merge_keeps_the_first_routine_signature_whole() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_a = GraphStore::from_graph("a", graph_a);
+        store_a.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(
+            key.clone(),
+            vec![param("p_i_date"), param("p_i_bs")],
+        )]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        let params = merged
+            .routine_parameters
+            .get(&key)
+            .expect("signature present");
+        assert_eq!(
+            params.len(),
+            1,
+            "the first declaration must be kept whole, not appended to: {params:?}"
+        );
+        assert_eq!(params[0].name, "p_i_date");
     }
 
     #[test]
