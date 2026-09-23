@@ -1437,8 +1437,13 @@ impl GraphStore {
         // naturally covers "already in the accumulator" duplicates from
         // earlier stores without needing to be seeded from anything.
         let mut seen_anchor_keys: HashSet<AnchorMergeKey> = HashSet::new();
+        // For each routine node that survives the merge, the index of the store it
+        // came from. Its parameters are copied from that store only: a store that
+        // contributed a node without a `routine_parameters` entry (an imported or
+        // partial node) must not inherit another store's signature.
+        let mut routine_param_sources: HashMap<String, usize> = HashMap::new();
 
-        for store in &stores {
+        for (store_index, store) in stores.iter().enumerate() {
             for (key, predicates) in &store.procedure_predicates {
                 let entry = merged.procedure_predicates.entry(key.clone()).or_default();
                 for predicate in predicates {
@@ -1446,16 +1451,6 @@ impl GraphStore {
                         entry.push(predicate.clone());
                     }
                 }
-            }
-            for (key, parameters) in &store.routine_parameters {
-                // Keep the first store's declaration whole, mirroring node merge
-                // (an existing key is never replaced, so the surviving body is the
-                // first one) and single-build first-wins. Appending parameter by
-                // parameter would synthesize a signature no declaration has.
-                merged
-                    .routine_parameters
-                    .entry(key.clone())
-                    .or_insert_with(|| parameters.clone());
             }
             let mut idx_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
 
@@ -1495,6 +1490,7 @@ impl GraphStore {
                 // No match — add as new node
                 let new_idx = merged.graph.add_node(store.graph[old_idx].clone());
                 merged.node_key_index.insert(key.clone(), new_idx);
+                routine_param_sources.insert(key.to_string(), store_index);
                 idx_map.insert(old_idx, new_idx);
             }
 
@@ -1555,6 +1551,18 @@ impl GraphStore {
 
             for (file, records) in &store.manifest {
                 merged.manifest.insert(file.clone(), records.clone());
+            }
+        }
+
+        // Copy each surviving routine's signature from the store that contributed
+        // its node. A winner with no entry keeps none (an imported/partial node must
+        // not pick up another store's signature); an empty list is a declaration too
+        // and is copied as-is.
+        for (key, store_index) in &routine_param_sources {
+            if let Some(parameters) = stores[*store_index].routine_parameters.get(key) {
+                merged
+                    .routine_parameters
+                    .insert(key.clone(), parameters.clone());
             }
         }
 
@@ -4084,6 +4092,66 @@ mod tests {
             "the first declaration must be kept whole, not appended to: {params:?}"
         );
         assert_eq!(params[0].name, "p_i_date");
+    }
+
+    /// A store that contributes the surviving node but declares no parameters (an
+    /// imported or partially-parsed routine) must not inherit a later store's
+    /// signature: the node's body and its signature have to come from the same
+    /// declaration.
+    #[test]
+    fn merge_does_not_backfill_a_signature_from_a_later_store() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert!(
+            !merged.routine_parameters.contains_key(&key),
+            "the winning node's store has no signature, so none may be invented: {:?}",
+            merged.routine_parameters
+        );
+    }
+
+    /// An empty parameter list is still a declaration: a later store's non-empty
+    /// list must not replace it.
+    #[test]
+    fn merge_keeps_an_empty_declaration() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_a = GraphStore::from_graph("a", graph_a);
+        store_a.set_routine_parameters(HashMap::from([(key.clone(), Vec::new())]));
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert_eq!(
+            merged.routine_parameters.get(&key),
+            Some(&Vec::new()),
+            "an empty declaration must survive, got {:?}",
+            merged.routine_parameters
+        );
     }
 
     #[test]
