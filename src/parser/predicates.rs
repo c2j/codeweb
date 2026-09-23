@@ -50,9 +50,17 @@ pub struct PredicateClause {
     /// from being mistaken for exact column equality.
     #[serde(default)]
     pub transform: Option<FilterTransform>,
+    /// The field name as written on the left of the comparison, when it differs
+    /// from the resolved [`column`](Self::column). A `%ROWTYPE` record field
+    /// resolves to the cursor's underlying source column, which need not keep the
+    /// field's name (`r.operation_no` can resolve to `bs`); this preserves the
+    /// written name so a caller matching on the field name still works.
+    #[serde(default)]
+    pub raw_column: Option<String>,
 }
 
-/// Human-readable serializers may omit `transform`, while bincode requires a fixed field count.
+/// Human-readable serializers may omit `transform`/`raw_column`, while bincode
+/// requires a fixed field count.
 impl serde::Serialize for PredicateClause {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -60,13 +68,17 @@ impl serde::Serialize for PredicateClause {
     {
         use serde::ser::SerializeStruct;
         let omit_transform = serializer.is_human_readable() && self.transform.is_none();
-        let field_count = if omit_transform { 3 } else { 4 };
+        let omit_raw = serializer.is_human_readable() && self.raw_column.is_none();
+        let field_count = 3 + usize::from(!omit_transform) + usize::from(!omit_raw);
         let mut state = serializer.serialize_struct("PredicateClause", field_count)?;
         state.serialize_field("column", &self.column)?;
         state.serialize_field("op", &self.op)?;
         state.serialize_field("value", &self.value)?;
         if !omit_transform {
             state.serialize_field("transform", &self.transform)?;
+        }
+        if !omit_raw {
+            state.serialize_field("raw_column", &self.raw_column)?;
         }
         state.end()
     }
@@ -267,13 +279,12 @@ impl Visitor for PredicateExtractor<'_> {
     fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
         match stmt {
             PlStatement::If(spanned) => {
-                self.push_condition(
-                    &spanned.condition,
-                    PredicateKind::If,
-                    spanned.span.as_ref().map_or(0, |span| span.start.line),
-                );
+                let line = spanned.span.as_ref().map_or(0, |span| span.start.line);
+                self.push_condition(&spanned.condition, PredicateKind::If, line);
+                // `PlElsif` carries no span of its own, so an `ELSIF` condition has
+                // no line; fall back to the enclosing `IF` rather than emitting 0.
                 for elsif in &spanned.elsifs {
-                    self.push_condition(&elsif.condition, PredicateKind::If, 0);
+                    self.push_condition(&elsif.condition, PredicateKind::If, line);
                 }
             }
             PlStatement::Case(spanned) => {
@@ -422,6 +433,7 @@ fn condition_operand(
                 op,
                 value,
                 transform,
+                raw_column: None,
             },
         )]));
     }
@@ -441,6 +453,7 @@ fn condition_operand(
                     op,
                     value,
                     transform,
+                    raw_column: None,
                 },
             )])
         });
@@ -578,6 +591,7 @@ fn direct_clauses(
                     op: operator,
                     value,
                     transform: None,
+                    raw_column: None,
                 },
             )])
         }
@@ -593,6 +607,12 @@ fn resolved_clause(
     transform: Option<FilterTransform>,
 ) -> Option<(String, PredicateClause)> {
     let (table, column) = resolve_record_field_from_context(ctx, names)?;
+    // `resolve_record_field_from_context` returns the cursor's underlying source
+    // column, which a `%ROWTYPE` field need not name. Keep the written field name
+    // when it differs so name-based consumers (e.g. `seed-hints` discriminators)
+    // can still match.
+    let written = names.last().map(ToString::to_string);
+    let raw_column = written.filter(|w| !w.eq_ignore_ascii_case(&column));
     Some((
         table,
         PredicateClause {
@@ -600,6 +620,7 @@ fn resolved_clause(
             op,
             value,
             transform,
+            raw_column,
         },
     ))
 }
@@ -646,6 +667,21 @@ fn format_condition(expr: &Expr) -> String {
             format_expr_short(low),
             format_expr_short(high)
         ),
+        // `format_expr_short` has no `InList` arm and would fall back to the AST
+        // Debug form, which must not reach the rendered predicate origin.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let items: Vec<String> = list.iter().map(format_expr_short).collect();
+            format!(
+                "{} {}IN ({})",
+                format_expr_short(expr),
+                if *negated { "NOT " } else { "" },
+                items.join(", ")
+            )
+        }
         _ => format_expr_short(expr),
     }
 }
@@ -710,6 +746,7 @@ END;
                     op: FilterOperator::Eq,
                     value: FilterValue::String("0100".to_string()),
                     transform: None,
+                    raw_column: None,
                 },
                 PredicateClause {
                     column: "zqdm".to_string(),
@@ -719,6 +756,7 @@ END;
                         FilterValue::String("609999".to_string()),
                     ]),
                     transform: None,
+                    raw_column: None,
                 },
             ]
         );
@@ -791,9 +829,69 @@ END;
                 FilterValue::String((index + 1).to_string())
             );
         }
+        // `PlElsif` carries no span, so an `ELSIF` condition has no line of its
+        // own; it falls back to the enclosing `IF` rather than emitting 0 (a 0
+        // line would be handed to `seed-hints` as if it were a real location).
         assert!(predicates[0].line > 0);
-        assert_eq!(predicates[1].line, 0);
-        assert_eq!(predicates[2].line, 0);
+        assert_eq!(predicates[1].line, predicates[0].line);
+        assert_eq!(predicates[2].line, predicates[0].line);
+    }
+
+    /// A `%ROWTYPE` field whose cursor projects the source column under another
+    /// name resolves to that projected column; the written field name is kept in
+    /// `raw_column` so a name-based consumer can still match it.
+    #[test]
+    fn record_field_keeps_the_written_name_when_it_differs_from_the_column() {
+        let sql = r#"
+CREATE PROCEDURE renamed_field AS
+  CURSOR c_cur IS SELECT t.bs AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  IF r_rec.operation_no = '0110999001' THEN NULL; END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 1);
+        let table = predicates[0]
+            .table_predicate
+            .as_ref()
+            .expect("table predicate");
+        let clause = &table.clauses[0];
+        assert_eq!(
+            clause.column, "bs",
+            "resolution yields the cursor's underlying source column"
+        );
+        assert_eq!(
+            clause.raw_column.as_deref(),
+            Some("operation_no"),
+            "the written field name is preserved when it differs"
+        );
+    }
+
+    /// When the resolved column already carries the written name there is nothing
+    /// to preserve, so `raw_column` stays `None`.
+    #[test]
+    fn raw_column_is_absent_when_the_names_match() {
+        let sql = r#"
+CREATE PROCEDURE same_name AS
+  CURSOR c_cur IS SELECT t.operation_no AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  IF r_rec.operation_no = '0110999001' THEN NULL; END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        let clause = &predicates[0].table_predicate.as_ref().unwrap().clauses[0];
+        assert_eq!(clause.column, "operation_no");
+        assert_eq!(clause.raw_column, None);
     }
 
     #[test]
@@ -827,6 +925,7 @@ END;
                     op: FilterOperator::Eq,
                     value: FilterValue::String((index + 1).to_string()),
                     transform: None,
+                    raw_column: None,
                 }]
             );
         }
@@ -1092,11 +1191,44 @@ END;
                 op: FilterOperator::Eq,
                 value: FilterValue::String("COMMISSION_SWITCH".to_string()),
                 transform: None,
+                raw_column: None,
             }]
         );
         assert_eq!(
             hint.set,
             vec![("kind_id".to_string(), FilterValue::String("1".to_string()))]
+        );
+    }
+
+    /// The rendered origin must be SQL, not the AST Debug form: it is what
+    /// `codeweb predicates` prints and what `columns --format seed-hints` exposes
+    /// as a discriminator value's `trigger`.
+    #[test]
+    fn in_list_condition_renders_as_sql_in_origin() {
+        let sql = r#"
+CREATE PROCEDURE p_inlist AS
+  CURSOR c_cur IS SELECT t.operation_no AS operation_no FROM src_op t;
+  r_rec c_cur%ROWTYPE;
+BEGIN
+  IF r_rec.operation_no IN ('0110004001', '0111004001') THEN
+    NULL;
+  END IF;
+END;
+"#;
+        let block = procedure_block(sql);
+        let ctx = context_from_block(&block);
+
+        let predicates = extract_predicates(&block, &ctx);
+
+        assert_eq!(predicates.len(), 1);
+        let origin = &predicates[0].origin;
+        assert!(
+            origin.contains("IN ('0110004001', '0111004001')"),
+            "the IN list must render as SQL, got {origin}"
+        );
+        assert!(
+            !origin.contains("InList {"),
+            "the origin must not leak the AST Debug form, got {origin}"
         );
     }
 }

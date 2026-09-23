@@ -448,9 +448,17 @@ enum Commands {
         #[arg(long)]
         table: Option<String>,
 
-        /// Output format (only "json" is supported today)
-        #[arg(long, default_value = "json", value_parser = ["json"])]
+        /// Output format: "json" (default, #165 schema) or "seed-hints"
+        /// (#181: tables + operations, signature, hard filters, cross-table
+        /// equalities, discriminator values)
+        #[arg(long, default_value = "json", value_parser = ["json", "seed-hints"])]
         format: String,
+
+        /// #181: column whose literal values `--format seed-hints` enumerates as
+        /// `discriminator_values` (repeatable). Overrides `[analysis]
+        /// discriminator_columns` from codeweb.toml when given.
+        #[arg(long = "discriminator")]
+        discriminator: Vec<String>,
 
         /// Project directory (default: current directory)
         #[arg(short, long, default_value = ".")]
@@ -1016,8 +1024,9 @@ fn run() -> Result<()> {
             package,
             table,
             format,
+            discriminator,
             project,
-        }) => cmd_columns(procedure, package, table, &format, &project),
+        }) => cmd_columns(procedure, package, table, &format, discriminator, &project),
         Some(Commands::Predicates {
             procedure,
             format,
@@ -1915,9 +1924,19 @@ fn cmd_columns(
     package: Option<String>,
     table: Option<String>,
     format: &str,
+    discriminator: Vec<String>,
     project: &Path,
 ) -> Result<()> {
     let mut proj = project::Project::find(project)?;
+    // `--discriminator` overrides the config; read the config before `load_store`
+    // borrows `proj` for the lifetime of the store.
+    let discriminators = if discriminator.is_empty() {
+        proj.config().analysis.discriminator_columns.clone()
+    } else {
+        discriminator
+    };
+    // Provenance paths are reported relative to the project root.
+    let base = proj.root().to_path_buf();
     let store = proj.load_store()?;
     let graph = store.graph();
 
@@ -1933,7 +1952,9 @@ fn cmd_columns(
 
     let table_filter = table.as_deref();
 
-    let result = if let Some(name) = procedure {
+    // Resolve the target once: both output formats read the same node, and the
+    // error contract (non-zero exit + message on stderr) is identical for both.
+    let (idx, is_routine, name) = if let Some(name) = procedure {
         let resolved = store.resolve_single_node(
             &name,
             crate::graph::search::MatchMode::Substring,
@@ -1961,49 +1982,76 @@ fn cmd_columns(
                 message: format!("'{}' is not a procedure or function", name),
             });
         }
-        graph::columns::column_analysis_of_routine(graph, idx, table_filter).ok_or_else(|| {
-            error::CodeWebError::ExportError {
-                message: format!("failed to aggregate column analysis for '{}'", name),
-            }
-        })?
+        (idx, true, name)
     } else {
         // clap's `columns_target` ArgGroup (required, mutually exclusive) guarantees
         // exactly one of `procedure`/`package` is `Some` by the time we get here.
         let name = package.expect("clap group guarantees procedure or package is set");
-        let resolved = store.resolve_single_node(
-            &name,
-            crate::graph::search::MatchMode::Substring,
-            false,
-            true,
-        );
-        let idx = match resolved {
-            crate::graph::search::ResolveResult::Single(idx, _) => idx,
-            crate::graph::search::ResolveResult::Empty => {
+        // Resolve against Package nodes only: a package's routine nodes are named
+        // `<package>.<routine>`, so a substring match on the package name would
+        // otherwise be ambiguous with its own procedures.
+        let matches: Vec<_> = store
+            .search_nodes_with_mode(&name, crate::graph::search::MatchMode::Substring)
+            .into_iter()
+            .filter(|(idx, _)| matches!(&graph[*idx], graph::Node::Package { .. }))
+            .collect();
+        let idx = match matches.as_slice() {
+            [] => {
                 return Err(error::CodeWebError::ExportError {
                     message: format!("No package found matching '{}'", name),
                 });
             }
+            [(idx, _)] => *idx,
             _ => {
                 return Err(error::CodeWebError::ExportError {
                     message: format!("Ambiguous match for '{}'", name),
                 });
             }
         };
-        if !matches!(&graph[idx], graph::Node::Package { .. }) {
-            return Err(error::CodeWebError::ExportError {
-                message: format!("'{}' is not a package", name),
-            });
-        }
-        graph::columns::column_analysis_of_package(graph, idx, table_filter).ok_or_else(|| {
-            error::CodeWebError::ExportError {
-                message: format!("failed to aggregate column analysis for package '{}'", name),
-            }
-        })?
+        (idx, false, name)
     };
 
     match format {
         "json" => {
+            let result = if is_routine {
+                graph::columns::column_analysis_of_routine(graph, idx, table_filter)
+            } else {
+                graph::columns::column_analysis_of_package(graph, idx, table_filter)
+            }
+            .ok_or_else(|| error::CodeWebError::ExportError {
+                message: format!("failed to aggregate column analysis for '{}'", name),
+            })?;
             let json_str = serde_json::to_string_pretty(&result).map_err(|e| {
+                error::CodeWebError::ExportError {
+                    message: format!("Failed to format JSON: {}", e),
+                }
+            })?;
+            println_stdout!("{}", json_str);
+        }
+        // #181: the seed-data entry point. `json` above stays the default and
+        // keeps its exact schema; this one is shaped for a generator.
+        "seed-hints" => {
+            let hints = if is_routine {
+                graph::columns::seed_hints_of_routine(
+                    store,
+                    idx,
+                    table_filter,
+                    &discriminators,
+                    &base,
+                )
+            } else {
+                graph::columns::seed_hints_of_package(
+                    store,
+                    idx,
+                    table_filter,
+                    &discriminators,
+                    &base,
+                )
+            }
+            .ok_or_else(|| error::CodeWebError::ExportError {
+                message: format!("failed to aggregate seed hints for '{}'", name),
+            })?;
+            let json_str = serde_json::to_string_pretty(&hints).map_err(|e| {
                 error::CodeWebError::ExportError {
                     message: format!("Failed to format JSON: {}", e),
                 }
@@ -2012,7 +2060,7 @@ fn cmd_columns(
         }
         other => {
             return Err(error::CodeWebError::ExportError {
-                message: format!("Unknown format: {}. Use 'json'", other),
+                message: format!("Unknown format: {}. Use 'json' or 'seed-hints'", other),
             });
         }
     }

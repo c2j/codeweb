@@ -11,6 +11,7 @@ pub mod jsp_preprocessor;
 pub mod jsp_types;
 mod loader;
 mod predicates;
+mod routine;
 pub mod scanner;
 pub mod snippet;
 
@@ -19,11 +20,11 @@ pub use extractor::{
     anchor_from_pl_data_type, anchor_targets_in_pl_type_decl, extract_body_sql,
     parse_anchor_from_type_string, pl_type_decl_name, AnchorExtractor, AnchorKind, AnchorRef,
     AnchorSite, CallEdge, CallExtractor, ColumnAccessExtractor, ColumnAnalysis, ColumnContext,
-    ColumnMapping, ColumnRef, ColumnSource, CursorColumn, EnumMapping, FilterOperator,
-    FilterTransform, FilterValue, HardFilter, InsertColumnInfo, JoinCondition, JoinConditionSource,
-    JoinType, MappingKind, ProcedureBodySql, ProcedureSqlExtractor, ProcedureVarContext,
-    SelectIntoMapping, SequenceRef, SequenceRefVia, TableAccessExtractor, TableAlias, TypeRef,
-    TypeSequenceRefExtractor, UpdateColumnInfo,
+    ColumnMapping, ColumnRef, ColumnSource, CrossTableEquality, CursorColumn, EnumMapping,
+    EqualitySide, FilterOperator, FilterTransform, FilterValue, HardFilter, InsertColumnInfo,
+    JoinCondition, JoinConditionSource, JoinType, MappingKind, ProcedureBodySql,
+    ProcedureSqlExtractor, ProcedureVarContext, SelectIntoMapping, SequenceRef, SequenceRefVia,
+    TableAccessExtractor, TableAlias, TypeRef, TypeSequenceRefExtractor, UpdateColumnInfo,
 };
 #[allow(unused_imports)]
 pub use ibatis_loader::{
@@ -45,5 +46,7 @@ pub use predicates::{
     extract_predicates, Confidence, ParamTableHint, PlPredicate, PredicateClause,
     PredicateExtractor, PredicateKind, TablePredicate,
 };
+#[allow(unused_imports)]
+pub use routine::RoutineParameter;
 #[allow(unused_imports)]
 pub use scanner::{build_exclude_matcher, scan_directory, ScannedFiles};

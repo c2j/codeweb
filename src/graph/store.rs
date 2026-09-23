@@ -34,7 +34,12 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// `HardFilter.transform`. Refs #167, #169.
 /// v13: adds the `Edge::AnchorsOn` variant for `%TYPE`/`%ROWTYPE` schema
 /// anchors (issue #158).
-pub const STORE_VERSION: u32 = 13;
+/// v14: adds the `routine_parameters` side-table (declared signatures) and
+/// `ColumnAnalysis.cross_table_equalities` (expression-keyed cross-table
+/// equalities), both #181.
+/// v15: `PredicateClause.raw_column` (the written field name when it differs from
+/// the resolved column) and first-declaration-wins `routine_parameters`, both #181.
+pub const STORE_VERSION: u32 = 15;
 
 /// Directory to name in the repair command: the nearest ancestor holding a
 /// `codeweb.toml`, else the store's own directory, else the cwd.
@@ -129,6 +134,9 @@ pub struct GraphStore {
     /// Routine NodeKey string (`proc:...` / `func:...`) → PL IF/CASE predicates.
     #[serde(default)]
     pub procedure_predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
+    /// Routine NodeKey string → declared parameters, in signature order (#181).
+    #[serde(default)]
+    pub routine_parameters: HashMap<String, Vec<crate::parser::RoutineParameter>>,
 }
 
 #[allow(dead_code)]
@@ -154,6 +162,7 @@ impl GraphStore {
             sql_fingerprint_index: HashMap::new(),
             lock_clause_index: HashMap::new(),
             procedure_predicates: HashMap::new(),
+            routine_parameters: HashMap::new(),
         }
     }
 
@@ -386,6 +395,7 @@ impl GraphStore {
             sql_fingerprint_index,
             lock_clause_index,
             procedure_predicates: HashMap::new(),
+            routine_parameters: HashMap::new(),
         }
     }
 
@@ -394,6 +404,13 @@ impl GraphStore {
         predicates: HashMap<String, Vec<crate::parser::PlPredicate>>,
     ) {
         self.procedure_predicates = predicates;
+    }
+
+    pub fn set_routine_parameters(
+        &mut self,
+        parameters: HashMap<String, Vec<crate::parser::RoutineParameter>>,
+    ) {
+        self.routine_parameters = parameters;
     }
 
     pub fn graph(&self) -> &CodeGraph {
@@ -1420,8 +1437,13 @@ impl GraphStore {
         // naturally covers "already in the accumulator" duplicates from
         // earlier stores without needing to be seeded from anything.
         let mut seen_anchor_keys: HashSet<AnchorMergeKey> = HashSet::new();
+        // For each routine node that survives the merge, the index of the store it
+        // came from. Its parameters are copied from that store only: a store that
+        // contributed a node without a `routine_parameters` entry (an imported or
+        // partial node) must not inherit another store's signature.
+        let mut routine_param_sources: HashMap<String, usize> = HashMap::new();
 
-        for store in &stores {
+        for (store_index, store) in stores.iter().enumerate() {
             for (key, predicates) in &store.procedure_predicates {
                 let entry = merged.procedure_predicates.entry(key.clone()).or_default();
                 for predicate in predicates {
@@ -1468,6 +1490,7 @@ impl GraphStore {
                 // No match — add as new node
                 let new_idx = merged.graph.add_node(store.graph[old_idx].clone());
                 merged.node_key_index.insert(key.clone(), new_idx);
+                routine_param_sources.insert(key.to_string(), store_index);
                 idx_map.insert(old_idx, new_idx);
             }
 
@@ -1528,6 +1551,18 @@ impl GraphStore {
 
             for (file, records) in &store.manifest {
                 merged.manifest.insert(file.clone(), records.clone());
+            }
+        }
+
+        // Copy each surviving routine's signature from the store that contributed
+        // its node. A winner with no entry keeps none (an imported/partial node must
+        // not pick up another store's signature); an empty list is a declaration too
+        // and is copied as-is.
+        for (key, store_index) in &routine_param_sources {
+            if let Some(parameters) = stores[*store_index].routine_parameters.get(key) {
+                merged
+                    .routine_parameters
+                    .insert(key.clone(), parameters.clone());
             }
         }
 
@@ -2568,6 +2603,7 @@ mod tests {
                             op: crate::parser::FilterOperator::Eq,
                             value: crate::parser::FilterValue::String("1".to_string()),
                             transform: None,
+                            raw_column: None,
                         },
                         // #167/#169: a transform-carrying clause must also survive the
                         // bincode round-trip via the hand-written `is_human_readable`
@@ -2583,6 +2619,7 @@ mod tests {
                                     crate::parser::FilterValue::Integer(2),
                                 ],
                             }),
+                            raw_column: None,
                         },
                     ],
                 }),
@@ -2595,6 +2632,35 @@ mod tests {
         let loaded = GraphStore::load_bincode(&path).unwrap();
 
         assert_eq!(loaded.procedure_predicates, store.procedure_predicates);
+    }
+
+    #[test]
+    fn routine_parameters_survive_bincode_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parameters.bincode");
+        let mut store = GraphStore::from_graph("roundtrip", CodeGraph::new());
+        store.routine_parameters.insert(
+            "proc:pkg_x.p".to_string(),
+            vec![
+                crate::parser::RoutineParameter {
+                    name: "p_i_date".to_string(),
+                    mode: None,
+                    data_type: "varchar2".to_string(),
+                    default_value: None,
+                },
+                crate::parser::RoutineParameter {
+                    name: "p_o_cnt".to_string(),
+                    mode: Some("OUT".to_string()),
+                    data_type: "number".to_string(),
+                    default_value: Some("0".to_string()),
+                },
+            ],
+        );
+
+        store.save_bincode(&path).unwrap();
+        let loaded = GraphStore::load_bincode(&path).unwrap();
+
+        assert_eq!(loaded.routine_parameters, store.routine_parameters);
     }
 
     /// A store written by the previous layout (version 7, before `ColumnAnalysis.read_tables`,
@@ -3862,6 +3928,15 @@ mod tests {
         }
     }
 
+    fn param(name: &str) -> crate::parser::RoutineParameter {
+        crate::parser::RoutineParameter {
+            name: name.to_string(),
+            mode: None,
+            data_type: "number".to_string(),
+            default_value: None,
+        }
+    }
+
     #[test]
     fn merge_relaxed_match_schema_vs_no_schema() {
         // Store A: SQL analysis produces procedures WITH schema
@@ -3977,6 +4052,105 @@ mod tests {
             merged.graph().node_count(),
             1,
             "same procedure with different case should deduplicate to 1 node"
+        );
+    }
+
+    /// Merging stores that declare the same routine with *different* signatures
+    /// must keep the first store's declaration whole. Appending parameter by
+    /// parameter would synthesize a signature no declaration has, while the
+    /// surviving body is the first store's.
+    #[test]
+    fn merge_keeps_the_first_routine_signature_whole() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_a = GraphStore::from_graph("a", graph_a);
+        store_a.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(
+            key.clone(),
+            vec![param("p_i_date"), param("p_i_bs")],
+        )]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        let params = merged
+            .routine_parameters
+            .get(&key)
+            .expect("signature present");
+        assert_eq!(
+            params.len(),
+            1,
+            "the first declaration must be kept whole, not appended to: {params:?}"
+        );
+        assert_eq!(params[0].name, "p_i_date");
+    }
+
+    /// A store that contributes the surviving node but declares no parameters (an
+    /// imported or partially-parsed routine) must not inherit a later store's
+    /// signature: the node's body and its signature have to come from the same
+    /// declaration.
+    #[test]
+    fn merge_does_not_backfill_a_signature_from_a_later_store() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let store_a = GraphStore::from_graph("a", graph_a);
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert!(
+            !merged.routine_parameters.contains_key(&key),
+            "the winning node's store has no signature, so none may be invented: {:?}",
+            merged.routine_parameters
+        );
+    }
+
+    /// An empty parameter list is still a declaration: a later store's non-empty
+    /// list must not replace it.
+    #[test]
+    fn merge_keeps_an_empty_declaration() {
+        let key = NodeKey::Procedure {
+            schema: Some("public".to_string()),
+            package: None,
+            name: "p".to_string(),
+        }
+        .to_string();
+
+        let mut graph_a = CodeGraph::new();
+        graph_a.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_a = GraphStore::from_graph("a", graph_a);
+        store_a.set_routine_parameters(HashMap::from([(key.clone(), Vec::new())]));
+
+        let mut graph_b = CodeGraph::new();
+        graph_b.add_node(make_proc(Some("public"), None, "p"));
+        let mut store_b = GraphStore::from_graph("b", graph_b);
+        store_b.set_routine_parameters(HashMap::from([(key.clone(), vec![param("p_i_date")])]));
+
+        let merged = GraphStore::merge(vec![store_a, store_b], "combined");
+        assert_eq!(
+            merged.routine_parameters.get(&key),
+            Some(&Vec::new()),
+            "an empty declaration must survive, got {:?}",
+            merged.routine_parameters
         );
     }
 
