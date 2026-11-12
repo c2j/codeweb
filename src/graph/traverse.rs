@@ -115,6 +115,9 @@ fn edge_label_part(edge: &crate::graph::Edge) -> Option<String> {
 /// first edge (as the old implementation did) silently drops labels for the
 /// rest — this aggregates them so callers see every applicable marker, e.g.
 /// `[R,T]` instead of just `[R]` or `[T]` (issue #158).
+///
+/// `AnchorsOn` is always the single letter `T`. Column names stay on the
+/// edges and are not printed in the tree.
 pub(crate) fn edge_label_for(
     graph: &crate::graph::CodeGraph,
     from: NodeIndex,
@@ -144,6 +147,32 @@ pub(crate) fn edge_label_for(
     }
 }
 
+/// Direct neighbors of `start`, one entry per `NodeIndex`, in the order
+/// `neighbors_directed` first yields each one. Parallel edges collapse here
+/// so the tree prints one row; the graph keeps every edge.
+fn direct_neighbors(
+    graph: &crate::graph::CodeGraph,
+    start: NodeIndex,
+    direction: Direction,
+    ancestors: &HashSet<NodeIndex>,
+    skip_builtins: bool,
+) -> Vec<NodeIndex> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for n in graph.neighbors_directed(start, direction) {
+        if ancestors.contains(&n) {
+            continue;
+        }
+        if skip_builtins && matches!(graph[n], crate::graph::Node::BuiltinFunction { .. }) {
+            continue;
+        }
+        if seen.insert(n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_tree_dfs(
     graph: &crate::graph::CodeGraph,
@@ -156,13 +185,7 @@ fn build_tree_dfs(
     visited: &mut usize,
     skip_builtins: bool,
 ) -> (Vec<TreeNode>, usize) {
-    let neighbors: Vec<NodeIndex> = graph
-        .neighbors_directed(start, direction)
-        .filter(|n| !ancestors.contains(n))
-        .filter(|n| {
-            !skip_builtins || !matches!(graph[*n], crate::graph::Node::BuiltinFunction { .. })
-        })
-        .collect();
+    let neighbors = direct_neighbors(graph, start, direction, ancestors, skip_builtins);
     let effective = neighbors.len();
 
     if *visited >= max_nodes {
@@ -1716,6 +1739,336 @@ mod tests {
             label.as_deref(),
             Some("[R,T,depends_on]"),
             "three distinct parallel edge kinds must all appear in creation order"
+        );
+    }
+
+    fn add_anchor(
+        graph: &mut crate::graph::CodeGraph,
+        from: petgraph::graph::NodeIndex,
+        to: petgraph::graph::NodeIndex,
+        column: Option<&str>,
+        kind: crate::parser::AnchorKind,
+        site: crate::parser::AnchorSite,
+    ) {
+        graph.add_edge(
+            from,
+            to,
+            crate::graph::Edge::AnchorsOn {
+                kind,
+                column: column.map(str::to_string),
+                site,
+                location: make_loc(),
+            },
+        );
+    }
+
+    fn add_read(
+        graph: &mut crate::graph::CodeGraph,
+        from: petgraph::graph::NodeIndex,
+        to: petgraph::graph::NodeIndex,
+    ) {
+        graph.add_edge(
+            from,
+            to,
+            crate::graph::Edge::TableAccess {
+                flow_kind: crate::graph::DataFlowKind::DmlAccess,
+                modes: crate::graph::AccessMode::Read,
+                write_kinds: std::collections::HashSet::new(),
+                column_analysis: None,
+                location: make_loc(),
+            },
+        );
+    }
+
+    #[test]
+    fn should_keep_single_column_anchor_as_bare_t() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_one");
+        let table = add_table_node(&mut graph, "par_sys_purchase");
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("purchase_days"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        assert_eq!(edge_label_for(&graph, proc, table).as_deref(), Some("[T]"));
+
+        // Read is added after the anchor, so creation order puts T before R.
+        add_read(&mut graph, proc, table);
+        assert_eq!(
+            edge_label_for(&graph, proc, table).as_deref(),
+            Some("[T,R]")
+        );
+    }
+
+    #[test]
+    fn should_keep_bare_t_when_same_column_has_two_sites() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_sites");
+        let table = add_table_node(&mut graph, "par_sys_purchase");
+        add_read(&mut graph, proc, table);
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("purchase_days"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::ReturnType,
+        );
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("purchase_days"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        assert_eq!(
+            edge_label_for(&graph, proc, table).as_deref(),
+            Some("[R,T]")
+        );
+    }
+
+    #[test]
+    fn should_keep_multi_column_anchors_as_bare_t() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_log");
+        let table = add_table_node(&mut graph, "db_log");
+        for col in ["proc_name", "step_no", "sql_txt", "sql_param"] {
+            add_anchor(
+                &mut graph,
+                proc,
+                table,
+                Some(col),
+                crate::parser::AnchorKind::PercentType,
+                crate::parser::AnchorSite::Variable,
+            );
+        }
+        assert_eq!(edge_label_for(&graph, proc, table).as_deref(), Some("[T]"));
+    }
+
+    #[test]
+    fn should_keep_one_t_among_other_edge_labels() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_pos");
+        let table = add_table_node(&mut graph, "t_pos");
+        add_read(&mut graph, proc, table);
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("a"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("b"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        graph.add_edge(
+            proc,
+            table,
+            crate::graph::Edge::DependsOn {
+                location: make_loc(),
+                column_analysis: None,
+            },
+        );
+        assert_eq!(
+            edge_label_for(&graph, proc, table).as_deref(),
+            Some("[R,T,depends_on]")
+        );
+
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_pos2");
+        let table = add_table_node(&mut graph, "t_pos2");
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("a"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("b"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        add_read(&mut graph, proc, table);
+        assert_eq!(
+            edge_label_for(&graph, proc, table).as_deref(),
+            Some("[T,R]")
+        );
+    }
+
+    fn direct_call(
+        graph: &mut crate::graph::CodeGraph,
+        from: petgraph::graph::NodeIndex,
+        to: petgraph::graph::NodeIndex,
+    ) {
+        graph.add_edge(
+            from,
+            to,
+            crate::graph::Edge::DirectCall {
+                scope: crate::graph::CallScope::IntraPackage,
+                location: make_loc(),
+            },
+        );
+    }
+
+    #[test]
+    fn should_collapse_parallel_callees_to_one_row_in_first_seen_order() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let p = add_proc_node(&mut graph, "p");
+        let b = add_proc_node(&mut graph, "b");
+        let a = add_proc_node(&mut graph, "a");
+        direct_call(&mut graph, p, b);
+        direct_call(&mut graph, p, a);
+        direct_call(&mut graph, p, b);
+
+        let (chain, _) = trace_chain(&graph, p, 1, usize::MAX, true);
+        assert_eq!(chain.callees.len(), 2);
+        assert_eq!(chain.callees[0].idx, b);
+        assert_eq!(chain.callees[1].idx, a);
+    }
+
+    #[test]
+    fn should_collapse_parallel_incoming_anchors_to_one_caller() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_in");
+        let table = add_table_node(&mut graph, "t_in");
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("c1"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+        add_anchor(
+            &mut graph,
+            proc,
+            table,
+            Some("c2"),
+            crate::parser::AnchorKind::PercentType,
+            crate::parser::AnchorSite::Variable,
+        );
+
+        let (chain, _) = trace_chain(&graph, table, 1, usize::MAX, true);
+        assert_eq!(chain.callers.len(), 1);
+        assert_eq!(chain.callers[0].idx, proc);
+        assert_eq!(chain.callers[0].edge_label.as_deref(), Some("[T]"));
+    }
+
+    #[test]
+    fn should_keep_node_reached_from_two_parents() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let root = add_proc_node(&mut graph, "root");
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        let c = add_proc_node(&mut graph, "c");
+        direct_call(&mut graph, root, a);
+        direct_call(&mut graph, root, b);
+        direct_call(&mut graph, a, c);
+        direct_call(&mut graph, b, c);
+
+        let (chain, _) = trace_chain(&graph, root, 2, usize::MAX, true);
+        assert_eq!(chain.callees.len(), 2);
+        assert!(
+            chain
+                .callees
+                .iter()
+                .all(|n| n.children.len() == 1 && n.children[0].idx == c),
+            "each parent must keep its own edge to C"
+        );
+    }
+
+    #[test]
+    fn should_not_count_parallel_edges_as_extra_neighbors_when_truncated() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        let c = add_proc_node(&mut graph, "c");
+        let d = add_proc_node(&mut graph, "d");
+        direct_call(&mut graph, a, b);
+        direct_call(&mut graph, b, d);
+        direct_call(&mut graph, b, c);
+        direct_call(&mut graph, b, c);
+        direct_call(&mut graph, b, c);
+
+        let (chain, _) = trace_chain(&graph, a, 3, 2, true);
+        assert_eq!(chain.callees.len(), 1);
+        let b_node = &chain.callees[0];
+        assert_eq!(b_node.idx, b);
+        assert_eq!(b_node.children.len(), 1);
+        assert_eq!(b_node.children[0].idx, c);
+        assert_eq!(b_node.more_count, 1);
+        assert!(b_node.has_more);
+    }
+
+    #[test]
+    fn should_not_spend_node_budget_on_duplicate_edges() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let g = add_proc_node(&mut graph, "g");
+        let p = add_proc_node(&mut graph, "p");
+        let a = add_proc_node(&mut graph, "a");
+        let b = add_proc_node(&mut graph, "b");
+        direct_call(&mut graph, g, p);
+        direct_call(&mut graph, p, a);
+        direct_call(&mut graph, p, a);
+        direct_call(&mut graph, p, b);
+        direct_call(&mut graph, p, b);
+
+        // P plus two unique children. Four edges out of P must not eat the budget.
+        let (chain, _) = trace_chain(&graph, g, 2, 3, true);
+        assert_eq!(chain.callees.len(), 1);
+        let p_node = &chain.callees[0];
+        assert_eq!(p_node.idx, p);
+        assert_eq!(p_node.children.len(), 2);
+        assert!(!p_node.has_more);
+        assert_eq!(p_node.more_count, 0);
+    }
+
+    #[test]
+    fn should_emit_one_path_for_a_neighbor_with_parallel_edges() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = add_proc_node(&mut graph, "proc_path");
+        let table = add_table_node(&mut graph, "db_log");
+        for col in ["proc_name", "step_no", "sql_txt"] {
+            add_anchor(
+                &mut graph,
+                proc,
+                table,
+                Some(col),
+                crate::parser::AnchorKind::PercentType,
+                crate::parser::AnchorSite::Variable,
+            );
+        }
+
+        let (chain, _) = trace_chain(&graph, proc, 1, usize::MAX, true);
+        let rendered = format_chain_paths(&chain, &graph);
+        let callees = rendered
+            .split("── CALLEES (")
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing CALLEES header:\n{rendered}"));
+        assert!(
+            callees.starts_with("1 paths)"),
+            "parallel edges must not become extra paths: {callees}"
+        );
+        let name = "table:sch.db_log";
+        assert_eq!(
+            callees.matches(name).count(),
+            1,
+            "table display name must appear once: {callees}"
         );
     }
 }

@@ -977,7 +977,7 @@ fn tree_node_to_lines(
     let connector = if is_last { "└── " } else { "├── " };
     let (tag, color) = node_tag(&graph[node.idx]);
     let key = NodeKey::from_node(&graph[node.idx]);
-    lines.push(Line::from(vec![
+    let mut spans = vec![
         Span::raw(prefix.to_string()),
         Span::styled(
             connector.to_string(),
@@ -987,7 +987,16 @@ fn tree_node_to_lines(
         ),
         Span::styled(format!("{:<8} ", tag), Style::default().fg(color)),
         Span::styled(key.to_string(), Style::default().fg(theme.fg_primary())),
-    ]));
+    ];
+    if let Some(label) = node.edge_label.as_deref() {
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default()
+                .fg(theme.fg_dim())
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    lines.push(Line::from(spans));
 
     let child_prefix = if is_last {
         format!("{}    ", prefix)
@@ -1190,4 +1199,49 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
         _ => {}
     }
     attrs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{RoutineId, RoutineKind, SourceLocation};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn should_append_edge_label_to_tui_tree_line() {
+        let mut graph = crate::graph::CodeGraph::new();
+        let proc = graph.add_node(Node::Procedure {
+            id: RoutineId {
+                schema: Some("sch".into()),
+                package: None,
+                name: "prc".into(),
+                kind: RoutineKind::Procedure,
+            },
+            location: SourceLocation {
+                file: Arc::new(PathBuf::from("t.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: vec![],
+        });
+        let node = traverse::TreeNode {
+            idx: proc,
+            edge_label: Some("[T]".into()),
+            children: vec![],
+            has_more: false,
+            more_count: 0,
+        };
+        let mut lines = Vec::new();
+        tree_node_to_lines(&node, &graph, "", true, &mut lines, &TuiTheme::detect());
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains(" [T]"),
+            "TUI tree must show the aggregated edge label, got {text}"
+        );
+    }
 }
