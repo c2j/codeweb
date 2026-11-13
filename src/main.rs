@@ -2663,6 +2663,8 @@ fn print_node_detail(
     verbose: bool,
 ) {
     let tag = node_type_tag(&graph[start_idx]);
+    // Degree counts edges (`neighbors_directed`), not unique neighbors.
+    // The tree below collapses parallel edges, so `out` can exceed the row count.
     let in_deg = graph
         .neighbors_directed(start_idx, petgraph::Direction::Incoming)
         .count();
