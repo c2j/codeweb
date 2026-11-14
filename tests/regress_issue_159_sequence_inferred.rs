@@ -148,9 +148,12 @@ $$ LANGUAGE plpgsql;
     );
     let rebuilt_store = fs::read(&store_path).unwrap();
     assert_eq!(&rebuilt_store[..9], b"CWEBSTORE");
+    // 重建后的 store 必须带**当前**格式版本；引用常量而非字面量，
+    // 让版本 bump 只在 STORE_VERSION 一处发生（v16 起布局与 feature 无关，
+    // 见 docs/validation V47.1）。
     assert_eq!(
         u32::from_le_bytes(rebuilt_store[9..13].try_into().unwrap()),
-        15
+        codeweb::graph::store::STORE_VERSION
     );
     assert_one_inferred_sequence_edge(&export_json(temp.path()));
 }
