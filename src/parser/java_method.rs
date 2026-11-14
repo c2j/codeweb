@@ -10,10 +10,14 @@ thread_local! {
     static JAVA_PARSER: RefCell<Parser> = RefCell::new({
         let mut p = Parser::new();
         let _ = p.set_language(&tree_sitter_java::LANGUAGE.into());
-        p.set_timeout_micros(5_000_000);
         p
     });
 }
+
+/// tree-sitter 0.25 弃用了按 Parser 持久的 `set_timeout_micros`，超时改由每次
+/// parse 的进度回调承担：超过 5 秒即取消解析（回调返回 false），`parse` 返回
+/// None，调用方的 `parse timeout or failure` 错误路径保持不变。
+const JAVA_PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_micros(5_000_000);
 
 // Public data structures
 // ---------------------------------------------------------------------------
@@ -453,7 +457,22 @@ pub fn parse_java_source(path: &Path, source_bytes: &[u8]) -> Result<JavaParseRe
     let content_hash = blake3::hash(source_bytes).to_hex().to_string();
 
     let tree = JAVA_PARSER
-        .with(|p| p.borrow_mut().parse(source_bytes, None))
+        .with(|p| {
+            let mut p = p.borrow_mut();
+            let deadline = std::time::Instant::now() + JAVA_PARSE_TIMEOUT;
+            let mut over_deadline =
+                |_state: &tree_sitter::ParseState| std::time::Instant::now() >= deadline;
+            let mut options = tree_sitter::ParseOptions::new();
+            options = options.progress_callback(&mut over_deadline);
+            let mut read = |i: usize, _| {
+                if i < source_bytes.len() {
+                    &source_bytes[i..]
+                } else {
+                    Default::default()
+                }
+            };
+            p.parse_with_options(&mut read, None, Some(options))
+        })
         .ok_or_else(|| format!("parse timeout or failure: {}", path.display()))?;
 
     let mut walker = JavaTreeWalker::new(source_bytes, path);
