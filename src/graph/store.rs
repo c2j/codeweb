@@ -4,7 +4,6 @@ use crate::graph::CodeGraph;
 use crate::graph::Node;
 use crate::parser::fingerprint::FileRecord;
 use crate::parser::{AnchorKind, AnchorSite};
-use crate::project::CODEWEB_TOML;
 use crate::sql_match;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -39,7 +38,8 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// equalities), both #181.
 /// v15: `PredicateClause.raw_column` (the written field name when it differs from
 /// the resolved column) and first-declaration-wins `routine_parameters`, both #181.
-pub const STORE_VERSION: u32 = 15;/// Pre-computed lightweight summary of a graph node for fast listing/filtering.
+pub const STORE_VERSION: u32 = 15;
+/// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub id: usize,

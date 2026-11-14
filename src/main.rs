@@ -1392,7 +1392,7 @@ fn cmd_analyze(project: &Path) -> Result<()> {
 }
 
 fn cmd_diff(project: &Path) -> Result<()> {
-    let mut proj = project::Project::find(project)?;
+    let proj = project::Project::find(project)?;
     let changes = proj.diff()?;
     if changes.is_empty() {
         eprintln!("Up to date. No changes detected.");

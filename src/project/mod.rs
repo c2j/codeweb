@@ -55,6 +55,18 @@ impl Project {
         })
     }
 
+    /// 仅检查指定目录本身是否有 `codeweb.toml` 并加载（不向上查找）。
+    /// 供嵌入方显式指定项目根时使用（docs/embeded-codeweb.md §3.2.2）。
+    pub fn open_exact(project_root: &Path) -> Result<Self> {
+        let toml_path = project_root.join(CODEWEB_TOML);
+        if toml_path.is_file() {
+            return Self::load_from(&toml_path);
+        }
+        Err(CodeWebError::ProjectNotFound {
+            search_from: project_root.to_path_buf(),
+        })
+    }
+
     pub fn init(source_dirs: &[PathBuf], name: &str) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_default();
         Self::init_at(&cwd, source_dirs, name)
