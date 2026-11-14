@@ -3,6 +3,7 @@ name = "codeweb"
 version = "0.9.8"
 edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
+license = "MIT OR Apache-2.0"
 
 [package.metadata.i18n]
 available_locales = ["en", "zh-CN"]
