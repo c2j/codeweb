@@ -39,54 +39,7 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// equalities), both #181.
 /// v15: `PredicateClause.raw_column` (the written field name when it differs from
 /// the resolved column) and first-declaration-wins `routine_parameters`, both #181.
-pub const STORE_VERSION: u32 = 15;
-
-/// Directory to name in the repair command: the nearest ancestor holding a
-/// `codeweb.toml`, else the store's own directory, else the cwd.
-fn store_project_root(store_path: &Path) -> PathBuf {
-    let start = match store_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    // For a single relative component (`.codeweb`) `Path::parent` is the empty
-    // path, so the cwd itself has to be probed separately.
-    let mut starts: Vec<PathBuf> = vec![start.to_path_buf()];
-    if start.is_relative() {
-        starts.push(PathBuf::from("."));
-    }
-    for from in &starts {
-        let mut dir = from.clone();
-        loop {
-            if dir.join(CODEWEB_TOML).is_file() {
-                return dir;
-            }
-            match dir.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
-                _ => break,
-            }
-        }
-    }
-    start.to_path_buf()
-}
-
-/// Single-quote a path so a root containing spaces or quotes can be pasted
-/// straight into a shell.
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
-}
-
-/// Version-gate error naming the store, the expected version, and a repair
-/// command that works from any cwd.
-fn stale_store_message(store_path: &Path, found: u32) -> String {
-    format!(
-        "unsupported cache version {found}, expected {STORE_VERSION}: run `codeweb analyze -p {}` \
-         to regenerate (stores are not migrated automatically; {} is unusable)",
-        shell_quote(&store_project_root(store_path)),
-        store_path.display()
-    )
-}
-
-/// Pre-computed lightweight summary of a graph node for fast listing/filtering.
+pub const STORE_VERSION: u32 = 15;/// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub id: usize,
@@ -1259,8 +1212,10 @@ impl GraphStore {
         let payload: &[u8] = if bytes.len() >= 13 && bytes[..9] == STORE_MAGIC {
             let stored_ver = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
             if stored_ver != STORE_VERSION {
-                return Err(crate::error::CodeWebError::ExportError {
-                    message: stale_store_message(path, stored_ver),
+                return Err(crate::error::CodeWebError::StoreVersionMismatch {
+                    path: path.to_path_buf(),
+                    found: stored_ver,
+                    expected: STORE_VERSION,
                 });
             }
             &bytes[13..]
@@ -1294,8 +1249,10 @@ impl GraphStore {
         // set to a mismatched value, and corrupted/garbage files that happened to
         // deserialize to *something*.
         if store.version != STORE_VERSION {
-            return Err(crate::error::CodeWebError::ExportError {
-                message: stale_store_message(path, store.version),
+            return Err(crate::error::CodeWebError::StoreVersionMismatch {
+                path: path.to_path_buf(),
+                found: store.version,
+                expected: STORE_VERSION,
             });
         }
         Ok(store)
@@ -1383,8 +1340,10 @@ impl GraphStore {
                 message: format!("json deserialize: {}", e),
             })?;
         if store.version != STORE_VERSION {
-            return Err(crate::error::CodeWebError::ExportError {
-                message: stale_store_message(path, store.version),
+            return Err(crate::error::CodeWebError::StoreVersionMismatch {
+                path: path.to_path_buf(),
+                found: store.version,
+                expected: STORE_VERSION,
             });
         }
         Ok(store)
@@ -2541,7 +2500,7 @@ mod tests {
         assert!(result.is_err(), "Version 3 cache should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "Error should mention version: {}",
             err_msg
         );
@@ -2682,7 +2641,7 @@ mod tests {
         assert!(result.is_err(), "previous-version cache must be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "error should mention the version gate: {}",
             err_msg
         );
@@ -2702,7 +2661,7 @@ mod tests {
         assert!(result.is_err(), "pre-issue-159 cache must be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "error should mention the version gate: {}",
             err_msg
         );
@@ -2732,7 +2691,7 @@ mod tests {
         let err_msg = GraphStore::load_bincode(&path).unwrap_err().to_string();
 
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "must keep the version-gate wording: {err_msg}"
         );
         assert!(
@@ -2756,65 +2715,6 @@ mod tests {
             err_msg.contains("not migrated"),
             "must warn that the old store is not migrated automatically: {err_msg}"
         );
-    }
-
-    /// The repair command must always carry a usable `-p` value, including for a
-    /// relative store path: `Path::parent` of `.codeweb` is the empty path, which
-    /// used to render as `codeweb analyze -p ` with nothing after the flag.
-    /// (Whether the search settles on `.` or on `.codeweb` depends on whether the
-    /// cwd holds a `codeweb.toml`, so this only pins the invariant.)
-    #[test]
-    fn stale_store_message_never_emits_an_empty_p_value() {
-        for path in [
-            Path::new(".codeweb/store.bincode"),
-            Path::new("store.bincode"),
-            Path::new("/nonexistent/place/store.bincode"),
-        ] {
-            let message = stale_store_message(path, 8);
-            let value = message
-                .split("analyze -p '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or_else(|| panic!("no quoted -p value in: {message}"));
-            assert!(
-                !value.trim().is_empty(),
-                "empty -p value for {path:?}: {message}"
-            );
-        }
-    }
-
-    /// A root containing spaces must still produce a pasteable command.
-    #[test]
-    fn stale_store_message_quotes_the_project_root() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("with space");
-        let store_dir = root.join(".codeweb");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        std::fs::write(root.join(CODEWEB_TOML), "[project]\nname = \"t\"\n").unwrap();
-        let path = store_dir.join("store.bincode");
-
-        let message = stale_store_message(&path, 8);
-        assert!(
-            message.contains(&format!("codeweb analyze -p '{}'", root.display())),
-            "the root must be shell-quoted: {message}"
-        );
-    }
-
-    /// The upward search must pick the tree the store actually belongs to, not
-    /// just the store's own directory.
-    #[test]
-    fn store_project_root_prefers_the_nearest_codeweb_toml() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("proj");
-        let store_dir = root.join(".codeweb");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        std::fs::write(root.join(CODEWEB_TOML), "[project]\nname = \"t\"\n").unwrap();
-
-        assert_eq!(store_project_root(&store_dir.join("store.bincode")), root);
-        // No codeweb.toml anywhere above: fall back to the store's directory.
-        let orphan = dir.path().join("elsewhere");
-        std::fs::create_dir_all(&orphan).unwrap();
-        assert_eq!(store_project_root(&orphan.join("store.bincode")), orphan);
     }
 
     /// Issue #180: same requirement for the JSON store format — the JSON path
@@ -2908,7 +2808,7 @@ mod tests {
         assert!(result.is_err(), "version mismatch must error");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "version-mismatch error should mention version: {}",
             err_msg
         );
@@ -3215,7 +3115,7 @@ mod tests {
     /// Mirrors `load_bincode_rejects_header_version_mismatch_with_friendly_error`: a
     /// store saved under the current `STORE_VERSION` whose on-disk header byte is then
     /// rewritten to `STORE_VERSION - 1` must be rejected by `load_bincode` with the
-    /// friendly "unsupported cache version" message, not a raw bincode error.
+    /// friendly "store version mismatch" message, not a raw bincode error.
     #[test]
     fn should_reject_store_with_stale_version() {
         let dir = TempDir::new().unwrap();
@@ -3235,7 +3135,7 @@ mod tests {
         assert!(result.is_err(), "stale-version store must be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unsupported cache version"),
+            err_msg.contains("store version mismatch"),
             "error should mention the version gate: {}",
             err_msg
         );

@@ -506,7 +506,7 @@ impl Project {
         })
     }
 
-    pub fn diff(&mut self) -> Result<FileChangeSet> {
+    pub fn diff(&self) -> Result<FileChangeSet> {
         let input_paths: Vec<PathBuf> = if self.config.analysis.paths.is_empty() {
             vec![self.root.clone()]
         } else {
@@ -545,11 +545,8 @@ impl Project {
         }
         self.store
             .as_ref()
-            .ok_or_else(|| CodeWebError::ExportError {
-                message: format!(
-                    "no store found at {} — run `codeweb analyze` first",
-                    store_path.display()
-                ),
+            .ok_or_else(|| CodeWebError::StoreNotFound {
+                path: store_path.clone(),
             })
     }
 
