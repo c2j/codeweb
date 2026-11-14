@@ -11,13 +11,13 @@ use petgraph::visit::EdgeRef;
 use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
-use crate::graph::key::NodeKey;
-use crate::graph::node_sub_type_tag;
-use crate::graph::query::spec::QuerySpec;
-use crate::graph::store::GraphStore;
-use crate::graph::traverse::{self, MatchRank, TreeNode};
-use crate::graph::{CodeGraph, Edge, Node};
-use crate::sql_match::PreparedQuery;
+use codeweb::graph::key::NodeKey;
+use codeweb::graph::node_sub_type_tag;
+use codeweb::graph::query::spec::QuerySpec;
+use codeweb::graph::store::GraphStore;
+use codeweb::graph::traverse::{self, MatchRank, TreeNode};
+use codeweb::graph::{CodeGraph, Edge, Node};
+use codeweb::sql_match::PreparedQuery;
 
 use super::access_log;
 use super::state::AppState;
@@ -339,8 +339,8 @@ async fn node_detail(
                                 "method": index_method,
                                 "columns": columns,
                                 "constraint": constraint.as_ref().map(|c| match c {
-                                    crate::graph::IndexConstraint::PrimaryKey => "PRIMARY KEY",
-                                    crate::graph::IndexConstraint::Unique => "UNIQUE",
+                                    codeweb::graph::IndexConstraint::PrimaryKey => "PRIMARY KEY",
+                                    codeweb::graph::IndexConstraint::Unique => "UNIQUE",
                                 }),
                             }))
                         } else {
@@ -495,18 +495,18 @@ fn resolve_node(
 ) -> Result<NodeIndex, ResolveNodeError> {
     match store.resolve_single_node(
         name,
-        crate::graph::search::MatchMode::Substring,
+        codeweb::graph::search::MatchMode::Substring,
         false,
         fail_on_multiple,
     ) {
-        crate::graph::search::ResolveResult::Single(idx, _) => Ok(idx),
-        crate::graph::search::ResolveResult::Empty => Err(ResolveNodeError::Empty),
-        crate::graph::search::ResolveResult::Ambiguous => Err(ResolveNodeError::Ambiguous(
+        codeweb::graph::search::ResolveResult::Single(idx, _) => Ok(idx),
+        codeweb::graph::search::ResolveResult::Empty => Err(ResolveNodeError::Empty),
+        codeweb::graph::search::ResolveResult::Ambiguous => Err(ResolveNodeError::Ambiguous(
             store
-                .search_nodes_with_mode(name, crate::graph::search::MatchMode::Substring)
+                .search_nodes_with_mode(name, codeweb::graph::search::MatchMode::Substring)
                 .len(),
         )),
-        crate::graph::search::ResolveResult::Multiple(_) => unreachable!("all_matches is false"),
+        codeweb::graph::search::ResolveResult::Multiple(_) => unreachable!("all_matches is false"),
     }
 }
 
@@ -554,7 +554,7 @@ async fn columns(
                 format!("'{}' is not a procedure or function", name),
             ));
         }
-        crate::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
+        codeweb::graph::columns::column_analysis_of_routine(graph, idx, table_filter)
     } else {
         let name = query.package.as_ref().expect("checked exactly-one above");
         let idx =
@@ -565,7 +565,7 @@ async fn columns(
                 format!("'{}' is not a package", name),
             ));
         }
-        crate::graph::columns::column_analysis_of_package(graph, idx, table_filter)
+        codeweb::graph::columns::column_analysis_of_package(graph, idx, table_filter)
     };
 
     match result {
@@ -594,8 +594,8 @@ async fn lineage(
     let direction = query.direction.as_deref().unwrap_or("both");
 
     let dir_spec = match direction.to_lowercase().as_str() {
-        "upstream" => Some(crate::graph::lineage::LineageDirection::Upstream),
-        "downstream" => Some(crate::graph::lineage::LineageDirection::Downstream),
+        "upstream" => Some(codeweb::graph::lineage::LineageDirection::Upstream),
+        "downstream" => Some(codeweb::graph::lineage::LineageDirection::Downstream),
         "both" => None,
         _ => {
             return Err((
@@ -608,26 +608,26 @@ async fn lineage(
         }
     };
 
-    let parsed = crate::graph::lineage::parse_lineage_target(graph, &query.target)
+    let parsed = codeweb::graph::lineage::parse_lineage_target(graph, &query.target)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     match parsed {
-        crate::graph::lineage::ParsedLineageTarget::Column(table, column) => {
-            let render = |dir: crate::graph::lineage::LineageDirection| {
+        codeweb::graph::lineage::ParsedLineageTarget::Column(table, column) => {
+            let render = |dir: codeweb::graph::lineage::LineageDirection| {
                 let node =
-                    crate::graph::lineage::lineage_column(graph, &table, &column, dir, depth);
-                crate::graph::lineage::format_column_lineage_json(&node, graph)
+                    codeweb::graph::lineage::lineage_column(graph, &table, &column, dir, depth);
+                codeweb::graph::lineage::format_column_lineage_json(&node, graph)
             };
             let json = match dir_spec {
                 Some(dir) => render(dir),
                 None => serde_json::json!({
-                    "upstream": render(crate::graph::lineage::LineageDirection::Upstream),
-                    "downstream": render(crate::graph::lineage::LineageDirection::Downstream),
+                    "upstream": render(codeweb::graph::lineage::LineageDirection::Upstream),
+                    "downstream": render(codeweb::graph::lineage::LineageDirection::Downstream),
                 }),
             };
             Ok(Json(json))
         }
-        crate::graph::lineage::ParsedLineageTarget::Table(table_name) => {
+        codeweb::graph::lineage::ParsedLineageTarget::Table(table_name) => {
             let table_idx = resolve_node(store, &table_name, false).map_err(|_| {
                 (
                     StatusCode::NOT_FOUND,
@@ -641,35 +641,35 @@ async fn lineage(
                 ));
             }
 
-            let cfg = crate::graph::lineage::LineageConfig::default();
-            let opts = crate::graph::lineage::DisplayOptions::new(
-                crate::graph::lineage::LineageView::Tree,
+            let cfg = codeweb::graph::lineage::LineageConfig::default();
+            let opts = codeweb::graph::lineage::DisplayOptions::new(
+                codeweb::graph::lineage::LineageView::Tree,
                 false,
             );
             let json = match dir_spec {
                 Some(dir) => {
                     let node =
-                        crate::graph::lineage::lineage_table(graph, table_idx, dir, depth, &cfg);
-                    crate::graph::lineage::format_lineage_json(&node, graph, &opts)
+                        codeweb::graph::lineage::lineage_table(graph, table_idx, dir, depth, &cfg);
+                    codeweb::graph::lineage::format_lineage_json(&node, graph, &opts)
                 }
                 None => {
-                    let up = crate::graph::lineage::lineage_table(
+                    let up = codeweb::graph::lineage::lineage_table(
                         graph,
                         table_idx,
-                        crate::graph::lineage::LineageDirection::Upstream,
+                        codeweb::graph::lineage::LineageDirection::Upstream,
                         depth,
                         &cfg,
                     );
-                    let down = crate::graph::lineage::lineage_table(
+                    let down = codeweb::graph::lineage::lineage_table(
                         graph,
                         table_idx,
-                        crate::graph::lineage::LineageDirection::Downstream,
+                        codeweb::graph::lineage::LineageDirection::Downstream,
                         depth,
                         &cfg,
                     );
                     serde_json::json!({
-                        "upstream": crate::graph::lineage::format_lineage_json(&up, graph, &opts),
-                        "downstream": crate::graph::lineage::format_lineage_json(&down, graph, &opts),
+                        "upstream": codeweb::graph::lineage::format_lineage_json(&up, graph, &opts),
+                        "downstream": codeweb::graph::lineage::format_lineage_json(&down, graph, &opts),
                     })
                 }
             };
@@ -778,7 +778,7 @@ async fn node_callees(
 
 async fn graph_data(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     let graph = state.graph();
-    match crate::export::json::to_json(graph) {
+    match codeweb::export::json::to_json(graph) {
         Ok(json) => Ok(([(header::CONTENT_TYPE, "application/json")], json)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -796,14 +796,14 @@ async fn export(
     let graph = state.graph();
 
     let (content_type, body) = match query.format.as_str() {
-        "dot" => ("text/vnd.graphviz", crate::export::dot::to_dot(graph)),
-        "json" => match crate::export::json::to_json(graph) {
+        "dot" => ("text/vnd.graphviz", codeweb::export::dot::to_dot(graph)),
+        "json" => match codeweb::export::json::to_json(graph) {
             Ok(json) => ("application/json", json),
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         },
         "ndjson" => {
             let mut buf = Vec::new();
-            if crate::export::ndjson::to_ndjson(graph, &mut buf).is_err() {
+            if codeweb::export::ndjson::to_ndjson(graph, &mut buf).is_err() {
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
             (
@@ -811,7 +811,7 @@ async fn export(
                 String::from_utf8_lossy(&buf).to_string(),
             )
         }
-        "mermaid" => ("text/plain", crate::export::mermaid::to_mermaid(graph)),
+        "mermaid" => ("text/plain", codeweb::export::mermaid::to_mermaid(graph)),
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
@@ -832,11 +832,11 @@ async fn files(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(path, record)| {
             let rel = path.strip_prefix(root).unwrap_or(path);
             let type_tag = match record.file_type {
-                crate::parser::fingerprint::FileType::Sql => "SQL",
-                crate::parser::fingerprint::FileType::Java => "Java",
-                crate::parser::fingerprint::FileType::Xml => "XML",
+                codeweb::parser::fingerprint::FileType::Sql => "SQL",
+                codeweb::parser::fingerprint::FileType::Java => "Java",
+                codeweb::parser::fingerprint::FileType::Xml => "XML",
                 #[cfg(feature = "jsp")]
-                crate::parser::fingerprint::FileType::Jsp => "JSP",
+                codeweb::parser::fingerprint::FileType::Jsp => "JSP",
             };
             let node_count = file_nodes
                 .get(path as &std::path::Path)

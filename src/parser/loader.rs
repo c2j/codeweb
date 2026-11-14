@@ -10,8 +10,11 @@ pub struct ParsedFile {
 
 pub struct AllParsedFiles {
     pub sql_files: Vec<ParsedFile>,
+    #[cfg(feature = "java")]
     pub java_files: Vec<crate::parser::java_loader::JavaParsedFile>,
+    #[cfg(feature = "jsp")]
     pub ibatis_files: Vec<crate::parser::ibatis_loader::IbatisParsedFile>,
+    #[cfg(feature = "java")]
     pub java_method_results: Vec<crate::parser::java_method::JavaParseResult>,
     #[cfg(feature = "jsp")]
     pub jsp_files: Vec<crate::parser::jsp_loader::JspFileResult>,
@@ -32,9 +35,12 @@ pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
     }
 
     let sql_files = parse_sql_files(&scanned.sql_files);
+    #[cfg(feature = "java")]
     let java_files = crate::parser::java_loader::load_java_files_from_paths(&scanned.java_files);
+    #[cfg(feature = "jsp")]
     let ibatis_files =
         crate::parser::ibatis_loader::load_ibatis_files_from_paths(&scanned.xml_files);
+    #[cfg(feature = "java")]
     let java_method_results =
         crate::parser::java_method::parse_java_files_from_paths(&scanned.java_files);
     #[cfg(feature = "jsp")]
@@ -48,8 +54,11 @@ pub fn load_all_files(input: &Path) -> Result<AllParsedFiles> {
 
     Ok(AllParsedFiles {
         sql_files,
+        #[cfg(feature = "java")]
         java_files,
+        #[cfg(feature = "jsp")]
         ibatis_files,
+        #[cfg(feature = "java")]
         java_method_results,
         #[cfg(feature = "jsp")]
         jsp_files,

@@ -319,7 +319,7 @@ enum EdgeKindJson {
         file: Option<String>,
         line: Option<usize>,
     },
-    #[cfg(feature = "jsp")]
+    #[cfg(any(feature = "jsp", feature = "java"))]
     #[serde(rename = "contains_sql")]
     ContainsSql,
     #[serde(rename = "anchors_on")]
@@ -898,7 +898,7 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.as_ref().map(|l| l.line),
                 },
             },
-            #[cfg(feature = "jsp")]
+            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => EdgeJson {
                 source: src.index(),
                 target: dst.index(),

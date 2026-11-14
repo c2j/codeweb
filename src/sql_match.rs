@@ -383,7 +383,7 @@ fn tables_compatible(query_table: &Option<String>, sql_normalized: &str) -> bool
 }
 
 /// Query normalized and pre-computed once, then reused for every node comparison.
-pub(crate) struct PreparedQuery {
+pub struct PreparedQuery {
     normalized: String,
     has_wildcard: bool,
     segments: Vec<String>,
@@ -392,7 +392,7 @@ pub(crate) struct PreparedQuery {
 }
 
 impl PreparedQuery {
-    pub(crate) fn new(query: &str) -> Self {
+    pub fn new(query: &str) -> Self {
         let lower = query.to_lowercase();
         let normalized = normalize_for_matching(&lower);
         let has_wildcard = normalized.contains('?');
@@ -418,7 +418,7 @@ impl PreparedQuery {
     }
 
     /// Check if `sql_text` matches this prepared query with wildcard support.
-    pub(crate) fn matches(&self, sql_text: &str) -> bool {
+    pub fn matches(&self, sql_text: &str) -> bool {
         let sql_lower = normalize_for_matching(&sql_text.to_lowercase());
 
         let sql_kw = SqlKeyword::extract(&sql_lower);

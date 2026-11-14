@@ -6,8 +6,8 @@ pub mod state;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use crate::error::Result;
-use crate::project::Project;
+use codeweb::error::Result;
+use codeweb::project::Project;
 
 pub fn run(project_path: &Path, addr: &str, open_browser: bool, log_level: &str) -> Result<()> {
     let pb = indicatif::ProgressBar::new_spinner();
@@ -38,7 +38,7 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool, log_level: &str)
     pb.finish_with_message(format!("Loaded {} nodes, {} edges", node_count, edge_count));
 
     let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| crate::error::CodeWebError::ExportError {
+        tokio::runtime::Runtime::new().map_err(|e| codeweb::error::CodeWebError::ExportError {
             message: format!("failed to create tokio runtime: {}", e),
         })?;
 
@@ -47,13 +47,13 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool, log_level: &str)
 
         let socket_addr: SocketAddr =
             addr.parse()
-                .map_err(|e| crate::error::CodeWebError::ExportError {
+                .map_err(|e| codeweb::error::CodeWebError::ExportError {
                     message: format!("invalid address '{}': {}", addr, e),
                 })?;
 
         let listener = tokio::net::TcpListener::bind(socket_addr)
             .await
-            .map_err(|e| crate::error::CodeWebError::ExportError {
+            .map_err(|e| codeweb::error::CodeWebError::ExportError {
                 message: format!("failed to bind to {}: {}", addr, e),
             })?;
 
@@ -69,7 +69,7 @@ pub fn run(project_path: &Path, addr: &str, open_browser: bool, log_level: &str)
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
-        .map_err(|e| crate::error::CodeWebError::ExportError {
+        .map_err(|e| codeweb::error::CodeWebError::ExportError {
             message: format!("server error: {}", e),
         })
     })

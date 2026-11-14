@@ -5,23 +5,40 @@ edition = "2021"
 description = "Semantic code graph analyzer — call graphs for SQL stored procedures"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "codeweb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codeweb"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [package.metadata.i18n]
 available_locales = ["en", "zh-CN"]
 default_locale = "zh-CN"
 fallback_locale = "en"
 
 [features]
-default = ["cli", "tui", "jsp"]
-full = ["cli", "tui", "serve", "mcp", "jsp", "search-sql-v2"]
-cli = ["clap"]
-tui = ["ratatui", "crossterm"]
+# jsp：JSP 脚本块 + iBatis mapper 链（ogsql-parser 的 ibatis feature）
+# java：tree-sitter Java 方法/类图 + ogsql-parser 的 Java SQL 抽取
+# analyze：嵌入形态标记——SpinDuck 以 default-features = false + ["analyze"]
+# 引入，得到无 CLI/TUI/serve/MCP/JSP/Java 的纯库构建（Task embed）。
+# ogsql-parser / petgraph / 扫描类依赖（rayon/walkdir/globset/blake3/encoding_rs/
+# indicatif）是任何可用形态的核心，保持非 optional，不进 feature。
+default = ["cli", "tui", "jsp", "java"]
+full = ["cli", "tui", "serve", "mcp", "jsp", "java", "analyze", "search-sql-v2"]
+cli = ["dep:clap"]
+tui = ["dep:ratatui", "dep:crossterm"]
 serve = ["dep:axum", "dep:chrono", "dep:tokio", "dep:tower-http", "dep:rust-embed", "dep:mime_guess"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
-jsp = []
+jsp = ["java", "ogsql-parser/ibatis"]
+java = ["dep:tree-sitter", "dep:tree-sitter-java", "ogsql-parser/java"]
+analyze = []
 search-sql-v2 = []
 
 [dependencies]
-ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", tag = "v0.11.0", features = ["ibatis", "java"] }
+ogsql-parser = { git = "https://github.com/c2j/ogsql-parser", tag = "v0.11.0" }
 petgraph = { version = "0.7", features = ["serde-1"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
@@ -29,8 +46,6 @@ serde_json = "1"
 rayon = "1.10"
 libc = "0.2"
 walkdir = "2"
-tree-sitter = "0.25"
-tree-sitter-java = "0.23.5"
 blake3 = "1"
 globset = "0.4"
 regex = { version = "1", default-features = false, features = ["std"] }
@@ -42,6 +57,8 @@ encoding_rs = "0.8"
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23.5", optional = true }
 axum = { version = "0.7", optional = true }
 chrono = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"], optional = true }

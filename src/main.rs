@@ -3,22 +3,15 @@ extern crate rust_i18n;
 
 i18n!("locales", fallback = "en");
 
-mod error;
-mod export;
-mod graph;
-#[allow(dead_code)]
-mod import;
-mod mark;
+// 分析内核已迁入 lib crate（src/lib.rs）；bin 侧保留 CLI/TUI/serve/MCP 与宏。
+// 下面这行让 main.rs 及其子模块里对 `error::` / `graph::` 等裸路径的既有引用
+// 继续解析（等价于旧 `mod` 声明，但指向 lib crate）。
+use codeweb::{error, export, graph, import, mark, parse_log, parser, project, sql_match};
+
 #[cfg(feature = "mcp")]
 mod mcp;
-mod parse_log;
-#[allow(dead_code)]
-mod parser;
-#[allow(dead_code)]
-mod project;
 #[cfg(feature = "serve")]
 mod server;
-mod sql_match;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -184,7 +177,7 @@ struct PredicatesResult {
     procedure: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     package: Option<String>,
-    predicates: Vec<crate::parser::PlPredicate>,
+    predicates: Vec<codeweb::parser::PlPredicate>,
 }
 
 const LOGO: &str = r#"
@@ -849,13 +842,13 @@ enum Commands {
     },
 }
 
-fn match_mode_from_flags(exact: bool, regex: bool) -> crate::graph::search::MatchMode {
+fn match_mode_from_flags(exact: bool, regex: bool) -> codeweb::graph::search::MatchMode {
     if exact {
-        crate::graph::search::MatchMode::Exact
+        codeweb::graph::search::MatchMode::Exact
     } else if regex {
-        crate::graph::search::MatchMode::Regex
+        codeweb::graph::search::MatchMode::Regex
     } else {
-        crate::graph::search::MatchMode::Substring
+        codeweb::graph::search::MatchMode::Substring
     }
 }
 
@@ -1209,8 +1202,8 @@ fn cmd_conflicts(
     format: &str,
     table_filter: Option<&str>,
 ) -> Result<()> {
-    use crate::graph::conflict::{find_conflicts, ConflictSeverity};
-    use crate::graph::{highest_lock_level, AccessMode, Node};
+    use codeweb::graph::conflict::{find_conflicts, ConflictSeverity};
+    use codeweb::graph::{highest_lock_level, AccessMode, Node};
 
     let mut proj = project::Project::find(project)?;
     let store = match proj.load_store() {
@@ -1463,10 +1456,10 @@ fn cmd_export(
 }
 
 fn build_filtered_subgraph(
-    full_graph: &crate::graph::CodeGraph,
-    store: &crate::graph::store::GraphStore,
+    full_graph: &codeweb::graph::CodeGraph,
+    store: &codeweb::graph::store::GraphStore,
     filter_query: &str,
-) -> crate::graph::CodeGraph {
+) -> codeweb::graph::CodeGraph {
     use petgraph::graph::NodeIndex;
     use std::collections::HashSet;
 
@@ -1477,7 +1470,7 @@ fn build_filtered_subgraph(
             "Filter '{}' matched 0 nodes; exporting empty graph.",
             filter_query
         );
-        return crate::graph::CodeGraph::new();
+        return codeweb::graph::CodeGraph::new();
     }
 
     eprintln!("Filter '{}': {} seed nodes", filter_query, matches.len());
@@ -1497,7 +1490,7 @@ fn build_filtered_subgraph(
     }
 
     // Build filtered graph: copy selected nodes, keep edges between them
-    let mut filtered = crate::graph::CodeGraph::new();
+    let mut filtered = codeweb::graph::CodeGraph::new();
     let mut old_to_new: std::collections::HashMap<NodeIndex, NodeIndex> =
         std::collections::HashMap::new();
 
@@ -1602,7 +1595,7 @@ fn cmd_trace(
     project: &Path,
     style: &str,
     show_builtins: bool,
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
     all_matches: bool,
     fail_on_multiple: bool,
 ) -> Result<()> {
@@ -1613,8 +1606,8 @@ fn cmd_trace(
     let result = store.resolve_single_node(from, match_mode, all_matches, fail_on_multiple);
 
     let start_idx = match result {
-        crate::graph::search::ResolveResult::Single(idx, _) => idx,
-        crate::graph::search::ResolveResult::Multiple(matches) => {
+        codeweb::graph::search::ResolveResult::Single(idx, _) => idx,
+        codeweb::graph::search::ResolveResult::Multiple(matches) => {
             eprintln!("Processing all {} matches...", matches.len());
             for (idx, name) in &matches {
                 eprintln!("  {}", name);
@@ -1633,11 +1626,11 @@ fn cmd_trace(
             }
             return Ok(());
         }
-        crate::graph::search::ResolveResult::Empty => {
+        codeweb::graph::search::ResolveResult::Empty => {
             eprintln!("No nodes matching '{}'", from);
             return Ok(());
         }
-        crate::graph::search::ResolveResult::Ambiguous => {
+        codeweb::graph::search::ResolveResult::Ambiguous => {
             eprintln!("Error: ambiguous match for '{}'", from);
             std::process::exit(2);
         }
@@ -1781,14 +1774,14 @@ fn cmd_lineage(
     // Find the table node (use substring matching for flexibility)
     let result = store.resolve_single_node(
         table_name,
-        crate::graph::search::MatchMode::Substring,
+        codeweb::graph::search::MatchMode::Substring,
         false,
         false,
     );
 
     let table_idx = match result {
-        crate::graph::search::ResolveResult::Single(idx, _) => idx,
-        crate::graph::search::ResolveResult::Empty => {
+        codeweb::graph::search::ResolveResult::Single(idx, _) => idx,
+        codeweb::graph::search::ResolveResult::Empty => {
             eprintln!("No table found matching '{}'", table_name);
             return Ok(());
         }
@@ -1957,13 +1950,13 @@ fn cmd_columns(
     let (idx, is_routine, name) = if let Some(name) = procedure {
         let resolved = store.resolve_single_node(
             &name,
-            crate::graph::search::MatchMode::Substring,
+            codeweb::graph::search::MatchMode::Substring,
             false,
             true,
         );
         let idx = match resolved {
-            crate::graph::search::ResolveResult::Single(idx, _) => idx,
-            crate::graph::search::ResolveResult::Empty => {
+            codeweb::graph::search::ResolveResult::Single(idx, _) => idx,
+            codeweb::graph::search::ResolveResult::Empty => {
                 return Err(error::CodeWebError::ExportError {
                     message: format!("No procedure or function found matching '{}'", name),
                 });
@@ -1991,7 +1984,7 @@ fn cmd_columns(
         // `<package>.<routine>`, so a substring match on the package name would
         // otherwise be ambiguous with its own procedures.
         let matches: Vec<_> = store
-            .search_nodes_with_mode(&name, crate::graph::search::MatchMode::Substring)
+            .search_nodes_with_mode(&name, codeweb::graph::search::MatchMode::Substring)
             .into_iter()
             .filter(|(idx, _)| matches!(&graph[*idx], graph::Node::Package { .. }))
             .collect();
@@ -2080,13 +2073,13 @@ fn cmd_predicates(procedure: &str, format: &str, project: &Path) -> Result<()> {
 
     let resolved = store.resolve_single_node(
         procedure,
-        crate::graph::search::MatchMode::Substring,
+        codeweb::graph::search::MatchMode::Substring,
         false,
         true,
     );
     let idx = match resolved {
-        crate::graph::search::ResolveResult::Single(idx, _) => idx,
-        crate::graph::search::ResolveResult::Empty => {
+        codeweb::graph::search::ResolveResult::Single(idx, _) => idx,
+        codeweb::graph::search::ResolveResult::Empty => {
             return Err(error::CodeWebError::ExportError {
                 message: format!("No procedure or function found matching '{}'", procedure),
             });
@@ -2105,7 +2098,7 @@ fn cmd_predicates(procedure: &str, format: &str, project: &Path) -> Result<()> {
             message: format!("'{}' is not a procedure or function", procedure),
         });
     }
-    let key = crate::graph::key::NodeKey::from_node(&store.graph()[idx]).to_string();
+    let key = codeweb::graph::key::NodeKey::from_node(&store.graph()[idx]).to_string();
     let predicates = store
         .procedure_predicates
         .get(&key)
@@ -2442,7 +2435,7 @@ fn is_system_node(node: &Node) -> bool {
 
 fn filter_indexes_from_tree(
     nodes: &mut Vec<graph::traverse::TreeNode>,
-    graph: &crate::graph::CodeGraph,
+    graph: &codeweb::graph::CodeGraph,
 ) {
     nodes.retain(|n| !matches!(&graph[n.idx], Node::Index { .. }));
     for node in nodes.iter_mut() {
@@ -2460,7 +2453,7 @@ fn cmd_detail(
     related_ddl: bool,
     show_builtins: bool,
     verbose: bool,
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
     all_matches: bool,
     fail_on_multiple: bool,
     summarize_tables: bool,
@@ -2493,15 +2486,15 @@ fn cmd_detail(
 #[allow(clippy::too_many_arguments)]
 fn detail_one(
     name: &str,
-    graph: &crate::graph::CodeGraph,
-    store: &crate::graph::store::GraphStore,
+    graph: &codeweb::graph::CodeGraph,
+    store: &codeweb::graph::store::GraphStore,
     style: &str,
     depth: i64,
     show_files: bool,
     related_ddl: bool,
     show_builtins: bool,
     verbose: bool,
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
     all_matches: bool,
     fail_on_multiple: bool,
     summarize_tables: bool,
@@ -2509,8 +2502,8 @@ fn detail_one(
     let result = store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple);
 
     let start_idx = match result {
-        crate::graph::search::ResolveResult::Single(idx, _) => idx,
-        crate::graph::search::ResolveResult::Multiple(matches) => {
+        codeweb::graph::search::ResolveResult::Single(idx, _) => idx,
+        codeweb::graph::search::ResolveResult::Multiple(matches) => {
             for (idx, _name) in &matches {
                 print_node_detail(
                     *idx,
@@ -2525,17 +2518,17 @@ fn detail_one(
             }
             return;
         }
-        crate::graph::search::ResolveResult::Empty => {
+        codeweb::graph::search::ResolveResult::Empty => {
             eprintln!("No nodes matching '{}'", name);
             return;
         }
-        crate::graph::search::ResolveResult::Ambiguous => {
+        codeweb::graph::search::ResolveResult::Ambiguous => {
             eprintln!("Error: ambiguous match for '{}'", name);
             std::process::exit(2);
         }
     };
 
-    if summarize_tables && matches!(graph[start_idx], crate::graph::Node::Package { .. }) {
+    if summarize_tables && matches!(graph[start_idx], codeweb::graph::Node::Package { .. }) {
         print_table_summary(graph, start_idx);
         return;
     }
@@ -2552,11 +2545,11 @@ fn detail_one(
     );
 }
 
-fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph::NodeIndex) {
-    use crate::graph::{AccessMode, DataFlowKind, Edge, WriteKind};
+fn print_table_summary(graph: &codeweb::graph::CodeGraph, pkg_idx: petgraph::graph::NodeIndex) {
+    use codeweb::graph::{AccessMode, DataFlowKind, Edge, WriteKind};
     use std::collections::{BTreeMap, HashSet};
 
-    let display_name = crate::graph::node_display_name(&graph[pkg_idx]);
+    let display_name = codeweb::graph::node_display_name(&graph[pkg_idx]);
 
     // Collect child procedures via ContainsRoutine edges
     let mut table_access: BTreeMap<String, (AccessMode, HashSet<WriteKind>)> = BTreeMap::new();
@@ -2580,7 +2573,7 @@ fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph
                     continue;
                 }
                 let dst = ta_ref.target();
-                if let crate::graph::Node::Table { name, .. } = &graph[dst] {
+                if let codeweb::graph::Node::Table { name, .. } = &graph[dst] {
                     let entry = table_access
                         .entry(name.clone())
                         .or_insert_with(|| (AccessMode::empty(), HashSet::new()));
@@ -2614,7 +2607,8 @@ fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph
         } else if is_read {
             reads.push(tbl);
         } else if is_write {
-            let mut wk_labels: Vec<&str> = wk.iter().map(crate::graph::write_kind_label).collect();
+            let mut wk_labels: Vec<&str> =
+                wk.iter().map(codeweb::graph::write_kind_label).collect();
             wk_labels.sort_unstable();
             writes.push((tbl, wk_labels));
         }
@@ -2654,7 +2648,7 @@ fn print_table_summary(graph: &crate::graph::CodeGraph, pkg_idx: petgraph::graph
 #[allow(clippy::too_many_arguments)]
 fn print_node_detail(
     start_idx: petgraph::graph::NodeIndex,
-    graph: &crate::graph::CodeGraph,
+    graph: &codeweb::graph::CodeGraph,
     style: &str,
     depth: i64,
     show_files: bool,
@@ -2989,7 +2983,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 if !callers.is_empty() {
                     println_stdout!("    called by:");
                     for ci in &callers {
-                        let key = crate::graph::key::NodeKey::from_node(&graph[*ci]);
+                        let key = codeweb::graph::key::NodeKey::from_node(&graph[*ci]);
                         println_stdout!("      {}", key);
                     }
                 }
@@ -3034,7 +3028,7 @@ fn cmd_trace_sql(sql: Option<&str>, file: Option<&Path>, project: &Path) -> Resu
                 if !callers.is_empty() {
                     println_stdout!("    called by:");
                     for ci in &callers {
-                        let key = crate::graph::key::NodeKey::from_node(&graph[*ci]);
+                        let key = codeweb::graph::key::NodeKey::from_node(&graph[*ci]);
                         println_stdout!("      {}", key);
                     }
                 }
@@ -3076,7 +3070,7 @@ fn cmd_query(file: Option<&Path>, spec_str: Option<&str>, project: &Path) -> Res
         }
     };
 
-    let query_spec: crate::graph::query::spec::QuerySpec = serde_json::from_str(&json_str)
+    let query_spec: codeweb::graph::query::spec::QuerySpec = serde_json::from_str(&json_str)
         .map_err(|e| error::CodeWebError::ExportError {
             message: format!("Invalid query spec: {}", e),
         })?;
@@ -3237,7 +3231,7 @@ fn format_columns(columns: &[graph::ColumnSummary]) -> String {
     lines.join("\n")
 }
 
-fn format_referenced_tables(graph: &crate::graph::CodeGraph, view_idx: NodeIndex) -> String {
+fn format_referenced_tables(graph: &codeweb::graph::CodeGraph, view_idx: NodeIndex) -> String {
     let mut ref_nodes: Vec<(NodeIndex, &Node)> = graph
         .neighbors_directed(view_idx, petgraph::Direction::Outgoing)
         .filter_map(|n| {
@@ -3464,7 +3458,7 @@ fn print_node_details(node: &Node, verbose: bool) {
     }
 }
 
-fn index_sort_key(graph: &crate::graph::CodeGraph, idx: NodeIndex) -> impl Ord {
+fn index_sort_key(graph: &codeweb::graph::CodeGraph, idx: NodeIndex) -> impl Ord {
     match &graph[idx] {
         Node::Index {
             constraint,
@@ -3484,7 +3478,7 @@ fn index_sort_key(graph: &crate::graph::CodeGraph, idx: NodeIndex) -> impl Ord {
     }
 }
 
-fn format_indexes(graph: &crate::graph::CodeGraph, table_idx: NodeIndex) -> String {
+fn format_indexes(graph: &codeweb::graph::CodeGraph, table_idx: NodeIndex) -> String {
     let mut indexes: Vec<NodeIndex> = graph
         .neighbors_directed(table_idx, petgraph::Direction::Incoming)
         .filter(|n| matches!(&graph[*n], Node::Index { .. }))
@@ -3689,16 +3683,23 @@ fn cmd_legacy(cli: Cli) -> Result<()> {
         builder.build(&files)
     } else {
         let all = parser::load_all_files(&input)?;
+        // format! 参数个数随 feature 组合变化，按三档拆分（jsp ⊇ java）。
+        #[cfg(feature = "jsp")]
         eprintln!(
             "loaded {} SQL, {} Java, {} XML file(s){}",
             all.sql_files.len(),
             all.java_files.len(),
             all.ibatis_files.len(),
-            jsp_count_fragment(
-                #[cfg(feature = "jsp")]
-                all.jsp_files.len(),
-            ),
+            jsp_count_fragment(all.jsp_files.len()),
         );
+        #[cfg(all(feature = "java", not(feature = "jsp")))]
+        eprintln!(
+            "loaded {} SQL, {} Java file(s)",
+            all.sql_files.len(),
+            all.java_files.len(),
+        );
+        #[cfg(all(not(feature = "java"), not(feature = "jsp")))]
+        eprintln!("loaded {} SQL file(s)", all.sql_files.len());
         let builder = graph::builder::GraphBuilder::new();
         #[cfg(feature = "jsp")]
         {
@@ -4293,18 +4294,18 @@ fn jsp_count_fragment() -> String {
     String::new()
 }
 
-fn build_edge_filter(types: &[String]) -> Result<crate::graph::query::filter::EdgeFilter> {
-    use crate::graph::query::filter::EdgeFilter;
+fn build_edge_filter(types: &[String]) -> Result<codeweb::graph::query::filter::EdgeFilter> {
+    use codeweb::graph::query::filter::EdgeFilter;
 
     if types.is_empty() || types.iter().any(|t| t.eq_ignore_ascii_case("all")) {
         return Ok(EdgeFilter::new());
     }
 
-    let categories: Vec<crate::graph::EdgeCategory> = types
+    let categories: Vec<codeweb::graph::EdgeCategory> = types
         .iter()
         .map(|t| {
-            t.parse::<crate::graph::EdgeCategory>()
-                .map_err(|e| crate::error::CodeWebError::ConfigError { message: e })
+            t.parse::<codeweb::graph::EdgeCategory>()
+                .map_err(|e| codeweb::error::CodeWebError::ConfigError { message: e })
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -4318,7 +4319,7 @@ fn cmd_impact(
     format: &str,
     depth: usize,
     edge_types: &[String],
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
 ) -> Result<()> {
     use petgraph::Direction;
 
@@ -4430,11 +4431,11 @@ fn cmd_inspect(
     max_paths: usize,
     style: &str,
     show_unreachable: bool,
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
     all_matches: bool,
     fail_on_multiple: bool,
 ) -> Result<()> {
-    use crate::graph::inspect::{
+    use codeweb::graph::inspect::{
         find_paths_between, format_inspect_result, InspectOptions, InspectStyle,
     };
 
@@ -4455,12 +4456,12 @@ fn cmd_inspect(
     for name in node_names {
         let result = store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple);
         match result {
-            crate::graph::search::ResolveResult::Single(idx, display) => {
+            codeweb::graph::search::ResolveResult::Single(idx, display) => {
                 eprintln!("  \"{}\" → 1 match  (exact)", name);
                 targets.push(idx);
                 all_matched_names.push(display);
             }
-            crate::graph::search::ResolveResult::Multiple(matches) => {
+            codeweb::graph::search::ResolveResult::Multiple(matches) => {
                 eprintln!("  \"{}\" → {} matches (using all)", name, matches.len());
                 for (i, (idx, display)) in matches.iter().enumerate() {
                     eprintln!("    {}. {}", i + 1, display);
@@ -4468,12 +4469,12 @@ fn cmd_inspect(
                     all_matched_names.push(display.clone());
                 }
             }
-            crate::graph::search::ResolveResult::Empty => {
+            codeweb::graph::search::ResolveResult::Empty => {
                 eprintln!("  \"{}\" → 0 matches", name);
                 eprintln!("Error: '{}' did not match any node.", name);
                 std::process::exit(2);
             }
-            crate::graph::search::ResolveResult::Ambiguous => {
+            codeweb::graph::search::ResolveResult::Ambiguous => {
                 eprintln!("  \"{}\" → ambiguous match", name);
                 eprintln!("Error: ambiguous match for '{}'", name);
                 std::process::exit(2);
@@ -4520,9 +4521,9 @@ enum ImpactTarget {
 /// 从文件入口解析出起始节点列表。
 /// 文件不在图中或无节点时返回 Ok((vec![], ImpactTarget::File{...})),由调用方走空结果路径。
 fn resolve_file_target(
-    _graph: &crate::graph::CodeGraph,
-    file_nodes: &HashMap<PathBuf, Vec<crate::graph::key::NodeKey>>,
-    key_index: &HashMap<crate::graph::key::NodeKey, NodeIndex>,
+    _graph: &codeweb::graph::CodeGraph,
+    file_nodes: &HashMap<PathBuf, Vec<codeweb::graph::key::NodeKey>>,
+    key_index: &HashMap<codeweb::graph::key::NodeKey, NodeIndex>,
     path: &Path,
 ) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
     let target = ImpactTarget::File {
@@ -4564,9 +4565,9 @@ fn resolve_file_target(
 /// 从节点名入口解析出起始节点列表(单个节点)。
 /// 复用 store.search_nodes(),与 cmd_trace / cmd_detail 一致。
 fn resolve_node_target(
-    store: &crate::graph::store::GraphStore,
+    store: &codeweb::graph::store::GraphStore,
     name: &str,
-    match_mode: crate::graph::search::MatchMode,
+    match_mode: codeweb::graph::search::MatchMode,
 ) -> Result<(Vec<NodeIndex>, ImpactTarget)> {
     let matches = store.search_nodes_with_mode(name, match_mode);
 
@@ -4659,7 +4660,7 @@ fn emit_batch_result(results: &[ImpactResult], format: &str) -> Result<()> {
 /// Returns (matched_path, was_fuzzy).
 fn resolve_file_path<'a>(
     input: &Path,
-    file_nodes: &'a HashMap<PathBuf, Vec<crate::graph::key::NodeKey>>,
+    file_nodes: &'a HashMap<PathBuf, Vec<codeweb::graph::key::NodeKey>>,
 ) -> Option<(&'a PathBuf, bool)> {
     if let Ok(canon) = input.canonicalize() {
         if let Some((k, _)) = file_nodes.get_key_value(canon.as_path()) {
@@ -4682,14 +4683,14 @@ fn resolve_file_path<'a>(
 
 /// `Incoming` → upstream callers, `Outgoing` → downstream callees.
 fn collect_impact_entries(
-    graph: &crate::graph::CodeGraph,
+    graph: &codeweb::graph::CodeGraph,
     start_nodes: &[NodeIndex],
     direction: petgraph::Direction,
     depth: usize,
-    edge_filter: &crate::graph::query::filter::EdgeFilter,
+    edge_filter: &codeweb::graph::query::filter::EdgeFilter,
     out: &mut HashMap<(Option<String>, String), ImpactEntry>,
 ) {
-    use crate::graph::key::NodeKey;
+    use codeweb::graph::key::NodeKey;
 
     if depth == 0 {
         return;
@@ -4726,7 +4727,7 @@ fn collect_impact_entries(
                 visited.insert(neighbor);
 
                 let neighbor_node = &graph[neighbor];
-                let file_path = crate::graph::store::node_source_file(neighbor_node)
+                let file_path = codeweb::graph::store::node_source_file(neighbor_node)
                     .map(|p| p.to_string_lossy().to_string());
                 let symbol = NodeKey::from_node(neighbor_node).to_string();
                 let line = impact_entry_line(neighbor_node, weight);
@@ -4756,10 +4757,10 @@ fn collect_impact_entries(
 /// relative to the extracted SQL text, not the source file. Use the
 /// node's own `line` field instead.
 fn impact_entry_line(
-    neighbor_node: &crate::graph::Node,
-    edge: &crate::graph::Edge,
+    neighbor_node: &codeweb::graph::Node,
+    edge: &codeweb::graph::Edge,
 ) -> Option<usize> {
-    use crate::graph::Node;
+    use codeweb::graph::Node;
     match neighbor_node {
         Node::JavaSql { line, .. } => Some(*line),
         Node::MappedStatement { line, .. } => Some(*line),
@@ -4769,8 +4770,8 @@ fn impact_entry_line(
     }
 }
 
-fn edge_location_line(edge: &crate::graph::Edge) -> Option<usize> {
-    use crate::graph::Edge;
+fn edge_location_line(edge: &codeweb::graph::Edge) -> Option<usize> {
+    use codeweb::graph::Edge;
     match edge {
         Edge::DirectCall { location, .. } => Some(location.line),
         Edge::DynamicCall { location, .. } => Some(location.line),

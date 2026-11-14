@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::{CodeWebError, Result};
-use crate::graph::store::GraphStore;
-use crate::project::Project;
+use codeweb::error::{CodeWebError, Result};
+use codeweb::graph::store::GraphStore;
+use codeweb::project::Project;
 use rmcp::transport::io;
 use rmcp::ServiceExt;
 
@@ -87,24 +87,22 @@ pub fn run(project_path: &Path) -> Result<()> {
     let state = McpState::new(workspace, project, store, project_name, empty_reason);
 
     let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| crate::error::CodeWebError::ExportError {
+        tokio::runtime::Runtime::new().map_err(|e| codeweb::error::CodeWebError::ExportError {
             message: format!("failed to create tokio runtime: {}", e),
         })?;
 
     runtime.block_on(async {
         let transport = io::stdio();
-        let server =
-            state
-                .serve(transport)
-                .await
-                .map_err(|e| crate::error::CodeWebError::ExportError {
-                    message: format!("MCP server error: {}", e),
-                })?;
+        let server = state.serve(transport).await.map_err(|e| {
+            codeweb::error::CodeWebError::ExportError {
+                message: format!("MCP server error: {}", e),
+            }
+        })?;
         server
             .waiting()
             .await
             .map(|_| ())
-            .map_err(|e| crate::error::CodeWebError::ExportError {
+            .map_err(|e| codeweb::error::CodeWebError::ExportError {
                 message: format!("MCP server wait error: {}", e),
             })
     })

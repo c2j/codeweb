@@ -1,8 +1,8 @@
-use crate::graph::key::NodeKey;
-use crate::graph::traverse;
-use crate::graph::{Edge, IndexConstraint, Node};
-use crate::project::Project;
 use crate::tui::theme::TuiTheme;
+use codeweb::graph::key::NodeKey;
+use codeweb::graph::traverse;
+use codeweb::graph::{Edge, IndexConstraint, Node};
+use codeweb::project::Project;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -83,22 +83,22 @@ impl App {
     pub fn run<B: ratatui::backend::Backend>(
         mut self,
         terminal: &mut ratatui::Terminal<B>,
-    ) -> crate::error::Result<()> {
+    ) -> codeweb::error::Result<()> {
         while !self.should_quit {
             terminal.draw(|f| self.draw(f)).map_err(|e| {
-                crate::error::CodeWebError::ExportError {
+                codeweb::error::CodeWebError::ExportError {
                     message: e.to_string(),
                 }
             })?;
 
             if crossterm::event::poll(std::time::Duration::from_millis(100)).map_err(|e| {
-                crate::error::CodeWebError::ExportError {
+                codeweb::error::CodeWebError::ExportError {
                     message: e.to_string(),
                 }
             })? {
                 if let crossterm::event::Event::Key(key) =
                     crossterm::event::read().map_err(|e| {
-                        crate::error::CodeWebError::ExportError {
+                        codeweb::error::CodeWebError::ExportError {
                             message: e.to_string(),
                         }
                     })?
@@ -810,11 +810,11 @@ impl App {
             .map(|(path, record)| {
                 let rel = path.strip_prefix(root).unwrap_or(path);
                 let type_tag = match record.file_type {
-                    crate::parser::fingerprint::FileType::Sql => t!("filetype.sql").to_string(),
-                    crate::parser::fingerprint::FileType::Java => t!("filetype.java").to_string(),
-                    crate::parser::fingerprint::FileType::Xml => t!("filetype.xml").to_string(),
+                    codeweb::parser::fingerprint::FileType::Sql => t!("filetype.sql").to_string(),
+                    codeweb::parser::fingerprint::FileType::Java => t!("filetype.java").to_string(),
+                    codeweb::parser::fingerprint::FileType::Xml => t!("filetype.xml").to_string(),
                     #[cfg(feature = "jsp")]
-                    crate::parser::fingerprint::FileType::Jsp => t!("filetype.jsp").to_string(),
+                    codeweb::parser::fingerprint::FileType::Jsp => t!("filetype.jsp").to_string(),
                 };
                 let node_count = file_nodes
                     .get(path as &std::path::Path)
@@ -847,7 +847,7 @@ impl App {
     fn render_chain_tree_tui(
         &self,
         chain: &traverse::CallChain,
-        graph: &crate::graph::CodeGraph,
+        graph: &codeweb::graph::CodeGraph,
         node_idx: NodeIndex,
     ) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
@@ -967,8 +967,8 @@ fn node_tag(node: &Node) -> (std::borrow::Cow<'static, str>, Color) {
 }
 
 fn tree_node_to_lines(
-    node: &crate::graph::traverse::TreeNode,
-    graph: &crate::graph::CodeGraph,
+    node: &codeweb::graph::traverse::TreeNode,
+    graph: &codeweb::graph::CodeGraph,
     prefix: &str,
     is_last: bool,
     lines: &mut Vec<Line>,
@@ -1018,7 +1018,7 @@ fn format_node_attributes_full(node: &Node) -> Vec<String> {
 }
 
 fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
-    use crate::graph::{DistributeInfo, PartitionInfo};
+    use codeweb::graph::{DistributeInfo, PartitionInfo};
     let mut attrs = Vec::new();
     match node {
         Node::Table {
@@ -1204,13 +1204,13 @@ fn format_node_attributes_impl(node: &Node, compact: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{RoutineId, RoutineKind, SourceLocation};
+    use codeweb::graph::{RoutineId, RoutineKind, SourceLocation};
     use std::path::PathBuf;
     use std::sync::Arc;
 
     #[test]
     fn should_append_edge_label_to_tui_tree_line() {
-        let mut graph = crate::graph::CodeGraph::new();
+        let mut graph = codeweb::graph::CodeGraph::new();
         let proc = graph.add_node(Node::Procedure {
             id: RoutineId {
                 schema: Some("sch".into()),

@@ -152,7 +152,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::CallsJava { .. } => "-.->",
             Edge::UsesBuiltinFunction { .. } => "-->",
             Edge::ContainsMethod => "-.->",
-            #[cfg(feature = "jsp")]
+            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => "-.->",
             Edge::Extends { .. } => "==>",
             Edge::Implements { .. } => "-->",

@@ -1929,7 +1929,7 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::CallsJava { .. } => "calls_java",
         crate::graph::Edge::UsesBuiltinFunction { .. } => "uses_builtin_function",
         crate::graph::Edge::ContainsMethod => "contains_method",
-        #[cfg(feature = "jsp")]
+        #[cfg(any(feature = "jsp", feature = "java"))]
         crate::graph::Edge::ContainsSql => "contains_sql",
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",

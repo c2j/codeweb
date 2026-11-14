@@ -1,10 +1,10 @@
 pub mod app;
 pub mod theme;
 
-use crate::error::Result;
+use codeweb::error::Result;
 
 pub fn run(project_path: &std::path::Path) -> Result<()> {
-    let mut proj = crate::project::Project::find(project_path)?;
+    let mut proj = codeweb::project::Project::find(project_path)?;
 
     if proj.load_store().is_err() {
         eprintln!("No store found. Running initial analysis...");

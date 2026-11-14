@@ -267,16 +267,30 @@ impl Project {
                 .map(|p| self.root.join(p))
                 .collect()
         };
+        // jsp/java 都关闭的嵌入形态下，source_paths 只被这两段消费。
+        #[cfg(not(any(feature = "jsp", feature = "java")))]
+        let _ = &source_paths;
 
         // Java files are typically heavier per-file than SQL, use smaller chunks.
+        // feature 门控：`java` 关闭（如 SpinDuck 嵌入形态）时整段不编译，
+        // 计数与 FQN 表给占位值，报告与 finish 文案沿用。
+        #[cfg(feature = "java")]
         const JAVA_CHUNK_SIZE: usize = 50;
+        #[cfg(feature = "java")]
         let java_config = ogsql_parser::java::JavaExtractConfig {
             extra_sql_methods: self.config.analysis.java.extra_sql_methods.clone(),
             extra_sql_var_patterns: self.config.analysis.java.extra_sql_var_patterns.clone(),
         };
+        #[cfg(feature = "java")]
         let mut java_files_count = 0usize;
+        #[cfg(feature = "java")]
         let mut simple_to_fqn: HashMap<String, String> = HashMap::new();
+        #[cfg(not(feature = "java"))]
+        let java_files_count = 0usize;
+        #[cfg(not(feature = "java"))]
+        let _simple_to_fqn: HashMap<String, String> = HashMap::new();
 
+        #[cfg(feature = "java")]
         if !all_java_paths.is_empty() {
             let java_chunks = all_java_paths.len().div_ceil(JAVA_CHUNK_SIZE);
             for (chunk_idx, chunk) in all_java_paths.chunks(JAVA_CHUNK_SIZE).enumerate() {
@@ -331,10 +345,20 @@ impl Project {
         }
 
         // XML: chunked combined parse (flat + structured in one read) → build → drop
+        // feature 门控：mapper 链归属 `jsp`（jdp 蕴含 java，见 Cargo.toml features）。
+        #[cfg(feature = "jsp")]
         const XML_CHUNK_SIZE: usize = 50;
+        #[cfg(feature = "jsp")]
         let mut ibatis_files_count = 0usize;
+        #[cfg(feature = "jsp")]
         let mut all_structured: Vec<parser::ibatis_loader::IbatisStructuredFile> = Vec::new();
+        #[cfg(not(feature = "jsp"))]
+        let (ibatis_files_count, _all_structured): (
+            usize,
+            Vec<parser::ibatis_loader::IbatisStructuredFile>,
+        ) = (0usize, Vec::new());
 
+        #[cfg(feature = "jsp")]
         if !all_xml_paths.is_empty() {
             let xml_chunks = all_xml_paths.len().div_ceil(XML_CHUNK_SIZE);
             for (chunk_idx, chunk) in all_xml_paths.chunks(XML_CHUNK_SIZE).enumerate() {
@@ -432,11 +456,15 @@ impl Project {
 
         // Expand dynamic SQL variants for fingerprint index.
         // Must run AFTER finalize_graph because dedup/merge may change node indices.
+        #[cfg(feature = "jsp")]
         let variant_map = GraphBuilder::add_ibatis_structured_variants(
             &all_structured,
             &ctx.mapper_index,
             &source_paths,
         );
+        #[cfg(not(feature = "jsp"))]
+        let variant_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
 
         // Phase 6: Build store
         let procedure_predicates = std::mem::take(&mut ctx.procedure_predicates);

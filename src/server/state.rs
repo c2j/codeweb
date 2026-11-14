@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::graph::store::GraphStore;
-use crate::graph::CodeGraph;
-use crate::project::Project;
+use codeweb::graph::store::GraphStore;
+use codeweb::graph::CodeGraph;
+use codeweb::project::Project;
 
 #[derive(Clone)]
 pub struct AppState {

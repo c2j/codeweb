@@ -789,7 +789,7 @@ pub enum Edge {
         location: SourceLocation,
     },
     ContainsMethod,
-    #[cfg(feature = "jsp")]
+    #[cfg(any(feature = "jsp", feature = "java"))]
     ContainsSql,
     Extends {
         location: SourceLocation,
@@ -879,7 +879,7 @@ impl Edge {
             | Edge::CallsJava { .. }
             | Edge::UsesBuiltinFunction { .. } => EdgeCategory::Call,
             Edge::ContainsRoutine | Edge::ContainsMethod => EdgeCategory::Composition,
-            #[cfg(feature = "jsp")]
+            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => EdgeCategory::Composition,
             Edge::TableAccess { .. } | Edge::DependsOn { .. } => EdgeCategory::DataFlow,
             Edge::TriggersRoutine { .. }

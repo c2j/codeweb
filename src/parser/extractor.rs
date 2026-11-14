@@ -25,6 +25,11 @@ pub struct ProcedureSqlExtractor {
     results: Vec<ProcedureBodySql>,
 }
 
+impl Default for ProcedureSqlExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl ProcedureSqlExtractor {
     pub fn new() -> Self {
         Self {
@@ -1168,6 +1173,11 @@ pub struct AnchorExtractor {
     var_names: HashSet<String>,
 }
 
+impl Default for AnchorExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl AnchorExtractor {
     pub fn new() -> Self {
         Self {
@@ -1324,6 +1334,11 @@ pub struct TableAccessExtractor {
     cte_scope: Vec<HashSet<String>>,
 }
 
+impl Default for TableAccessExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl TableAccessExtractor {
     pub fn new() -> Self {
         Self {
@@ -2429,6 +2444,11 @@ pub struct ColumnAccessExtractor {
     current_cursor: Option<String>,
 }
 
+impl Default for ColumnAccessExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl ColumnAccessExtractor {
     pub fn new() -> Self {
         Self {

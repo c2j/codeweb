@@ -1903,7 +1903,7 @@ pub fn format_column_lineage_json(
 /// Outcome of [`parse_lineage_target`]: a target string resolves to either a bare table
 /// (table-level lineage) or a `table.column` pair (column-level lineage).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ParsedLineageTarget {
+pub enum ParsedLineageTarget {
     Table(String),
     Column(String, String),
 }
@@ -1911,7 +1911,7 @@ pub(crate) enum ParsedLineageTarget {
 /// Handles the same three grammars as the CLI: a node-key (`table:schema.table`, left
 /// alone — table-level), `table.column` (column-level, but only once the table half is
 /// confirmed to exist unambiguously), and a bare table name (table-level).
-pub(crate) fn parse_lineage_target(
+pub fn parse_lineage_target(
     graph: &CodeGraph,
     target: &str,
 ) -> Result<ParsedLineageTarget, String> {

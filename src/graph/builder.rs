@@ -157,6 +157,11 @@ pub struct GraphBuildContext {
     pub deferred_column_comments: Vec<DeferredColumnComment>,
 }
 
+impl Default for GraphBuildContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl GraphBuildContext {
     pub fn new() -> Self {
         Self {
@@ -182,6 +187,7 @@ impl GraphBuildContext {
 /// `BuiltinFunction` nodes + `UsesBuiltinFunction` edges; everything else
 /// follows the existing `CallsProcedure` path.
 #[derive(Clone)]
+#[cfg(any(feature = "jsp", feature = "java"))]
 pub(crate) struct ExtractedCall {
     pub callee_name: String,
     pub builtin_meta: Option<ogsql_parser::ast::BuiltinFuncMeta>,
@@ -198,18 +204,28 @@ impl GraphBuilder {
 
     #[cfg_attr(feature = "jsp", allow(dead_code))]
     pub fn build_all(&self, all: &AllParsedFiles) -> CodeGraph {
-        Self::build_graph_internal(
-            &all.sql_files,
-            &all.ibatis_files,
-            &all.java_files,
-            &all.java_method_results,
-        )
+        // feature 关闭时 AllParsedFiles 无对应字段，用空切片补位
+        // （stub 类型见 parser::ibatis_loader / java_loader / java_method）。
+        #[cfg(feature = "jsp")]
+        let ibatis = &all.ibatis_files;
+        #[cfg(not(feature = "jsp"))]
+        let ibatis: &[crate::parser::ibatis_loader::IbatisParsedFile] = &[];
+        #[cfg(feature = "java")]
+        let java = &all.java_files;
+        #[cfg(not(feature = "java"))]
+        let java: &[crate::parser::java_loader::JavaParsedFile] = &[];
+        #[cfg(feature = "java")]
+        let java_method_results = &all.java_method_results;
+        #[cfg(not(feature = "java"))]
+        let java_method_results: &[crate::parser::java_method::JavaParseResult] = &[];
+        Self::build_graph_internal(&all.sql_files, ibatis, java, java_method_results)
     }
 
     #[allow(dead_code)]
     pub fn build_store(&self, all: &AllParsedFiles, project_name: &str) -> GraphStore {
         let mut ctx = GraphBuildContext::new();
         Self::build_sql_chunk(&mut ctx, &all.sql_files);
+        #[cfg(feature = "jsp")]
         Self::add_ibatis_nodes_from_parsed(
             &all.ibatis_files,
             &mut ctx.graph,
@@ -218,6 +234,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.builtin_index,
         );
+        #[cfg(feature = "java")]
         Self::add_java_nodes_from_parsed(
             &all.java_files,
             &mut ctx.graph,
@@ -226,6 +243,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.builtin_index,
         );
+        #[cfg(feature = "java")]
         Self::add_java_method_nodes_from_parsed(
             &all.java_method_results,
             &mut ctx.graph,
@@ -250,6 +268,7 @@ impl GraphBuilder {
         let mut ctx = GraphBuildContext::new();
 
         Self::build_sql_chunk(&mut ctx, sql_files);
+        #[cfg(feature = "jsp")]
         Self::add_ibatis_nodes_from_parsed(
             ibatis_files,
             &mut ctx.graph,
@@ -258,6 +277,7 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.builtin_index,
         );
+        #[cfg(feature = "java")]
         Self::add_java_nodes_from_parsed(
             java_files,
             &mut ctx.graph,
@@ -266,12 +286,17 @@ impl GraphBuilder {
             &mut ctx.table_index,
             &mut ctx.builtin_index,
         );
+        #[cfg(feature = "java")]
         Self::add_java_method_nodes_from_parsed(
             java_method_results,
             &mut ctx.graph,
             &mut ctx.proc_index,
             &ctx.mapper_index,
         );
+        #[cfg(not(feature = "jsp"))]
+        let _ = ibatis_files;
+        #[cfg(not(feature = "java"))]
+        let _ = (java_files, java_method_results);
         Self::finalize_graph(&mut ctx);
 
         ctx.graph
@@ -3115,6 +3140,7 @@ impl GraphBuilder {
         }
     }
 
+    #[cfg(feature = "jsp")]
     pub(crate) fn add_ibatis_nodes_from_parsed(
         ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         graph: &mut CodeGraph,
@@ -3135,6 +3161,7 @@ impl GraphBuilder {
     }
 
     /// Like `add_ibatis_nodes_from_parsed` but accepts `source_paths` to make stored paths relative.
+    #[cfg(feature = "jsp")]
     pub(crate) fn add_ibatis_nodes_from_parsed_with_source_paths(
         ibatis_files: &[crate::parser::ibatis_loader::IbatisParsedFile],
         graph: &mut CodeGraph,
@@ -3264,6 +3291,7 @@ impl GraphBuilder {
         }
     }
 
+    #[cfg(feature = "jsp")]
     pub(crate) fn add_ibatis_structured_variants(
         structured_files: &[crate::parser::ibatis_loader::IbatisStructuredFile],
         mapper_index: &HashMap<String, petgraph::graph::NodeIndex>,
@@ -3311,6 +3339,7 @@ impl GraphBuilder {
         variant_map
     }
 
+    #[cfg(feature = "java")]
     pub(crate) fn add_java_nodes_from_parsed(
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
@@ -3332,6 +3361,7 @@ impl GraphBuilder {
 
     /// Like `add_java_nodes_from_parsed` but accepts `source_paths` (absolute analysis source dirs)
     /// so that stored Java file paths are relative to the matching analysis path.
+    #[cfg(feature = "java")]
     pub(crate) fn add_java_nodes_from_parsed_with_source_paths(
         java_files: &[crate::parser::java_loader::JavaParsedFile],
         graph: &mut CodeGraph,
@@ -3492,6 +3522,7 @@ impl GraphBuilder {
         }
     }
 
+    #[cfg(any(feature = "jsp", feature = "java"))]
     fn extract_calls_from_statements(
         statements: &[ogsql_parser::StatementInfo],
         file_path: &Arc<PathBuf>,
@@ -4387,6 +4418,7 @@ impl GraphBuilder {
         }
     }
 
+    #[cfg(feature = "java")]
     pub(crate) fn add_java_method_nodes_from_parsed(
         java_results: &[crate::parser::java_method::JavaParseResult],
         graph: &mut CodeGraph,
@@ -4751,6 +4783,7 @@ impl GraphBuilder {
     }
 }
 
+#[cfg(feature = "java")]
 fn resolve_fqn(
     simple_name: &str,
     simple_name_to_fqn: &HashMap<String, String>,
@@ -4770,6 +4803,7 @@ fn resolve_fqn(
     None
 }
 
+#[cfg(feature = "java")]
 fn is_sqlsession_method(method: &str) -> bool {
     matches!(
         method,
@@ -4786,6 +4820,7 @@ fn is_sqlsession_method(method: &str) -> bool {
     )
 }
 
+#[cfg(feature = "java")]
 fn names_match(field_name: &str, class_name: &str) -> bool {
     if field_name == class_name {
         return true;
