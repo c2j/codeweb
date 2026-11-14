@@ -10,7 +10,8 @@ pub mod java_method;
 pub mod jsp_loader;
 #[cfg(feature = "jsp")]
 pub mod jsp_preprocessor;
-#[cfg(feature = "jsp")]
+// `jsp_types` 不随 feature 门控：`Node::JspSql.kind` 是**持久化**字段（store 的
+// bincode 布局必须与 feature 组合无关，见 STORE_VERSION 与 embed 契约）。
 pub mod jsp_types;
 mod loader;
 mod predicates;

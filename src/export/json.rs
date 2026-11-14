@@ -232,7 +232,6 @@ enum NodeKindJson {
         file: Option<String>,
         line: Option<usize>,
     },
-    #[cfg(feature = "jsp")]
     #[serde(rename = "jsp")]
     JspPage {
         file: String,
@@ -240,7 +239,6 @@ enum NodeKindJson {
         line: usize,
         url_pattern: Option<String>,
     },
-    #[cfg(feature = "jsp")]
     #[serde(rename = "jspsql")]
     JspSql {
         sql: String,
@@ -319,7 +317,6 @@ enum EdgeKindJson {
         file: Option<String>,
         line: Option<usize>,
     },
-    #[cfg(any(feature = "jsp", feature = "java"))]
     #[serde(rename = "contains_sql")]
     ContainsSql,
     #[serde(rename = "anchors_on")]
@@ -660,7 +657,6 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.as_ref().map(|l| l.line),
                 },
             },
-            #[cfg(feature = "jsp")]
             Node::JspPage {
                 path,
                 display_name,
@@ -675,7 +671,6 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     url_pattern: url_pattern.clone(),
                 },
             },
-            #[cfg(feature = "jsp")]
             Node::JspSql {
                 sql,
                 file,
@@ -898,7 +893,6 @@ pub fn to_json(graph: &CodeGraph) -> Result<String> {
                     line: location.as_ref().map(|l| l.line),
                 },
             },
-            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => EdgeJson {
                 source: src.index(),
                 target: dst.index(),

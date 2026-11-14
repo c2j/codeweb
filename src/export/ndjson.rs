@@ -138,9 +138,7 @@ fn node_name_and_schema(node: &Node) -> (String, Option<String>) {
         Node::JavaMethod { fqn, .. } => (fqn.clone(), None),
         Node::JavaClass { fqn, .. } => (fqn.clone(), None),
         Node::Custom { label, .. } => (label.to_string(), None),
-        #[cfg(feature = "jsp")]
         Node::JspPage { display_name, .. } => (display_name.clone(), None),
-        #[cfg(feature = "jsp")]
         Node::JspSql { sql, .. } => {
             let preview: String = sql.chars().take(60).collect();
             (preview, None)
@@ -169,9 +167,7 @@ fn node_json_type(node: &Node) -> &'static str {
         Node::Event { .. } => "event",
         Node::BuiltinFunction { .. } => "builtin_function",
         Node::Custom { .. } => "custom",
-        #[cfg(feature = "jsp")]
         Node::JspPage { .. } => "jsp",
-        #[cfg(feature = "jsp")]
         Node::JspSql { .. } => "jspsql",
     }
 }
@@ -185,7 +181,6 @@ fn edge_json_type(edge: &Edge) -> &str {
         Edge::CallsJava { .. } => "calls_java",
         Edge::UsesBuiltinFunction { .. } => "uses_builtin_function",
         Edge::ContainsMethod => "contains_method",
-        #[cfg(feature = "jsp")]
         Edge::ContainsSql => "contains_sql",
         Edge::Extends { .. } => "extends",
         Edge::Implements { .. } => "implements",

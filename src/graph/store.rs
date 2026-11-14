@@ -38,7 +38,16 @@ const STORE_MAGIC: [u8; 9] = *b"CWEBSTORE";
 /// equalities), both #181.
 /// v15: `PredicateClause.raw_column` (the written field name when it differs from
 /// the resolved column) and first-declaration-wins `routine_parameters`, both #181.
-pub const STORE_VERSION: u32 = 15;
+/// v16: **store layout is now feature-independent**. `Node::JspPage` /
+/// `Node::JspSql` / `Node::JspSql.kind` / `Edge::ContainsSql` /
+/// `NodeKey::JspPage` / `NodeKey::JspSql` / `StoreStats.jsp_*` are no longer
+/// behind `cfg(feature = "jsp"/"java")`: bincode encodes enum variants by
+/// index, so a `full`-feature build and an `analyze`-only build (the SpinDuck
+/// embed form) previously wrote mutually unreadable stores. Layout must stay
+/// identical for every feature combination from here on; the guard test
+/// `graph::tests::should_keep_persisted_enum_variants_feature_independent`
+/// pins the variant indices. v15 stores are rejected (re-analyze to rebuild).
+pub const STORE_VERSION: u32 = 16;
 /// Pre-computed lightweight summary of a graph node for fast listing/filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
@@ -627,9 +636,7 @@ impl GraphStore {
                 Node::Event { .. } => s.events += 1,
                 Node::BuiltinFunction { .. } => s.builtin_functions += 1,
                 Node::Custom { .. } => s.custom_nodes += 1,
-                #[cfg(feature = "jsp")]
                 Node::JspPage { .. } => s.jsp_pages += 1,
-                #[cfg(feature = "jsp")]
                 Node::JspSql { .. } => s.jsp_sql += 1,
             }
         }
@@ -1855,9 +1862,7 @@ pub fn node_source_file(node: &Node) -> Option<PathBuf> {
         Node::Event { location, .. } => Some(location.file.to_path_buf()),
         Node::BuiltinFunction { location, .. } => Some(location.file.to_path_buf()),
         Node::Custom { location, .. } => location.as_ref().map(|l| l.file.to_path_buf()),
-        #[cfg(feature = "jsp")]
         Node::JspPage { path, .. } => Some(path.clone()),
-        #[cfg(feature = "jsp")]
         Node::JspSql { file, .. } => Some(file.clone()),
     }
 }
@@ -1888,7 +1893,6 @@ fn edge_type_tag(edge: &crate::graph::Edge) -> String {
         crate::graph::Edge::CallsJava { .. } => "calls_java",
         crate::graph::Edge::UsesBuiltinFunction { .. } => "uses_builtin_function",
         crate::graph::Edge::ContainsMethod => "contains_method",
-        #[cfg(any(feature = "jsp", feature = "java"))]
         crate::graph::Edge::ContainsSql => "contains_sql",
         crate::graph::Edge::Extends { .. } => "extends",
         crate::graph::Edge::Implements { .. } => "implements",
@@ -1967,9 +1971,9 @@ pub struct StoreStats {
     pub custom_edges: usize,
     pub edges: usize,
     pub files: usize,
-    #[cfg(feature = "jsp")]
+    // jsp_* 是**持久化**统计字段：不随 feature 门控（store bincode 布局稳定
+    // 对 feature 组合的硬约束，见 STORE_VERSION 注释）。
     pub jsp_pages: usize,
-    #[cfg(feature = "jsp")]
     pub jsp_sql: usize,
 }
 

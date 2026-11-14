@@ -78,11 +78,9 @@ pub enum NodeKey {
         type_name: String,
         key: String,
     },
-    #[cfg(feature = "jsp")]
     JspPage {
         path: String,
     },
-    #[cfg(feature = "jsp")]
     JspSql {
         file: String,
         line: usize,
@@ -191,9 +189,7 @@ impl fmt::Display for NodeKey {
                     write!(f, "custom:{}:{}", type_name, key)
                 }
             }
-            #[cfg(feature = "jsp")]
             NodeKey::JspPage { path } => write!(f, "jsp:{}", path),
-            #[cfg(feature = "jsp")]
             NodeKey::JspSql {
                 file,
                 line,
@@ -293,11 +289,9 @@ impl NodeKey {
                     key,
                 }
             }
-            #[cfg(feature = "jsp")]
             super::Node::JspPage { path, .. } => NodeKey::JspPage {
                 path: path.to_string_lossy().to_string(),
             },
-            #[cfg(feature = "jsp")]
             super::Node::JspSql {
                 sql, file, line, ..
             } => {

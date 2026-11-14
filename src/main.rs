@@ -2256,9 +2256,8 @@ fn node_type_tag(node: &Node) -> std::borrow::Cow<'static, str> {
             _ => std::borrow::Cow::Borrowed("builtin:func"),
         },
         Node::Custom { type_name, .. } => std::borrow::Cow::Owned((**type_name).clone()),
-        #[cfg(feature = "jsp")]
+        // JSP 变体不随 feature 门控（store 布局约束，STORE_VERSION v16）
         Node::JspPage { .. } => std::borrow::Cow::Borrowed("jsp"),
-        #[cfg(feature = "jsp")]
         Node::JspSql { .. } => std::borrow::Cow::Borrowed("jspsql"),
     }
 }
@@ -4206,9 +4205,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
     let mut builtin_functions = 0usize;
     let mut partial = 0usize;
     let mut custom_nodes = 0usize;
-    #[cfg(feature = "jsp")]
     let mut jsp_pages = 0usize;
-    #[cfg(feature = "jsp")]
     let mut jsp_sql = 0usize;
 
     for idx in graph.node_indices() {
@@ -4240,9 +4237,7 @@ fn print_stats(graph: &graph::CodeGraph, include_unresolved: bool) {
             Node::Event { .. } => events += 1,
             Node::BuiltinFunction { .. } => builtin_functions += 1,
             Node::Custom { .. } => custom_nodes += 1,
-            #[cfg(feature = "jsp")]
             Node::JspPage { .. } => jsp_pages += 1,
-            #[cfg(feature = "jsp")]
             Node::JspSql { .. } => jsp_sql += 1,
         }
     }
@@ -4779,6 +4774,7 @@ fn edge_location_line(edge: &codeweb::graph::Edge) -> Option<usize> {
         Edge::InvokesMapper { location, .. } => Some(location.line),
         Edge::CallsJava { location, .. } => Some(location.line),
         Edge::UsesBuiltinFunction { location, .. } => Some(location.line),
+        Edge::ContainsSql => None,
         Edge::Extends { location, .. } => Some(location.line),
         Edge::Implements { location, .. } => Some(location.line),
         Edge::TableAccess { location, .. } => Some(location.line),
@@ -4791,8 +4787,6 @@ fn edge_location_line(edge: &codeweb::graph::Edge) -> Option<usize> {
         Edge::AnchorsOn { location, .. } => Some(location.line),
         Edge::CustomEdge { location, .. } => location.as_ref().map(|l| l.line),
         Edge::ContainsMethod | Edge::ContainsRoutine => None,
-        #[cfg(feature = "jsp")]
-        Edge::ContainsSql => None,
     }
 }
 

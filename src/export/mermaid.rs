@@ -121,9 +121,7 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Node::Custom {
                 label, type_name, ..
             } => (format!("{}:{}", **type_name, **label), ("[\"", "\"]")),
-            #[cfg(feature = "jsp")]
             Node::JspPage { display_name, .. } => (format!("JSP:{}", display_name), ("[\"", "\"]")),
-            #[cfg(feature = "jsp")]
             Node::JspSql { sql, kind, .. } => {
                 let short: String = sql.chars().take(30).collect();
                 (format!("{}|{}", kind.as_str(), short), ("[\"", "\"]"))
@@ -152,7 +150,6 @@ pub fn to_mermaid(graph: &CodeGraph) -> String {
             Edge::CallsJava { .. } => "-.->",
             Edge::UsesBuiltinFunction { .. } => "-->",
             Edge::ContainsMethod => "-.->",
-            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => "-.->",
             Edge::Extends { .. } => "==>",
             Edge::Implements { .. } => "-->",

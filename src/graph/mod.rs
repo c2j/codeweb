@@ -661,7 +661,6 @@ pub enum Node {
         location: Option<SourceLocation>,
     },
     /// A JSP page that contains embedded SQL.
-    #[cfg(feature = "jsp")]
     JspPage {
         path: PathBuf,
         display_name: String,
@@ -671,7 +670,6 @@ pub enum Node {
         url_pattern: Option<String>,
     },
     /// SQL extracted from a JSP page (scriptlet, declaration, or JSTL tag).
-    #[cfg(feature = "jsp")]
     JspSql {
         sql: String,
         file: PathBuf,
@@ -715,9 +713,7 @@ pub fn node_type_tag(node: &Node) -> &'static str {
         Node::Event { .. } => "event",
         Node::BuiltinFunction { .. } => "builtin",
         Node::Custom { .. } => "custom",
-        #[cfg(feature = "jsp")]
         Node::JspPage { .. } => "jsp",
-        #[cfg(feature = "jsp")]
         Node::JspSql { .. } => "jspsql",
     }
 }
@@ -728,16 +724,19 @@ pub fn node_type_tag(node: &Node) -> &'static str {
 /// paths), this returns a readable name — for JspPage/JspSql it uses a
 /// shortened relative path, for others it falls back to [`NodeKey::to_string`].
 pub fn node_display_name(node: &Node) -> String {
-    #[cfg(feature = "jsp")]
     if let Node::JspPage {
         ref display_name, ..
     } = node
     {
         return format!("jsp:{}", display_name);
     }
-    #[cfg(feature = "jsp")]
     if let Node::JspSql { ref file, line, .. } = node {
+        // 展示名口径：jsp feature 下走 jsp_preprocessor 的统一缩短规则，
+        // 其余构建（如嵌入形态）退回完整路径——展示差异不影响持久化布局。
+        #[cfg(feature = "jsp")]
         let short = crate::parser::jsp_preprocessor::compute_display_name(file);
+        #[cfg(not(feature = "jsp"))]
+        let short = file.to_string_lossy().into_owned();
         return format!("jspsql:{}:{}", short, line);
     }
     key::NodeKey::from_node(node).to_string()
@@ -789,7 +788,6 @@ pub enum Edge {
         location: SourceLocation,
     },
     ContainsMethod,
-    #[cfg(any(feature = "jsp", feature = "java"))]
     ContainsSql,
     Extends {
         location: SourceLocation,
@@ -879,7 +877,6 @@ impl Edge {
             | Edge::CallsJava { .. }
             | Edge::UsesBuiltinFunction { .. } => EdgeCategory::Call,
             Edge::ContainsRoutine | Edge::ContainsMethod => EdgeCategory::Composition,
-            #[cfg(any(feature = "jsp", feature = "java"))]
             Edge::ContainsSql => EdgeCategory::Composition,
             Edge::TableAccess { .. } | Edge::DependsOn { .. } => EdgeCategory::DataFlow,
             Edge::TriggersRoutine { .. }
@@ -944,9 +941,7 @@ impl Node {
                 .as_ref()
                 .map(|l| l.file.as_path())
                 .unwrap_or(Path::new("")),
-            #[cfg(feature = "jsp")]
             Node::JspPage { path, .. } => path.as_path(),
-            #[cfg(feature = "jsp")]
             Node::JspSql { file, .. } => file.as_path(),
         }
     }
@@ -956,6 +951,59 @@ impl Node {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    /// 持久化布局守卫（STORE_VERSION v16，缺陷实证见 validation V47）：
+    /// `Node` / `NodeKey` 的 bincode 编码用**变体索引**，所以这些变体在
+    /// 任何 feature 组合下都必须存在且顺序不变。本测试在 analyze-only 构建
+    /// （无 jsp/java）下编译通过 = 变体存在；下面再钉死索引数值，防止有人
+    /// 重排/新增变体却不 bump STORE_VERSION。
+    #[test]
+    fn should_keep_persisted_enum_variants_feature_independent() {
+        // 构造即证明变体存在（顺序由源码位置固定，不得再给它们加 cfg）。
+        let page = Node::JspPage {
+            path: std::path::PathBuf::from("a.jsp"),
+            display_name: "a".to_string(),
+            line: 1,
+            url_pattern: None,
+        };
+        let sql = Node::JspSql {
+            sql: "select 1".to_string(),
+            file: std::path::PathBuf::from("a.jsp"),
+            line: 2,
+            kind: crate::parser::jsp_types::JspSqlKind::Scriptlet,
+            parsed: false,
+        };
+        let key_page = key::NodeKey::JspPage {
+            path: "a.jsp".to_string(),
+        };
+        let key_sql = key::NodeKey::JspSql {
+            file: "a.jsp".to_string(),
+            line: 2,
+            sql_hash: "h".to_string(),
+        };
+        assert_eq!(node_type_tag(&page), "jsp");
+        assert_eq!(node_type_tag(&sql), "jspsql");
+        assert_eq!(key_page.to_string(), "jsp:a.jsp");
+        assert_eq!(key_sql.to_string(), "jspsql:a.jsp:2:h");
+
+        // 变体索引钉死：bincode 的枚举判别码 = 索引（u32 LE，前 4 字节）。
+        let idx_of = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(
+            idx_of(&bincode::serialize(&page).unwrap()),
+            19,
+            "Node::JspPage 索引变了：必须 bump STORE_VERSION 并显式迁移"
+        );
+        assert_eq!(
+            idx_of(&bincode::serialize(&sql).unwrap()),
+            20,
+            "Node::JspSql 索引变了：必须 bump STORE_VERSION 并显式迁移"
+        );
+        assert_eq!(
+            idx_of(&bincode::serialize(&Edge::ContainsSql).unwrap()),
+            7,
+            "Edge::ContainsSql 索引变了：必须 bump STORE_VERSION 并显式迁移"
+        );
+    }
 
     #[test]
     fn access_mode_bitflags_or() {
