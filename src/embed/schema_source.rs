@@ -5,7 +5,7 @@ use crate::project::Project;
 use globset::{Glob, GlobSetBuilder};
 use ogsql_parser::{Parser, StatementInfo, Tokenizer};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(super) fn files(project: &Project) -> Result<BTreeSet<PathBuf>> {
     let config = &project.config().analysis;
@@ -22,8 +22,8 @@ pub(super) fn files(project: &Project) -> Result<BTreeSet<PathBuf>> {
         config
             .paths
             .iter()
-            .map(|p| project.root().join(p))
-            .collect()
+            .map(|p| resolve_source_root(project.root(), p))
+            .collect::<Result<Vec<_>>>()?
     };
     let mut files = BTreeSet::new();
     for root in roots {
@@ -68,6 +68,75 @@ pub(super) fn files(project: &Project) -> Result<BTreeSet<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+/// 解析配置给出的源根：相对路径词法规范化后必须留在项目根内，且路径的
+/// 每个分量都不得是符号链接；绝对路径仅在配置本来就是绝对路径、且中间
+/// 不再穿符号链接时才放行。
+fn resolve_source_root(root: &Path, configured: &str) -> Result<PathBuf> {
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        reject_symlink_ancestors(path)?;
+        return Ok(path.to_path_buf());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(error_at(
+                        root,
+                        format!("schema source path escapes project root: {configured}"),
+                    ));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            _ => {
+                return Err(error_at(
+                    root,
+                    format!("schema source path is not a plain relative path: {configured}"),
+                ))
+            }
+        }
+    }
+    reject_symlink_components(root, &normalized)?;
+    Ok(root.join(normalized))
+}
+
+/// 检查相对路径每个分量（相对项目根拼接后）是否为符号链接。
+/// 项目根自身的祖先不在检查范围内。
+fn reject_symlink_components(root: &Path, relative: &Path) -> Result<()> {
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&cursor) {
+            if meta.file_type().is_symlink() {
+                return Err(error_at(
+                    &cursor,
+                    "symbolic source links are not proof-complete",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 检查绝对路径从根到叶的每个前缀是否为符号链接。
+fn reject_symlink_ancestors(path: &Path) -> Result<()> {
+    let mut prefixes: Vec<&Path> = path.ancestors().collect();
+    prefixes.reverse();
+    for prefix in prefixes {
+        if let Ok(meta) = std::fs::symlink_metadata(prefix) {
+            if meta.file_type().is_symlink() {
+                return Err(error_at(
+                    prefix,
+                    "symbolic source links are not proof-complete",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn parse_file(path: &Path) -> Result<(Vec<StatementInfo>, Vec<String>)> {

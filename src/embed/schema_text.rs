@@ -8,6 +8,15 @@ use ogsql_parser::ast::{
 use ogsql_parser::token::{Token, TokenWithSpan};
 use ogsql_parser::{Parser, Tokenizer};
 
+/// 解析器会静默吞掉、但改变空值/默认值语义的列级 token。
+/// 命中即视为列定义不完备（`columns()` 返回 None → 表标 opaque）。
+const SWALLOWED_COLUMN_KEYWORDS: &[ogsql_parser::token::Keyword] = &[
+    ogsql_parser::token::Keyword::GENERATED,
+    ogsql_parser::token::Keyword::IDENTITY_P,
+    ogsql_parser::token::Keyword::ENABLE_P,
+    ogsql_parser::token::Keyword::DISABLE_P,
+];
+
 pub(super) struct ColumnText {
     pub name: String,
     pub source_type: String,
@@ -23,7 +32,7 @@ pub(super) fn columns(table: &CreateTableStatement, sql: &str) -> Option<Vec<Col
             return None;
         };
         if let [column] = single.columns.as_slice() {
-            if table.columns.get(columns.len()) != Some(column) {
+            if has_swallowed_tokens(item) || table.columns.get(columns.len()) != Some(column) {
                 return None;
             }
             columns.push(column_text(column, item)?);
@@ -194,6 +203,100 @@ pub(super) fn parse(sql: &str) -> Option<Vec<Statement>> {
             .filter(|s| !matches!(s, Statement::Empty))
             .collect(),
     )
+}
+
+/// 列项 token 中是否残留被解析器吞掉的 GENERATED/IDENTITY/ENABLE/DISABLE。
+/// 跳过首个 token（列名位置：非保留关键字可作列名）。
+fn has_swallowed_tokens(item: &str) -> bool {
+    let Some(tokens) = tokens(item) else {
+        return true;
+    };
+    tokens.iter().skip(1).any(|t| {
+        matches!(
+            &t.token,
+            Token::Keyword(kw) if SWALLOWED_COLUMN_KEYWORDS.contains(kw)
+        )
+    })
+}
+
+/// 表级 PRIMARY KEY 声明引用的列名：QuotedIdent 保留原文，未加引号标识符
+/// （含被当作标识符的非保留关键字）只做 ASCII 小写。成员形态无法唯一对应到
+/// 单个标识符、存在 USING INDEX 或条目无法解析时返回 None。
+pub(super) fn primary_key_columns(sql: &str) -> Option<Vec<String>> {
+    let mut members = Vec::new();
+    for item in table_items(sql)? {
+        let parsed = parse(&format!("CREATE TABLE __schema_export ({item})"))?;
+        let [Statement::CreateTable(single)] = parsed.as_slice() else {
+            return None;
+        };
+        let Some((expected, uses_index)) = single.constraints.iter().find_map(|c| match c {
+            TableConstraint::PrimaryKey {
+                columns,
+                using_index,
+            } => Some((columns.len(), using_index.is_some())),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if uses_index {
+            return None;
+        }
+        let found = primary_key_members(item)?;
+        if found.len() != expected {
+            return None;
+        }
+        members.extend(found);
+    }
+    Some(members)
+}
+
+/// 从 `PRIMARY KEY (...)` 原文 token 中取成员列名；任何成员不是单个
+/// 标识符 token 时返回 None。
+fn primary_key_members(item: &str) -> Option<Vec<String>> {
+    let tokens = tokens(item)?;
+    let open = tokens.windows(3).position(|w| {
+        matches!(
+            w[0].token,
+            Token::Keyword(ogsql_parser::token::Keyword::PRIMARY)
+        ) && matches!(
+            w[1].token,
+            Token::Keyword(ogsql_parser::token::Keyword::KEY)
+        ) && w[2].token == Token::LParen
+    })? + 2;
+    let mut members = Vec::new();
+    let mut depth = 1usize;
+    let mut element_start = open + 1;
+    for pos in open + 1..tokens.len() {
+        match tokens[pos].token {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => {
+                depth -= 1;
+                if depth == 0 {
+                    push_member(&tokens[element_start..pos], &mut members)?;
+                    return Some(members);
+                }
+            }
+            Token::Comma if depth == 1 => {
+                push_member(&tokens[element_start..pos], &mut members)?;
+                element_start = pos + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn push_member(range: &[TokenWithSpan], members: &mut Vec<String>) -> Option<()> {
+    let [token] = range else {
+        return None;
+    };
+    members.push(match &token.token {
+        Token::QuotedIdent(name) => name.clone(),
+        Token::Ident(name) => name.to_ascii_lowercase(),
+        Token::Keyword(kw) => kw.as_str().to_ascii_lowercase(),
+        _ => return None,
+    });
+    Some(())
 }
 
 fn tokens(sql: &str) -> Option<Vec<TokenWithSpan>> {

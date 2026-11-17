@@ -8,7 +8,6 @@ use crate::graph::format::format_data_type;
 use crate::project::Project;
 use ogsql_parser::ast::{
     ColumnConstraint, CreateIndexStatement, CreateTableStatement, DataType, ObjectName, Statement,
-    TableConstraint,
 };
 
 /// 配置 SQL 源文件的结构快照；诊断存在时所有表均标记不完备。
@@ -193,8 +192,10 @@ fn object_name(name: &ObjectName) -> Vec<String> {
 fn table_schema(table: &CreateTableStatement, sql: &str) -> TableSchemaExport {
     let raw = text::columns(table, sql);
     let constraints = text::constraints(sql);
+    let pk_members = text::primary_key_columns(sql);
     let mut opaque = raw.is_none()
         || constraints.is_none()
+        || pk_members.is_none()
         || table.temporary
         || table.unlogged
         || table.if_not_exists
@@ -212,21 +213,44 @@ fn table_schema(table: &CreateTableStatement, sql: &str) -> TableSchemaExport {
         || table.compress.is_some()
         || table.ilm.is_some()
         || table.row_movement.is_some();
-    let columns = table.columns.iter().enumerate().map(|(index, column)| {
-        let raw = raw.as_ref().and_then(|columns| columns.get(index));
-        opaque |= column.compress_mode.is_some() || column.charset.is_some()
-            || column.collate.is_some() || column.on_update.is_some()
-            || column.generated.is_some() || column.encrypted_with.is_some()
-            || matches!(column.data_type, DataType::Serial | DataType::SmallSerial | DataType::BigSerial);
-        ColumnSchemaExport {
-            name: raw.map_or_else(|| column.name.clone(), |raw| raw.name.clone()),
-            source_type: raw.map_or_else(|| format_data_type(&column.data_type), |raw| raw.source_type.clone()),
-            nullable: !column.constraints.contains(&ColumnConstraint::NotNull)
-                && !column.constraints.contains(&ColumnConstraint::PrimaryKey)
-                && !table.constraints.iter().any(|c| matches!(c, TableConstraint::PrimaryKey { columns, .. } if columns.contains(&column.name))),
-            default_expr_raw: raw.and_then(|raw| raw.default_expr_raw.clone()),
-        }
-    }).collect();
+    let pk_members = pk_members.unwrap_or_default();
+    let columns: Vec<ColumnSchemaExport> = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let raw = raw.as_ref().and_then(|columns| columns.get(index));
+            opaque |= column.compress_mode.is_some()
+                || column.charset.is_some()
+                || column.collate.is_some()
+                || column.on_update.is_some()
+                || column.generated.is_some()
+                || column.encrypted_with.is_some()
+                || matches!(
+                    column.data_type,
+                    DataType::Serial | DataType::SmallSerial | DataType::BigSerial
+                );
+            let name = raw.map_or_else(|| column.name.clone(), |raw| raw.name.clone());
+            ColumnSchemaExport {
+                nullable: !column.constraints.contains(&ColumnConstraint::NotNull)
+                    && !column.constraints.contains(&ColumnConstraint::PrimaryKey)
+                    && !pk_members.iter().any(|member| member == &name),
+                name,
+                source_type: raw.map_or_else(
+                    || format_data_type(&column.data_type),
+                    |raw| raw.source_type.clone(),
+                ),
+                default_expr_raw: raw.and_then(|raw| raw.default_expr_raw.clone()),
+            }
+        })
+        .collect();
+    // 主键成员对不上任何导出列名时不得猜 nullable：整表按不完备处理。
+    if pk_members
+        .iter()
+        .any(|member| !columns.iter().any(|column| column.name == *member))
+    {
+        opaque = true;
+    }
     TableSchemaExport {
         name: object_name(&table.name),
         columns,
