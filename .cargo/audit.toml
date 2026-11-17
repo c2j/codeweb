@@ -1,0 +1,10 @@
+# cargo-audit exceptions. Each entry must carry a justification comment.
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0462: unbounded response buffering in rmcp's Streamable HTTP
+    # *client* transport. codeweb only enables rmcp features ["server",
+    # "transport-io"] (stdio JSON-RPC server); the vulnerable HTTP client code
+    # path is not compiled in. Fix requires rmcp >= 3.9.0 (two-major upgrade);
+    # revisit when the mcp transport surface changes.
+    "RUSTSEC-2026-0462",
+]
