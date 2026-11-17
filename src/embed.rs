@@ -24,6 +24,15 @@
 //! **边两端只要有一端落在被跳过节点集 → 整条边跳过**（`Dynamic` 边的 target
 //! 指向发出调用的例程自身，天然保留）。
 
+mod schema;
+mod schema_source;
+mod schema_text;
+
+pub use schema::{
+    ColumnSchemaExport, ConstraintKind, ConstraintSchemaExport, IndexSchemaExport, SchemaExport,
+    TableSchemaExport,
+};
+
 use petgraph::visit::EdgeRef;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -134,6 +143,11 @@ impl EmbeddedProject {
     pub fn export_thin_graph(&mut self) -> Result<ThinGraph> {
         let store = self.inner.load_store()?;
         Ok(project_thin_graph(store.graph()))
+    }
+
+    /// 从配置 SQL 源导出表结构；不读取或更新图存储。
+    pub fn export_table_schemas(&self) -> Result<SchemaExport> {
+        schema::export(&self.inner)
     }
 
     /// 已加载的 store（若尚未加载则为 None）。供等价测试取参照面；

@@ -1332,9 +1332,9 @@ fn compute_cluster_stats(
     let mut internal_weights: Vec<f64> = vec![0.0; k];
     let mut external_weights: Vec<f64> = vec![0.0; k];
 
-    for i in 0..condensed.adj.len() {
+    for (i, neighbors) in condensed.adj.iter().enumerate() {
         let ci = super_communities_for_idx(i, condensation, assignments) as usize;
-        for (&j, &weight) in &condensed.adj[i] {
+        for (&j, &weight) in neighbors {
             let cj = super_communities_for_idx(j, condensation, assignments) as usize;
             if ci == cj {
                 internal_weights[ci] += weight;
