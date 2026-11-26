@@ -2250,6 +2250,7 @@ fn cmd_extract(
         depth,
         output,
         overwrite,
+        report_path,
     )
     .map_err(|e| error::CodeWebError::ExportError {
         message: e.to_string(),

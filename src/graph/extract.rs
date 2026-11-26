@@ -361,6 +361,63 @@ pub fn parse_nodes_file(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Make `path` absolute without touching the filesystem.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Lexically resolve `.` and `..` components without touching the
+/// filesystem (symlinks are handled later by `canonicalize`).
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !path.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalize `path` even when its tail does not exist yet (e.g. an output
+/// directory that has not been created): resolve the deepest existing
+/// ancestor and re-append the missing components lexically. This resolves
+/// `.`/`..`/symlinks for the existing part, which is what makes stored
+/// `../<project>/...` analyze paths map back under the project root.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let normalized = normalize_lexical(path);
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = normalized.clone();
+    loop {
+        if let Ok(canon) = cur.canonicalize() {
+            let mut out = canon;
+            for comp in missing.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            _ => return normalized,
+        }
+    }
+}
+
 /// Where a location's file lands inside the output directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputPathMapping {
@@ -493,6 +550,9 @@ pub enum ExtractError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// An output/report target would delete or overwrite project sources —
+    /// refused before any filesystem mutation (review on #194).
+    ProtectedPath { path: PathBuf, reason: String },
 }
 
 impl std::fmt::Display for ExtractError {
@@ -506,8 +566,69 @@ impl std::fmt::Display for ExtractError {
             ExtractError::OutputWrite { path, source } => {
                 write!(f, "cannot write {}: {}", path.display(), source)
             }
+            ExtractError::ProtectedPath { path, reason } => {
+                write!(f, "refusing unsafe target {}: {}", path.display(), reason)
+            }
         }
     }
+}
+
+/// Refuse any output/report target that would delete or overwrite project
+/// sources (review on #194: `--output <srcdir> --overwrite` used to wipe the
+/// analyzed SQL files and still exit 0).
+///
+/// The output directory must not be, contain, or sit on the ancestor chain of
+/// the project root or of any closure source file; the report path must not
+/// equal or contain a source file. All comparisons run on canonicalized
+/// absolute paths so `..`/symlink tricks cannot slip through.
+fn validate_extract_targets(
+    project_root: &Path,
+    output_dir: &Path,
+    report_path: Option<&Path>,
+    source_paths: &[PathBuf],
+) -> Result<(), ExtractError> {
+    let protected = |path: &Path, reason: String| ExtractError::ProtectedPath {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let root_c = canonicalize_lenient(&absolutize(project_root));
+    let out_c = canonicalize_lenient(&absolutize(output_dir));
+    if out_c == root_c || root_c.starts_with(&out_c) {
+        return Err(protected(
+            output_dir,
+            "output directory is or contains the project root".to_string(),
+        ));
+    }
+    let src_canons: Vec<PathBuf> = source_paths
+        .iter()
+        .map(|p| canonicalize_lenient(&absolutize(p)))
+        .collect();
+    for (src, canon) in source_paths.iter().zip(src_canons.iter()) {
+        if canon == &out_c || canon.starts_with(&out_c) {
+            return Err(protected(
+                output_dir,
+                format!(
+                    "output directory would contain or replace source file '{}'",
+                    src.display()
+                ),
+            ));
+        }
+    }
+    if let Some(report) = report_path {
+        let rep_c = canonicalize_lenient(&absolutize(report));
+        for (src, canon) in source_paths.iter().zip(src_canons.iter()) {
+            if canon == &rep_c || canon.starts_with(&rep_c) {
+                return Err(protected(
+                    report,
+                    format!(
+                        "report path would overwrite or contain source file '{}'",
+                        src.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One closure member awaiting slicing, grouped by source file.
@@ -535,23 +656,8 @@ pub fn run_extract(
     max_depth: Option<usize>,
     output_dir: &Path,
     overwrite: bool,
+    report_path: Option<&Path>,
 ) -> Result<ExtractOutcome, ExtractError> {
-    // Output directory policy (issue #193 requirement 3): refuse instead of
-    // silently merging into an existing tree.
-    if output_dir.exists() {
-        if !overwrite {
-            return Err(ExtractError::OutputDirExists(output_dir.to_path_buf()));
-        }
-        std::fs::remove_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
-            path: output_dir.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::create_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
-        path: output_dir.to_path_buf(),
-        source,
-    })?;
-
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut unresolved: Vec<UnresolvedReport> = Vec::new();
@@ -654,6 +760,37 @@ pub fn run_extract(
             }
         }
     }
+
+    // ── Pre-flight: validate targets and output mappings BEFORE any
+    // filesystem mutation. `--overwrite` must never be able to delete or
+    // overwrite analyzed sources (review on #194). ──
+    let source_paths: Vec<PathBuf> = by_file
+        .keys()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                project_root.join(p)
+            }
+        })
+        .collect();
+    validate_extract_targets(project_root, output_dir, report_path, &source_paths)?;
+
+    // Output directory policy (issue #193 requirement 3): refuse instead of
+    // silently merging into an existing tree.
+    if output_dir.exists() {
+        if !overwrite {
+            return Err(ExtractError::OutputDirExists(output_dir.to_path_buf()));
+        }
+        std::fs::remove_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
+            path: output_dir.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::create_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
 
     // Slice each file's members out of a fresh parse of that file.
     let mut files_report: Vec<FileExtractionReport> = Vec::new();
@@ -773,8 +910,7 @@ pub fn run_extract(
         })?;
         files_written += 1;
 
-        // Range report: one entry per member whose span was used, in member
-        // (source) order.
+        // Range report: one entry per member whose span/statement was used.
         let mut ranges: Vec<RangeReport> = Vec::new();
         for (slot, span) in &matched {
             ranges.push(RangeReport {
@@ -1554,6 +1690,7 @@ func:reporting.b1
             None,
             &out_dir,
             false,
+            None,
         )
         .expect("extraction should succeed");
 
@@ -1674,6 +1811,7 @@ CREATE TABLE tbl_other(id INT);
             None,
             &out_dir,
             false,
+            None,
         )
         .expect("extraction should succeed");
 
@@ -1740,6 +1878,7 @@ CREATE TABLE tbl_other(id INT);
             None,
             &out_dir,
             false,
+            None,
         )
         .expect("run itself should succeed");
 
@@ -1820,6 +1959,7 @@ CREATE TABLE ghost_tbl(id INT);
             None,
             &out_dir,
             false,
+            None,
         )
         .expect("extraction should succeed");
 
@@ -1866,6 +2006,7 @@ CREATE TABLE ghost_tbl(id INT);
             None,
             &out_dir,
             false,
+            None,
         )
         .expect_err("must refuse an existing output dir");
 
@@ -1884,7 +2025,7 @@ CREATE TABLE ghost_tbl(id INT);
     /// from a previous run do not survive.
     #[test]
     fn should_clear_and_recreate_output_dir_on_overwrite() {
-        let (graph, root, solo, dir) = solo_project_fixture();
+        let (graph, root, solo, _dir) = solo_project_fixture();
         let out_dir = root.join("out");
         std::fs::create_dir_all(out_dir.join("stale")).unwrap();
         std::fs::write(out_dir.join("stale/old.sql"), "old").unwrap();
@@ -1898,6 +2039,7 @@ CREATE TABLE ghost_tbl(id INT);
             None,
             &out_dir,
             true,
+            None,
         )
         .expect("overwrite run should succeed");
 
@@ -1958,6 +2100,7 @@ END pkg_a;
             None,
             &out_dir,
             false,
+            None,
         )
         .expect("extraction should succeed");
 
@@ -1978,6 +2121,93 @@ END pkg_a;
                 .all(|n| n.status != STATUS_MISSING_STATEMENT),
             "member must map to the package statement: {:?}",
             outcome.report.closure_nodes
+        );
+    }
+
+    // ── Review on #194: output/report path isolation ────────────
+
+    /// Regression (blocker): `--output <srcdir> --overwrite` used to delete
+    /// every analyzed SQL file and still exit 0. The run must be refused
+    /// BEFORE `remove_dir_all`, leaving sources byte- and mtime-identical.
+    #[test]
+    fn should_refuse_output_dir_containing_source_files() {
+        let (graph, root, solo, _dir) = solo_project_fixture();
+        let src_dir = root.join("src");
+        let src_file = src_dir.join("s.sql");
+        let before = std::fs::read(&src_file).unwrap();
+        let mtime_before = std::fs::metadata(&src_file).unwrap().modified().unwrap();
+
+        let err = run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &src_dir,
+            true,
+            None,
+        )
+        .expect_err("output dir containing sources must be refused");
+
+        assert!(
+            matches!(err, ExtractError::ProtectedPath { .. }),
+            "expected ProtectedPath, got {err}"
+        );
+        assert_eq!(std::fs::read(&src_file).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&src_file).unwrap().modified().unwrap(),
+            mtime_before,
+            "source file must be untouched"
+        );
+    }
+
+    /// The project root itself is never a valid output directory.
+    #[test]
+    fn should_refuse_output_dir_equal_to_project_root() {
+        let (graph, root, solo, _dir) = solo_project_fixture();
+        let err = run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &root,
+            true,
+            None,
+        )
+        .expect_err("project root as output must be refused");
+        assert!(matches!(err, ExtractError::ProtectedPath { .. }));
+        assert!(root.join("src/s.sql").exists());
+    }
+
+    /// A report path pointing at a source file must be refused before any
+    /// write — the report `fs::write` would otherwise overwrite the SQL.
+    #[test]
+    fn should_refuse_report_path_equal_to_source_file() {
+        let (graph, root, solo, _dir) = solo_project_fixture();
+        let src_file = root.join("src/s.sql");
+        let before = std::fs::read(&src_file).unwrap();
+
+        let err = run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &root.join("out"),
+            false,
+            Some(&src_file),
+        )
+        .expect_err("report path on a source file must be refused");
+
+        assert!(matches!(err, ExtractError::ProtectedPath { .. }));
+        assert_eq!(std::fs::read(&src_file).unwrap(), before);
+        assert!(
+            !root.join("out").exists(),
+            "refusal happens before the output dir is created"
         );
     }
 

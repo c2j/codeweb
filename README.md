@@ -238,7 +238,9 @@ Behavior:
   existing stores keep working without re-analysis.
 - Output paths mirror the source layout relative to the project root; output
   file order follows the source file order.
-- The original SQL files are **never modified**.
+- The original SQL files are **never modified**; `--output`/`--report`
+  targets equal to or containing the project root or any source file are
+  refused before anything is written or deleted.
 - An existing output directory is refused (non-zero exit) unless `--overwrite`
   is given (clears it first).
 - Members without an extractable SQL definition — unresolved dynamic calls,
@@ -642,7 +644,8 @@ codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sour
   行/列 span——字符串、注释、dollar-quoted、嵌套 BEGIN/END 由 parser 处理），
   既有图谱无需重新分析即可复用。
 - 输出路径按相对项目根的目录结构镜像源码布局；输出文件内的定义按原文件顺序排列。
-- **绝不修改**原始 SQL 文件。
+- **绝不修改**原始 SQL 文件；`--output`/`--report` 目标等于或包含项目根
+  或任一源文件时，在任何写入/删除之前即被拒绝。
 - 输出目录已存在时默认拒绝（退出非 0）；`--overwrite` 才会清空重建。
 - 没有可提取 SQL 定义的闭包成员——未解析动态调用、推断型表/视图、内建函数、
   XML/Java/JSP 图节点、包规范 partial 声明——全部列入 `--report <path>` JSON
