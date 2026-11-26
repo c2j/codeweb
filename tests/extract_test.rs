@@ -395,6 +395,74 @@ fn extract_depth_zero_limits_to_root() {
     );
 }
 
+/// Fix 3 regression (review on #194): real stores can hold source paths
+/// containing `..` that re-enter the project root — produced when the
+/// analysis path is configured through the parent directory (e.g.
+/// `paths = ["../<project>/sql"]`, as happens when analyze runs against the
+/// project from a different CWD). The old code flattened EVERY such path to
+/// the output root; the fix must canonicalize, map back under the root, and
+/// preserve the directory layout.
+#[test]
+fn extract_maps_dotdot_source_paths_back_under_project_root() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let sql = root.join("sql");
+    fs::create_dir_all(&sql).unwrap();
+    fs::write(
+        sql.join("A.sql"),
+        "CREATE PROCEDURE pa AS\nBEGIN\n    NULL;\nEND;\n/\n",
+    )
+    .unwrap();
+
+    let out = run_codeweb_in(&root, &["init", "dotdot-demo", "--dir", "sql"]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Re-point the analysis path through the parent so stored locations
+    // contain `../<root-name>/sql/...` — the shape seen in the review.
+    let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+    let toml_path = root.join("codeweb.toml");
+    let toml = read(&toml_path);
+    fs::write(
+        &toml_path,
+        toml.replace(
+            "paths = [\"sql\"]",
+            &format!("paths = [\"../{root_name}/sql\"]"),
+        ),
+    )
+    .unwrap();
+
+    let out = run_codeweb_in(&root, &["analyze"]);
+    assert!(
+        out.status.success(),
+        "analyze failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_codeweb_in(&root, &["extract", "--node", "pa", "--output", "out"]);
+    assert!(
+        out.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        root.join("out/sql/A.sql").exists(),
+        "dotdot source path must map back under the root and keep its layout"
+    );
+    assert!(
+        !root.join("out/A.sql").exists(),
+        "path must NOT be flattened to the output root"
+    );
+    assert_eq!(
+        read(&root.join("out/sql/A.sql")),
+        "CREATE PROCEDURE pa AS\nBEGIN\n    NULL;\nEND;\n/"
+    );
+}
+
 /// Strict root resolution (review on #194): a name matching several nodes is
 /// an error with a non-zero exit — never a silent first match that could
 /// export the WRONG definition. `--all-matches` is the explicit opt-in.

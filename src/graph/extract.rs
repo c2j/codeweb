@@ -448,55 +448,32 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
     }
 }
 
-/// Where a location's file lands inside the output directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputPathMapping {
-    /// Path relative to the output root (directory structure preserved).
-    pub relative: PathBuf,
-    /// True when the location escapes the project root and was flattened to
-    /// the output root's file name; callers add a report warning.
-    pub escaped: bool,
-}
-
 /// Map a node location's file path to its output-relative path.
 ///
-/// Relative locations keep their directory structure (`./` components are
-/// dropped). Absolute locations are re-based onto the project root; anything
-/// that would land outside the project root (foreign absolute paths, `..`
-/// components) is flattened to the output root's file name and flagged.
-pub fn output_relative_path(location_file: &Path, project_root: &Path) -> OutputPathMapping {
-    let flatten = |p: &Path| OutputPathMapping {
-        relative: p
-            .file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("unknown.sql")),
-        escaped: true,
+/// The stored path is joined onto the project root (when relative) and
+/// canonicalized, so `../`-containing paths recorded by an analyze run from a
+/// different working directory resolve back under the root and keep their
+/// original directory structure. Returns `Err` when the source cannot be
+/// mapped safely under the project root — callers must fail explicitly
+/// rather than flatten (flattening silently overwrote same-named files from
+/// different directories, review on #194).
+pub fn output_relative_path(location_file: &Path, project_root: &Path) -> Result<PathBuf, String> {
+    let abs = if location_file.is_absolute() {
+        location_file.to_path_buf()
+    } else {
+        absolutize(project_root).join(location_file)
     };
-
-    if location_file.is_absolute() {
-        return match location_file.strip_prefix(project_root) {
-            Ok(rel) => OutputPathMapping {
-                relative: rel.to_path_buf(),
-                escaped: false,
-            },
-            Err(_) => flatten(location_file),
-        };
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in location_file.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            _ => return flatten(location_file),
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return flatten(location_file);
-    }
-    OutputPathMapping {
-        relative: normalized,
-        escaped: false,
+    let canon = canonicalize_lenient(&abs);
+    let root_canon = canonicalize_lenient(&absolutize(project_root));
+    match canon.strip_prefix(&root_canon) {
+        Ok(rel) if !rel.as_os_str().is_empty() => Ok(rel.to_path_buf()),
+        _ => Err(format!(
+            "source path '{}' (resolved to '{}') is not under project root '{}' — \
+             refusing to flatten it into the output root",
+            location_file.display(),
+            canon.display(),
+            root_canon.display()
+        )),
     }
 }
 
@@ -806,6 +783,29 @@ pub fn run_extract(
         .collect();
     validate_extract_targets(project_root, output_dir, report_path, &source_paths)?;
 
+    // Map every source file to its output-relative path up front. Two
+    // different stored paths resolving to the same output path is a hard
+    // error — silently overwriting would lose a definition (review on #194).
+    let mut out_rel: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+    for stored in by_file.keys() {
+        let rel = output_relative_path(stored, project_root).map_err(|reason| {
+            ExtractError::ProtectedPath {
+                path: stored.clone(),
+                reason,
+            }
+        })?;
+        if out_rel.values().any(|r| r == &rel) {
+            return Err(ExtractError::ProtectedPath {
+                path: stored.clone(),
+                reason: format!(
+                    "output path '{}' is produced by more than one source file",
+                    rel.display()
+                ),
+            });
+        }
+        out_rel.insert(stored.clone(), rel);
+    }
+
     // Output directory policy (issue #193 requirement 3): refuse instead of
     // silently merging into an existing tree.
     if output_dir.exists() {
@@ -918,15 +918,11 @@ pub fn run_extract(
             continue;
         };
 
-        let mapping = output_relative_path(&stored_path, project_root);
-        if mapping.escaped {
-            warnings.push(format!(
-                "source file '{}' resolves outside the project root — flattened to the \
-                 output directory root",
-                file_display
-            ));
-        }
-        let out_path = output_dir.join(&mapping.relative);
+        let rel = out_rel
+            .get(&stored_path)
+            .expect("output mapping precomputed for every by_file key")
+            .clone();
+        let out_path = output_dir.join(&rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| ExtractError::OutputWrite {
                 path: parent.to_path_buf(),
@@ -948,7 +944,7 @@ pub fn run_extract(
                 end_line: span.end_line,
             });
         }
-        let out_display = mapping.relative.to_string_lossy().into_owned();
+        let out_display = rel.to_string_lossy().into_owned();
         files_report.push(FileExtractionReport {
             source: file_display.clone(),
             output: out_display.clone(),
@@ -1677,28 +1673,65 @@ func:reporting.b1
     /// the project root; `./` prefixes are normalized away.
     #[test]
     fn should_map_location_relative_path_under_project_root() {
-        let root = PathBuf::from("/proj");
-        let rel = output_relative_path(Path::new("./src/schema/x.sql"), &root);
-        assert_eq!(rel.relative, PathBuf::from("src/schema/x.sql"));
-        assert!(!rel.escaped);
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src/schema")).unwrap();
+        std::fs::write(root.join("src/schema/x.sql"), "SELECT 1;").unwrap();
+
+        let rel = output_relative_path(Path::new("./src/schema/x.sql"), &root)
+            .expect("in-root relative path must map");
+        assert_eq!(rel, PathBuf::from("src/schema/x.sql"));
+
+        // Absolute stored paths inside the root map the same way.
+        let abs = output_relative_path(&root.join("src/schema/x.sql"), &root)
+            .expect("in-root absolute path must map");
+        assert_eq!(abs, PathBuf::from("src/schema/x.sql"));
     }
 
-    /// Locations outside the project root (absolute analyze inputs from other
-    /// trees, `..` escapes) flatten to the output root and are flagged so the
-    /// caller warns instead of silently surprising the user.
+    /// Real-store form (review on #194): analyze run from a different working
+    /// directory records `../<project>/...` relative paths. They must resolve
+    /// back under the project root and keep the directory structure — the old
+    /// flatten behavior dumped 564/564 real files into the output root.
     #[test]
-    fn should_flatten_paths_escaping_project_root() {
-        let root = PathBuf::from("/proj");
-        let outside = output_relative_path(Path::new("/elsewhere/src/x.sql"), &root);
-        assert!(
-            outside.escaped,
-            "absolute path outside root must be flagged"
-        );
-        assert_eq!(outside.relative, PathBuf::from("x.sql"));
+    fn should_resolve_dotdot_relative_paths_back_under_project_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join("src/deep/x.sql"), "SELECT 1;").unwrap();
 
-        let parent = output_relative_path(Path::new("../shared/x.sql"), &root);
-        assert!(parent.escaped, "`..` escape must be flagged");
-        assert_eq!(parent.relative, PathBuf::from("x.sql"));
+        // Real store form: analyze recorded "../proj/src/deep/x.sql" (the
+        // `..` re-enters the project). Joined onto the root and normalized it
+        // lands back inside — structure preserved, no flatten.
+        let stored = PathBuf::from("../proj/src/deep/x.sql");
+        let rel =
+            output_relative_path(&stored, &root).expect("`..` path re-entering the root must map");
+        assert_eq!(rel, PathBuf::from("src/deep/x.sql"));
+
+        // A `..` path that escapes the root for good is an error, not a flatten.
+        assert!(output_relative_path(Path::new("../other/src/x.sql"), &root).is_err());
+    }
+
+    /// Locations that cannot be mapped under the project root are a hard
+    /// error — never flattened (flattening let same-named files from
+    /// different directories silently overwrite each other).
+    #[test]
+    fn should_reject_unmappable_paths_instead_of_flattening() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(
+            output_relative_path(Path::new("/etc/hostname"), &root).is_err(),
+            "foreign absolute path must fail"
+        );
+        assert!(
+            output_relative_path(Path::new("../../outside/x.sql"), &root).is_err(),
+            "`..` escape must fail"
+        );
+        assert!(
+            output_relative_path(Path::new(""), &root).is_err(),
+            "empty location must fail"
+        );
     }
 
     // ── Engine: end-to-end extraction ───────────────────────────
@@ -2262,6 +2295,52 @@ END pkg_a;
             !root.join("out").exists(),
             "refusal happens before the output dir is created"
         );
+    }
+
+    /// Two different stored paths resolving to the same output path must be
+    /// a hard error — flatten/mirror collisions silently overwrote files.
+    #[test]
+    fn should_fail_on_output_path_collisions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("d");
+        std::fs::create_dir_all(&src).unwrap();
+        // pa lives at stored path "d/x.sql"; pb at "d/../d/x.sql" — different
+        // PathBuf keys that canonicalize to the SAME output path.
+        let sql_a = "CREATE PROCEDURE pa AS\nBEGIN\n    PERFORM pb();\nEND;\n/\n";
+        let sql_b = "CREATE PROCEDURE pb AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        std::fs::write(src.join("x.sql"), sql_a).unwrap();
+
+        let mk = |text: &str, stored: &str| {
+            let tokens = ogsql_parser::Tokenizer::new(text).tokenize().unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, text.to_string());
+            crate::parser::ParsedFile {
+                path: PathBuf::from(stored),
+                statements: parser.parse_with_text(),
+                content_hash: String::new(),
+            }
+        };
+        let parsed = vec![mk(sql_a, "d/x.sql"), mk(sql_b, "d/../d/x.sql")];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let pa = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "pa"))
+            .expect("pa in graph");
+
+        // pa → pb puts both files in the closure; both map to "d/x.sql".
+        let err = run_extract(
+            &graph,
+            &root,
+            &[pa],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &root.join("out"),
+            false,
+            None,
+        )
+        .expect_err("colliding output paths must fail");
+        assert!(matches!(err, ExtractError::ProtectedPath { .. }));
     }
 
     /// Shared fixture: a one-procedure project whose graph is already built.

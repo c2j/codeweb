@@ -241,8 +241,11 @@ Behavior:
   existing stores keep working without re-analysis. A stored location whose
   line no longer matches a statement (file changed since `codeweb analyze`)
   is reported, never guessed.
-- Output paths mirror the source layout relative to the project root; output
-  file order follows the source file order.
+- Output paths mirror the source layout relative to the project root
+  (canonicalized, so `..` segments that re-enter the root still map
+  correctly); a source path that cannot be mapped safely under the root —
+  or two sources colliding on one output path — is a hard error, never a
+  silent flatten. Output file order follows the source file order.
 - The original SQL files are **never modified**; `--output`/`--report`
   targets equal to or containing the project root or any source file are
   refused before anything is written or deleted.
@@ -651,7 +654,10 @@ codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sour
   行/列 span——字符串、注释、dollar-quoted、嵌套 BEGIN/END 由 parser 处理），
   既有图谱无需重新分析即可复用。存储位置在重新解析后对不上任何语句
   （`codeweb analyze` 之后文件已变化）只进报告，绝不猜测边界。
-- 输出路径按相对项目根的目录结构镜像源码布局；输出文件内的定义按原文件顺序排列。
+- 输出路径按相对项目根的目录结构镜像源码布局（经 canonicalize，回绕到
+  根内的 `..` 段也能正确映射）；无法安全映射到根内的源路径、或多个源文件
+  映射到同一输出路径，均为硬错误，绝不静默平铺。输出文件内的定义按原文件
+  顺序排列。
 - **绝不修改**原始 SQL 文件；`--output`/`--report` 目标等于或包含项目根
   或任一源文件时，在任何写入/删除之前即被拒绝。
 - 输出目录已存在时默认拒绝（退出非 0）；`--overwrite` 才会清空重建。
