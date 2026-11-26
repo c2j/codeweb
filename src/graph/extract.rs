@@ -267,19 +267,26 @@ pub fn build_span_index(
 /// Outcome of matching a stored node location against a fresh span index.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpanMatch {
-    /// One statement starts on the line (or the object name picks one out of
-    /// several).
+    /// Exactly one statement on the line defines the node's object (or the
+    /// node kind carries no object name and a single candidate exists).
     Matched(LineSpan),
-    /// Several statements start on the line and no object name matched — the
-    /// first is returned as a deterministic guess; callers warn.
-    GuessedFirst(LineSpan),
     /// No statement starts on this line: the source changed since the last
     /// `codeweb analyze` (stale store). Callers must NOT invent boundaries.
     NotFound,
+    /// Statements start on this line but none defines the node's object name
+    /// — exporting the first candidate would silently emit the WRONG
+    /// definition, which is worse than reporting the member missing.
+    NameMismatch,
 }
 
 /// Find the span of the statement defining a node whose `location.line` is
 /// `line` and whose object name (if any) is `node_name`.
+///
+/// Strict matching (review on #194): when the node carries an object name,
+/// the candidate statement must define that same name — a single candidate
+/// with a different name is a `NameMismatch`, never a guess. When the node
+/// kind has no object name (`node_name == None`), only a single candidate on
+/// the line may match; several candidates are `NotFound`.
 pub fn match_span(
     index: &std::collections::BTreeMap<usize, Vec<SpanCandidate>>,
     line: usize,
@@ -288,20 +295,43 @@ pub fn match_span(
     let Some(candidates) = index.get(&line) else {
         return SpanMatch::NotFound;
     };
-    if candidates.len() == 1 {
-        return SpanMatch::Matched(candidates[0].span);
-    }
-    if let Some(name) = node_name {
-        let by_name: Vec<LineSpan> = candidates
-            .iter()
-            .filter(|c| c.object_name.as_deref() == Some(name))
-            .map(|c| c.span)
-            .collect();
-        if by_name.len() == 1 {
-            return SpanMatch::Matched(by_name[0]);
+    match node_name {
+        Some(name) => {
+            let by_name: Vec<LineSpan> = candidates
+                .iter()
+                .filter(|c| c.object_name.as_deref() == Some(name))
+                .map(|c| c.span)
+                .collect();
+            if by_name.len() == 1 {
+                SpanMatch::Matched(by_name[0])
+            } else if by_name.is_empty() && candidates.iter().all(|c| c.object_name.is_some()) {
+                SpanMatch::NameMismatch
+            } else {
+                SpanMatch::NotFound
+            }
+        }
+        None => {
+            if candidates.len() == 1 {
+                SpanMatch::Matched(candidates[0].span)
+            } else {
+                SpanMatch::NotFound
+            }
         }
     }
-    SpanMatch::GuessedFirst(candidates[0].span)
+}
+
+/// The name a package member's defining statement carries: members share the
+/// package statement's start line, and the statement they map to IS the
+/// package — so strict span matching must verify the package name, not the
+/// member name (review on #194).
+fn package_member_match_name(node: &crate::graph::Node) -> Option<String> {
+    use crate::graph::Node;
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => {
+            id.package.as_ref().map(|p| p.to_lowercase())
+        }
+        _ => None,
+    }
 }
 
 /// The lowercased object name a node declares (used to disambiguate several
@@ -712,7 +742,7 @@ pub fn run_extract(
                         idx,
                         key,
                         line,
-                        name: node_object_name(node),
+                        name: package_member_match_name(node).or_else(|| node_object_name(node)),
                     });
             }
             ClosureMemberKind::PartialRoutine => {
@@ -833,17 +863,16 @@ pub fn run_extract(
                     matched.push((slot, span));
                     extracted_slots.insert(slot);
                 }
-                SpanMatch::GuessedFirst(span) => {
+                SpanMatch::NameMismatch => {
                     warnings.push(format!(
-                        "'{}': {} statements start at line {} in '{}' — used the first \
-                         (provide the full NodeKey if this is wrong)",
+                        "'{}': name_mismatch — statement(s) start at line {} in '{}' but \
+                         none defines '{}'; member skipped (a wrong definition is worse \
+                         than a missing report)",
                         member.key,
-                        index.get(&member.line).map_or(0, Vec::len),
                         member.line,
-                        file_display
+                        file_display,
+                        member.name.as_deref().unwrap_or("?")
                     ));
-                    matched.push((slot, span));
-                    extracted_slots.insert(slot);
                 }
                 SpanMatch::NotFound => {
                     warnings.push(format!(
@@ -1545,12 +1574,36 @@ $$;
             "must slice the t_y statement only: {sliced:?}"
         );
 
-        // Without a usable name hint the first same-line statement is used —
-        // deterministically — and the caller is told it is a guess.
+        // Strict matching (review on #194): without a name hint and several
+        // candidates there is NO guess — the member is reported missing.
+        assert!(matches!(match_span(&index, 1, None), SpanMatch::NotFound));
+        // A name that matches no candidate is a name_mismatch, not a pick.
         assert!(matches!(
-            match_span(&index, 1, None),
-            SpanMatch::GuessedFirst(_)
+            match_span(&index, 1, Some("t_z")),
+            SpanMatch::NameMismatch
         ));
+    }
+
+    /// A single candidate whose object name differs from the node's must NOT
+    /// be exported — the reviewer observed `prc_gen_inst` silently resolving
+    /// to `prc_gen_inst_byfund`'s definition (review on #194).
+    #[test]
+    fn should_reject_single_candidate_with_mismatched_name() {
+        let source = "CREATE PROCEDURE prc_gen_inst_byfund AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        let f = write_temp_sql(source);
+        let (stmts, _text) = crate::parser::parse_sql_file_with_source(f.path()).expect("parse");
+        let index = build_span_index(&stmts);
+
+        assert!(matches!(
+            match_span(&index, 1, Some("prc_gen_inst")),
+            SpanMatch::NameMismatch
+        ));
+        assert!(matches!(
+            match_span(&index, 1, Some("prc_gen_inst_byfund")),
+            SpanMatch::Matched(_)
+        ));
+        // Nameless node kinds may still match a single candidate directly.
+        assert!(matches!(match_span(&index, 1, None), SpanMatch::Matched(_)));
     }
 
     /// `node_object_name` feeds the same-line disambiguation: routine ids,

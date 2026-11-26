@@ -500,11 +500,13 @@ enum Commands {
         #[arg(long, conflicts_with = "exact")]
         regex: bool,
 
-        /// Process all matching nodes per root name
+        /// Process all matching nodes per root name (explicit opt-in: without
+        /// it, an ambiguous root name is an error, never a silent first match)
         #[arg(long)]
         all_matches: bool,
 
-        /// Exit with error on ambiguous root match
+        /// Exit with error on ambiguous root match (default behavior; kept
+        /// for compatibility)
         #[arg(long)]
         fail_on_multiple: bool,
 
@@ -2159,7 +2161,9 @@ fn cmd_extract(
     report_path: Option<&Path>,
     match_mode: codeweb::graph::search::MatchMode,
     all_matches: bool,
-    fail_on_multiple: bool,
+    // Strict by default (review on #194): ambiguity is always an error unless
+    // --all-matches opts in. The flag is accepted for CLI compatibility.
+    _fail_on_multiple: bool,
     project: &Path,
 ) -> Result<()> {
     use codeweb::graph::extract;
@@ -2201,8 +2205,12 @@ fn cmd_extract(
                 roots.push(idx);
             }
         };
+    // Strict root resolution (review on #194): a fuzzy name must never
+    // silently pick the wrong object (`prc_gen_inst` vs
+    // `prc_gen_inst_byfund`). `fail_on_multiple` is always on; `--all-matches`
+    // remains the explicit opt-in that expands a name to every hit.
     for name in &root_names {
-        match store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple) {
+        match store.resolve_single_node(name, match_mode, all_matches, true) {
             codeweb::graph::search::ResolveResult::Single(idx, _) => {
                 push_root(idx, &mut roots, &mut seen_roots);
             }
@@ -2216,7 +2224,8 @@ fn cmd_extract(
             }
             codeweb::graph::search::ResolveResult::Ambiguous => {
                 resolution_errors.push(format!(
-                    "ambiguous match for root '{}' (--exact may help)",
+                    "ambiguous match for root '{}' — a near-name matched several nodes; \
+                     use the full NodeKey or --exact (--all-matches expands every hit)",
                     name
                 ));
             }
@@ -2225,6 +2234,28 @@ fn cmd_extract(
     if roots.is_empty() {
         for err in &resolution_errors {
             eprintln!("error: {}", err);
+        }
+        // Still write the report: strict resolution failures must be
+        // recorded in `errors` (review on #194), not lost with the exit.
+        if let Some(path) = report_path {
+            let report = extract::ExtractReport {
+                schema_version: extract::EXTRACT_REPORT_SCHEMA_VERSION,
+                roots: Vec::new(),
+                direction: direction.to_string(),
+                closure_nodes: Vec::new(),
+                files: Vec::new(),
+                unresolved: Vec::new(),
+                warnings: Vec::new(),
+                errors: resolution_errors.clone(),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&report) {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                let _ = std::fs::write(path, json);
+            }
         }
         return Err(error::CodeWebError::ExportError {
             message: "no root could be resolved — nothing to extract".to_string(),
@@ -2312,6 +2343,21 @@ fn cmd_extract(
     }
     if let Some(path) = report_path {
         println_stdout!("report: {}", path.display());
+    }
+
+    // Strict roots + honest reporting (review on #194): any resolution or
+    // extraction error recorded in the report means a non-zero exit, even
+    // though partial output was still produced.
+    if !report.errors.is_empty() {
+        return Err(error::CodeWebError::ExportError {
+            message: format!(
+                "extract finished with {} error(s) — see {} for details",
+                report.errors.len(),
+                report_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the report".to_string())
+            ),
+        });
     }
 
     Ok(())

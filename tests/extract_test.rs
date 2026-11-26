@@ -258,8 +258,11 @@ $$;
         &root,
         &[
             "extract",
+            // Strict resolution (review on #194): the bare name 'caller' also
+            // substring-matches the unresolved `mystery_proc` node, so the
+            // full NodeKey is required.
             "--node",
-            "caller",
+            "proc:caller",
             "--output",
             "out",
             "--report",
@@ -389,5 +392,59 @@ fn extract_depth_zero_limits_to_root() {
     assert!(
         !root.join("out/sql/TBL_C1.sql").exists(),
         "depth 0 must exclude transitive deps"
+    );
+}
+
+/// Strict root resolution (review on #194): a name matching several nodes is
+/// an error with a non-zero exit — never a silent first match that could
+/// export the WRONG definition. `--all-matches` is the explicit opt-in.
+#[test]
+fn extract_rejects_ambiguous_root_name() {
+    let (_d, root) = fixture_project();
+    // "a" substring-matches a1..a4 — ambiguous under strict resolution.
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "a",
+            "--output",
+            "out",
+            "--report",
+            "report.json",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "ambiguous root must exit non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&read(&root.join("report.json"))).expect("report written");
+    assert!(
+        report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("ambiguous")),
+        "ambiguity recorded in report errors: {report}"
+    );
+
+    // --all-matches is the explicit opt-in that expands every hit.
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "a",
+            "--all-matches",
+            "--output",
+            "out2",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "--all-matches must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

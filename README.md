@@ -229,13 +229,18 @@ codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sour
 
 Behavior:
 
-- Roots resolve exactly like `trace`/`detail` (substring by default,
-  `--exact`/`--regex`, `--all-matches`, `--fail-on-multiple`).
+- Roots resolve like `trace`/`detail` (substring by default,
+  `--exact`/`--regex`), but **strictly**: an ambiguous or unmatched root is
+  recorded in the report's `errors` and the command exits non-zero — a fuzzy
+  name never silently exports the wrong definition. `--all-matches` is the
+  explicit opt-in that expands a name to every match.
 - `--depth N` bounds recursion (default: unlimited); depth 0 = roots only.
 - Statement boundaries come from a **fresh re-parse** of the involved files at
   extraction time (`StatementInfo` line/col spans — strings, comments,
   dollar-quoted bodies and nested BEGIN/END are handled by the parser), so
-  existing stores keep working without re-analysis.
+  existing stores keep working without re-analysis. A stored location whose
+  line no longer matches a statement (file changed since `codeweb analyze`)
+  is reported, never guessed.
 - Output paths mirror the source layout relative to the project root; output
   file order follows the source file order.
 - The original SQL files are **never modified**; `--output`/`--report`
@@ -637,12 +642,15 @@ codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sour
 
 行为约定：
 
-- 起点解析与 `trace`/`detail` 完全一致（默认子串匹配，`--exact`/`--regex`、
-  `--all-matches`、`--fail-on-multiple`）。
+- 起点解析与 `trace`/`detail` 一致（默认子串匹配，`--exact`/`--regex`），但
+  **严格**：歧义或无匹配的起点会记入报告 `errors` 并以非 0 退出——模糊
+  名称绝不会静默导出错误的定义。`--all-matches` 是显式放行选项，把一个
+  名称展开为全部命中。
 - `--depth N` 限制递归深度（默认不限；0 = 仅起点自身）。
 - 定义边界来自提取时对相关文件的**现场重新解析**（`StatementInfo`
   行/列 span——字符串、注释、dollar-quoted、嵌套 BEGIN/END 由 parser 处理），
-  既有图谱无需重新分析即可复用。
+  既有图谱无需重新分析即可复用。存储位置在重新解析后对不上任何语句
+  （`codeweb analyze` 之后文件已变化）只进报告，绝不猜测边界。
 - 输出路径按相对项目根的目录结构镜像源码布局；输出文件内的定义按原文件顺序排列。
 - **绝不修改**原始 SQL 文件；`--output`/`--report` 目标等于或包含项目根
   或任一源文件时，在任何写入/删除之前即被拒绝。
