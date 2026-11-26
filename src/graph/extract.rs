@@ -173,6 +173,182 @@ pub fn collect_closure(
     closure.into_iter().collect()
 }
 
+/// How a closure member maps (or fails to map) to an extractable SQL
+/// definition. Issue #193 requirement 4: every non-extractable member is
+/// reported, never silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureMemberKind {
+    /// Carries a `SourceLocation` into an SQL file — slice the definition.
+    Extractable,
+    /// Routine declared in a package spec whose body implementation could not
+    /// be parsed (`partial: true`, `location.line == 0`).
+    PartialRoutine,
+    /// No source definition exists in the analyzed SQL sources (inferred
+    /// table/view/sequence, built-in function call site).
+    NoSourceDefinition,
+    /// Definition lives outside SQL sources (XML mapper, Java, JSP, custom).
+    NonSqlSource,
+    /// Unresolved dynamic reference — no definition anywhere.
+    Unresolved,
+}
+
+/// Classify one graph node for extraction purposes.
+///
+/// Note: `BuiltinFunction` nodes DO carry a call-site `SourceLocation` (first
+/// call site wins at build time), so a location alone is not proof of a
+/// definable statement — the node kind decides.
+pub fn classify_member(node: &crate::graph::Node) -> ClosureMemberKind {
+    use crate::graph::Node;
+    match node {
+        Node::Procedure {
+            location, partial, ..
+        }
+        | Node::Function {
+            location, partial, ..
+        } => {
+            if *partial || location.line == 0 {
+                ClosureMemberKind::PartialRoutine
+            } else {
+                ClosureMemberKind::Extractable
+            }
+        }
+        Node::Package { .. }
+        | Node::Trigger { .. }
+        | Node::Type { .. }
+        | Node::Index { .. }
+        | Node::MaterializedView { .. }
+        | Node::Synonym { .. }
+        | Node::Event { .. } => ClosureMemberKind::Extractable,
+        Node::Table { location, .. }
+        | Node::View { location, .. }
+        | Node::Sequence { location, .. } => match location {
+            Some(_) => ClosureMemberKind::Extractable,
+            None => ClosureMemberKind::NoSourceDefinition,
+        },
+        Node::BuiltinFunction { .. } => ClosureMemberKind::NoSourceDefinition,
+        Node::Unresolved { .. } => ClosureMemberKind::Unresolved,
+        Node::MappedStatement { .. }
+        | Node::JavaSql { .. }
+        | Node::JavaMethod { .. }
+        | Node::JavaClass { .. }
+        | Node::JspPage { .. }
+        | Node::JspSql { .. }
+        | Node::Custom { .. } => ClosureMemberKind::NonSqlSource,
+    }
+}
+
+/// One freshly parsed statement that starts on a given line: its span plus the
+/// lowercased name of the object it defines (when the statement kind has one).
+#[derive(Debug, Clone)]
+pub struct SpanCandidate {
+    pub span: LineSpan,
+    pub object_name: Option<String>,
+}
+
+/// Index a freshly parsed file's statements by `start_line` — the join key
+/// stored in graph `SourceLocation.line` values.
+pub fn build_span_index(
+    stmts: &[StatementInfo],
+) -> std::collections::BTreeMap<usize, Vec<SpanCandidate>> {
+    let mut index = std::collections::BTreeMap::new();
+    for info in stmts {
+        index
+            .entry(info.start_line)
+            .or_insert_with(Vec::new)
+            .push(SpanCandidate {
+                span: LineSpan::from_info(info),
+                object_name: statement_object_name(&info.statement),
+            });
+    }
+    index
+}
+
+/// Outcome of matching a stored node location against a fresh span index.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanMatch {
+    /// One statement starts on the line (or the object name picks one out of
+    /// several).
+    Matched(LineSpan),
+    /// Several statements start on the line and no object name matched — the
+    /// first is returned as a deterministic guess; callers warn.
+    GuessedFirst(LineSpan),
+    /// No statement starts on this line: the source changed since the last
+    /// `codeweb analyze` (stale store). Callers must NOT invent boundaries.
+    NotFound,
+}
+
+/// Find the span of the statement defining a node whose `location.line` is
+/// `line` and whose object name (if any) is `node_name`.
+pub fn match_span(
+    index: &std::collections::BTreeMap<usize, Vec<SpanCandidate>>,
+    line: usize,
+    node_name: Option<&str>,
+) -> SpanMatch {
+    let Some(candidates) = index.get(&line) else {
+        return SpanMatch::NotFound;
+    };
+    if candidates.len() == 1 {
+        return SpanMatch::Matched(candidates[0].span);
+    }
+    if let Some(name) = node_name {
+        let by_name: Vec<LineSpan> = candidates
+            .iter()
+            .filter(|c| c.object_name.as_deref() == Some(name))
+            .map(|c| c.span)
+            .collect();
+        if by_name.len() == 1 {
+            return SpanMatch::Matched(by_name[0]);
+        }
+    }
+    SpanMatch::GuessedFirst(candidates[0].span)
+}
+
+/// The lowercased object name a node declares (used to disambiguate several
+/// statements sharing one start line). `None` when the node kind has no
+/// single object name (e.g. unnamed indexes).
+pub fn node_object_name(node: &crate::graph::Node) -> Option<String> {
+    use crate::graph::Node;
+    let lower = |s: &str| s.to_lowercase();
+    match node {
+        Node::Procedure { id, .. } | Node::Function { id, .. } => Some(lower(&id.name)),
+        Node::Package { name, .. }
+        | Node::Table { name, .. }
+        | Node::View { name, .. }
+        | Node::Type { name, .. }
+        | Node::Sequence { name, .. }
+        | Node::MaterializedView { name, .. }
+        | Node::Synonym { name, .. }
+        | Node::Event { name, .. } => Some(lower(name)),
+        Node::Trigger { name, .. } => Some(lower(name)),
+        Node::Index { name, .. } => name.as_deref().map(lower),
+        _ => None,
+    }
+}
+
+/// The lowercased last identifier of the object a statement defines, or `None`
+/// for statements without a single defining name.
+fn statement_object_name(stmt: &ogsql_parser::ast::Statement) -> Option<String> {
+    use ogsql_parser::ast::Statement;
+    let last_ident =
+        |name: &ogsql_parser::ast::ObjectName| name.last().map(|i| i.to_string().to_lowercase());
+    match stmt {
+        Statement::CreateTable(t) => last_ident(&t.name),
+        Statement::CreateView(v) => last_ident(&v.name),
+        Statement::CreateMaterializedView(v) => last_ident(&v.name),
+        Statement::CreateSequence(s) => last_ident(&s.name),
+        Statement::CreateType(t) => last_ident(&t.name),
+        Statement::CreateFunction(f) => last_ident(&f.name),
+        Statement::CreateProcedure(p) => last_ident(&p.name),
+        Statement::CreatePackage(p) => last_ident(&p.name),
+        Statement::CreatePackageBody(p) => last_ident(&p.name),
+        Statement::CreateSynonym(s) => last_ident(&s.name),
+        Statement::CreateTrigger(t) => Some(t.name.to_lowercase()),
+        Statement::CreateEvent(e) => Some(e.name.to_lowercase()),
+        Statement::CreateIndex(i) => i.name.as_ref().and_then(|n| last_ident(n)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +738,237 @@ $$;
             !depth1.iter().any(|k| k.contains("shared_tbl")),
             "depth 1 excludes transitive dep: {depth1:?}"
         );
+    }
+
+    /// Issue #193 requirement 4: closure members without an extractable SQL
+    /// definition must be classified, never silently dropped.
+    /// - routines with a real location → Extractable
+    /// - partial routines (spec-declared, line 0) → PartialRoutine
+    /// - inferred tables / builtins → NoSourceDefinition
+    /// - XML/Java/JSP graph nodes → NonSqlSource
+    /// - unresolved dynamic calls → Unresolved
+    #[test]
+    fn should_classify_closure_members_by_extractability() {
+        let loc = || crate::graph::SourceLocation {
+            file: std::sync::Arc::new(PathBuf::from("src/a.sql")),
+            line: 3,
+        };
+        let cases: Vec<(crate::graph::Node, ClosureMemberKind)> = vec![
+            (
+                crate::graph::Node::Procedure {
+                    id: crate::graph::RoutineId {
+                        schema: None,
+                        package: None,
+                        name: "a1".into(),
+                        kind: crate::graph::RoutineKind::Procedure,
+                    },
+                    location: loc(),
+                    partial: false,
+                    body_sql: Vec::new(),
+                },
+                ClosureMemberKind::Extractable,
+            ),
+            (
+                crate::graph::Node::Function {
+                    id: crate::graph::RoutineId {
+                        schema: None,
+                        package: None,
+                        name: "b1".into(),
+                        kind: crate::graph::RoutineKind::Function,
+                    },
+                    location: loc(),
+                    partial: false,
+                    body_sql: Vec::new(),
+                },
+                ClosureMemberKind::Extractable,
+            ),
+            (
+                crate::graph::Node::Procedure {
+                    id: crate::graph::RoutineId {
+                        schema: None,
+                        package: Some("pkg".into()),
+                        name: "declared_only".into(),
+                        kind: crate::graph::RoutineKind::Procedure,
+                    },
+                    location: crate::graph::SourceLocation {
+                        file: std::sync::Arc::new(PathBuf::from("src/a.sql")),
+                        line: 0,
+                    },
+                    partial: true,
+                    body_sql: Vec::new(),
+                },
+                ClosureMemberKind::PartialRoutine,
+            ),
+            (
+                crate::graph::Node::Table {
+                    schema: None,
+                    name: "inferred_tbl".into(),
+                    explicit: false,
+                    system: false,
+                    location: None,
+                    columns: Box::new(Vec::new()),
+                    partition_by: None,
+                    distribute_by: None,
+                    tablespace: None,
+                    temporary: false,
+                    unlogged: false,
+                    ddl_source: None,
+                },
+                ClosureMemberKind::NoSourceDefinition,
+            ),
+            (
+                crate::graph::Node::Table {
+                    schema: None,
+                    name: "ddl_tbl".into(),
+                    explicit: true,
+                    system: false,
+                    location: Some(loc()),
+                    columns: Box::new(Vec::new()),
+                    partition_by: None,
+                    distribute_by: None,
+                    tablespace: None,
+                    temporary: false,
+                    unlogged: false,
+                    ddl_source: None,
+                },
+                ClosureMemberKind::Extractable,
+            ),
+            (
+                crate::graph::Node::BuiltinFunction {
+                    name: "count".into(),
+                    category: "aggregate".into(),
+                    domain: "core".into(),
+                    location: loc(),
+                },
+                ClosureMemberKind::NoSourceDefinition,
+            ),
+            (
+                crate::graph::Node::Unresolved {
+                    raw_expr: Box::new("dynamic_call()".into()),
+                    context: Box::new("proc:a1".into()),
+                },
+                ClosureMemberKind::Unresolved,
+            ),
+        ];
+        for (node, expected) in cases {
+            assert_eq!(classify_member(&node), expected, "mis-classified {node:?}");
+        }
+
+        // Non-SQL graph node kinds (XML mapper / Java / JSP) can never be
+        // sliced from SQL sources.
+        let mapper = crate::graph::Node::MappedStatement {
+            namespace: "ns".into(),
+            statement_id: "stmt".into(),
+            kind: "select".into(),
+            xml_file: PathBuf::from("m.xml"),
+            line: 1,
+            sql: None,
+        };
+        assert_eq!(classify_member(&mapper), ClosureMemberKind::NonSqlSource);
+        let java = crate::graph::Node::JavaMethod {
+            fqn: "F.m".into(),
+            class_fqn: "F".into(),
+            name: "m".into(),
+            signature: String::new(),
+            file: PathBuf::from("F.java"),
+            line: 1,
+        };
+        assert_eq!(classify_member(&java), ClosureMemberKind::NonSqlSource);
+    }
+
+    /// A stored node's `location.line` must find its defining statement's
+    /// span in a freshly re-parsed file.
+    #[test]
+    fn should_match_statement_span_by_location_line() {
+        let source = "CREATE TABLE t_a(id INT);\n\nCREATE VIEW v_a AS SELECT 1;\n";
+        let f = write_temp_sql(source);
+        let (stmts, _text) = crate::parser::parse_sql_file_with_source(f.path()).expect("parse");
+        let index = build_span_index(&stmts);
+
+        let m = match_span(&index, 3, Some("v_a"));
+        assert!(matches!(m, SpanMatch::Matched(_)), "view on line 3: {m:?}");
+
+        // A line no statement starts on (e.g. after the file was edited since
+        // the last `codeweb analyze`) must NOT invent a boundary.
+        let stale = match_span(&index, 2, Some("whatever"));
+        assert!(
+            matches!(stale, SpanMatch::NotFound),
+            "blank line: {stale:?}"
+        );
+    }
+
+    /// Two statements sharing one start line are told apart by the node's
+    /// object name (single-line `CREATE TABLE a(...); CREATE TABLE b(...);`).
+    #[test]
+    fn should_disambiguate_same_line_statements_by_object_name() {
+        let source = "CREATE TABLE t_x(id INT); CREATE TABLE t_y(id INT);\n";
+        let f = write_temp_sql(source);
+        let (stmts, text) = crate::parser::parse_sql_file_with_source(f.path()).expect("parse");
+        let index = build_span_index(&stmts);
+
+        let m = match_span(&index, 1, Some("t_y"));
+        let SpanMatch::Matched(span) = m else {
+            panic!("expected name-matched span, got {m:?}");
+        };
+        let sliced = slice_span(&text, span).expect("in bounds");
+        assert!(
+            sliced.contains("t_y") && !sliced.contains("t_x"),
+            "must slice the t_y statement only: {sliced:?}"
+        );
+
+        // Without a usable name hint the first same-line statement is used —
+        // deterministically — and the caller is told it is a guess.
+        assert!(matches!(
+            match_span(&index, 1, None),
+            SpanMatch::GuessedFirst(_)
+        ));
+    }
+
+    /// `node_object_name` feeds the same-line disambiguation: routine ids,
+    /// tables/views/sequences, triggers, packages.
+    #[test]
+    fn should_expose_node_object_name_for_matching() {
+        let mk_id = |name: &str| crate::graph::RoutineId {
+            schema: Some("s".into()),
+            package: None,
+            name: name.into(),
+            kind: crate::graph::RoutineKind::Procedure,
+        };
+        let proc = crate::graph::Node::Procedure {
+            id: mk_id("A1"),
+            location: crate::graph::SourceLocation {
+                file: std::sync::Arc::new(PathBuf::from("x.sql")),
+                line: 1,
+            },
+            partial: false,
+            body_sql: Vec::new(),
+        };
+        assert_eq!(node_object_name(&proc).as_deref(), Some("a1"));
+
+        let table = crate::graph::Node::Table {
+            schema: None,
+            name: "TBL".into(),
+            explicit: true,
+            system: false,
+            location: None,
+            columns: Box::new(Vec::new()),
+            partition_by: None,
+            distribute_by: None,
+            tablespace: None,
+            temporary: false,
+            unlogged: false,
+            ddl_source: None,
+        };
+        assert_eq!(node_object_name(&table).as_deref(), Some("tbl"));
+
+        let trigger = crate::graph::Node::Trigger {
+            name: "TRG".into(),
+            table: vec!["t".into()],
+            location: crate::graph::SourceLocation {
+                file: std::sync::Arc::new(PathBuf::from("x.sql")),
+                line: 1,
+            },
+        };
+        assert_eq!(node_object_name(&trigger).as_deref(), Some("trg"));
     }
 }
