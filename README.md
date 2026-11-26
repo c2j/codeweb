@@ -257,9 +257,15 @@ Behavior:
   closure nodes with status, per-file ranges, unresolved, warnings, errors).
   A stale store (source changed since `codeweb analyze`) produces a warning
   and no invented boundary; run `codeweb analyze` to refresh.
-- Package members resolve to their defining `CREATE PACKAGE [BODY]` statement:
-  the package spec/body is the deployable unit, so a member root exports the
-  complete statement rather than a lone member fragment.
+- Package members are trimmed **at member level**: when the closure hits
+  members of package `P`, the output is a reassembled
+  `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;` containing only the
+  selected member bodies (or, for the spec, only their signatures) plus the
+  package-level declarations they transitively reference — deployable, never
+  the whole package verbatim. Declaration retention is a lexical
+  approximation (word-boundary, case-insensitive): references hidden inside
+  dynamic SQL (`EXECUTE '…'`) cannot be seen, and a kept member referencing
+  an unselected sibling produces a warning.
 
 A minimal runnable example lives in
 [`tests/fixtures/extract`](tests/fixtures/extract/README.md) (A1→B1→C1 chain
@@ -666,8 +672,12 @@ codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sour
   （roots、closure_nodes 状态、逐文件 range、unresolved、warnings、errors）。
   源文件在 `codeweb analyze` 之后发生过变化时给出 warning 且不编造边界，请
   重新 `codeweb analyze`。
-- 包成员定位到其所属的 `CREATE PACKAGE [BODY]` 语句：包规范/包体是可部署
-  单元，成员起点导出的是完整包语句而非孤立成员片段。
+- 包成员按**成员级**裁剪：闭包命中包 `P` 的成员时，输出为重组的
+  `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;`——只含选中成员
+  的函数体（规范侧则只含其签名），以及这些成员传递引用到的包级声明，
+  可部署但绝不再是整包原文。声明保留是词法近似（词边界 + 大小写不敏感）：
+  动态 SQL（`EXECUTE '…'`）中的引用无法识别；被保留成员引用了未入闭包的
+  兄弟成员时会给出 warning。
 
 最小可运行示例见
 [`tests/fixtures/extract`](tests/fixtures/extract/README.md)（跨三个文件的
