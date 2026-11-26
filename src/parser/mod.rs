@@ -105,7 +105,10 @@ pub mod java_method {
         Vec::new()
     }
 }
-pub use loader::{load_all_files, load_sql_files, parse_sql_files, AllParsedFiles, ParsedFile};
+pub use loader::{
+    load_all_files, load_sql_files, parse_sql_file_with_source, parse_sql_files, AllParsedFiles,
+    ParsedFile,
+};
 #[allow(unused_imports)]
 pub use predicates::{
     extract_predicates, Confidence, ParamTableHint, PlPredicate, PredicateClause,
