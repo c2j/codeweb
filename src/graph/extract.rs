@@ -413,6 +413,414 @@ pub fn output_relative_path(location_file: &Path, project_root: &Path) -> Output
     }
 }
 
+// ── Extraction engine ───────────────────────────────────────────
+
+/// `extract` JSON report schema version (see `columns` for the convention).
+pub const EXTRACT_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Status values used in the report's `closure_nodes` array.
+pub const STATUS_EXTRACTED: &str = "extracted";
+pub const STATUS_PARTIAL_ROUTINE: &str = "partial_routine";
+pub const STATUS_NO_SOURCE_DEFINITION: &str = "no_source_definition";
+pub const STATUS_NON_SQL_SOURCE: &str = "non_sql_source";
+pub const STATUS_UNRESOLVED: &str = "unresolved";
+pub const STATUS_MISSING_STATEMENT: &str = "missing_statement";
+
+/// Machine-readable result of an extraction run (`--report <path>`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtractReport {
+    pub schema_version: u32,
+    /// Display keys of the resolved roots, in the order they were given.
+    pub roots: Vec<String>,
+    /// "outgoing" or "incoming".
+    pub direction: String,
+    /// Every closure member with its extraction status.
+    pub closure_nodes: Vec<ClosureNodeReport>,
+    /// One entry per source file that contributed definitions.
+    pub files: Vec<FileExtractionReport>,
+    /// Members without an extractable definition (inferred objects, builtins,
+    /// unresolved dynamic calls) — issue #193 requirement 4: never silent.
+    pub unresolved: Vec<UnresolvedReport>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClosureNodeReport {
+    pub key: String,
+    pub type_tag: String,
+    pub status: &'static str,
+    /// Source file as stored in the graph, when the node has a location.
+    pub source: Option<String>,
+    /// Path of the trimmed definition relative to the output directory.
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileExtractionReport {
+    pub source: String,
+    pub output: String,
+    pub ranges: Vec<RangeReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RangeReport {
+    pub node: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnresolvedReport {
+    pub key: String,
+    pub reason: String,
+}
+
+/// What an extraction run produced.
+#[derive(Debug)]
+pub struct ExtractOutcome {
+    pub report: ExtractReport,
+    pub files_written: usize,
+}
+
+/// Fatal extraction errors — the CLI maps these to exit code 1.
+#[derive(Debug)]
+pub enum ExtractError {
+    /// Target directory exists and `--overwrite` was not given.
+    OutputDirExists(PathBuf),
+    /// An output file or directory could not be written.
+    OutputWrite { path: PathBuf, source: std::io::Error },
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractError::OutputDirExists(path) => write!(
+                f,
+                "output directory already exists: {} (use --overwrite to replace it)",
+                path.display()
+            ),
+            ExtractError::OutputWrite { path, source } => {
+                write!(f, "cannot write {}: {}", path.display(), source)
+            }
+        }
+    }
+}
+
+/// One closure member awaiting slicing, grouped by source file.
+struct FileMember {
+    idx: petgraph::graph::NodeIndex,
+    key: String,
+    line: usize,
+    name: Option<String>,
+}
+
+/// Compute the dependency closure of `roots` and write the closure members'
+/// original SQL definitions, trimmed per file, into `output_dir`.
+///
+/// Never mutates the source tree — only reads it. When `output_dir` exists it
+/// is refused unless `overwrite` (then cleared and recreated). Members whose
+/// stored location no longer matches a statement in the re-parsed file are
+/// reported via warnings (stale store), never given invented boundaries.
+pub fn run_extract(
+    graph: &crate::graph::CodeGraph,
+    project_root: &Path,
+    roots: &[petgraph::graph::NodeIndex],
+    direction: petgraph::Direction,
+    direction_label: &str,
+    max_depth: Option<usize>,
+    output_dir: &Path,
+    overwrite: bool,
+) -> Result<ExtractOutcome, ExtractError> {
+    // Output directory policy (issue #193 requirement 3): refuse instead of
+    // silently merging into an existing tree.
+    if output_dir.exists() {
+        if !overwrite {
+            return Err(ExtractError::OutputDirExists(output_dir.to_path_buf()));
+        }
+        std::fs::remove_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
+            path: output_dir.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::create_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut unresolved: Vec<UnresolvedReport> = Vec::new();
+    let mut closure_nodes: Vec<ClosureNodeReport> = Vec::new();
+
+    let key_of = |idx: petgraph::graph::NodeIndex| {
+        crate::graph::key::NodeKey::from_node(&graph[idx]).to_string()
+    };
+
+    let mut report_roots: Vec<String> = Vec::new();
+    for &root in roots {
+        let key = key_of(root);
+        if !report_roots.contains(&key) {
+            report_roots.push(key);
+        }
+    }
+
+    let closure = collect_closure(graph, roots, direction, max_depth);
+
+    // Group extractable members by source file; classify the rest into the
+    // report immediately (issue #193 requirement 4).
+    let mut by_file: std::collections::BTreeMap<PathBuf, Vec<FileMember>> =
+        std::collections::BTreeMap::new();
+    for idx in closure {
+        let node = &graph[idx];
+        let key = key_of(idx);
+        let type_tag = crate::graph::node_type_tag(node).to_string();
+        let push_unresolved = |unresolved: &mut Vec<UnresolvedReport>,
+                               key: String,
+                               reason: String,
+                               status: &'static str,
+                               source: Option<String>| {
+            unresolved.push(UnresolvedReport { key: key.clone(), reason });
+            closure_nodes.push(ClosureNodeReport {
+                key,
+                type_tag,
+                status,
+                source,
+                output: None,
+            });
+        };
+        match classify_member(node) {
+            ClosureMemberKind::Extractable => {
+                let (file, line) = node_location(node).expect("extractable has location");
+                by_file.entry((*file).clone()).or_default().push(FileMember {
+                    idx,
+                    key,
+                    line,
+                    name: node_object_name(node),
+                });
+            }
+            ClosureMemberKind::PartialRoutine => {
+                let (file, _) = node_location(node).expect("partial has location");
+                push_unresolved(
+                    &mut unresolved,
+                    key,
+                    "partial routine: package spec declaration whose body implementation \
+                     could not be parsed — no standalone definition to extract"
+                        .to_string(),
+                    STATUS_PARTIAL_ROUTINE,
+                    Some(file.to_string_lossy().into_owned()),
+                );
+            }
+            ClosureMemberKind::NoSourceDefinition => {
+                push_unresolved(
+                    &mut unresolved,
+                    key,
+                    "no source definition in analyzed SQL sources (inferred from \
+                     references, or built-in)"
+                        .to_string(),
+                    STATUS_NO_SOURCE_DEFINITION,
+                    None,
+                );
+            }
+            ClosureMemberKind::NonSqlSource => {
+                push_unresolved(
+                    &mut unresolved,
+                    key,
+                    "definition lives outside SQL sources (XML mapper / Java / JSP node); \
+                     SQL trimming does not apply"
+                        .to_string(),
+                    STATUS_NON_SQL_SOURCE,
+                    None,
+                );
+            }
+            ClosureMemberKind::Unresolved => {
+                push_unresolved(
+                    &mut unresolved,
+                    key,
+                    "unresolved dynamic reference — no definition anywhere".to_string(),
+                    STATUS_UNRESOLVED,
+                    None,
+                );
+            }
+        }
+    }
+
+    // Slice each file's members out of a fresh parse of that file.
+    let mut files_report: Vec<FileExtractionReport> = Vec::new();
+    let mut files_written: usize = 0;
+    for (stored_path, members) in by_file {
+        let source_path = if stored_path.is_absolute() {
+            stored_path.clone()
+        } else {
+            project_root.join(&stored_path)
+        };
+        let file_display = stored_path.to_string_lossy().into_owned();
+
+        let Ok((stmts, source_text)) =
+            crate::parser::parse_sql_file_with_source(&source_path)
+        else {
+            errors.push(format!(
+                "cannot re-parse source file '{}' — its definitions were not extracted",
+                source_path.display()
+            ));
+            for member in &members {
+                closure_nodes.push(ClosureNodeReport {
+                    key: member.key.clone(),
+                    type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
+                    status: STATUS_MISSING_STATEMENT,
+                    source: Some(file_display.clone()),
+                    output: None,
+                });
+            }
+            continue;
+        };
+        let index = build_span_index(&stmts);
+
+        // Match every member against the fresh index. `matched` keeps
+        // (member slot, span); everything else becomes a warning.
+        let mut matched: Vec<(usize, LineSpan)> = Vec::new();
+        let mut extracted_slots: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for (slot, member) in members.iter().enumerate() {
+            match match_span(&index, member.line, member.name.as_deref()) {
+                SpanMatch::Matched(span) => {
+                    matched.push((slot, span));
+                    extracted_slots.insert(slot);
+                }
+                SpanMatch::GuessedFirst(span) => {
+                    warnings.push(format!(
+                        "'{}': {} statements start at line {} in '{}' — used the first \
+                         (provide the full NodeKey if this is wrong)",
+                        member.key,
+                        index.get(&member.line).map_or(0, Vec::len),
+                        member.line,
+                        file_display
+                    ));
+                    matched.push((slot, span));
+                    extracted_slots.insert(slot);
+                }
+                SpanMatch::NotFound => {
+                    warnings.push(format!(
+                        "'{}': no statement starts at line {} in '{}' — the file changed \
+                         since the last `codeweb analyze`; no boundary invented",
+                        member.key, member.line, file_display
+                    ));
+                }
+            }
+        }
+
+        let spans: Vec<LineSpan> = matched.iter().map(|(_, s)| *s).collect();
+        let merged = merge_spans(spans);
+        let Some(trimmed) = slice_spans(&source_text, &merged) else {
+            warnings.push(format!(
+                "statement spans exceed the bounds of '{}' — the file changed since the \
+                 last `codeweb analyze`; nothing written for it",
+                file_display
+            ));
+            for (slot, member) in members.iter().enumerate() {
+                closure_nodes.push(ClosureNodeReport {
+                    key: member.key.clone(),
+                    type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
+                    status: STATUS_MISSING_STATEMENT,
+                    source: Some(file_display.clone()),
+                    output: None,
+                });
+            }
+            continue;
+        };
+
+        let mapping = output_relative_path(&stored_path, project_root);
+        if mapping.escaped {
+            warnings.push(format!(
+                "source file '{}' resolves outside the project root — flattened to the \
+                 output directory root",
+                file_display
+            ));
+        }
+        let out_path = output_dir.join(&mapping.relative);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| ExtractError::OutputWrite {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::write(&out_path, &trimmed).map_err(|source| ExtractError::OutputWrite {
+            path: out_path.clone(),
+            source,
+        })?;
+        files_written += 1;
+
+        // Range report: one entry per member whose span was used, in member
+        // (source) order.
+        let mut ranges: Vec<RangeReport> = Vec::new();
+        for (slot, span) in &matched {
+            ranges.push(RangeReport {
+                node: members[*slot].key.clone(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+            });
+        }
+        let out_display = mapping.relative.to_string_lossy().into_owned();
+        files_report.push(FileExtractionReport {
+            source: file_display.clone(),
+            output: out_display.clone(),
+            ranges,
+        });
+
+        for (slot, member) in members.iter().enumerate() {
+            let extracted = extracted_slots.contains(&slot);
+            closure_nodes.push(ClosureNodeReport {
+                key: member.key.clone(),
+                type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
+                status: if extracted {
+                    STATUS_EXTRACTED
+                } else {
+                    STATUS_MISSING_STATEMENT
+                },
+                source: Some(file_display.clone()),
+                output: extracted.then(|| out_display.clone()),
+            });
+        }
+    }
+
+    Ok(ExtractOutcome {
+        report: ExtractReport {
+            schema_version: EXTRACT_REPORT_SCHEMA_VERSION,
+            roots: report_roots,
+            direction: direction_label.to_string(),
+            closure_nodes,
+            files: files_report,
+            unresolved,
+            warnings,
+            errors,
+        },
+        files_written,
+    })
+}
+
+/// The stored `SourceLocation` of an extractable node (file, start line).
+fn node_location(node: &crate::graph::Node) -> Option<(std::sync::Arc<PathBuf>, usize)> {
+    use crate::graph::Node;
+    match node {
+        Node::Procedure { location, .. }
+        | Node::Function { location, .. }
+        | Node::Package { location, .. }
+        | Node::Trigger { location, .. }
+        | Node::Type { location, .. }
+        | Node::Index { location, .. }
+        | Node::MaterializedView { location, .. }
+        | Node::Synonym { location, .. }
+        | Node::Event { location, .. } => Some((location.file.clone(), location.line)),
+        Node::Table { location, .. } | Node::View { location, .. } => {
+            location.as_ref().map(|l| (l.file.clone(), l.line))
+        }
+        Node::Sequence { location, .. } => {
+            location.as_ref().map(|l| (l.file.clone(), l.line))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,5 +1486,188 @@ func:reporting.b1
         let parent = output_relative_path(Path::new("../shared/x.sql"), &root);
         assert!(parent.escaped, "`..` escape must be flagged");
         assert_eq!(parent.relative, PathBuf::from("x.sql"));
+    }
+
+    // ── Engine: end-to-end extraction ───────────────────────────
+
+    /// Full run: root_a's outgoing closure (root_a, b1, shared_tbl) is sliced
+    /// out of its source file — same-file non-members (root_b, unrelated_p,
+    /// cyclic_*) stay out, members appear once each in source order.
+    #[test]
+    fn should_extract_closure_definitions_per_file_from_engine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.sql"), CALL_CHAIN_SQL).unwrap();
+
+        // Build the graph the same way an analyze would (relative path).
+        let stmts = {
+            let tokens =
+                ogsql_parser::Tokenizer::new(CALL_CHAIN_SQL).tokenize().unwrap();
+            let mut parser =
+                ogsql_parser::Parser::with_source(tokens, CALL_CHAIN_SQL.to_string());
+            parser.parse_with_text()
+        };
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from("src/app.sql"),
+            statements: stmts,
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let root_a = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "root_a"))
+            .expect("root_a in graph");
+
+        let out_dir = dir.path().join("out");
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[root_a],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect("extraction should succeed");
+
+        let written = std::fs::read_to_string(out_dir.join("src/app.sql"))
+            .expect("output file exists");
+        assert!(written.contains("CREATE PROCEDURE root_a"), "{written:?}");
+        assert!(written.contains("CREATE FUNCTION b1"), "{written:?}");
+        assert!(written.contains("CREATE TABLE shared_tbl"), "{written:?}");
+        assert!(
+            !written.contains("root_b"),
+            "non-member must be trimmed: {written:?}"
+        );
+        assert!(
+            !written.contains("unrelated_p"),
+            "non-member must be trimmed: {written:?}"
+        );
+        assert!(
+            !written.contains("cyclic_a"),
+            "non-member must be trimmed: {written:?}"
+        );
+
+        // Report: one source file, three extracted ranges in source order.
+        assert_eq!(outcome.report.schema_version, 1);
+        assert_eq!(outcome.report.files.len(), 1);
+        let file_report = &outcome.report.files[0];
+        assert_eq!(file_report.ranges.len(), 3, "{:?}: {outcome:?}", file_report);
+        let starts: Vec<usize> =
+            file_report.ranges.iter().map(|r| r.start_line).collect();
+        let mut sorted = starts.clone();
+        sorted.sort();
+        assert_eq!(starts, sorted, "ranges must be in source order");
+        assert_eq!(outcome.files_written, 1);
+    }
+
+    /// Issue #193 acceptance example: a chain across three files
+    /// (`a1` → `b1` → `tbl_c1`) produces three output files, each containing
+    /// only the closure member — the issue's PKG_A/FNC_B scenario.
+    #[test]
+    fn should_distribute_closure_across_source_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("sql");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let pkg_a = r#"-- PKG_A.sql: a1 needs a2/a3 trimmed away
+CREATE OR REPLACE PROCEDURE a1 AS
+BEGIN
+    v := b1(1);
+END;
+/
+
+CREATE OR REPLACE PROCEDURE a2 AS
+BEGIN
+    NULL;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE a3 AS
+BEGIN
+    NULL;
+END;
+/
+"#;
+        let fnc_b = r#"-- FNC_B.sql
+CREATE FUNCTION b1(p INT) RETURNS INTEGER AS $$
+BEGIN
+    INSERT INTO tbl_c1 VALUES (p);
+    RETURN p;
+END;
+$$;
+
+CREATE FUNCTION b2() RETURNS INTEGER AS $$
+BEGIN
+    RETURN 2;
+END;
+$$;
+"#;
+        let tbl_c = r#"-- TBL_C1.sql
+CREATE TABLE tbl_c1(id INT);
+
+CREATE TABLE tbl_other(id INT);
+"#;
+        std::fs::write(src.join("PKG_A.sql"), pkg_a).unwrap();
+        std::fs::write(src.join("FNC_B.sql"), fnc_b).unwrap();
+        std::fs::write(src.join("TBL_C1.sql"), tbl_c).unwrap();
+
+        let mk = |text: &str, name: &str| {
+            let tokens = ogsql_parser::Tokenizer::new(text).tokenize().unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, text.to_string());
+            crate::parser::ParsedFile {
+                path: src.join(name),
+                statements: parser.parse_with_text(),
+                content_hash: String::new(),
+            }
+        };
+        let parsed = vec![
+            mk(pkg_a, "PKG_A.sql"),
+            mk(fnc_b, "FNC_B.sql"),
+            mk(tbl_c, "TBL_C1.sql"),
+        ];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let a1 = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "a1"))
+            .expect("a1 in graph");
+
+        let out_dir = dir.path().join("out");
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[a1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect("extraction should succeed");
+
+        let pkg_out = std::fs::read_to_string(out_dir.join("sql/PKG_A.sql")).unwrap();
+        assert!(pkg_out.contains("PROCEDURE a1"), "{pkg_out:?}");
+        assert!(
+            !pkg_out.contains("a2") && !pkg_out.contains("a3"),
+            "same-file non-members trimmed: {pkg_out:?}"
+        );
+
+        let fnc_out = std::fs::read_to_string(out_dir.join("sql/FNC_B.sql")).unwrap();
+        assert!(fnc_out.contains("FUNCTION b1"), "{fnc_out:?}");
+        assert!(!fnc_out.contains("b2"), "{fnc_out:?}");
+
+        let tbl_out = std::fs::read_to_string(out_dir.join("sql/TBL_C1.sql")).unwrap();
+        assert!(tbl_out.contains("CREATE TABLE tbl_c1"), "{tbl_out:?}");
+        assert!(
+            !tbl_out.contains("tbl_other"),
+            "unrelated DDL trimmed: {tbl_out:?}"
+        );
+
+        assert_eq!(outcome.files_written, 3);
+        assert_eq!(outcome.report.files.len(), 3);
     }
 }
