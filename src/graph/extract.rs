@@ -1830,4 +1830,95 @@ CREATE TABLE ghost_tbl(id INT);
         let written = std::fs::read_to_string(out_dir.join("src/c.sql")).unwrap();
         assert!(written.contains("CREATE PROCEDURE caller"), "{written:?}");
     }
+
+    /// An existing output directory is refused (exit-worthy error) unless
+    /// `overwrite` is set — issue #193 requirement 3: no silent merging.
+    #[test]
+    fn should_refuse_existing_output_dir_without_overwrite() {
+        let (graph, root, solo, _dir) = solo_project_fixture();
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let marker = out_dir.join("precious.txt");
+        std::fs::write(&marker, "keep me").unwrap();
+
+        let err = run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect_err("must refuse an existing output dir");
+
+        assert!(
+            matches!(err, ExtractError::OutputDirExists(_)),
+            "expected OutputDirExists, got {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "keep me",
+            "existing dir must not be touched"
+        );
+    }
+
+    /// `overwrite` clears the output directory and re-extracts; stale files
+    /// from a previous run do not survive.
+    #[test]
+    fn should_clear_and_recreate_output_dir_on_overwrite() {
+        let (graph, root, solo, dir) = solo_project_fixture();
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(out_dir.join("stale")).unwrap();
+        std::fs::write(out_dir.join("stale/old.sql"), "old").unwrap();
+
+        run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            true,
+        )
+        .expect("overwrite run should succeed");
+
+        assert!(
+            !out_dir.join("stale").exists(),
+            "stale content must be cleared"
+        );
+        let written = std::fs::read_to_string(out_dir.join("src/s.sql")).unwrap();
+        assert!(written.contains("CREATE PROCEDURE solo"), "{written:?}");
+    }
+
+    /// Shared fixture: a one-procedure project whose graph is already built.
+    fn solo_project_fixture() -> (
+        crate::graph::CodeGraph,
+        PathBuf,
+        petgraph::graph::NodeIndex,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let sql = "CREATE PROCEDURE solo AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        std::fs::write(src.join("s.sql"), sql).unwrap();
+
+        let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from("src/s.sql"),
+            statements: parser.parse_with_text(),
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let solo = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { .. }))
+            .expect("solo in graph");
+        (graph, root, solo, dir)
+    }
 }
