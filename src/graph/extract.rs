@@ -709,6 +709,20 @@ pub fn run_extract(
             }
         }
 
+        // Nothing matched (all stale) — do not write an empty file.
+        if matched.is_empty() {
+            for member in &members {
+                closure_nodes.push(ClosureNodeReport {
+                    key: member.key.clone(),
+                    type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
+                    status: STATUS_MISSING_STATEMENT,
+                    source: Some(file_display.clone()),
+                    output: None,
+                });
+            }
+            continue;
+        }
+
         let spans: Vec<LineSpan> = matched.iter().map(|(_, s)| *s).collect();
         let merged = merge_spans(spans);
         let Some(trimmed) = slice_spans(&source_text, &merged) else {
@@ -1669,5 +1683,151 @@ CREATE TABLE tbl_other(id INT);
 
         assert_eq!(outcome.files_written, 3);
         assert_eq!(outcome.report.files.len(), 3);
+    }
+
+    /// When the source file changed since `codeweb analyze` (stored
+    /// `location.line` no longer starts a statement), no boundary is invented:
+    /// a warning is recorded, the member reports `missing_statement`, and the
+    /// output is not written.
+    #[test]
+    fn should_not_invent_boundaries_for_stale_source_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let sql = "CREATE PROCEDURE solo AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        std::fs::write(src.join("s.sql"), sql).unwrap();
+
+        let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from("src/s.sql"),
+            statements: parser.parse_with_text(),
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let solo = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { .. }))
+            .expect("solo in graph");
+
+        // The file changes after the graph was built: one comment line
+        // inserted at the top shifts every stored line number.
+        std::fs::write(src.join("s.sql"), format!("-- moved\n{sql}")).unwrap();
+
+        let out_dir = dir.path().join("out");
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[solo],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect("run itself should succeed");
+
+        assert!(
+            !out_dir.join("src/s.sql").exists(),
+            "no output must be written from stale lines"
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("no statement starts at line")),
+            "stale line must be warned about: {:?}",
+            outcome.report.warnings
+        );
+        assert!(
+            outcome
+                .report
+                .closure_nodes
+                .iter()
+                .any(|n| n.status == STATUS_MISSING_STATEMENT),
+            "member must report missing_statement: {:?}",
+            outcome.report.closure_nodes
+        );
+    }
+
+    /// Unresolved calls, inferred tables and builtins are listed in the
+    /// report (issue #193 requirement 4) without aborting extraction of the
+    /// extractable members.
+    #[test]
+    fn should_report_unresolved_and_inferred_members_without_aborting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let sql = r#"
+CREATE PROCEDURE caller AS $$
+BEGIN
+    PERFORM mystery_proc();
+    INSERT INTO ghost_tbl SELECT COUNT(*) FROM ghost_tbl;
+END;
+$$;
+
+CREATE TABLE ghost_tbl(id INT);
+"#;
+        // ghost_tbl has NO DDL in this project — remove its statement to make
+        // it inferred-only, as if the DDL lives in an unanalyzed file.
+        let without_ddl = sql
+            .replace("CREATE TABLE ghost_tbl(id INT);\n", "")
+            .trim_start()
+            .to_string();
+        std::fs::write(src.join("c.sql"), &without_ddl).unwrap();
+
+        let tokens = ogsql_parser::Tokenizer::new(&without_ddl).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, without_ddl.clone());
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from("src/c.sql"),
+            statements: parser.parse_with_text(),
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let caller = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "caller"))
+            .expect("caller in graph");
+
+        let out_dir = dir.path().join("out");
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[caller],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect("extraction should succeed");
+
+        let unresolved_keys = outcome
+            .report
+            .unresolved
+            .iter()
+            .map(|u| u.key.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            unresolved_keys.contains("mystery_proc"),
+            "unresolved call must be listed: {unresolved_keys}"
+        );
+        assert!(
+            unresolved_keys.contains("ghost_tbl"),
+            "inferred table must be listed: {unresolved_keys}"
+        );
+        assert!(
+            unresolved_keys.contains("count"),
+            "builtin must be listed: {unresolved_keys}"
+        );
+        // The extractable root is still exported.
+        let written = std::fs::read_to_string(out_dir.join("src/c.sql")).unwrap();
+        assert!(written.contains("CREATE PROCEDURE caller"), "{written:?}");
     }
 }
