@@ -14,6 +14,7 @@
 //! bump or re-analysis.
 
 use ogsql_parser::StatementInfo;
+use std::path::{Path, PathBuf};
 
 /// A statement's source span in 1-based line / 1-based byte-column units,
 /// exactly as reported by ogsql-parser's `StatementInfo`. The end position is
@@ -346,6 +347,69 @@ fn statement_object_name(stmt: &ogsql_parser::ast::Statement) -> Option<String> 
         Statement::CreateEvent(e) => Some(e.name.to_lowercase()),
         Statement::CreateIndex(i) => i.name.as_ref().and_then(|n| last_ident(n)),
         _ => None,
+    }
+}
+
+/// `--nodes-file` content: one NodeKey or resolvable object name per line.
+/// Blank lines and `#` comment lines are skipped; entries are trimmed.
+pub fn parse_nodes_file(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Where a location's file lands inside the output directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputPathMapping {
+    /// Path relative to the output root (directory structure preserved).
+    pub relative: PathBuf,
+    /// True when the location escapes the project root and was flattened to
+    /// the output root's file name; callers add a report warning.
+    pub escaped: bool,
+}
+
+/// Map a node location's file path to its output-relative path.
+///
+/// Relative locations keep their directory structure (`./` components are
+/// dropped). Absolute locations are re-based onto the project root; anything
+/// that would land outside the project root (foreign absolute paths, `..`
+/// components) is flattened to the output root's file name and flagged.
+pub fn output_relative_path(location_file: &Path, project_root: &Path) -> OutputPathMapping {
+    let flatten = |p: &Path| OutputPathMapping {
+        relative: p
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("unknown.sql")),
+        escaped: true,
+    };
+
+    if location_file.is_absolute() {
+        return match location_file.strip_prefix(project_root) {
+            Ok(rel) => OutputPathMapping {
+                relative: rel.to_path_buf(),
+                escaped: false,
+            },
+            Err(_) => flatten(location_file),
+        };
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in location_file.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            _ => return flatten(location_file),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return flatten(location_file);
+    }
+    OutputPathMapping {
+        relative: normalized,
+        escaped: false,
     }
 }
 
@@ -970,5 +1034,49 @@ $$;
             },
         };
         assert_eq!(node_object_name(&trigger).as_deref(), Some("trg"));
+    }
+
+    /// `--nodes-file`: one NodeKey or object name per line; blank lines and
+    /// `#` comment lines are skipped; entries are trimmed.
+    #[test]
+    fn should_parse_nodes_file_skipping_comments_and_blank_lines() {
+        let content = "\
+# 16 target routines for the migration cut
+
+proc:sales.pkg_a.a1
+
+  pkg_a.a2
+# another comment
+func:reporting.b1
+";
+        assert_eq!(
+            parse_nodes_file(content),
+            vec!["proc:sales.pkg_a.a1", "pkg_a.a2", "func:reporting.b1"]
+        );
+    }
+
+    /// Output paths preserve the location's directory structure relative to
+    /// the project root; `./` prefixes are normalized away.
+    #[test]
+    fn should_map_location_relative_path_under_project_root() {
+        let root = PathBuf::from("/proj");
+        let rel = output_relative_path(Path::new("./src/schema/x.sql"), &root);
+        assert_eq!(rel.relative, PathBuf::from("src/schema/x.sql"));
+        assert!(!rel.escaped);
+    }
+
+    /// Locations outside the project root (absolute analyze inputs from other
+    /// trees, `..` escapes) flatten to the output root and are flagged so the
+    /// caller warns instead of silently surprising the user.
+    #[test]
+    fn should_flatten_paths_escaping_project_root() {
+        let root = PathBuf::from("/proj");
+        let outside = output_relative_path(Path::new("/elsewhere/src/x.sql"), &root);
+        assert!(outside.escaped, "absolute path outside root must be flagged");
+        assert_eq!(outside.relative, PathBuf::from("x.sql"));
+
+        let parent = output_relative_path(Path::new("../shared/x.sql"), &root);
+        assert!(parent.escaped, "`..` escape must be flagged");
+        assert_eq!(parent.relative, PathBuf::from("x.sql"));
     }
 }
