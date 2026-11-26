@@ -142,6 +142,37 @@ pub fn slice_spans(source: &str, spans: &[LineSpan]) -> Option<String> {
     Some(parts.join("\n"))
 }
 
+/// Dependency closure of one or more root nodes.
+///
+/// Each root is traversed independently with [`crate::graph::query::traversal`]
+/// machinery (same edge semantics as `trace`/`impact`: every edge kind is
+/// followed, the visited-set makes cycles terminate), then the per-root
+/// results are unioned. Roots themselves are always members (issue #193:
+/// "包含所有起点自身定义"); shared dependencies collapse via the set. Returned
+/// in ascending [`petgraph::graph::NodeIndex`] order for deterministic output.
+pub fn collect_closure(
+    graph: &crate::graph::CodeGraph,
+    roots: &[petgraph::graph::NodeIndex],
+    direction: petgraph::Direction,
+    max_depth: Option<usize>,
+) -> Vec<petgraph::graph::NodeIndex> {
+    use crate::graph::query::traversal::GraphTraversal;
+    use std::collections::BTreeSet;
+
+    let mut closure = BTreeSet::new();
+    for &root in roots {
+        closure.insert(root);
+        let mut traversal = GraphTraversal::new(graph, root).direction(direction);
+        if let Some(depth) = max_depth {
+            traversal = traversal.max_depth(depth);
+        }
+        for idx in traversal.collect_nodes() {
+            closure.insert(idx);
+        }
+    }
+    closure.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +387,180 @@ END;
         // Inter-range gap content (blank lines, unrelated separators) is
         // trimmed; definitions are emitted back-to-back in source order.
         assert_eq!(out, "A1\nx\n/\nA2\ny\n/");
+    }
+
+    // ── Closure fixtures ────────────────────────────────────────
+
+    const CALL_CHAIN_SQL: &str = r#"
+CREATE TABLE shared_tbl(id INT);
+
+CREATE FUNCTION b1() RETURNS INTEGER AS $$
+BEGIN
+    INSERT INTO shared_tbl(id) VALUES (1);
+    RETURN 1;
+END;
+$$;
+
+CREATE PROCEDURE root_a AS $$
+BEGIN
+    PERFORM b1();
+END;
+$$;
+
+CREATE PROCEDURE root_b AS $$
+BEGIN
+    PERFORM b1();
+END;
+$$;
+
+CREATE PROCEDURE unrelated_p AS $$
+BEGIN
+    NULL;
+END;
+$$;
+
+CREATE PROCEDURE cyclic_a AS $$
+BEGIN
+    PERFORM cyclic_b();
+END;
+$$;
+
+CREATE PROCEDURE cyclic_b AS $$
+BEGIN
+    PERFORM cyclic_a();
+END;
+$$;
+"#;
+
+    fn graph_with_nodes(
+        file_name: &str,
+    ) -> (
+        crate::graph::CodeGraph,
+        std::collections::HashMap<String, petgraph::graph::NodeIndex>,
+    ) {
+        let stmts = {
+            let tokens = ogsql_parser::Tokenizer::new(CALL_CHAIN_SQL)
+                .tokenize()
+                .unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, CALL_CHAIN_SQL.to_string());
+            parser.parse_with_text()
+        };
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from(file_name),
+            statements: stmts,
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let mut nodes = std::collections::HashMap::new();
+        for idx in graph.node_indices() {
+            if let crate::graph::Node::Procedure { id, .. } = &graph[idx] {
+                nodes.insert(id.name.clone(), idx);
+            }
+        }
+        (graph, nodes)
+    }
+
+    fn closure_keys(
+        graph: &crate::graph::CodeGraph,
+        roots: &[petgraph::graph::NodeIndex],
+        direction: petgraph::Direction,
+        max_depth: Option<usize>,
+    ) -> Vec<String> {
+        collect_closure(graph, roots, direction, max_depth)
+            .into_iter()
+            .map(|idx| crate::graph::key::NodeKey::from_node(&graph[idx]).to_string())
+            .collect()
+    }
+
+    /// Outgoing closure includes the root itself plus transitive dependencies
+    /// (root_a → b1 → shared_tbl), and nothing else.
+    #[test]
+    fn should_include_root_and_transitive_deps_in_outgoing_closure() {
+        let (graph, nodes) = graph_with_nodes("test.sql");
+        let keys = closure_keys(
+            &graph,
+            &[nodes["root_a"]],
+            petgraph::Direction::Outgoing,
+            None,
+        );
+        assert!(
+            keys.iter().any(|k| k.contains("root_a")),
+            "root itself: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.contains("b1")),
+            "direct dep: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.contains("shared_tbl")),
+            "transitive dep: {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.contains("root_b") || k.contains("unrelated")),
+            "non-dependencies must stay out: {keys:?}"
+        );
+    }
+
+    /// Multiple roots compute the UNION of their closures; a dependency shared
+    /// by both roots appears exactly once.
+    #[test]
+    fn should_union_multiple_roots_and_dedup_shared_deps() {
+        let (graph, nodes) = graph_with_nodes("test.sql");
+        let keys = closure_keys(
+            &graph,
+            &[nodes["root_a"], nodes["root_b"]],
+            petgraph::Direction::Outgoing,
+            None,
+        );
+        let b1_count = keys.iter().filter(|k| k.contains("b1")).count();
+        assert_eq!(b1_count, 1, "shared dep must appear once: {keys:?}");
+        assert!(keys.iter().any(|k| k.contains("root_a")));
+        assert!(keys.iter().any(|k| k.contains("root_b")));
+        assert!(!keys.iter().any(|k| k.contains("unrelated")), "{keys:?}");
+    }
+
+    /// A dependency cycle must terminate (no infinite recursion, no
+    /// duplicated members) — issue #193 requirement 1.
+    #[test]
+    fn should_terminate_on_dependency_cycle() {
+        let (graph, nodes) = graph_with_nodes("test.sql");
+        let keys = closure_keys(
+            &graph,
+            &[nodes["cyclic_a"]],
+            petgraph::Direction::Outgoing,
+            None,
+        );
+        let cyclic_count = keys.iter().filter(|k| k.contains("cyclic")).count();
+        assert_eq!(cyclic_count, 2, "cycle members exactly once each: {keys:?}");
+    }
+
+    /// `max_depth` bounds the recursion: 0 = roots only, 1 = direct deps.
+    #[test]
+    fn should_limit_closure_by_depth() {
+        let (graph, nodes) = graph_with_nodes("test.sql");
+        let depth0 = closure_keys(
+            &graph,
+            &[nodes["root_a"]],
+            petgraph::Direction::Outgoing,
+            Some(0),
+        );
+        assert_eq!(depth0.len(), 1, "depth 0 = root only: {depth0:?}");
+
+        let depth1 = closure_keys(
+            &graph,
+            &[nodes["root_a"]],
+            petgraph::Direction::Outgoing,
+            Some(1),
+        );
+        assert!(
+            depth1.iter().any(|k| k.contains("b1")),
+            "depth 1 includes direct dep: {depth1:?}"
+        );
+        assert!(
+            !depth1.iter().any(|k| k.contains("shared_tbl")),
+            "depth 1 excludes transitive dep: {depth1:?}"
+        );
     }
 }
