@@ -489,7 +489,10 @@ pub enum ExtractError {
     /// Target directory exists and `--overwrite` was not given.
     OutputDirExists(PathBuf),
     /// An output file or directory could not be written.
-    OutputWrite { path: PathBuf, source: std::io::Error },
+    OutputWrite {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for ExtractError {
@@ -581,7 +584,10 @@ pub fn run_extract(
                                reason: String,
                                status: &'static str,
                                source: Option<String>| {
-            unresolved.push(UnresolvedReport { key: key.clone(), reason });
+            unresolved.push(UnresolvedReport {
+                key: key.clone(),
+                reason,
+            });
             closure_nodes.push(ClosureNodeReport {
                 key,
                 type_tag,
@@ -593,12 +599,15 @@ pub fn run_extract(
         match classify_member(node) {
             ClosureMemberKind::Extractable => {
                 let (file, line) = node_location(node).expect("extractable has location");
-                by_file.entry((*file).clone()).or_default().push(FileMember {
-                    idx,
-                    key,
-                    line,
-                    name: node_object_name(node),
-                });
+                by_file
+                    .entry((*file).clone())
+                    .or_default()
+                    .push(FileMember {
+                        idx,
+                        key,
+                        line,
+                        name: node_object_name(node),
+                    });
             }
             ClosureMemberKind::PartialRoutine => {
                 let (file, _) = node_location(node).expect("partial has location");
@@ -657,8 +666,7 @@ pub fn run_extract(
         };
         let file_display = stored_path.to_string_lossy().into_owned();
 
-        let Ok((stmts, source_text)) =
-            crate::parser::parse_sql_file_with_source(&source_path)
+        let Ok((stmts, source_text)) = crate::parser::parse_sql_file_with_source(&source_path)
         else {
             errors.push(format!(
                 "cannot re-parse source file '{}' — its definitions were not extracted",
@@ -829,9 +837,7 @@ fn node_location(node: &crate::graph::Node) -> Option<(std::sync::Arc<PathBuf>, 
         Node::Table { location, .. } | Node::View { location, .. } => {
             location.as_ref().map(|l| (l.file.clone(), l.line))
         }
-        Node::Sequence { location, .. } => {
-            location.as_ref().map(|l| (l.file.clone(), l.line))
-        }
+        Node::Sequence { location, .. } => location.as_ref().map(|l| (l.file.clone(), l.line)),
         _ => None,
     }
 }
@@ -1495,7 +1501,10 @@ func:reporting.b1
     fn should_flatten_paths_escaping_project_root() {
         let root = PathBuf::from("/proj");
         let outside = output_relative_path(Path::new("/elsewhere/src/x.sql"), &root);
-        assert!(outside.escaped, "absolute path outside root must be flagged");
+        assert!(
+            outside.escaped,
+            "absolute path outside root must be flagged"
+        );
         assert_eq!(outside.relative, PathBuf::from("x.sql"));
 
         let parent = output_relative_path(Path::new("../shared/x.sql"), &root);
@@ -1518,10 +1527,10 @@ func:reporting.b1
 
         // Build the graph the same way an analyze would (relative path).
         let stmts = {
-            let tokens =
-                ogsql_parser::Tokenizer::new(CALL_CHAIN_SQL).tokenize().unwrap();
-            let mut parser =
-                ogsql_parser::Parser::with_source(tokens, CALL_CHAIN_SQL.to_string());
+            let tokens = ogsql_parser::Tokenizer::new(CALL_CHAIN_SQL)
+                .tokenize()
+                .unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, CALL_CHAIN_SQL.to_string());
             parser.parse_with_text()
         };
         let parsed = vec![crate::parser::ParsedFile {
@@ -1548,8 +1557,8 @@ func:reporting.b1
         )
         .expect("extraction should succeed");
 
-        let written = std::fs::read_to_string(out_dir.join("src/app.sql"))
-            .expect("output file exists");
+        let written =
+            std::fs::read_to_string(out_dir.join("src/app.sql")).expect("output file exists");
         assert!(written.contains("CREATE PROCEDURE root_a"), "{written:?}");
         assert!(written.contains("CREATE FUNCTION b1"), "{written:?}");
         assert!(written.contains("CREATE TABLE shared_tbl"), "{written:?}");
@@ -1570,9 +1579,13 @@ func:reporting.b1
         assert_eq!(outcome.report.schema_version, 1);
         assert_eq!(outcome.report.files.len(), 1);
         let file_report = &outcome.report.files[0];
-        assert_eq!(file_report.ranges.len(), 3, "{:?}: {outcome:?}", file_report);
-        let starts: Vec<usize> =
-            file_report.ranges.iter().map(|r| r.start_line).collect();
+        assert_eq!(
+            file_report.ranges.len(),
+            3,
+            "{:?}: {outcome:?}",
+            file_report
+        );
+        let starts: Vec<usize> = file_report.ranges.iter().map(|r| r.start_line).collect();
         let mut sorted = starts.clone();
         sorted.sort();
         assert_eq!(starts, sorted, "ranges must be in source order");
@@ -1782,7 +1795,9 @@ CREATE TABLE ghost_tbl(id INT);
             .to_string();
         std::fs::write(src.join("c.sql"), &without_ddl).unwrap();
 
-        let tokens = ogsql_parser::Tokenizer::new(&without_ddl).tokenize().unwrap();
+        let tokens = ogsql_parser::Tokenizer::new(&without_ddl)
+            .tokenize()
+            .unwrap();
         let mut parser = ogsql_parser::Parser::with_source(tokens, without_ddl.clone());
         let parsed = vec![crate::parser::ParsedFile {
             path: PathBuf::from("src/c.sql"),
@@ -1892,6 +1907,78 @@ CREATE TABLE ghost_tbl(id INT);
         );
         let written = std::fs::read_to_string(out_dir.join("src/s.sql")).unwrap();
         assert!(written.contains("CREATE PROCEDURE solo"), "{written:?}");
+    }
+
+    /// Package members share the package statement's start line, so a member
+    /// root exports the WHOLE package spec/body statement — the deployable
+    /// unit. Cutting a lone member out of a package body would produce SQL
+    /// that cannot be deployed; this test locks that granularity decision.
+    #[test]
+    fn should_extract_whole_package_statement_for_member_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_a AS
+    PROCEDURE p1 IS
+    BEGIN
+        NULL;
+    END;
+
+    PROCEDURE p2 IS
+    BEGIN
+        NULL;
+    END;
+END pkg_a;
+/"#;
+        std::fs::write(src.join("pkg.sql"), sql).unwrap();
+
+        let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();
+        let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+        let parsed = vec![crate::parser::ParsedFile {
+            path: PathBuf::from("src/pkg.sql"),
+            statements: parser.parse_with_text(),
+            content_hash: String::new(),
+        }];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let p1 = graph
+            .node_indices()
+            .find(|&idx| {
+                matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.package.as_deref() == Some("pkg_a") && id.name == "p1")
+            })
+            .expect("pkg_a.p1 in graph");
+
+        let out_dir = dir.path().join("out");
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[p1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+        )
+        .expect("extraction should succeed");
+
+        let written = std::fs::read_to_string(out_dir.join("src/pkg.sql")).unwrap();
+        assert!(
+            written.starts_with("CREATE OR REPLACE PACKAGE BODY pkg_a"),
+            "member root exports the package statement, not a fragment: {written:?}"
+        );
+        assert!(
+            written.contains("p1") && written.contains("p2"),
+            "the package body is kept complete (deployable unit): {written:?}"
+        );
+        assert!(
+            outcome
+                .report
+                .closure_nodes
+                .iter()
+                .all(|n| n.status != STATUS_MISSING_STATEMENT),
+            "member must map to the package statement: {:?}",
+            outcome.report.closure_nodes
+        );
     }
 
     /// Shared fixture: a one-procedure project whose graph is already built.

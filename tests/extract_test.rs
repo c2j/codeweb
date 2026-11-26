@@ -1,0 +1,393 @@
+//! #193: `codeweb extract` — dependency-closure-trimmed SQL definition export,
+//! exercised end-to-end through the compiled binary (init → analyze → extract).
+
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use tempfile::TempDir;
+
+/// Committed example fixture (see tests/fixtures/extract/README.md): PKG_A.sql
+/// holds procedures a1..a4 (only a1 is extracted by default; a4 is a second
+/// root sharing the b1 dependency), FNC_B.sql holds functions b1/b2, and
+/// TBL_C1.sql holds two tables. Dependency chain: a1/a4 → b1 → tbl_c1.
+const FIXTURE_PKG_A: &str = include_str!("fixtures/extract/sql/PKG_A.sql");
+const FIXTURE_FNC_B: &str = include_str!("fixtures/extract/sql/FNC_B.sql");
+const FIXTURE_TBL_C1: &str = include_str!("fixtures/extract/sql/TBL_C1.sql");
+const FIXTURE_TARGETS: &str = include_str!("fixtures/extract/targets.txt");
+
+fn codeweb_bin() -> PathBuf {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let bin_name = if cfg!(windows) {
+        "codeweb.exe"
+    } else {
+        "codeweb"
+    };
+    if let Ok(entries) = fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("debug").join(bin_name);
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    base.join("debug").join(bin_name)
+}
+
+fn run_codeweb_in(cwd: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(codeweb_bin())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("failed to run codeweb")
+}
+
+fn fixture_project() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let sql = root.join("sql");
+    fs::create_dir_all(&sql).unwrap();
+
+    fs::write(sql.join("PKG_A.sql"), FIXTURE_PKG_A).unwrap();
+    fs::write(sql.join("FNC_B.sql"), FIXTURE_FNC_B).unwrap();
+    fs::write(sql.join("TBL_C1.sql"), FIXTURE_TBL_C1).unwrap();
+
+    let out = run_codeweb_in(&root, &["init", "issue193-demo", "--dir", "sql"]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_codeweb_in(&root, &["analyze"]);
+    assert!(
+        out.status.success(),
+        "analyze failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, root)
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Acceptance: a single root produces its full dependency closure as trimmed
+/// files — PKG_A.sql contains ONLY a1, FNC_B.sql ONLY b1, TBL_C1.sql ONLY
+/// tbl_c1 (byte-exact, terminators included).
+#[test]
+fn extract_single_root_produces_exact_trimmed_files() {
+    let (_d, root) = fixture_project();
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--node", "a1", "--output", "dependency_sources"],
+    );
+    assert!(
+        out.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        read(&root.join("dependency_sources/sql/PKG_A.sql")),
+        "CREATE OR REPLACE PROCEDURE a1 AS\nBEGIN\n    v := b1(1);\nEND;\n/",
+        "PKG_A.sql must contain exactly the a1 definition"
+    );
+    assert_eq!(
+        read(&root.join("dependency_sources/sql/FNC_B.sql")),
+        "CREATE FUNCTION b1(p INT) RETURNS INTEGER AS $$\nBEGIN\n    INSERT INTO tbl_c1 \
+         VALUES (p);\n    RETURN p;\nEND;\n$$;",
+        "FNC_B.sql must contain exactly the b1 definition"
+    );
+    assert_eq!(
+        read(&root.join("dependency_sources/sql/TBL_C1.sql")),
+        "CREATE TABLE tbl_c1(id INT);",
+        "TBL_C1.sql must contain exactly the tbl_c1 DDL"
+    );
+}
+
+/// Original SQL files keep their exact content and mtime — extract is
+/// read-only on the source tree (issue #193 requirement 3).
+#[test]
+fn extract_preserves_original_files_untouched() {
+    let (_d, root) = fixture_project();
+    let originals = ["sql/PKG_A.sql", "sql/FNC_B.sql", "sql/TBL_C1.sql"];
+    let before: Vec<(String, String, SystemTime)> = originals
+        .iter()
+        .map(|rel| {
+            let meta = fs::metadata(root.join(rel)).unwrap();
+            (
+                rel.to_string(),
+                read(&root.join(rel)),
+                meta.modified().unwrap(),
+            )
+        })
+        .collect();
+
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--node", "a1", "--output", "dependency_sources"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (rel, content, mtime_before) in before {
+        assert_eq!(
+            read(&root.join(&rel)),
+            content,
+            "{rel} content must be unchanged"
+        );
+        let mtime_after = fs::metadata(root.join(&rel)).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "{rel} mtime must be unchanged (read-only extraction)"
+        );
+    }
+}
+
+/// An existing output directory is refused with a non-zero exit and without
+/// touching its content; `--overwrite` clears it and re-extracts.
+#[test]
+fn extract_refuses_existing_output_and_overwrite_replaces() {
+    let (_d, root) = fixture_project();
+
+    // First run creates the output.
+    let out = run_codeweb_in(&root, &["extract", "--node", "a1", "--output", "out"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Second run without --overwrite must fail and keep a pre-existing marker.
+    fs::write(root.join("out/marker.txt"), "keep").unwrap();
+    let out = run_codeweb_in(&root, &["extract", "--node", "a1", "--output", "out"]);
+    assert!(
+        !out.status.success(),
+        "refusal must exit non-zero, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--overwrite"),
+        "refusal message must point at --overwrite: {stderr}"
+    );
+    assert_eq!(read(&root.join("out/marker.txt")), "keep");
+
+    // --overwrite clears and re-extracts.
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--node", "a1", "--output", "out", "--overwrite"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!root.join("out/marker.txt").exists(), "stale file cleared");
+    assert!(root.join("out/sql/PKG_A.sql").exists(), "re-extracted");
+}
+
+/// Multiple roots union their closures; the shared b1 dependency is written
+/// exactly once and same-file roots merge in source order (a1 … a4).
+#[test]
+fn extract_multiple_roots_share_dependency_once() {
+    let (_d, root) = fixture_project();
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--node", "a1", "--node", "a4", "--output", "out"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pkg = read(&root.join("out/sql/PKG_A.sql"));
+    assert_eq!(
+        pkg,
+        "CREATE OR REPLACE PROCEDURE a1 AS\nBEGIN\n    v := b1(1);\nEND;\n/\nCREATE OR \
+         REPLACE PROCEDURE a4 AS\nBEGIN\n    PERFORM b1(7);\nEND;\n/",
+        "a1 and a4 must merge in source order, a2/a3 trimmed"
+    );
+    let fnc = read(&root.join("out/sql/FNC_B.sql"));
+    assert_eq!(
+        fnc.matches("CREATE FUNCTION b1").count(),
+        1,
+        "shared dependency must appear exactly once: {fnc:?}"
+    );
+}
+
+/// `--report` writes the JSON report; unresolved calls and inferred objects
+/// appear there (issue #193 requirement 4).
+#[test]
+fn extract_report_lists_unresolved() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let sql = root.join("sql");
+    fs::create_dir_all(&sql).unwrap();
+    // caller → mystery_proc (unresolved) and ghost_tbl (inferred: no DDL in
+    // the project).
+    fs::write(
+        sql.join("CALLER.sql"),
+        r#"CREATE PROCEDURE caller AS $$
+BEGIN
+    PERFORM mystery_proc();
+    INSERT INTO ghost_tbl SELECT COUNT(*) FROM ghost_tbl;
+END;
+$$;
+"#,
+    )
+    .unwrap();
+    let out = run_codeweb_in(&root, &["init", "unres-demo", "--dir", "sql"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_codeweb_in(&root, &["analyze"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "caller",
+            "--output",
+            "out",
+            "--report",
+            "out/report.json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let report: Value = serde_json::from_str(&read(&root.join("out/report.json"))).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["direction"], "outgoing");
+    let unresolved = report["unresolved"].as_array().unwrap();
+    let keys: Vec<&str> = unresolved
+        .iter()
+        .filter_map(|u| u["key"].as_str())
+        .collect();
+    let joined = keys.join(" | ");
+    assert!(
+        joined.contains("mystery_proc"),
+        "unresolved call must be listed: {joined}"
+    );
+    assert!(
+        joined.contains("ghost_tbl"),
+        "inferred table must be listed: {joined}"
+    );
+    assert!(joined.contains("count"), "builtin must be listed: {joined}");
+    // The extractable root is still exported.
+    assert!(
+        read(&root.join("out/sql/CALLER.sql")).contains("CREATE PROCEDURE caller"),
+        "extractable member exported despite unresolved siblings"
+    );
+}
+
+/// `--direction incoming` collects callers: extracting b1 backwards yields
+/// a1 and a4 definitions plus b1 itself.
+#[test]
+fn extract_incoming_direction_includes_callers() {
+    let (_d, root) = fixture_project();
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "b1",
+            "--direction",
+            "incoming",
+            "--output",
+            "out",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pkg = read(&root.join("out/sql/PKG_A.sql"));
+    assert!(
+        pkg.contains("CREATE OR REPLACE PROCEDURE a1")
+            && pkg.contains("CREATE OR REPLACE PROCEDURE a4"),
+        "incoming closure must include the callers: {pkg:?}"
+    );
+    assert!(
+        !pkg.contains("a2") && !pkg.contains("a3"),
+        "non-callers stay out: {pkg:?}"
+    );
+    assert!(
+        read(&root.join("out/sql/FNC_B.sql")).contains("CREATE FUNCTION b1"),
+        "root definition included"
+    );
+}
+
+/// `--nodes-file`: one root per line, `#` comments and blank lines skipped —
+/// same union as repeating `--node`.
+#[test]
+fn extract_nodes_file_skips_comments_and_blank_lines() {
+    let (_d, root) = fixture_project();
+    fs::write(root.join("targets.txt"), FIXTURE_TARGETS).unwrap();
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--nodes-file", "targets.txt", "--output", "out"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pkg = read(&root.join("out/sql/PKG_A.sql"));
+    assert!(
+        pkg.contains("PROCEDURE a1") && pkg.contains("PROCEDURE a4"),
+        "both file roots extracted: {pkg:?}"
+    );
+    assert_eq!(
+        read(&root.join("out/sql/FNC_B.sql"))
+            .matches("CREATE FUNCTION b1")
+            .count(),
+        1,
+        "shared dependency exactly once"
+    );
+}
+
+/// `--depth 0` restricts the closure to the roots themselves: only the root's
+/// file is written.
+#[test]
+fn extract_depth_zero_limits_to_root() {
+    let (_d, root) = fixture_project();
+    let out = run_codeweb_in(
+        &root,
+        &["extract", "--node", "a1", "--depth", "0", "--output", "out"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(root.join("out/sql/PKG_A.sql").exists(), "root file written");
+    assert!(
+        !root.join("out/sql/FNC_B.sql").exists(),
+        "depth 0 must exclude dependencies"
+    );
+    assert!(
+        !root.join("out/sql/TBL_C1.sql").exists(),
+        "depth 0 must exclude transitive deps"
+    );
+}

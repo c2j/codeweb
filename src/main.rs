@@ -2193,13 +2193,14 @@ fn cmd_extract(
     let mut roots: Vec<petgraph::graph::NodeIndex> = Vec::new();
     let mut seen_roots: std::collections::HashSet<petgraph::graph::NodeIndex> =
         std::collections::HashSet::new();
-    let push_root = |idx: petgraph::graph::NodeIndex,
-                         roots: &mut Vec<petgraph::graph::NodeIndex>,
-                         seen: &mut std::collections::HashSet<petgraph::graph::NodeIndex>| {
-        if seen.insert(idx) {
-            roots.push(idx);
-        }
-    };
+    let push_root =
+        |idx: petgraph::graph::NodeIndex,
+         roots: &mut Vec<petgraph::graph::NodeIndex>,
+         seen: &mut std::collections::HashSet<petgraph::graph::NodeIndex>| {
+            if seen.insert(idx) {
+                roots.push(idx);
+            }
+        };
     for name in &root_names {
         match store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple) {
             codeweb::graph::search::ResolveResult::Single(idx, _) => {
@@ -2214,8 +2215,10 @@ fn cmd_extract(
                 resolution_errors.push(format!("no node matches root '{}'", name));
             }
             codeweb::graph::search::ResolveResult::Ambiguous => {
-                resolution_errors
-                    .push(format!("ambiguous match for root '{}' (--exact may help)", name));
+                resolution_errors.push(format!(
+                    "ambiguous match for root '{}' (--exact may help)",
+                    name
+                ));
             }
         }
     }
@@ -2264,11 +2267,9 @@ fn cmd_extract(
         })?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    error::CodeWebError::FileRead {
-                        path: parent.to_path_buf(),
-                        source: e,
-                    }
+                std::fs::create_dir_all(parent).map_err(|e| error::CodeWebError::FileRead {
+                    path: parent.to_path_buf(),
+                    source: e,
                 })?;
             }
         }
