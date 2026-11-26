@@ -167,6 +167,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb columns --procedure <name>` | Aggregate column-analysis for a procedure/package (`--format json`, or `seed-hints` for the predicate/table requirement inventory: signature, per-table ops, cross-table equalities, configurable discriminator values, each with provenance + confidence) |
 | `codeweb predicates --procedure <name>` | PL IF/CASE predicates resolved to table columns (JSON) |
 | `codeweb query` | Execute declarative JSON QuerySpec |
+| `codeweb extract` | Export the dependency closure of nodes as trimmed SQL definition files (`--node`/`--nodes-file`, `--direction outgoing|incoming`, `--depth`, `--output`, `--overwrite`, `--report`) |
 | `codeweb import` | Import CGEF JSON graph file |
 | `codeweb merge` | Merge multiple graph stores |
 | `codeweb dedup` | Deduplicate graph nodes and edges |
@@ -208,6 +209,51 @@ Tags with `*` suffix indicate inferred nodes (referenced in DML but without DDL 
 | Unresolved | `unres` | Unresolved reference |
 
 System tables/views in known system schemas (`pg_catalog`, `sys`, `dbe_*`, etc.) and well-known system names (`dual`, `sys_dummy`) are marked with `system: true` in JSON output. Use `--system` flag to filter them.
+
+## Extracting Dependency-Closure SQL (`extract`)
+
+Given one or more graph nodes, `codeweb extract` computes the dependency
+closure (outgoing = dependencies, by default; `--direction incoming` for
+callers) and writes the **original SQL definition text** of every closure
+member into an output directory, trimmed per file — same-file definitions the
+closure doesn't need are left out.
+
+```sh
+codeweb extract -p <project> \
+    --node proc:sales.pkg_a.a1 --node pkg_a.a4 \
+    --output ./dependency_sources
+# or read roots from a file (one NodeKey or object name per line,
+# `#` comments / blank lines skipped):
+codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sources
+```
+
+Behavior:
+
+- Roots resolve exactly like `trace`/`detail` (substring by default,
+  `--exact`/`--regex`, `--all-matches`, `--fail-on-multiple`).
+- `--depth N` bounds recursion (default: unlimited); depth 0 = roots only.
+- Statement boundaries come from a **fresh re-parse** of the involved files at
+  extraction time (`StatementInfo` line/col spans — strings, comments,
+  dollar-quoted bodies and nested BEGIN/END are handled by the parser), so
+  existing stores keep working without re-analysis.
+- Output paths mirror the source layout relative to the project root; output
+  file order follows the source file order.
+- The original SQL files are **never modified**.
+- An existing output directory is refused (non-zero exit) unless `--overwrite`
+  is given (clears it first).
+- Members without an extractable SQL definition — unresolved dynamic calls,
+  inferred tables/views, built-in functions, XML/Java/JSP graph nodes, partial
+  package-spec declarations — are listed in the `--report <path>` JSON (roots,
+  closure nodes with status, per-file ranges, unresolved, warnings, errors).
+  A stale store (source changed since `codeweb analyze`) produces a warning
+  and no invented boundary; run `codeweb analyze` to refresh.
+- Package members resolve to their defining `CREATE PACKAGE [BODY]` statement:
+  the package spec/body is the deployable unit, so a member root exports the
+  complete statement rather than a lone member fragment.
+
+A minimal runnable example lives in
+[`tests/fixtures/extract`](tests/fixtures/extract/README.md) (A1→B1→C1 chain
+across three files) and is exercised by `tests/extract_test.rs`.
 
 ## HTTP API (serve mode)
 
@@ -529,6 +575,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb columns --procedure <name>` | 按过程/包聚合列级分析结果（`--format json`；`--format seed-hints` 为谓词/表需求清单：签名、每表操作、跨表等式、可配置判别列取值，每条带 provenance + confidence） |
 | `codeweb predicates --procedure <name>` | 解析 PL IF/CASE 条件为表列谓词 (JSON) |
 | `codeweb query` | 执行声明式 JSON QuerySpec |
+| `codeweb extract` | 将节点的依赖闭包导出为按文件裁剪的 SQL 定义文件（`--node`/`--nodes-file`，`--direction outgoing|incoming`，`--depth`，`--output`，`--overwrite`，`--report`） |
 | `codeweb import` | 导入 CGEF JSON 图谱文件 |
 | `codeweb merge` | 合并多个图谱存储 |
 | `codeweb dedup` | 去重图谱节点和边 |
@@ -570,6 +617,44 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | 未解析引用 | `unres` | Unresolved Reference |
 
 已知系统 schema（`pg_catalog`、`sys`、`dbe_*` 等）和系统表名（`dual`、`sys_dummy`）中的表/视图会标记 `system: true`。可使用 `--system` 过滤。
+
+## 提取依赖闭包 SQL（extract）
+
+以一个或多个图节点为起点，`codeweb extract` 沿依赖方向递归计算闭包（默认
+`outgoing` = 依赖方；`--direction incoming` = 调用方），把闭包内每个对象的
+**原始 SQL 定义**按文件裁剪后写入输出目录——同文件内闭包不需要的定义不会
+被携带。
+
+```sh
+codeweb extract -p <project> \
+    --node proc:sales.pkg_a.a1 --node pkg_a.a4 \
+    --output ./dependency_sources
+# 也可从文件读取起点（每行一个 NodeKey 或对象名，`#` 注释行与空行跳过）：
+codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sources
+```
+
+行为约定：
+
+- 起点解析与 `trace`/`detail` 完全一致（默认子串匹配，`--exact`/`--regex`、
+  `--all-matches`、`--fail-on-multiple`）。
+- `--depth N` 限制递归深度（默认不限；0 = 仅起点自身）。
+- 定义边界来自提取时对相关文件的**现场重新解析**（`StatementInfo`
+  行/列 span——字符串、注释、dollar-quoted、嵌套 BEGIN/END 由 parser 处理），
+  既有图谱无需重新分析即可复用。
+- 输出路径按相对项目根的目录结构镜像源码布局；输出文件内的定义按原文件顺序排列。
+- **绝不修改**原始 SQL 文件。
+- 输出目录已存在时默认拒绝（退出非 0）；`--overwrite` 才会清空重建。
+- 没有可提取 SQL 定义的闭包成员——未解析动态调用、推断型表/视图、内建函数、
+  XML/Java/JSP 图节点、包规范 partial 声明——全部列入 `--report <path>` JSON
+  （roots、closure_nodes 状态、逐文件 range、unresolved、warnings、errors）。
+  源文件在 `codeweb analyze` 之后发生过变化时给出 warning 且不编造边界，请
+  重新 `codeweb analyze`。
+- 包成员定位到其所属的 `CREATE PACKAGE [BODY]` 语句：包规范/包体是可部署
+  单元，成员起点导出的是完整包语句而非孤立成员片段。
+
+最小可运行示例见
+[`tests/fixtures/extract`](tests/fixtures/extract/README.md)（跨三个文件的
+A1→B1→C1 链），由 `tests/extract_test.rs` 覆盖。
 
 ## HTTP API（serve 模式）
 
