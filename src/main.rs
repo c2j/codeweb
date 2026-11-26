@@ -458,6 +458,61 @@ enum Commands {
         project: PathBuf,
     },
 
+    /// #193: export the dependency closure of one or more nodes as trimmed
+    /// SQL definition files. Roots follow the same resolution grammar as
+    /// `trace`/`detail` (substring by default, `--exact`/`--regex`, or a full
+    /// NodeKey like `proc:schema.pkg.name`).
+    #[command(group(clap::ArgGroup::new("extract_target").required(true).multiple(false)))]
+    Extract {
+        /// Root node(s): NodeKey or resolvable object name (repeatable)
+        #[arg(long, group = "extract_target")]
+        node: Vec<String>,
+
+        /// File with one root per line (`#` comments and blank lines skipped)
+        #[arg(long, group = "extract_target")]
+        nodes_file: Option<PathBuf>,
+
+        /// Closure direction: outgoing (dependencies, default) or incoming (callers)
+        #[arg(long, default_value = "outgoing", value_parser = ["outgoing", "incoming"])]
+        direction: String,
+
+        /// Maximum recursion depth (omit for unlimited)
+        #[arg(long)]
+        depth: Option<usize>,
+
+        /// Output directory for the trimmed SQL files (required)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Replace an existing output directory (clears it first)
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Write the extraction report JSON (roots, closure, files, unresolved)
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Exact case-insensitive key match
+        #[arg(long, conflicts_with = "regex")]
+        exact: bool,
+
+        /// Regex match against node keys
+        #[arg(long, conflicts_with = "exact")]
+        regex: bool,
+
+        /// Process all matching nodes per root name
+        #[arg(long)]
+        all_matches: bool,
+
+        /// Exit with error on ambiguous root match
+        #[arg(long)]
+        fail_on_multiple: bool,
+
+        /// Project directory (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        project: PathBuf,
+    },
+
     /// #167: PL IF/CASE predicates resolved to table columns.
     Predicates {
         /// Procedure or function name (substring match, same as `columns`)
@@ -1020,6 +1075,32 @@ fn run() -> Result<()> {
             discriminator,
             project,
         }) => cmd_columns(procedure, package, table, &format, discriminator, &project),
+        Some(Commands::Extract {
+            node,
+            nodes_file,
+            direction,
+            depth,
+            output,
+            overwrite,
+            report,
+            exact,
+            regex,
+            all_matches,
+            fail_on_multiple,
+            project,
+        }) => cmd_extract(
+            node,
+            nodes_file.as_deref(),
+            &direction,
+            depth,
+            &output,
+            overwrite,
+            report.as_deref(),
+            match_mode_from_flags(exact, regex),
+            all_matches,
+            fail_on_multiple,
+            &project,
+        ),
         Some(Commands::Predicates {
             procedure,
             format,
@@ -2056,6 +2137,179 @@ fn cmd_columns(
                 message: format!("Unknown format: {}. Use 'json' or 'seed-hints'", other),
             });
         }
+    }
+
+    Ok(())
+}
+
+/// #193: `codeweb extract` — dependency-closure-trimmed SQL definition export.
+///
+/// Roots resolve exactly like `trace`/`detail`; each unresolvable root is
+/// recorded as an error without aborting the run. Partial failures exit 0
+/// (the report carries them); only a run that can do nothing (no root
+/// resolved) or a refused output directory exits non-zero.
+#[allow(clippy::too_many_arguments)]
+fn cmd_extract(
+    nodes: Vec<String>,
+    nodes_file: Option<&Path>,
+    direction: &str,
+    depth: Option<usize>,
+    output: &Path,
+    overwrite: bool,
+    report_path: Option<&Path>,
+    match_mode: codeweb::graph::search::MatchMode,
+    all_matches: bool,
+    fail_on_multiple: bool,
+    project: &Path,
+) -> Result<()> {
+    use codeweb::graph::extract;
+
+    // ── Gather root names ──
+    let mut root_names = nodes;
+    if let Some(path) = nodes_file {
+        let content = std::fs::read_to_string(path).map_err(|e| error::CodeWebError::FileRead {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let entries = extract::parse_nodes_file(&content);
+        if entries.is_empty() {
+            eprintln!("note: --nodes-file {} contains no entries", path.display());
+        }
+        root_names.extend(entries);
+    }
+    if root_names.is_empty() {
+        return Err(error::CodeWebError::ExportError {
+            message: "no roots given: pass --node or --nodes-file".to_string(),
+        });
+    }
+
+    let mut proj = project::Project::find(project)?;
+    let project_root = proj.root().to_path_buf();
+    let store = proj.load_store()?;
+    let graph = store.graph();
+
+    // ── Resolve roots (a failed root is an error entry, not a hard stop) ──
+    let mut resolution_errors: Vec<String> = Vec::new();
+    let mut roots: Vec<petgraph::graph::NodeIndex> = Vec::new();
+    let mut seen_roots: std::collections::HashSet<petgraph::graph::NodeIndex> =
+        std::collections::HashSet::new();
+    let push_root = |idx: petgraph::graph::NodeIndex,
+                         roots: &mut Vec<petgraph::graph::NodeIndex>,
+                         seen: &mut std::collections::HashSet<petgraph::graph::NodeIndex>| {
+        if seen.insert(idx) {
+            roots.push(idx);
+        }
+    };
+    for name in &root_names {
+        match store.resolve_single_node(name, match_mode, all_matches, fail_on_multiple) {
+            codeweb::graph::search::ResolveResult::Single(idx, _) => {
+                push_root(idx, &mut roots, &mut seen_roots);
+            }
+            codeweb::graph::search::ResolveResult::Multiple(matches) => {
+                for (idx, _) in matches {
+                    push_root(idx, &mut roots, &mut seen_roots);
+                }
+            }
+            codeweb::graph::search::ResolveResult::Empty => {
+                resolution_errors.push(format!("no node matches root '{}'", name));
+            }
+            codeweb::graph::search::ResolveResult::Ambiguous => {
+                resolution_errors
+                    .push(format!("ambiguous match for root '{}' (--exact may help)", name));
+            }
+        }
+    }
+    if roots.is_empty() {
+        for err in &resolution_errors {
+            eprintln!("error: {}", err);
+        }
+        return Err(error::CodeWebError::ExportError {
+            message: "no root could be resolved — nothing to extract".to_string(),
+        });
+    }
+
+    let direction_enum = match direction {
+        "outgoing" => petgraph::Direction::Outgoing,
+        "incoming" => petgraph::Direction::Incoming,
+        other => {
+            return Err(error::CodeWebError::ExportError {
+                message: format!("unknown direction '{}' (use outgoing|incoming)", other),
+            });
+        }
+    };
+
+    let outcome = extract::run_extract(
+        graph,
+        &project_root,
+        &roots,
+        direction_enum,
+        direction,
+        depth,
+        output,
+        overwrite,
+    )
+    .map_err(|e| error::CodeWebError::ExportError {
+        message: e.to_string(),
+    })?;
+
+    let mut report = outcome.report;
+    report.errors.splice(0..0, resolution_errors);
+
+    // ── Report file ──
+    if let Some(path) = report_path {
+        let json = serde_json::to_string_pretty(&report).map_err(|e| {
+            error::CodeWebError::ExportError {
+                message: format!("failed to serialize extract report: {}", e),
+            }
+        })?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    error::CodeWebError::FileRead {
+                        path: parent.to_path_buf(),
+                        source: e,
+                    }
+                })?;
+            }
+        }
+        std::fs::write(path, json).map_err(|e| error::CodeWebError::FileRead {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    // ── Human summary ──
+    let extracted_count = report
+        .closure_nodes
+        .iter()
+        .filter(|n| n.status == extract::STATUS_EXTRACTED)
+        .count();
+    println_stdout!(
+        "Extracted {} definition(s) from {} file(s) into {}",
+        extracted_count,
+        report.files.len(),
+        output.display()
+    );
+    println_stdout!(
+        "roots: {} | closure nodes: {} ({} unresolved)",
+        report.roots.len(),
+        report.closure_nodes.len(),
+        report.unresolved.len()
+    );
+    if !report.warnings.is_empty() {
+        println_stdout!("warnings: {}", report.warnings.len());
+        for w in &report.warnings {
+            eprintln!("warning: {}", w);
+        }
+    }
+    if !report.errors.is_empty() {
+        println_stdout!("errors: {}", report.errors.len());
+        for e in &report.errors {
+            eprintln!("error: {}", e);
+        }
+    }
+    if let Some(path) = report_path {
+        println_stdout!("report: {}", path.display());
     }
 
     Ok(())

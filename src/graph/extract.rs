@@ -345,7 +345,7 @@ fn statement_object_name(stmt: &ogsql_parser::ast::Statement) -> Option<String> 
         Statement::CreateSynonym(s) => last_ident(&s.name),
         Statement::CreateTrigger(t) => Some(t.name.to_lowercase()),
         Statement::CreateEvent(e) => Some(e.name.to_lowercase()),
-        Statement::CreateIndex(i) => i.name.as_ref().and_then(|n| last_ident(n)),
+        Statement::CreateIndex(i) => i.name.as_ref().and_then(last_ident),
         _ => None,
     }
 }
@@ -522,6 +522,7 @@ struct FileMember {
 /// is refused unless `overwrite` (then cleared and recreated). Members whose
 /// stored location no longer matches a statement in the re-parsed file are
 /// reported via warnings (stale store), never given invented boundaries.
+#[allow(clippy::too_many_arguments)]
 pub fn run_extract(
     graph: &crate::graph::CodeGraph,
     project_root: &Path,
@@ -731,7 +732,7 @@ pub fn run_extract(
                  last `codeweb analyze`; nothing written for it",
                 file_display
             ));
-            for (slot, member) in members.iter().enumerate() {
+            for member in members.iter() {
                 closure_nodes.push(ClosureNodeReport {
                     key: member.key.clone(),
                     type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
