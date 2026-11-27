@@ -671,12 +671,18 @@ pub fn analyzed_source_paths(graph: &crate::graph::CodeGraph) -> Vec<PathBuf> {
 /// resolves (review on #194, round 2).
 pub fn validate_extract_targets_for_graph(
     graph: &crate::graph::CodeGraph,
+    manifest_paths: &[PathBuf],
     project_root: &Path,
     output_dir: &Path,
     report_path: Option<&Path>,
 ) -> Result<(), ExtractError> {
-    let source_paths: Vec<PathBuf> = analyzed_source_paths(graph)
+    // Protection = graph-node files UNION store-manifest files: analyzed
+    // files that produced zero nodes (e.g. comment-only SQL) appear only
+    // in the manifest and must be protected just the same (review on #194,
+    // round 3).
+    let mut source_paths: Vec<PathBuf> = analyzed_source_paths(graph)
         .into_iter()
+        .chain(manifest_paths.iter().cloned())
         .map(|p| {
             if p.is_absolute() {
                 p
@@ -685,6 +691,8 @@ pub fn validate_extract_targets_for_graph(
             }
         })
         .collect();
+    source_paths.sort();
+    source_paths.dedup();
     validate_extract_targets(project_root, output_dir, report_path, &source_paths)
 }
 
@@ -1484,6 +1492,7 @@ pub fn run_extract(
     output_dir: &Path,
     overwrite: bool,
     report_path: Option<&Path>,
+    manifest_paths: &[PathBuf],
 ) -> Result<ExtractOutcome, ExtractError> {
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -1643,7 +1652,13 @@ pub fn run_extract(
     // filesystem mutation. `--overwrite` must never be able to delete or
     // overwrite analyzed sources — ALL of them, not just closure members
     // (review on #194, round 2). ──
-    validate_extract_targets_for_graph(graph, project_root, output_dir, report_path)?;
+    validate_extract_targets_for_graph(
+        graph,
+        manifest_paths,
+        project_root,
+        output_dir,
+        report_path,
+    )?;
 
     // Map every source file to its output-relative path up front. Two
     // different stored paths resolving to the same output path is a hard
@@ -3081,6 +3096,7 @@ func:reporting.b1
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3202,6 +3218,7 @@ CREATE TABLE tbl_other(id INT);
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3269,6 +3286,7 @@ CREATE TABLE tbl_other(id INT);
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("run itself should succeed");
 
@@ -3350,6 +3368,7 @@ CREATE TABLE ghost_tbl(id INT);
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3397,6 +3416,7 @@ CREATE TABLE ghost_tbl(id INT);
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect_err("must refuse an existing output dir");
 
@@ -3430,6 +3450,7 @@ CREATE TABLE ghost_tbl(id INT);
             &out_dir,
             true,
             None,
+            &[],
         )
         .expect("overwrite run should succeed");
 
@@ -3484,6 +3505,7 @@ END pkg_sib;
             &dir.path().join("out"),
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3557,6 +3579,7 @@ END pkg_ts;
             &dir.path().join("out"),
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3620,6 +3643,7 @@ END pkg_q;
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("run completes with per-file errors recorded");
 
@@ -3726,6 +3750,7 @@ END pkg_a;
             &out_dir,
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3795,6 +3820,7 @@ END pkg_t;
             &dir.path().join("out"),
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3846,6 +3872,7 @@ END pkg_m;
             &dir.path().join("out"),
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3923,6 +3950,7 @@ END pkg_b;
             &dir.path().join("out"),
             false,
             None,
+            &[],
         )
         .expect("extraction should succeed");
 
@@ -3984,6 +4012,7 @@ END pkg_b;
             &src_dir,
             true,
             None,
+            &[],
         )
         .expect_err("output dir containing sources must be refused");
 
@@ -4013,6 +4042,7 @@ END pkg_b;
             &root,
             true,
             None,
+            &[],
         )
         .expect_err("project root as output must be refused");
         assert!(matches!(err, ExtractError::ProtectedPath { .. }));
@@ -4037,6 +4067,7 @@ END pkg_b;
             &root.join("out"),
             false,
             Some(&src_file),
+            &[],
         )
         .expect_err("report path on a source file must be refused");
 
@@ -4094,6 +4125,7 @@ END pkg_b;
             &unrelated,
             true,
             None,
+            &[],
         )
         .expect_err("output dir containing analyzed sources must be refused");
         assert!(
@@ -4117,6 +4149,7 @@ END pkg_b;
             &root.join("out"),
             false,
             Some(&unrelated.join("keep.sql")),
+            &[],
         )
         .expect_err("report path on an analyzed source must be refused");
         assert!(matches!(err, ExtractError::ProtectedPath { .. }));
@@ -4184,6 +4217,7 @@ END pkg_b;
             &root.join("link/../victim"),
             true,
             None,
+            &[],
         )
         .expect_err("symlink+.. output resolving onto sources must be refused");
         assert!(
@@ -4271,6 +4305,7 @@ END pkg_b;
             &root.join("out"),
             false,
             None,
+            &[],
         )
         .expect_err("colliding output paths must fail");
         assert!(matches!(err, ExtractError::ProtectedPath { .. }));

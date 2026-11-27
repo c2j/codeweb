@@ -2191,14 +2191,24 @@ fn cmd_extract(
     let project_root = proj.root().to_path_buf();
     let store = proj.load_store()?;
     let graph = store.graph();
+    // Protection covers analyzed files that produced ZERO graph nodes
+    // (e.g. comment-only SQL) — they exist only in the store manifest
+    // (review on #194 round 3).
+    let manifest_paths: Vec<std::path::PathBuf> = store.manifest().keys().cloned().collect();
 
     // ── Pre-flight (review on #194 round 2): validate output/report
     // targets against EVERY analyzed source before ANY write path —
     // including the early report written when no root resolves below. ──
-    extract::validate_extract_targets_for_graph(graph, &project_root, output, report_path)
-        .map_err(|e| error::CodeWebError::ExportError {
-            message: e.to_string(),
-        })?;
+    extract::validate_extract_targets_for_graph(
+        graph,
+        &manifest_paths,
+        &project_root,
+        output,
+        report_path,
+    )
+    .map_err(|e| error::CodeWebError::ExportError {
+        message: e.to_string(),
+    })?;
 
     // Resolve the report path with the same filesystem semantics the
     // validation used; every report write below uses THIS path object
@@ -2302,6 +2312,7 @@ fn cmd_extract(
         output,
         overwrite,
         report_path,
+        &manifest_paths,
     )
     .map_err(|e| error::CodeWebError::ExportError {
         message: e.to_string(),

@@ -550,3 +550,95 @@ fn extract_early_report_write_is_source_protected() {
         "analyzed source must not be overwritten by the early report"
     );
 }
+
+/// Regression (review on #194 round 3, blocker F): files that were
+/// ANALYZED but produced ZERO graph nodes (e.g. comment-only SQL) exist
+/// only in the store manifest — `--output <their dir> --overwrite` and
+/// `--report <their file>` must still be refused.
+#[test]
+fn extract_protects_analyzed_files_with_zero_nodes() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let sql = root.join("sql");
+    let unrel = root.join("unrelated");
+    fs::create_dir_all(&sql).unwrap();
+    fs::create_dir_all(&unrel).unwrap();
+    fs::write(
+        sql.join("A.sql"),
+        "CREATE PROCEDURE a1 IS\nBEGIN\n    NULL;\nEND;\n/\n",
+    )
+    .unwrap();
+    let empty = unrel.join("empty.sql");
+    let empty_src = "-- comment only: analyzed but zero graph nodes\n";
+    fs::write(&empty, empty_src).unwrap();
+
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "init",
+            "zero-node-demo",
+            "--dir",
+            "sql",
+            "--dir",
+            "unrelated",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_codeweb_in(&root, &["analyze"]);
+    assert!(
+        out.status.success(),
+        "analyze failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --output on the zero-node file's directory must be refused.
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "a1",
+            "--output",
+            "unrelated",
+            "--overwrite",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "--output on a zero-node analyzed dir must exit non-zero: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        read(&empty),
+        empty_src,
+        "zero-node analyzed file must survive --overwrite"
+    );
+
+    // --report on the zero-node file itself must be refused.
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "a1",
+            "--output",
+            "out2",
+            "--report",
+            "unrelated/empty.sql",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "--report on a zero-node analyzed file must exit non-zero: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        read(&empty),
+        empty_src,
+        "zero-node analyzed file must not be overwritten by the report"
+    );
+}
