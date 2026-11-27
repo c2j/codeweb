@@ -92,6 +92,26 @@ pub fn parse_sql_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
     files
 }
 
+/// Parse one SQL file, returning its statements together with the **decoded
+/// source text** the statement spans refer to (`codeweb extract` slices the
+/// original definitions out of this text). Uses the same UTF-8/GBK decoding
+/// and parse pipeline as [`parse_sql_files`], so line/col spans line up with
+/// graph `SourceLocation.line` values recorded at analyze time.
+pub fn parse_sql_file_with_source(
+    path: &Path,
+) -> std::result::Result<(Vec<StatementInfo>, String), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {}", e))?;
+    let sql = decode_sql_bytes(bytes);
+
+    let tokens = Tokenizer::new(&sql)
+        .tokenize()
+        .map_err(|e| format!("tokenize error: {}", e))?;
+
+    let mut parser = ogsql_parser::Parser::with_source(tokens, sql.clone());
+    let stmts = parser.parse_with_text();
+    Ok((stmts, sql))
+}
+
 fn decode_sql_bytes(bytes: Vec<u8>) -> String {
     match String::from_utf8(bytes) {
         Ok(s) => s,

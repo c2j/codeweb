@@ -4,6 +4,7 @@ pub mod builder;
 pub mod cluster;
 pub mod columns;
 pub mod conflict;
+pub mod extract;
 pub mod format;
 pub mod inspect;
 pub mod key;

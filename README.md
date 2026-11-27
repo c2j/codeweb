@@ -167,6 +167,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb columns --procedure <name>` | Aggregate column-analysis for a procedure/package (`--format json`, or `seed-hints` for the predicate/table requirement inventory: signature, per-table ops, cross-table equalities, configurable discriminator values, each with provenance + confidence) |
 | `codeweb predicates --procedure <name>` | PL IF/CASE predicates resolved to table columns (JSON) |
 | `codeweb query` | Execute declarative JSON QuerySpec |
+| `codeweb extract` | Export the dependency closure of nodes as trimmed SQL definition files (`--node`/`--nodes-file`, `--direction outgoing|incoming`, `--depth`, `--output`, `--overwrite`, `--report`) |
 | `codeweb import` | Import CGEF JSON graph file |
 | `codeweb merge` | Merge multiple graph stores |
 | `codeweb dedup` | Deduplicate graph nodes and edges |
@@ -208,6 +209,80 @@ Tags with `*` suffix indicate inferred nodes (referenced in DML but without DDL 
 | Unresolved | `unres` | Unresolved reference |
 
 System tables/views in known system schemas (`pg_catalog`, `sys`, `dbe_*`, etc.) and well-known system names (`dual`, `sys_dummy`) are marked with `system: true` in JSON output. Use `--system` flag to filter them.
+
+## Extracting Dependency-Closure SQL (`extract`)
+
+Given one or more graph nodes, `codeweb extract` computes the dependency
+closure (outgoing = dependencies, by default; `--direction incoming` for
+callers) and writes the **original SQL definition text** of every closure
+member into an output directory, trimmed per file — same-file definitions the
+closure doesn't need are left out.
+
+```sh
+codeweb extract -p <project> \
+    --node proc:sales.pkg_a.a1 --node pkg_a.a4 \
+    --output ./dependency_sources
+# or read roots from a file (one NodeKey or object name per line,
+# `#` comments / blank lines skipped):
+codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sources
+```
+
+Behavior:
+
+- Roots resolve like `trace`/`detail` (substring by default,
+  `--exact`/`--regex`), but **strictly**: an ambiguous or unmatched root is
+  recorded in the report's `errors` and the command exits non-zero — a fuzzy
+  name never silently exports the wrong definition. `--all-matches` is the
+  explicit opt-in that expands a name to every match.
+- `--depth N` bounds recursion (default: unlimited); depth 0 = roots only.
+- Statement boundaries come from a **fresh re-parse** of the involved files at
+  extraction time (`StatementInfo` line/col spans — strings, comments,
+  dollar-quoted bodies and nested BEGIN/END are handled by the parser), so
+  existing stores keep working without re-analysis. A stored location whose
+  line no longer matches a statement (file changed since `codeweb analyze`)
+  is reported, never guessed.
+- Output paths mirror the source layout relative to the project root
+  (canonicalized, so `..` segments that re-enter the root still map
+  correctly); a source path that cannot be mapped safely under the root —
+  or two sources colliding on one output path — is a hard error, never a
+  silent flatten. Output file order follows the source file order.
+- The original SQL files are **never modified**; `--output`/`--report`
+  targets equal to or containing the project root or any source file are
+  refused before anything is written or deleted.
+- An existing output directory is refused (non-zero exit) unless `--overwrite`
+  is given (clears it first).
+- Members without an extractable SQL definition — unresolved dynamic calls,
+  inferred tables/views, built-in functions, XML/Java/JSP graph nodes, partial
+  package-spec declarations — are listed in the `--report <path>` JSON (roots,
+  closure nodes with status, per-file ranges, unresolved, warnings, errors).
+  A stale store (source changed since `codeweb analyze`) produces a warning
+  and no invented boundary; run `codeweb analyze` to refresh.
+- Package members are trimmed **at member level**: when the closure hits
+  members of package `P`, the output is a reassembled
+  `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;` containing only the
+  selected member bodies (or, for the spec, only their signatures) plus the
+  package-level declarations they transitively reference — deployable, never
+  the whole package verbatim. Selecting any member also pulls in the
+  package's spec statement (from whichever file it lives in, trimmed to the
+  selected signatures plus the declarations the member bodies reference);
+  when no spec exists in the analyzed sources a minimal spec is synthesized
+  from the member signatures and a warning is recorded. Reassembly is
+  two-phase — all package statements are decomposed before any member is
+  selected — so the result never depends on file order. A kept member that
+  references a same-package
+  sibling member by name pulls that sibling into the selection (iterated to
+  a fixpoint), so the reassembled package stays self-contained even when the
+  graph has no edge for the call (e.g. dynamic SQL). Declaration and sibling
+  retention are lexical approximations (word-boundary, case-insensitive):
+  references hidden inside string-built SQL that never names the sibling
+  cannot be seen. When a needed package statement's member boundaries
+  cannot be determined reliably, the file fails explicitly — an error is
+  recorded, nothing is written for it, and the run exits non-zero — rather
+  than silently emitting the whole package.
+
+A minimal runnable example lives in
+[`tests/fixtures/extract`](tests/fixtures/extract/README.md) (A1→B1→C1 chain
+across three files) and is exercised by `tests/extract_test.rs`.
 
 ## HTTP API (serve mode)
 
@@ -529,6 +604,7 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | `codeweb columns --procedure <name>` | 按过程/包聚合列级分析结果（`--format json`；`--format seed-hints` 为谓词/表需求清单：签名、每表操作、跨表等式、可配置判别列取值，每条带 provenance + confidence） |
 | `codeweb predicates --procedure <name>` | 解析 PL IF/CASE 条件为表列谓词 (JSON) |
 | `codeweb query` | 执行声明式 JSON QuerySpec |
+| `codeweb extract` | 将节点的依赖闭包导出为按文件裁剪的 SQL 定义文件（`--node`/`--nodes-file`，`--direction outgoing|incoming`，`--depth`，`--output`，`--overwrite`，`--report`） |
 | `codeweb import` | 导入 CGEF JSON 图谱文件 |
 | `codeweb merge` | 合并多个图谱存储 |
 | `codeweb dedup` | 去重图谱节点和边 |
@@ -570,6 +646,55 @@ codeweb merge -o full-graph.bincode my-project.bincode erp-store.bincode
 | 未解析引用 | `unres` | Unresolved Reference |
 
 已知系统 schema（`pg_catalog`、`sys`、`dbe_*` 等）和系统表名（`dual`、`sys_dummy`）中的表/视图会标记 `system: true`。可使用 `--system` 过滤。
+
+## 提取依赖闭包 SQL（extract）
+
+以一个或多个图节点为起点，`codeweb extract` 沿依赖方向递归计算闭包（默认
+`outgoing` = 依赖方；`--direction incoming` = 调用方），把闭包内每个对象的
+**原始 SQL 定义**按文件裁剪后写入输出目录——同文件内闭包不需要的定义不会
+被携带。
+
+```sh
+codeweb extract -p <project> \
+    --node proc:sales.pkg_a.a1 --node pkg_a.a4 \
+    --output ./dependency_sources
+# 也可从文件读取起点（每行一个 NodeKey 或对象名，`#` 注释行与空行跳过）：
+codeweb extract -p <project> --nodes-file targets.txt --output ./dependency_sources
+```
+
+行为约定：
+
+- 起点解析与 `trace`/`detail` 一致（默认子串匹配，`--exact`/`--regex`），但
+  **严格**：歧义或无匹配的起点会记入报告 `errors` 并以非 0 退出——模糊
+  名称绝不会静默导出错误的定义。`--all-matches` 是显式放行选项，把一个
+  名称展开为全部命中。
+- `--depth N` 限制递归深度（默认不限；0 = 仅起点自身）。
+- 定义边界来自提取时对相关文件的**现场重新解析**（`StatementInfo`
+  行/列 span——字符串、注释、dollar-quoted、嵌套 BEGIN/END 由 parser 处理），
+  既有图谱无需重新分析即可复用。存储位置在重新解析后对不上任何语句
+  （`codeweb analyze` 之后文件已变化）只进报告，绝不猜测边界。
+- 输出路径按相对项目根的目录结构镜像源码布局（经 canonicalize，回绕到
+  根内的 `..` 段也能正确映射）；无法安全映射到根内的源路径、或多个源文件
+  映射到同一输出路径，均为硬错误，绝不静默平铺。输出文件内的定义按原文件
+  顺序排列。
+- **绝不修改**原始 SQL 文件；`--output`/`--report` 目标等于或包含项目根
+  或任一源文件时，在任何写入/删除之前即被拒绝。
+- 输出目录已存在时默认拒绝（退出非 0）；`--overwrite` 才会清空重建。
+- 没有可提取 SQL 定义的闭包成员——未解析动态调用、推断型表/视图、内建函数、
+  XML/Java/JSP 图节点、包规范 partial 声明——全部列入 `--report <path>` JSON
+  （roots、closure_nodes 状态、逐文件 range、unresolved、warnings、errors）。
+  源文件在 `codeweb analyze` 之后发生过变化时给出 warning 且不编造边界，请
+  重新 `codeweb analyze`。
+- 包成员按**成员级**裁剪：闭包命中包 `P` 的成员时，输出为重组的
+  `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;`——只含选中成员
+  的函数体（规范侧则只含其签名），以及这些成员传递引用到的包级声明，
+  可部署但绝不再是整包原文。声明保留是词法近似（词边界 + 大小写不敏感）：
+  动态 SQL（`EXECUTE '…'`）中的引用无法识别；被保留成员引用了未入闭包的
+  兄弟成员时会给出 warning。
+
+最小可运行示例见
+[`tests/fixtures/extract`](tests/fixtures/extract/README.md)（跨三个文件的
+A1→B1→C1 链），由 `tests/extract_test.rs` 覆盖。
 
 ## HTTP API（serve 模式）
 
