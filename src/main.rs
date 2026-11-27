@@ -2192,6 +2192,14 @@ fn cmd_extract(
     let store = proj.load_store()?;
     let graph = store.graph();
 
+    // ── Pre-flight (review on #194 round 2): validate output/report
+    // targets against EVERY analyzed source before ANY write path —
+    // including the early report written when no root resolves below. ──
+    extract::validate_extract_targets_for_graph(graph, &project_root, output, report_path)
+        .map_err(|e| error::CodeWebError::ExportError {
+            message: e.to_string(),
+        })?;
+
     // ── Resolve roots (a failed root is an error entry, not a hard stop) ──
     let mut resolution_errors: Vec<String> = Vec::new();
     let mut roots: Vec<petgraph::graph::NodeIndex> = Vec::new();

@@ -566,12 +566,88 @@ impl std::fmt::Display for ExtractError {
     }
 }
 
+/// Every file that participated in the analysis — all node kinds carrying a
+/// source path (SQL `SourceLocation`s, mapper XML, Java, JSP). Source
+/// protection must cover the WHOLE graph, not just the extraction closure:
+/// `--output <dir> --overwrite` / `--report <file>` pointing at an analyzed
+/// file outside the closure used to pass validation and destroy it (review
+/// on #194, round 2).
+pub fn analyzed_source_paths(graph: &crate::graph::CodeGraph) -> Vec<PathBuf> {
+    use crate::graph::Node;
+    let mut out: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for idx in graph.node_indices() {
+        let node = &graph[idx];
+        match node {
+            Node::Procedure { location, .. }
+            | Node::Function { location, .. }
+            | Node::Package { location, .. }
+            | Node::Trigger { location, .. }
+            | Node::Type { location, .. }
+            | Node::Index { location, .. }
+            | Node::MaterializedView { location, .. }
+            | Node::Synonym { location, .. }
+            | Node::Event { location, .. }
+            | Node::BuiltinFunction { location, .. } => {
+                out.insert(location.file.as_ref().clone());
+            }
+            Node::Table { location, .. }
+            | Node::View { location, .. }
+            | Node::Sequence { location, .. }
+            | Node::Custom { location, .. } => {
+                if let Some(loc) = location {
+                    out.insert(loc.file.as_ref().clone());
+                }
+            }
+            Node::MappedStatement { xml_file, .. } => {
+                out.insert(xml_file.clone());
+            }
+            Node::JavaSql { java_file, .. } => {
+                out.insert(java_file.clone());
+            }
+            Node::JavaMethod { file, .. }
+            | Node::JavaClass { file, .. }
+            | Node::JspSql { file, .. } => {
+                out.insert(file.clone());
+            }
+            Node::JspPage { path, .. } => {
+                out.insert(path.clone());
+            }
+            Node::Unresolved { .. } => {}
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Run-level pre-flight shared by the CLI and [`run_extract`]: refuse
+/// output/report targets that would delete or overwrite ANY analyzed
+/// source — the whole graph, not just the extraction closure. Called before
+/// any write path, including the early report written when no root
+/// resolves (review on #194, round 2).
+pub fn validate_extract_targets_for_graph(
+    graph: &crate::graph::CodeGraph,
+    project_root: &Path,
+    output_dir: &Path,
+    report_path: Option<&Path>,
+) -> Result<(), ExtractError> {
+    let source_paths: Vec<PathBuf> = analyzed_source_paths(graph)
+        .into_iter()
+        .map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                project_root.join(p)
+            }
+        })
+        .collect();
+    validate_extract_targets(project_root, output_dir, report_path, &source_paths)
+}
+
 /// Refuse any output/report target that would delete or overwrite project
 /// sources (review on #194: `--output <srcdir> --overwrite` used to wipe the
 /// analyzed SQL files and still exit 0).
 ///
 /// The output directory must not be, contain, or sit on the ancestor chain of
-/// the project root or of any closure source file; the report path must not
+/// the project root or of any analyzed source file; the report path must not
 /// equal or contain a source file. All comparisons run on canonicalized
 /// absolute paths so `..`/symlink tricks cannot slip through.
 fn validate_extract_targets(
@@ -1384,18 +1460,9 @@ pub fn run_extract(
 
     // ── Pre-flight: validate targets and output mappings BEFORE any
     // filesystem mutation. `--overwrite` must never be able to delete or
-    // overwrite analyzed sources (review on #194). ──
-    let source_paths: Vec<PathBuf> = by_file
-        .keys()
-        .map(|p| {
-            if p.is_absolute() {
-                p.clone()
-            } else {
-                project_root.join(p)
-            }
-        })
-        .collect();
-    validate_extract_targets(project_root, output_dir, report_path, &source_paths)?;
+    // overwrite analyzed sources — ALL of them, not just closure members
+    // (review on #194, round 2). ──
+    validate_extract_targets_for_graph(graph, project_root, output_dir, report_path)?;
 
     // Map every source file to its output-relative path up front. Two
     // different stored paths resolving to the same output path is a hard
@@ -3292,6 +3359,89 @@ END pkg_b;
 
         assert!(matches!(err, ExtractError::ProtectedPath { .. }));
         assert_eq!(std::fs::read(&src_file).unwrap(), before);
+        assert!(
+            !root.join("out").exists(),
+            "refusal happens before the output dir is created"
+        );
+    }
+
+    /// Regression (review on #194 round 2, blocker): source protection must
+    /// cover EVERY analyzed file, not just closure members.
+    /// `unrelated/keep.sql` was analyzed (its nodes are in the graph) but is
+    /// not in `a1`'s closure — `--output unrelated --overwrite` and
+    /// `--report unrelated/keep.sql` must both be refused before any write.
+    #[test]
+    fn should_protect_analyzed_sources_outside_the_closure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let used = root.join("used");
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&used).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let a_sql = "CREATE PROCEDURE a1 AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        let keep_sql = "CREATE PROCEDURE keep_p AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        std::fs::write(used.join("a.sql"), a_sql).unwrap();
+        std::fs::write(unrelated.join("keep.sql"), keep_sql).unwrap();
+
+        let mk = |text: &str, stored: &str| {
+            let tokens = ogsql_parser::Tokenizer::new(text).tokenize().unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, text.to_string());
+            crate::parser::ParsedFile {
+                path: PathBuf::from(stored),
+                statements: parser.parse_with_text(),
+                content_hash: String::new(),
+            }
+        };
+        let parsed = vec![mk(a_sql, "used/a.sql"), mk(keep_sql, "unrelated/keep.sql")];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let a1 = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "a1"))
+            .expect("a1 in graph");
+        let keep_before = std::fs::read(unrelated.join("keep.sql")).unwrap();
+
+        // Output dir containing an analyzed-but-not-in-closure source.
+        let err = run_extract(
+            &graph,
+            &root,
+            &[a1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &unrelated,
+            true,
+            None,
+        )
+        .expect_err("output dir containing analyzed sources must be refused");
+        assert!(
+            matches!(err, ExtractError::ProtectedPath { .. }),
+            "expected ProtectedPath, got {err}"
+        );
+        assert_eq!(
+            std::fs::read(unrelated.join("keep.sql")).unwrap(),
+            keep_before,
+            "keep.sql must survive --overwrite"
+        );
+
+        // Report path equal to an analyzed-but-not-in-closure source.
+        let err = run_extract(
+            &graph,
+            &root,
+            &[a1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &root.join("out"),
+            false,
+            Some(&unrelated.join("keep.sql")),
+        )
+        .expect_err("report path on an analyzed source must be refused");
+        assert!(matches!(err, ExtractError::ProtectedPath { .. }));
+        assert_eq!(
+            std::fs::read(unrelated.join("keep.sql")).unwrap(),
+            keep_before,
+            "keep.sql must not be overwritten by the report"
+        );
         assert!(
             !root.join("out").exists(),
             "refusal happens before the output dir is created"

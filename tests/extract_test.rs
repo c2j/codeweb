@@ -516,3 +516,37 @@ fn extract_rejects_ambiguous_root_name() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Regression (review on #194 round 2, blocker): when EVERY root fails to
+/// resolve, the early `--report` write must still pass source protection —
+/// a report path equal to an analyzed source file is refused and the file
+/// is left byte-identical.
+#[test]
+fn extract_early_report_write_is_source_protected() {
+    let (_d, root) = fixture_project();
+    let target = root.join("sql/PKG_A.sql");
+    let before = read(&target);
+
+    let out = run_codeweb_in(
+        &root,
+        &[
+            "extract",
+            "--node",
+            "no_such_object_anywhere",
+            "--output",
+            "out",
+            "--report",
+            "sql/PKG_A.sql",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "report on a source file must exit non-zero even when roots fail: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        read(&target),
+        before,
+        "analyzed source must not be overwritten by the early report"
+    );
+}
