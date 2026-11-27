@@ -388,50 +388,92 @@ fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
-/// Lexically resolve `.` and `..` components without touching the
-/// filesystem (symlinks are handled later by `canonicalize`).
-fn normalize_lexical(path: &Path) -> PathBuf {
+/// Resolve `path` to the unique canonical location the filesystem would
+/// use, component by component (review on #194 round 2): every existing
+/// component is checked with `symlink_metadata`, symlinks are canonicalized
+/// BEFORE any following `..` is applied, `.`/`..` move on the real parent,
+/// and a dangling symlink or an uninspectable component is an explicit
+/// error. Nonexistent tail components cannot contain symlinks, so they join
+/// lexically — `..` among them still pops the real (canonical) parent.
+///
+/// Validation AND every subsequent read/write/delete MUST use this same
+/// resolved path: mixing a lexically-folded check with raw-path fs ops was
+/// the `link/../victim` TOCTOU hole.
+pub fn resolve_fs_path(path: &Path) -> Result<PathBuf, String> {
     use std::path::Component;
+    let abs = absolutize(path);
     let mut out = PathBuf::new();
-    for comp in path.components() {
+    let mut comps = abs.components().peekable();
+    while let Some(comp) = comps.next() {
         match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() && !path.has_root() {
-                    out.push("..");
+                // `..` pops the real parent; at the filesystem root it is a
+                // no-op (POSIX). `out` is always canonical so far, so the
+                // pop lands on the true parent directory.
+                if !out.pop() && !out.has_root() {
+                    return Err(format!(
+                        "'..' in '{}' escapes the filesystem root",
+                        path.display()
+                    ));
                 }
             }
-            other => out.push(other.as_os_str()),
+            Component::Normal(name) => {
+                let cand = out.join(name);
+                match std::fs::symlink_metadata(&cand) {
+                    Ok(md) => {
+                        if md.file_type().is_symlink() {
+                            match cand.canonicalize() {
+                                Ok(canon) => out = canon,
+                                Err(e) => {
+                                    return Err(format!(
+                                        "cannot resolve symlink '{}': {}",
+                                        cand.display(),
+                                        e
+                                    ));
+                                }
+                            }
+                        } else {
+                            out = cand;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Tail does not exist: nothing below it can be a
+                        // symlink — append it and the remaining components
+                        // lexically (`..` still pops the real parent).
+                        out = cand;
+                        for rest in comps {
+                            match rest {
+                                Component::Normal(n) => out.push(n),
+                                Component::CurDir => {}
+                                Component::ParentDir => {
+                                    if !out.pop() && !out.has_root() {
+                                        return Err(format!(
+                                            "'..' in '{}' escapes the filesystem root",
+                                            path.display()
+                                        ));
+                                    }
+                                }
+                                Component::Prefix(_) | Component::RootDir => {
+                                    return Err(format!(
+                                        "unexpected path component in '{}'",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(format!("cannot inspect '{}': {}", cand.display(), e));
+                    }
+                }
+            }
         }
     }
-    out
-}
-
-/// Canonicalize `path` even when its tail does not exist yet (e.g. an output
-/// directory that has not been created): resolve the deepest existing
-/// ancestor and re-append the missing components lexically. This resolves
-/// `.`/`..`/symlinks for the existing part, which is what makes stored
-/// `../<project>/...` analyze paths map back under the project root.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
-    let normalized = normalize_lexical(path);
-    let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = normalized.clone();
-    loop {
-        if let Ok(canon) = cur.canonicalize() {
-            let mut out = canon;
-            for comp in missing.iter().rev() {
-                out.push(comp);
-            }
-            return out;
-        }
-        match (cur.file_name(), cur.parent()) {
-            (Some(name), Some(parent)) => {
-                missing.push(name.to_os_string());
-                cur = parent.to_path_buf();
-            }
-            _ => return normalized,
-        }
-    }
+    Ok(out)
 }
 
 /// Map a node location's file path to its output-relative path.
@@ -449,8 +491,8 @@ pub fn output_relative_path(location_file: &Path, project_root: &Path) -> Result
     } else {
         absolutize(project_root).join(location_file)
     };
-    let canon = canonicalize_lenient(&abs);
-    let root_canon = canonicalize_lenient(&absolutize(project_root));
+    let canon = resolve_fs_path(&abs)?;
+    let root_canon = resolve_fs_path(&absolutize(project_root))?;
     match canon.strip_prefix(&root_canon) {
         Ok(rel) if !rel.as_os_str().is_empty() => Ok(rel.to_path_buf()),
         _ => Err(format!(
@@ -660,8 +702,11 @@ fn validate_extract_targets(
         path: path.to_path_buf(),
         reason,
     };
-    let root_c = canonicalize_lenient(&absolutize(project_root));
-    let out_c = canonicalize_lenient(&absolutize(output_dir));
+    let resolve = |path: &Path| -> Result<PathBuf, ExtractError> {
+        resolve_fs_path(path).map_err(|reason| protected(path, reason))
+    };
+    let root_c = resolve(&absolutize(project_root))?;
+    let out_c = resolve(&absolutize(output_dir))?;
     if out_c == root_c || root_c.starts_with(&out_c) {
         return Err(protected(
             output_dir,
@@ -670,8 +715,8 @@ fn validate_extract_targets(
     }
     let src_canons: Vec<PathBuf> = source_paths
         .iter()
-        .map(|p| canonicalize_lenient(&absolutize(p)))
-        .collect();
+        .map(|p| resolve(&absolutize(p)))
+        .collect::<Result<_, _>>()?;
     for (src, canon) in source_paths.iter().zip(src_canons.iter()) {
         if canon == &out_c || canon.starts_with(&out_c) {
             return Err(protected(
@@ -684,7 +729,7 @@ fn validate_extract_targets(
         }
     }
     if let Some(report) = report_path {
-        let rep_c = canonicalize_lenient(&absolutize(report));
+        let rep_c = resolve(&absolutize(report))?;
         for (src, canon) in source_paths.iter().zip(src_canons.iter()) {
             if canon == &rep_c || canon.starts_with(&rep_c) {
                 return Err(protected(
@@ -1488,18 +1533,26 @@ pub fn run_extract(
     }
 
     // Output directory policy (issue #193 requirement 3): refuse instead of
-    // silently merging into an existing tree.
-    if output_dir.exists() {
-        if !overwrite {
-            return Err(ExtractError::OutputDirExists(output_dir.to_path_buf()));
-        }
-        std::fs::remove_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
+    // silently merging into an existing tree. All filesystem operations use
+    // the SAME resolved path the validation checked (review on #194 round
+    // 2): `link/../victim`-style inputs must not validate one path and
+    // delete another.
+    let out_dir_resolved =
+        resolve_fs_path(output_dir).map_err(|reason| ExtractError::ProtectedPath {
             path: output_dir.to_path_buf(),
+            reason,
+        })?;
+    if out_dir_resolved.exists() {
+        if !overwrite {
+            return Err(ExtractError::OutputDirExists(out_dir_resolved.clone()));
+        }
+        std::fs::remove_dir_all(&out_dir_resolved).map_err(|source| ExtractError::OutputWrite {
+            path: out_dir_resolved.clone(),
             source,
         })?;
     }
-    std::fs::create_dir_all(output_dir).map_err(|source| ExtractError::OutputWrite {
-        path: output_dir.to_path_buf(),
+    std::fs::create_dir_all(&out_dir_resolved).map_err(|source| ExtractError::OutputWrite {
+        path: out_dir_resolved.clone(),
         source,
     })?;
 
@@ -1770,7 +1823,7 @@ pub fn run_extract(
             .get(&stored_path)
             .expect("output mapping precomputed for every by_file key")
             .clone();
-        let out_path = output_dir.join(&rel);
+        let out_path = out_dir_resolved.join(&rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| ExtractError::OutputWrite {
                 path: parent.to_path_buf(),
@@ -3446,6 +3499,105 @@ END pkg_b;
             !root.join("out").exists(),
             "refusal happens before the output dir is created"
         );
+    }
+
+    /// Regression (review on #194 round 2, blocker): canonical validation
+    /// and the actual fs operations must resolve `..`/symlinks with real
+    /// filesystem semantics. `link -> real/subdir` plus
+    /// `--output link/../victim --overwrite` used to validate `<root>/victim`
+    /// but DELETE `<root>/real/victim`.
+    #[cfg(unix)]
+    #[test]
+    fn should_resolve_symlink_dotdot_output_to_the_real_victim_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("used")).unwrap();
+        std::fs::create_dir_all(root.join("real/subdir")).unwrap();
+        std::fs::create_dir_all(root.join("real/victim")).unwrap();
+        let a_sql = "CREATE PROCEDURE a1 AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        let keep_sql = "CREATE PROCEDURE keep_p AS\nBEGIN\n    NULL;\nEND;\n/\n";
+        std::fs::write(root.join("used/a.sql"), a_sql).unwrap();
+        std::fs::write(root.join("real/victim/keep.sql"), keep_sql).unwrap();
+        // link -> real/subdir (relative target resolves inside proj).
+        std::os::unix::fs::symlink("real/subdir", root.join("link")).unwrap();
+
+        let mk = |text: &str, stored: &str| {
+            let tokens = ogsql_parser::Tokenizer::new(text).tokenize().unwrap();
+            let mut parser = ogsql_parser::Parser::with_source(tokens, text.to_string());
+            crate::parser::ParsedFile {
+                path: PathBuf::from(stored),
+                statements: parser.parse_with_text(),
+                content_hash: String::new(),
+            }
+        };
+        let parsed = vec![
+            mk(a_sql, "used/a.sql"),
+            mk(keep_sql, "real/victim/keep.sql"),
+        ];
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let a1 = graph
+            .node_indices()
+            .find(|&idx| matches!(&graph[idx], crate::graph::Node::Procedure { id, .. } if id.name == "a1"))
+            .expect("a1 in graph");
+        let keep_before = std::fs::read(root.join("real/victim/keep.sql")).unwrap();
+
+        // link/../victim resolves through the symlink to real/victim —
+        // which contains an analyzed source, so the run must be refused
+        // and keep.sql must survive.
+        let err = run_extract(
+            &graph,
+            &root,
+            &[a1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &root.join("link/../victim"),
+            true,
+            None,
+        )
+        .expect_err("symlink+.. output resolving onto sources must be refused");
+        assert!(
+            matches!(err, ExtractError::ProtectedPath { .. }),
+            "expected ProtectedPath, got {err}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("real/victim/keep.sql")).unwrap(),
+            keep_before,
+            "victim/keep.sql must survive"
+        );
+        assert!(
+            root.join("real/victim").is_dir(),
+            "victim dir must not be deleted"
+        );
+    }
+
+    /// `resolve_fs_path` applies filesystem semantics component by
+    /// component: symlinks are resolved before `..` is applied, `.`/`..`
+    /// move on the real parent, and unresolvable tails (dangling symlink)
+    /// are explicit errors — never a silently different path.
+    #[cfg(unix)]
+    #[test]
+    fn should_resolve_fs_path_with_real_symlink_semantics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::fs::create_dir_all(base.join("real/other")).unwrap();
+        std::os::unix::fs::symlink("real/sub", base.join("link")).unwrap();
+        // Dangling symlink: exists per lstat but canonicalize fails.
+        std::os::unix::fs::symlink("no/such/target", base.join("dangle")).unwrap();
+
+        // link/../other == real/other (.. applies to the symlink TARGET's
+        // parent, not to the lexical parent).
+        let resolved = resolve_fs_path(&base.join("link/../other")).unwrap();
+        assert_eq!(resolved, base.join("real/other").canonicalize().unwrap());
+
+        // A dangling symlink in the path is an explicit error.
+        assert!(resolve_fs_path(&base.join("dangle/x")).is_err());
+        // `..` at the filesystem root stays at the root (POSIX), not an
+        // error — `/../etc` resolves to the canonical `/etc` (a symlink on
+        // macOS, so compare against canonicalize).
+        let root_resolved = resolve_fs_path(Path::new("/../etc")).unwrap();
+        assert_eq!(root_resolved, Path::new("/etc").canonicalize().unwrap());
     }
 
     /// Two different stored paths resolving to the same output path must be

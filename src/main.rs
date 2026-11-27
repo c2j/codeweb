@@ -2200,6 +2200,18 @@ fn cmd_extract(
             message: e.to_string(),
         })?;
 
+    // Resolve the report path with the same filesystem semantics the
+    // validation used; every report write below uses THIS path object
+    // (review on #194 round 2: validate and write must not diverge).
+    let report_path_buf = report_path
+        .map(|p| {
+            extract::resolve_fs_path(p).map_err(|reason| error::CodeWebError::ExportError {
+                message: format!("cannot resolve report path '{}': {}", p.display(), reason),
+            })
+        })
+        .transpose()?;
+    let report_path = report_path_buf.as_deref();
+
     // ── Resolve roots (a failed root is an error entry, not a hard stop) ──
     let mut resolution_errors: Vec<String> = Vec::new();
     let mut roots: Vec<petgraph::graph::NodeIndex> = Vec::new();
