@@ -262,10 +262,16 @@ Behavior:
   `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;` containing only the
   selected member bodies (or, for the spec, only their signatures) plus the
   package-level declarations they transitively reference — deployable, never
-  the whole package verbatim. Declaration retention is a lexical
-  approximation (word-boundary, case-insensitive): references hidden inside
-  dynamic SQL (`EXECUTE '…'`) cannot be seen, and a kept member referencing
-  an unselected sibling produces a warning.
+  the whole package verbatim. A kept member that references a same-package
+  sibling member by name pulls that sibling into the selection (iterated to
+  a fixpoint), so the reassembled package stays self-contained even when the
+  graph has no edge for the call (e.g. dynamic SQL). Declaration and sibling
+  retention are lexical approximations (word-boundary, case-insensitive):
+  references hidden inside string-built SQL that never names the sibling
+  cannot be seen. When a needed package statement's member boundaries
+  cannot be determined reliably, the file fails explicitly — an error is
+  recorded, nothing is written for it, and the run exits non-zero — rather
+  than silently emitting the whole package.
 
 A minimal runnable example lives in
 [`tests/fixtures/extract`](tests/fixtures/extract/README.md) (A1→B1→C1 chain
