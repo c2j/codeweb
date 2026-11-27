@@ -776,10 +776,6 @@ struct PackageTrim {
     text: String,
     /// Selected member names actually found (and emitted) in the AST items.
     found_members: std::collections::BTreeSet<String>,
-    /// Lowercased text of the kept member bodies — lets a sibling spec trim
-    /// keep declarations the members reference (spec signatures alone would
-    /// miss them).
-    member_hay: String,
     /// The statement's start line (for segment ordering / range reports).
     start_line: usize,
     end_line: usize,
@@ -1020,8 +1016,23 @@ struct PackageAnalysis {
     /// Lowercased member name → full member text, lowercased (input for
     /// word-boundary reference scans).
     member_texts: std::collections::BTreeMap<String, String>,
+    /// Member name → signature usable in a synthesized spec
+    /// (`PROCEDURE p(x INT);`). For spec members this is the signature
+    /// text itself; for body members it is the header up to `IS|AS`.
+    member_sigs: std::collections::BTreeMap<String, String>,
     /// Every AST member name (lowercased, qualified).
     member_names: std::collections::BTreeSet<String>,
+}
+
+/// A package statement decomposed for extraction, plus its identity.
+struct PkgStmtInfo {
+    /// Qualified lowercased package name (`schema.pkg` or `pkg`).
+    pkg: String,
+    /// `true` for `CREATE PACKAGE` (spec), `false` for `CREATE PACKAGE BODY`.
+    is_spec: bool,
+    /// `None` when the statement exists but its member boundaries cannot
+    /// be determined — using it must fail the file explicitly.
+    analysis: Option<PackageAnalysis>,
 }
 
 /// `AS`/`IS` keyword test shared by the package-statement region scan.
@@ -1197,6 +1208,7 @@ fn analyze_package_statement(
 
     let mut cursor_tok = as_tok + 1;
     let mut member_texts = std::collections::BTreeMap::new();
+    let mut member_sigs = std::collections::BTreeMap::new();
     let mut member_names = std::collections::BTreeSet::new();
     for (ms, me, name) in &member_ranges {
         // Decl gap before this member: global indices (cursor_tok, ms).
@@ -1214,6 +1226,18 @@ fn analyze_package_statement(
         });
         member_texts.insert(name.clone(), source[start..end].to_lowercase());
         member_names.insert(name.clone());
+        // Signature for a synthesized spec: spec members already ARE
+        // signatures (text ends with `;`); body members contribute their
+        // header up to the `IS|AS` that introduces the body.
+        let sig = if is_spec {
+            let text = source[start..end].trim().to_string();
+            (!text.is_empty()).then_some(text)
+        } else {
+            member_signature(source, &tokens, *ms, *me)
+        };
+        if let Some(sig) = sig {
+            member_sigs.insert(name.clone(), sig);
+        }
         cursor_tok = me + 1;
     }
     if end_tok > cursor_tok {
@@ -1232,8 +1256,35 @@ fn analyze_package_statement(
         end_line: span.end_line,
         pieces,
         member_texts,
+        member_sigs,
         member_names,
     })
+}
+
+/// The `PROCEDURE|FUNCTION name(…)` header of a body member, terminated
+/// with `;` — the signature a synthesized spec needs. The header ends at
+/// the first depth-0 `IS`/`AS` keyword inside the member's token range.
+fn member_signature(
+    source: &str,
+    tokens: &[TokenWithSpan],
+    start_tok: usize,
+    end_tok: usize,
+) -> Option<String> {
+    let mut paren_depth = 0i32;
+    for i in start_tok + 1..=end_tok {
+        match &tokens[i].token {
+            Token::LParen => paren_depth += 1,
+            Token::RParen => paren_depth -= 1,
+            t if paren_depth == 0 && is_as_or_is_keyword(t) => {
+                let text = source[tokens[start_tok].span.start..tokens[i].span.start]
+                    .trim_end()
+                    .to_string();
+                return (!text.is_empty()).then(|| format!("{text};"));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Reassemble a decomposed package statement for `selected` members plus
@@ -1362,7 +1413,6 @@ fn assemble_package_trim(
     PackageTrim {
         text: out,
         found_members,
-        member_hay,
         start_line: analysis.start_line,
         end_line: analysis.end_line,
     }
@@ -1557,6 +1607,38 @@ pub fn run_extract(
         }
     }
 
+    // ── Spec auto-include (review on #194 round 2, fix E): any selected
+    // package member needs its spec statement. A package node's location
+    // IS the spec statement's line when a spec was analyzed (the builder
+    // lets the spec overwrite the body location), so make sure that file
+    // and node take part in the extraction — phase 3 then trims the spec
+    // to the selected members' signatures plus the declarations their
+    // bodies reference, or synthesizes a minimal spec when the graph has
+    // none. ──
+    for idx in graph.node_indices() {
+        let crate::graph::Node::Package { schema, name, .. } = &graph[idx] else {
+            continue;
+        };
+        let pkg = routine_pkg_qualified(schema, name);
+        if pkg_members.get(&pkg).is_none_or(|s| s.is_empty()) {
+            continue;
+        }
+        let Some((file, line)) = node_location(&graph[idx]) else {
+            continue;
+        };
+        let members = by_file.entry((*file).clone()).or_default();
+        if members.iter().any(|m| m.idx == idx) {
+            continue;
+        }
+        members.push(FileMember {
+            idx,
+            key: key_of(idx),
+            line,
+            name: node_object_name(&graph[idx]),
+            route: MemberRoute::PackageNode { pkg },
+        });
+    }
+
     // ── Pre-flight: validate targets and output mappings BEFORE any
     // filesystem mutation. `--overwrite` must never be able to delete or
     // overwrite analyzed sources — ALL of them, not just closure members
@@ -1610,20 +1692,22 @@ pub fn run_extract(
         source,
     })?;
 
-    // pkg → kept member-body text across ALL files, so a spec trim (possibly
-    // in a different file than the body) retains declarations the selected
-    // members' bodies reference.
-    let mut body_hay: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-
-    // Slice each file's members out of a fresh parse of that file.
-    let mut files_report: Vec<FileExtractionReport> = Vec::new();
-    let mut files_written: usize = 0;
-    for (stored_path, members) in by_file {
+    // ── Phase 1: parse every closure file and decompose the package
+    // statements its routed members need — for ALL files before any
+    // selection or output decision, so results never depend on file
+    // processing order (review on #194 round 2, fix E). ──
+    struct FileWork {
+        stmts: Vec<StatementInfo>,
+        source_text: String,
+        index: std::collections::BTreeMap<usize, Vec<SpanCandidate>>,
+        pkg_stmts: std::collections::HashMap<usize, PkgStmtInfo>,
+    }
+    let mut works: std::collections::HashMap<PathBuf, FileWork> = std::collections::HashMap::new();
+    for (stored_path, members) in &by_file {
         let source_path = if stored_path.is_absolute() {
             stored_path.clone()
         } else {
-            project_root.join(&stored_path)
+            project_root.join(stored_path)
         };
         let file_display = stored_path.to_string_lossy().into_owned();
 
@@ -1633,7 +1717,7 @@ pub fn run_extract(
                 "cannot re-parse source file '{}' — its definitions were not extracted",
                 source_path.display()
             ));
-            for member in &members {
+            for member in members {
                 closure_nodes.push(ClosureNodeReport {
                     key: member.key.clone(),
                     type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
@@ -1645,6 +1729,182 @@ pub fn run_extract(
             continue;
         };
         let index = build_span_index(&stmts);
+
+        // Decompose every package statement a routed member points at.
+        let needed: std::collections::BTreeSet<usize> = members
+            .iter()
+            .filter_map(|m| match m.route {
+                MemberRoute::PackageMember { .. } | MemberRoute::PackageNode { .. } => Some(m.line),
+                MemberRoute::Regular => None,
+            })
+            .collect();
+        let mut pkg_stmts: std::collections::HashMap<usize, PkgStmtInfo> =
+            std::collections::HashMap::new();
+        for info in &stmts {
+            if !needed.contains(&info.start_line) {
+                continue;
+            }
+            let (name, is_spec) = match &info.statement {
+                Statement::CreatePackage(p) => (ast_object_qualified(&p.name), true),
+                Statement::CreatePackageBody(p) => (ast_object_qualified(&p.name), false),
+                _ => continue,
+            };
+            let analysis = analyze_package_statement(&source_text, info, &mut warnings);
+            pkg_stmts.insert(
+                info.start_line,
+                PkgStmtInfo {
+                    pkg: name,
+                    is_spec,
+                    analysis,
+                },
+            );
+        }
+        works.insert(
+            stored_path.clone(),
+            FileWork {
+                stmts,
+                source_text,
+                index,
+                pkg_stmts,
+            },
+        );
+    }
+
+    // ── Phase 2: finalize member selection and referenced declarations
+    // over ALL files at once — independent of file order. ──
+
+    // Same-package sibling closure (review on #194 round 2): a kept
+    // member body that references a sibling member by name pulls that
+    // sibling into the selection — iterated to a fixpoint. Same
+    // word-boundary, case-insensitive lexical approximation as the
+    // package-level declaration scan.
+    for work in works.values() {
+        for stmt in work.pkg_stmts.values() {
+            if stmt.is_spec {
+                continue;
+            }
+            let Some(analysis) = &stmt.analysis else {
+                continue;
+            };
+            let Some(selected) = pkg_members.get_mut(&stmt.pkg) else {
+                continue;
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            loop {
+                let mut hay = String::new();
+                for m in selected.iter() {
+                    if let Some(t) = analysis.member_texts.get(m) {
+                        hay.push_str(t);
+                        hay.push('\n');
+                    }
+                }
+                let mut added = false;
+                for name in &analysis.member_names {
+                    if !selected.contains(name) && text_references_name(&hay, name) {
+                        selected.insert(name.clone());
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+        }
+    }
+
+    // pkg → concatenated selected member-body texts across ALL files, so a
+    // spec trim retains declarations the selected members' bodies
+    // reference — regardless of which file is processed first.
+    let mut pkg_member_hay: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for work in works.values() {
+        for stmt in work.pkg_stmts.values() {
+            if stmt.is_spec {
+                continue;
+            }
+            let Some(analysis) = &stmt.analysis else {
+                continue;
+            };
+            let Some(selected) = pkg_members.get(&stmt.pkg) else {
+                continue;
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            let hay = pkg_member_hay.entry(stmt.pkg.clone()).or_default();
+            for m in selected {
+                if let Some(t) = analysis.member_texts.get(m) {
+                    hay.push_str(t);
+                    hay.push('\n');
+                }
+            }
+        }
+    }
+
+    // Packages with selected members but no spec statement anywhere in the
+    // analyzed sources get a synthesized minimal spec (the selected
+    // members' signatures) — emitted ahead of the body statement.
+    let mut synth_specs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (pkg, selected) in &pkg_members {
+        if selected.is_empty() {
+            continue;
+        }
+        let spec_exists = works
+            .values()
+            .any(|w| w.pkg_stmts.values().any(|s| s.is_spec && s.pkg == *pkg));
+        if spec_exists {
+            continue;
+        }
+        let mut sigs: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for work in works.values() {
+            for stmt in work.pkg_stmts.values() {
+                if stmt.is_spec || stmt.pkg != *pkg {
+                    continue;
+                }
+                if let Some(analysis) = &stmt.analysis {
+                    for m in selected {
+                        if let Some(sig) = analysis.member_sigs.get(m) {
+                            sigs.insert(m.clone(), sig.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if sigs.is_empty() {
+            continue;
+        }
+        let mut text = format!("CREATE OR REPLACE PACKAGE {pkg} AS\n");
+        for sig in sigs.values() {
+            text.push_str(sig);
+            text.push('\n');
+        }
+        let end_name = pkg.rsplit('.').next().unwrap_or(pkg);
+        text.push_str(&format!("END {end_name};\n"));
+        synth_specs.insert(pkg.clone(), text);
+        warnings.push(format!(
+            "package '{pkg}' has no spec statement in the analyzed sources — \
+             synthesized a minimal spec from the selected members' signatures"
+        ));
+    }
+
+    // ── Phase 3: slice each file's members out of its fresh parse. ──
+    let mut files_report: Vec<FileExtractionReport> = Vec::new();
+    let mut files_written: usize = 0;
+    for (stored_path, members) in &by_file {
+        let Some(work) = works.get(stored_path) else {
+            continue; // parse failure already reported in phase 1
+        };
+        let FileWork {
+            stmts,
+            source_text,
+            index,
+            pkg_stmts,
+        } = work;
+        let file_display = stored_path.to_string_lossy().into_owned();
 
         // ── Package-routed members: reassemble trimmed PACKAGE [BODY]
         // statements instead of slicing whole statements (fix 4). ──
@@ -1679,86 +1939,6 @@ pub fn run_extract(
                     node_items.push((slot, member.line, pkg.clone()));
                 }
                 MemberRoute::Regular => {}
-            }
-        }
-
-        // Pre-decomposed package statements for this file (phase 1 of the
-        // per-file pass): every statement a routed member points at is
-        // analyzed BEFORE member selection so boundaries are known up
-        // front. `analysis: None` records "statement exists but its member
-        // boundaries cannot be determined" — the file then fails
-        // explicitly, never falls back to the whole package verbatim
-        // (review on #194 round 2).
-        struct PkgStmtInfo {
-            pkg: String,
-            is_spec: bool,
-            analysis: Option<PackageAnalysis>,
-        }
-        let mut pkg_stmts: std::collections::HashMap<usize, PkgStmtInfo> =
-            std::collections::HashMap::new();
-        {
-            let needed: std::collections::BTreeSet<usize> = body_groups
-                .keys()
-                .copied()
-                .chain(node_items.iter().map(|(_, l, _)| *l))
-                .collect();
-            for info in &stmts {
-                if !needed.contains(&info.start_line) {
-                    continue;
-                }
-                let (name, is_spec) = match &info.statement {
-                    Statement::CreatePackage(p) => (ast_object_qualified(&p.name), true),
-                    Statement::CreatePackageBody(p) => (ast_object_qualified(&p.name), false),
-                    _ => continue,
-                };
-                let analysis = analyze_package_statement(&source_text, info, &mut warnings);
-                pkg_stmts.insert(
-                    info.start_line,
-                    PkgStmtInfo {
-                        pkg: name,
-                        is_spec,
-                        analysis,
-                    },
-                );
-            }
-        }
-
-        // Same-package sibling closure (review on #194 round 2): a kept
-        // member body that references a sibling member by name pulls that
-        // sibling into the selection — iterated to a fixpoint. Same
-        // word-boundary, case-insensitive lexical approximation as the
-        // package-level declaration scan.
-        for stmt in pkg_stmts.values() {
-            if stmt.is_spec {
-                continue;
-            }
-            let Some(analysis) = &stmt.analysis else {
-                continue;
-            };
-            let Some(selected) = pkg_members.get_mut(&stmt.pkg) else {
-                continue;
-            };
-            if selected.is_empty() {
-                continue;
-            }
-            loop {
-                let mut hay = String::new();
-                for m in selected.iter() {
-                    if let Some(t) = analysis.member_texts.get(m) {
-                        hay.push_str(t);
-                        hay.push('\n');
-                    }
-                }
-                let mut added = false;
-                for name in &analysis.member_names {
-                    if !selected.contains(name) && text_references_name(&hay, name) {
-                        selected.insert(name.clone());
-                        added = true;
-                    }
-                }
-                if !added {
-                    break;
-                }
             }
         }
 
@@ -1799,20 +1979,29 @@ pub fn run_extract(
         }
 
         for (line, (pkg, slots)) in body_groups {
-            match trim_pkg_stmt(
+            let trimmed = trim_pkg_stmt(
                 line,
                 &pkg,
                 true,
                 "",
-                &pkg_stmts,
-                &source_text,
+                pkg_stmts,
+                source_text,
                 &pkg_members,
                 &mut pkg_trims,
                 &mut warnings,
                 &mut file_failed,
-            ) {
-                Some(trim) => {
-                    body_hay.insert(pkg.clone(), trim.member_hay.clone());
+            )
+            .is_some();
+            if trimmed {
+                // No spec statement exists for this package — prepend the
+                // synthesized minimal spec so the output stays deployable
+                // (review on #194 round 2, fix E).
+                if let Some(spec_text) = synth_specs.get(&pkg) {
+                    if let Some(t) = pkg_trims.get_mut(&line) {
+                        t.text = format!("{spec_text}\n{}", t.text);
+                    }
+                }
+                if let Some(trim) = pkg_trims.get(&line) {
                     for slot in slots {
                         if let MemberRoute::PackageMember { member, .. } = &members[slot].route {
                             if trim.found_members.contains(member) {
@@ -1827,13 +2016,12 @@ pub fn run_extract(
                         }
                     }
                 }
-                None => {
-                    for slot in slots {
-                        warnings.push(format!(
-                            "'{}': no package body statement for '{}' at line {} in '{}'",
-                            members[slot].key, pkg, line, file_display
-                        ));
-                    }
+            } else {
+                for slot in slots {
+                    warnings.push(format!(
+                        "'{}': no package body statement for '{}' at line {} in '{}'",
+                        members[slot].key, pkg, line, file_display
+                    ));
                 }
             }
         }
@@ -1862,7 +2050,7 @@ pub fn run_extract(
                         };
                         (items_name == pkg)
                             .then(|| LineSpan::from_info(info))
-                            .and_then(|span| slice_span(&source_text, span).map(|t| (span, t)))
+                            .and_then(|span| slice_span(source_text, span).map(|t| (span, t)))
                     });
                 match verbatim {
                     Some((span, text)) => {
@@ -1871,7 +2059,6 @@ pub fn run_extract(
                             PackageTrim {
                                 text,
                                 found_members: std::collections::BTreeSet::new(),
-                                member_hay: String::new(),
                                 start_line: span.start_line,
                                 end_line: span.end_line,
                             },
@@ -1896,7 +2083,7 @@ pub fn run_extract(
             // members' bodies — signatures alone cannot see those references.
             let is_spec_stmt = pkg_stmts.get(&line).is_some_and(|s| s.is_spec);
             let extra = if is_spec_stmt {
-                body_hay.get(&pkg).map(String::as_str).unwrap_or("")
+                pkg_member_hay.get(&pkg).map(String::as_str).unwrap_or("")
             } else {
                 ""
             };
@@ -1905,8 +2092,8 @@ pub fn run_extract(
                 &pkg,
                 false,
                 extra,
-                &pkg_stmts,
-                &source_text,
+                pkg_stmts,
+                source_text,
                 &pkg_members,
                 &mut pkg_trims,
                 &mut warnings,
@@ -1934,7 +2121,7 @@ pub fn run_extract(
                 "'{}': a package statement's member boundaries could not be                  determined reliably — no output produced for this file",
                 file_display
             ));
-            for member in &members {
+            for member in members {
                 closure_nodes.push(ClosureNodeReport {
                     key: member.key.clone(),
                     type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
@@ -1954,7 +2141,7 @@ pub fn run_extract(
             if !matches!(member.route, MemberRoute::Regular) {
                 continue;
             }
-            match match_span(&index, member.line, member.name.as_deref()) {
+            match match_span(index, member.line, member.name.as_deref()) {
                 SpanMatch::Matched(span) => {
                     matched.push((slot, span));
                     extracted_slots.insert(slot);
@@ -1985,7 +2172,7 @@ pub fn run_extract(
         if !matched.is_empty() {
             let spans: Vec<LineSpan> = matched.iter().map(|(_, s)| *s).collect();
             for span in merge_spans(spans) {
-                match slice_span(&source_text, span) {
+                match slice_span(source_text, span) {
                     Some(text) => segments.push((span.start_line, text)),
                     None => {
                         warnings.push(format!(
@@ -2005,7 +2192,7 @@ pub fn run_extract(
         segments.sort_by_key(|(line, _)| *line);
 
         if segments.is_empty() {
-            for member in &members {
+            for member in members {
                 closure_nodes.push(ClosureNodeReport {
                     key: member.key.clone(),
                     type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
@@ -2024,7 +2211,7 @@ pub fn run_extract(
             .join("\n");
 
         let rel = out_rel
-            .get(&stored_path)
+            .get(stored_path)
             .expect("output mapping precomputed for every by_file key")
             .clone();
         let out_path = out_dir_resolved.join(&rel);
@@ -3319,6 +3506,87 @@ END pkg_sib;
         );
     }
 
+    /// Review on #194 round 2, fix E: spec and body live in DIFFERENT
+    /// files and the spec sorts FIRST — the spec file must still be
+    /// emitted, trimmed to the selected members' signatures plus the spec
+    /// declarations their bodies reference (`t_rec`), independent of file
+    /// processing order.
+    #[test]
+    fn should_include_spec_file_and_body_referenced_spec_decls() {
+        let spec_sql = r#"CREATE OR REPLACE PACKAGE pkg_ts AS
+    TYPE t_rec IS RECORD (x NUMBER);
+    TYPE t_unused IS RECORD (y NUMBER);
+    PROCEDURE p_use(p IN t_rec);
+END pkg_ts;
+/"#;
+        let body_sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_ts AS
+    PROCEDURE p_use(p IN t_rec) IS
+    BEGIN
+        NULL;
+    END;
+END pkg_ts;
+/"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, sql) in [("a_spec.sql", spec_sql), ("z_body.sql", body_sql)] {
+            std::fs::write(dir.path().join(name), sql).unwrap();
+        }
+        let parsed: Vec<crate::parser::ParsedFile> = [spec_sql, body_sql]
+            .iter()
+            .zip(["a_spec.sql", "z_body.sql"])
+            .map(|(sql, name)| {
+                let tokens = ogsql_parser::Tokenizer::new(sql).tokenize().unwrap();
+                let mut parser = ogsql_parser::Parser::with_source(tokens, sql.to_string());
+                crate::parser::ParsedFile {
+                    path: PathBuf::from(name),
+                    statements: parser.parse_with_text(),
+                    content_hash: String::new(),
+                }
+            })
+            .collect();
+        let graph = crate::graph::builder::GraphBuilder::new().build(&parsed);
+        let p_use = find_pkg_member(&graph, "pkg_ts", "p_use");
+        let root = dir.path().to_path_buf();
+
+        run_extract(
+            &graph,
+            &root,
+            &[p_use],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &dir.path().join("out"),
+            false,
+            None,
+        )
+        .expect("extraction should succeed");
+
+        let spec_out = std::fs::read_to_string(dir.path().join("out/a_spec.sql"))
+            .expect("spec file must be emitted even though it sorts first");
+        assert!(
+            spec_out.contains("CREATE OR REPLACE PACKAGE pkg_ts AS"),
+            "spec statement emitted: {spec_out:?}"
+        );
+        assert!(
+            spec_out.contains("PROCEDURE p_use(p IN t_rec);"),
+            "selected member signature kept: {spec_out:?}"
+        );
+        assert!(
+            spec_out.contains("TYPE t_rec"),
+            "spec decl referenced by the body kept: {spec_out:?}"
+        );
+        assert!(
+            !spec_out.contains("t_unused"),
+            "unreferenced spec decl dropped: {spec_out:?}"
+        );
+
+        let body_out =
+            std::fs::read_to_string(dir.path().join("out/z_body.sql")).expect("body file emitted");
+        assert!(
+            body_out.contains("PROCEDURE p_use(p IN t_rec) IS"),
+            "member body emitted: {body_out:?}"
+        );
+    }
+
     /// Review on #194 round 2, fix D2: when a needed package statement's
     /// member boundaries cannot be determined (here a quoted member name
     /// the token mapping cannot verify), the FILE fails explicitly —
@@ -3462,9 +3730,16 @@ END pkg_a;
         .expect("extraction should succeed");
 
         let written = std::fs::read_to_string(out_dir.join("src/pkg.sql")).unwrap();
+        // No spec statement exists for pkg_a — a minimal spec synthesized
+        // from the selected members' signatures is emitted ahead of the
+        // reassembled body (review on #194 round 2, fix E).
         assert!(
-            written.starts_with("CREATE OR REPLACE PACKAGE BODY pkg_a AS"),
-            "reassembled deployable wrapper: {written:?}"
+            written.starts_with("CREATE OR REPLACE PACKAGE pkg_a AS\nPROCEDURE p1;"),
+            "synthesized spec precedes the body: {written:?}"
+        );
+        assert!(
+            written.contains("CREATE OR REPLACE PACKAGE BODY pkg_a AS"),
+            "reassembled deployable body follows: {written:?}"
         );
         assert!(written.contains("PROCEDURE p1 IS"), "p1 kept: {written:?}");
         assert!(!written.contains("PROCEDURE p2"), "p2 trimmed: {written:?}");

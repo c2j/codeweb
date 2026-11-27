@@ -262,7 +262,14 @@ Behavior:
   `CREATE [OR REPLACE] PACKAGE [BODY] P AS|IS … END P;` containing only the
   selected member bodies (or, for the spec, only their signatures) plus the
   package-level declarations they transitively reference — deployable, never
-  the whole package verbatim. A kept member that references a same-package
+  the whole package verbatim. Selecting any member also pulls in the
+  package's spec statement (from whichever file it lives in, trimmed to the
+  selected signatures plus the declarations the member bodies reference);
+  when no spec exists in the analyzed sources a minimal spec is synthesized
+  from the member signatures and a warning is recorded. Reassembly is
+  two-phase — all package statements are decomposed before any member is
+  selected — so the result never depends on file order. A kept member that
+  references a same-package
   sibling member by name pulls that sibling into the selection (iterated to
   a fixpoint), so the reassembled package stays self-contained even when the
   graph has no edge for the call (e.g. dynamic SQL). Declaration and sibling
