@@ -1033,7 +1033,12 @@ struct PackageAnalysis {
 }
 
 /// A package statement decomposed for extraction, plus its identity.
+/// Keyed in `pkg_stmts` by the statement's INDEX in the file's parse
+/// result — two package statements may legally share one physical line,
+/// so the line alone is not a stable identity (review on #194 round 3).
 struct PkgStmtInfo {
+    /// The statement's start line (nodes only carry a line, not a column).
+    line: usize,
     /// Qualified lowercased package name (`schema.pkg` or `pkg`).
     pkg: String,
     /// `true` for `CREATE PACKAGE` (spec), `false` for `CREATE PACKAGE BODY`.
@@ -1715,6 +1720,7 @@ pub fn run_extract(
         stmts: Vec<StatementInfo>,
         source_text: String,
         index: std::collections::BTreeMap<usize, Vec<SpanCandidate>>,
+        /// stmt index in `stmts` → decomposed package statement.
         pkg_stmts: std::collections::HashMap<usize, PkgStmtInfo>,
     }
     let mut works: std::collections::HashMap<PathBuf, FileWork> = std::collections::HashMap::new();
@@ -1755,7 +1761,7 @@ pub fn run_extract(
             .collect();
         let mut pkg_stmts: std::collections::HashMap<usize, PkgStmtInfo> =
             std::collections::HashMap::new();
-        for info in &stmts {
+        for (stmt_idx, info) in stmts.iter().enumerate() {
             if !needed.contains(&info.start_line) {
                 continue;
             }
@@ -1766,8 +1772,9 @@ pub fn run_extract(
             };
             let analysis = analyze_package_statement(&source_text, info, &mut warnings);
             pkg_stmts.insert(
-                info.start_line,
+                stmt_idx,
                 PkgStmtInfo {
+                    line: info.start_line,
                     pkg: name,
                     is_spec,
                     analysis,
@@ -1957,16 +1964,39 @@ pub fn run_extract(
             }
         }
 
-        // Find + trim one package statement; `require_body` distinguishes
-        // member bodies (must be CreatePackageBody) from package nodes.
-        // `failed` is set when the statement EXISTS and matches but its
-        // member boundaries cannot be determined reliably — the file must
-        // then fail explicitly instead of falling back to the whole
-        // package verbatim (review on #194 round 2).
-        fn trim_pkg_stmt<'a>(
+        // Resolve the statement a routed member points at. Nodes carry
+        // only a line — never a column — so when several package
+        // statements share that physical line the PACKAGE NAME is the
+        // disambiguator (review on #194 round 3). Zero matches → None
+        // (reported missing); more than one → the file fails explicitly.
+        fn resolve_pkg_stmt(
+            pkg_stmts: &std::collections::HashMap<usize, PkgStmtInfo>,
             line: usize,
             pkg: &str,
             require_body: bool,
+            failed: &mut bool,
+        ) -> Option<usize> {
+            let mut found = pkg_stmts.iter().filter_map(|(idx, s)| {
+                (s.line == line && s.pkg == pkg && (!require_body || !s.is_spec)).then_some(*idx)
+            });
+            match (found.next(), found.next()) {
+                (Some(idx), None) => Some(idx),
+                (None, _) => None,
+                (Some(_), Some(_)) => {
+                    *failed = true;
+                    None
+                }
+            }
+        }
+
+        // Trim the package statement at `stmt_idx` (a key into
+        // `pkg_stmts`/`pkg_trims`). `failed` is set when the statement's
+        // member boundaries cannot be determined reliably — the file must
+        // then fail explicitly, never fall back to the whole package
+        // verbatim (review on #194 round 2).
+        fn trim_pkg_stmt<'a>(
+            stmt_idx: usize,
+            pkg: &str,
             extra_refs: &str,
             pkg_stmts: &'a std::collections::HashMap<usize, PkgStmtInfo>,
             source_text: &str,
@@ -1975,13 +2005,10 @@ pub fn run_extract(
             warnings: &mut Vec<String>,
             failed: &mut bool,
         ) -> Option<&'a PackageTrim> {
-            if pkg_trims.contains_key(&line) {
-                return pkg_trims.get(&line);
+            if pkg_trims.contains_key(&stmt_idx) {
+                return pkg_trims.get(&stmt_idx);
             }
-            let stmt = pkg_stmts.get(&line)?;
-            if stmt.pkg != pkg || (require_body && stmt.is_spec) {
-                return None;
-            }
+            let stmt = pkg_stmts.get(&stmt_idx)?;
             let Some(analysis) = &stmt.analysis else {
                 *failed = true;
                 return None;
@@ -1989,34 +2016,38 @@ pub fn run_extract(
             let selected = pkg_members.get(pkg).cloned().unwrap_or_default();
             let trim =
                 assemble_package_trim(source_text, analysis, &selected, extra_refs, warnings);
-            pkg_trims.insert(line, trim);
-            pkg_trims.get(&line)
+            pkg_trims.insert(stmt_idx, trim);
+            pkg_trims.get(&stmt_idx)
         }
 
         for (line, (pkg, slots)) in body_groups {
-            let trimmed = trim_pkg_stmt(
-                line,
-                &pkg,
-                true,
-                "",
-                pkg_stmts,
-                source_text,
-                &pkg_members,
-                &mut pkg_trims,
-                &mut warnings,
-                &mut file_failed,
-            )
-            .is_some();
+            let stmt_idx = resolve_pkg_stmt(pkg_stmts, line, &pkg, true, &mut file_failed);
+            let trimmed = stmt_idx
+                .and_then(|i| {
+                    trim_pkg_stmt(
+                        i,
+                        &pkg,
+                        "",
+                        pkg_stmts,
+                        source_text,
+                        &pkg_members,
+                        &mut pkg_trims,
+                        &mut warnings,
+                        &mut file_failed,
+                    )
+                })
+                .is_some();
             if trimmed {
+                let stmt_idx = stmt_idx.expect("trimmed implies resolved");
                 // No spec statement exists for this package — prepend the
                 // synthesized minimal spec so the output stays deployable
                 // (review on #194 round 2, fix E).
                 if let Some(spec_text) = synth_specs.get(&pkg) {
-                    if let Some(t) = pkg_trims.get_mut(&line) {
+                    if let Some(t) = pkg_trims.get_mut(&stmt_idx) {
                         t.text = format!("{spec_text}\n{}", t.text);
                     }
                 }
-                if let Some(trim) = pkg_trims.get(&line) {
+                if let Some(trim) = pkg_trims.get(&stmt_idx) {
                     for slot in slots {
                         if let MemberRoute::PackageMember { member, .. } = &members[slot].route {
                             if trim.found_members.contains(member) {
@@ -2048,16 +2079,14 @@ pub fn run_extract(
             // report it `untrimmed_package` — never enter trim logic with
             // an empty selection.
             if pkg_members.get(&pkg).is_none_or(|s| s.is_empty()) {
-                let verbatim = stmts
+                // Same-line disambiguation as the trim path: the package
+                // NAME selects the statement; anything but exactly one
+                // match is reported, never guessed (review on #194 round 3).
+                let verbatim: Vec<(usize, LineSpan, String)> = stmts
                     .iter()
-                    .find(|s| s.start_line == line)
-                    .filter(|s| {
-                        matches!(
-                            s.statement,
-                            Statement::CreatePackage(_) | Statement::CreatePackageBody(_)
-                        )
-                    })
-                    .and_then(|info| {
+                    .enumerate()
+                    .filter(|(_, s)| s.start_line == line)
+                    .filter_map(|(idx, info)| {
                         let items_name = match &info.statement {
                             Statement::CreatePackage(p) => ast_object_qualified(&p.name),
                             Statement::CreatePackageBody(p) => ast_object_qualified(&p.name),
@@ -2065,14 +2094,15 @@ pub fn run_extract(
                         };
                         (items_name == pkg)
                             .then(|| LineSpan::from_info(info))
-                            .and_then(|span| slice_span(source_text, span).map(|t| (span, t)))
-                    });
-                match verbatim {
-                    Some((span, text)) => {
+                            .and_then(|span| slice_span(source_text, span).map(|t| (idx, span, t)))
+                    })
+                    .collect();
+                match verbatim.as_slice() {
+                    [(idx, span, text)] => {
                         pkg_trims.insert(
-                            line,
+                            *idx,
                             PackageTrim {
-                                text,
+                                text: text.clone(),
                                 found_members: std::collections::BTreeSet::new(),
                                 start_line: span.start_line,
                                 end_line: span.end_line,
@@ -2085,9 +2115,16 @@ pub fn run_extract(
                             members[slot].key, pkg
                         ));
                     }
-                    None => {
+                    [] => {
                         warnings.push(format!(
                             "'{}': no package statement for '{}' at line {} in '{}'",
+                            members[slot].key, pkg, line, file_display
+                        ));
+                    }
+                    _ => {
+                        warnings.push(format!(
+                            "'{}': several package statements for '{}' share line {} in \
+                             '{}' — cannot pick one untrimmed",
                             members[slot].key, pkg, line, file_display
                         ));
                     }
@@ -2096,27 +2133,32 @@ pub fn run_extract(
             }
             // A spec statement keeps declarations referenced by the selected
             // members' bodies — signatures alone cannot see those references.
-            let is_spec_stmt = pkg_stmts.get(&line).is_some_and(|s| s.is_spec);
+            let stmt_idx = resolve_pkg_stmt(pkg_stmts, line, &pkg, false, &mut file_failed);
+            let is_spec_stmt = stmt_idx
+                .and_then(|i| pkg_stmts.get(&i))
+                .is_some_and(|s| s.is_spec);
             let extra = if is_spec_stmt {
                 pkg_member_hay.get(&pkg).map(String::as_str).unwrap_or("")
             } else {
                 ""
             };
-            if trim_pkg_stmt(
-                line,
-                &pkg,
-                false,
-                extra,
-                pkg_stmts,
-                source_text,
-                &pkg_members,
-                &mut pkg_trims,
-                &mut warnings,
-                &mut file_failed,
-            )
-            .is_some()
-            {
-                if let Some(t) = pkg_trims.get(&line) {
+            let trimmed = stmt_idx
+                .and_then(|i| {
+                    trim_pkg_stmt(
+                        i,
+                        &pkg,
+                        extra,
+                        pkg_stmts,
+                        source_text,
+                        &pkg_members,
+                        &mut pkg_trims,
+                        &mut warnings,
+                        &mut file_failed,
+                    )
+                })
+                .is_some();
+            if trimmed {
+                if let Some(t) = pkg_trims.get(&stmt_idx.unwrap()) {
                     pkg_slot_span.insert(slot, (t.start_line, t.end_line));
                 }
             } else {
@@ -2283,6 +2325,19 @@ pub fn run_extract(
                 output: (extracted || untrimmed_slots.contains_key(&slot))
                     .then(|| out_display.clone()),
             });
+        }
+    }
+
+    // A member reported `missing_statement` means its definition could
+    // not be located at the recorded position — that is an extraction
+    // error, never a silent success (review on #194 round 3).
+    for node in &closure_nodes {
+        if node.status == STATUS_MISSING_STATEMENT {
+            errors.push(format!(
+                "'{}': definition statement not found at its recorded location — \
+                 no boundary invented",
+                node.key
+            ));
         }
     }
 
@@ -3525,6 +3580,105 @@ END pkg_sib;
         assert!(
             !written.contains("PROCEDURE p_other"),
             "unreferenced sibling stays trimmed: {written:?}"
+        );
+    }
+
+    /// Review on #194 round 3, fix G: two package bodies may legally
+    /// share ONE physical line — nodes carry only a line, so the package
+    /// NAME is the disambiguator. Extracting pkg_a.a1 must emit pkg_a's
+    /// body and nothing of pkg_b.
+    #[test]
+    fn should_match_package_stmt_by_name_when_two_share_a_line() {
+        // Both package bodies start on the SAME physical line — the
+        // reviewer's exact repro shape.
+        let sql = "CREATE OR REPLACE PACKAGE BODY pkg_a AS \
+                   PROCEDURE a1 IS BEGIN NULL; END; END pkg_a; \
+                   CREATE OR REPLACE PACKAGE BODY pkg_b AS \
+                   PROCEDURE b1 IS BEGIN NULL; END; END pkg_b;\n/\n";
+        let (graph, dir) = package_project(&sql, "src/pkg.sql");
+        let a1 = find_pkg_member(&graph, "pkg_a", "a1");
+        let root = dir.path().to_path_buf();
+
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[a1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &dir.path().join("out"),
+            false,
+            None,
+            &[],
+        )
+        .expect("extraction should succeed");
+
+        let written = std::fs::read_to_string(dir.path().join("out/src/pkg.sql"))
+            .expect("output produced by name-matched statement");
+        assert!(
+            written.contains("PACKAGE BODY pkg_a") && written.contains("PROCEDURE a1"),
+            "pkg_a body emitted: {written:?}"
+        );
+        assert!(
+            !written.contains("pkg_b") && !written.contains("PROCEDURE b1"),
+            "pkg_b must not leak into pkg_a's output: {written:?}"
+        );
+        assert!(
+            outcome.report.errors.is_empty(),
+            "clean name match is not an error: {:?}",
+            outcome.report.errors
+        );
+    }
+
+    /// Review on #194 round 3, fix G: a member whose statement cannot be
+    /// found (stale store) is `missing_statement` — and that MUST surface
+    /// in `errors` so the run exits non-zero; zero-error fake success is
+    /// not allowed.
+    #[test]
+    fn should_record_missing_statement_as_error() {
+        let sql_v1 = "CREATE PROCEDURE p1 IS\nBEGIN\n    NULL;\nEND;\n/\n";
+        let (graph, dir) = package_project(sql_v1, "src/s.sql");
+        // Stale the store: the file on disk now defines a different object.
+        std::fs::write(
+            dir.path().join("src/s.sql"),
+            "CREATE PROCEDURE p2 IS\nBEGIN\n    NULL;\nEND;\n/\n",
+        )
+        .unwrap();
+        let p1 = graph
+            .node_indices()
+            .find(|&i| {
+                matches!(&graph[i], crate::graph::Node::Procedure { id, .. } if id.name == "p1")
+            })
+            .expect("p1 in graph");
+        let root = dir.path().to_path_buf();
+
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[p1],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &dir.path().join("out"),
+            false,
+            None,
+            &[],
+        )
+        .expect("run completes with errors recorded");
+
+        assert!(
+            outcome
+                .report
+                .closure_nodes
+                .iter()
+                .any(|n| n.status == STATUS_MISSING_STATEMENT),
+            "stale member reported missing: {:?}",
+            outcome.report.closure_nodes
+        );
+        assert!(
+            !outcome.report.errors.is_empty(),
+            "missing_statement must be an error, not silent success: {:?}",
+            outcome.report.errors
         );
     }
 
