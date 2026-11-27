@@ -819,10 +819,27 @@ fn ast_object_qualified(name: &ogsql_parser::ast::ObjectName) -> String {
         .join(".")
 }
 
+/// Block kinds tracked by the member-end scan. `IF`/`LOOP` are NOT on the
+/// stack — their compound `END IF`/`END LOOP` forms are recognized by
+/// lookahead and skipped, keeping open/close pairing self-consistent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockKind {
+    Begin,
+    Case,
+}
+
 /// Scan forward from a member's `PROCEDURE`/`FUNCTION` keyword token to the
 /// token that ends the member. Body members end at the `;` after the closing
 /// `END [name]`; spec signatures end at their first depth-0 `;` (`spec_mode`).
-/// `BEGIN`/`CASE` push depth, compound `END IF|LOOP|CASE` never pop it.
+///
+/// Nesting uses ONE block stack (review on #194 round 3): `BEGIN`/`CASE`
+/// push, `END CASE` pops a `Case` (anything else on top is a structural
+/// anomaly → `None`), and a bare `END` pops whatever is on top — covering
+/// CASE *expressions*, which legally end with a bare `END`. When only the
+/// member's own `BEGIN` remains on the stack, that bare `END` is the
+/// member's end. The old dual-counter version decremented `case_d` before
+/// `begin_d`, so a `BEGIN…END` nested inside a `CASE` statement had its
+/// `END` stolen by the CASE and real packages failed to decompose.
 fn scan_pkg_member_end(
     tokens: &[TokenWithSpan],
     start: usize,
@@ -830,15 +847,15 @@ fn scan_pkg_member_end(
     spec_mode: bool,
 ) -> Option<usize> {
     let mut i = start + 1;
-    let (mut begin_d, mut case_d) = (0i32, 0i32);
+    let mut stack: Vec<BlockKind> = Vec::new();
     while i < bound {
         match &tokens[i].token {
             // Spec signature: `PROCEDURE p(x INT);` — first top-level `;`.
             // (In a body, `;` at depth 0 is a local declaration separator and
             // must NOT end the member.)
-            Token::Semicolon if spec_mode && begin_d == 0 && case_d == 0 => return Some(i),
-            Token::Keyword(Keyword::CASE) => case_d += 1,
-            Token::Keyword(Keyword::BEGIN_P) => begin_d += 1,
+            Token::Semicolon if spec_mode && stack.is_empty() => return Some(i),
+            Token::Keyword(Keyword::CASE) => stack.push(BlockKind::Case),
+            Token::Keyword(Keyword::BEGIN_P) => stack.push(BlockKind::Begin),
             Token::Keyword(Keyword::END_P) => {
                 match tokens.get(i + 1).map(|t| &t.token) {
                     // Compound ends close IF/LOOP blocks — no depth change.
@@ -846,28 +863,28 @@ fn scan_pkg_member_end(
                         i += 2;
                         continue;
                     }
-                    // `END CASE` closes a CASE statement/expression.
+                    // `END CASE` closes a CASE statement — valid only when
+                    // the innermost open block IS that CASE.
                     Some(Token::Keyword(Keyword::CASE)) => {
-                        if case_d > 0 {
-                            case_d -= 1;
+                        if stack.pop() != Some(BlockKind::Case) {
+                            return None;
                         }
                         i += 2;
                         continue;
                     }
-                    _ => {
-                        if case_d > 0 {
-                            case_d -= 1;
-                        } else if begin_d > 1 {
-                            // A nested BEGIN..END block inside the member.
-                            begin_d -= 1;
-                        } else {
-                            // This END closes the member itself: consume the
-                            // optional member name and the terminating `;`.
+                    _ => match stack.last() {
+                        // Only the member's own BEGIN remains: this END
+                        // closes the member — consume the optional member
+                        // name and the terminating `;`.
+                        Some(BlockKind::Begin) if stack.len() == 1 => {
                             let mut j = i + 1;
+                            // The optional member name may lex as a Keyword
+                            // when it collides with a reserved word (e.g.
+                            // `END log;` in PACK_LOG).
                             while j < tokens.len()
                                 && matches!(
                                     tokens[j].token,
-                                    Token::Ident(_) | Token::QuotedIdent(_)
+                                    Token::Ident(_) | Token::QuotedIdent(_) | Token::Keyword(_)
                                 )
                             {
                                 j += 1;
@@ -877,7 +894,14 @@ fn scan_pkg_member_end(
                             }
                             return Some(j - 1);
                         }
-                    }
+                        // Bare END closes whatever block is innermost —
+                        // including a CASE *expression*.
+                        Some(_) => {
+                            stack.pop();
+                        }
+                        // END with nothing open — structural anomaly.
+                        None => return None,
+                    },
                 }
             }
             Token::Eof => return None,
@@ -1157,12 +1181,18 @@ fn analyze_package_statement(
         };
         // Verify the token after the keyword really is this member's name —
         // guards against matching a nested subprogram's keyword instead.
+        // Member names that collide with reserved words (e.g. `log`, seen in
+        // the real PACK_LOG package) lex as Keyword tokens, so recover the
+        // spelling from the source slice rather than accepting Ident only.
         let name_after = tokens
             .iter()
             .skip(st + 1)
             .find(|t| !matches!(t.token, Token::Comment(_)))
             .and_then(|t| match &t.token {
                 Token::Ident(s) => Some(s.to_lowercase()),
+                Token::Keyword(_) => source
+                    .get(t.span.start..t.span.end)
+                    .map(|s| s.to_lowercase()),
                 _ => None,
             });
         let expected_first = m.name.split('.').next().unwrap_or(m.name.as_str());
@@ -4463,6 +4493,92 @@ END pkg_b;
         )
         .expect_err("colliding output paths must fail");
         assert!(matches!(err, ExtractError::ProtectedPath { .. }));
+    }
+
+    /// Review on #194 round 3, fix H: the member-end scan must attribute
+    /// every `END` to the innermost open block, not to CASE first. This
+    /// fixture packs the real-world shapes that failed on the 16-root run —
+    /// a CASE statement wrapping a nested BEGIN…END, a CASE *expression*
+    /// closed by a bare END, IF…END IF, a doubly-nested BEGIN, and two
+    /// overloaded members both named `log` (PACK_LOG shape). Under the old
+    /// dual-counter scan the nested BEGIN's END was stolen by the CASE and
+    /// the whole file failed to decompose.
+    #[test]
+    fn should_decompose_package_with_case_nested_blocks_and_overloads() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_hard AS
+    PROCEDURE log(p_msg VARCHAR2) IS
+    BEGIN
+        NULL;
+    END;
+
+    PROCEDURE log(p_msg VARCHAR2, p_lv INT) IS
+    BEGIN
+        CASE WHEN p_lv > 0 THEN
+            BEGIN
+                NULL;
+            END;
+        END CASE;
+    END log;
+
+    PROCEDURE p_use IS
+        v_cnt NUMBER;
+    BEGIN
+        v_cnt := CASE WHEN v_cnt > 0 THEN 1 ELSE 2 END;
+        IF v_cnt > 0 THEN
+            BEGIN
+                v_cnt := v_cnt + 1;
+            END;
+        END IF;
+    END;
+END pkg_hard;
+/"#;
+        let (graph, dir) = package_project(sql, "src/pkg.sql");
+        let p_use = find_pkg_member(&graph, "pkg_hard", "p_use");
+        let root = dir.path().to_path_buf();
+        let out_dir = dir.path().join("out");
+
+        let outcome = run_extract(
+            &graph,
+            &root,
+            &[p_use],
+            petgraph::Direction::Outgoing,
+            "outgoing",
+            None,
+            &out_dir,
+            false,
+            None,
+            &[],
+        )
+        .expect("run completes");
+
+        assert!(
+            outcome.report.errors.is_empty(),
+            "every member boundary must be detected — no file failure: {:?}",
+            outcome.report.errors
+        );
+        let written = std::fs::read_to_string(out_dir.join("src/pkg.sql"))
+            .expect("output file produced for the decomposed package");
+        assert!(
+            written.contains("PROCEDURE p_use IS"),
+            "selected member kept: {written:?}"
+        );
+        assert!(
+            written.contains("CASE WHEN v_cnt > 0 THEN 1 ELSE 2 END"),
+            "CASE-expression member body survives verbatim: {written:?}"
+        );
+        assert!(
+            !written.contains("PROCEDURE log"),
+            "unselected overloads trimmed: {written:?}"
+        );
+        assert!(
+            outcome
+                .report
+                .closure_nodes
+                .iter()
+                .all(|n| n.status != STATUS_MISSING_STATEMENT),
+            "members must map to the package statement: {:?}",
+            outcome.report.closure_nodes
+        );
     }
 
     /// Shared fixture: a one-procedure project whose graph is already built.
