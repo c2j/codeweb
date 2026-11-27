@@ -517,6 +517,10 @@ pub const STATUS_NO_SOURCE_DEFINITION: &str = "no_source_definition";
 pub const STATUS_NON_SQL_SOURCE: &str = "non_sql_source";
 pub const STATUS_UNRESOLVED: &str = "unresolved";
 pub const STATUS_MISSING_STATEMENT: &str = "missing_statement";
+/// A bare package node whose package has no selected members: the complete
+/// original package statement was emitted verbatim — deliberately NOT
+/// counted as `extracted` (review on #194 round 2).
+pub const STATUS_UNTRIMMED_PACKAGE: &str = "untrimmed_package";
 
 /// Machine-readable result of an extraction run (`--report <path>`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1601,6 +1605,10 @@ pub fn run_extract(
         // member slot → extracted via package stmt (with its stmt span).
         let mut pkg_slot_span: std::collections::HashMap<usize, (usize, usize)> =
             std::collections::HashMap::new();
+        // member slot → emitted VERBATIM via a bare package node (with its
+        // stmt span): reported `untrimmed_package`, never `extracted`.
+        let mut untrimmed_slots: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
         // (stmt start_line, pkg) groups for member bodies, in source order.
         let mut body_groups: std::collections::BTreeMap<usize, (String, Vec<usize>)> =
             std::collections::BTreeMap::new();
@@ -1707,6 +1715,60 @@ pub fn run_extract(
             }
         }
         for (slot, line, pkg) in node_items {
+            // Bare package node (review on #194 round 2, fix C): when the
+            // package has NO selected members, trimming would produce an
+            // empty `CREATE PACKAGE … END;` wrapper silently counted as
+            // extracted. Emit the COMPLETE original statement instead and
+            // report it `untrimmed_package` — never enter trim logic with
+            // an empty selection.
+            if pkg_members.get(&pkg).is_none_or(|s| s.is_empty()) {
+                let verbatim = stmts
+                    .iter()
+                    .find(|s| s.start_line == line)
+                    .filter(|s| {
+                        matches!(
+                            s.statement,
+                            Statement::CreatePackage(_) | Statement::CreatePackageBody(_)
+                        )
+                    })
+                    .and_then(|info| {
+                        let items_name = match &info.statement {
+                            Statement::CreatePackage(p) => ast_object_qualified(&p.name),
+                            Statement::CreatePackageBody(p) => ast_object_qualified(&p.name),
+                            _ => return None,
+                        };
+                        (items_name == pkg)
+                            .then(|| LineSpan::from_info(info))
+                            .and_then(|span| slice_span(&source_text, span).map(|t| (span, t)))
+                    });
+                match verbatim {
+                    Some((span, text)) => {
+                        pkg_trims.insert(
+                            line,
+                            PackageTrim {
+                                text,
+                                found_members: std::collections::BTreeSet::new(),
+                                member_hay: String::new(),
+                                start_line: span.start_line,
+                                end_line: span.end_line,
+                            },
+                        );
+                        untrimmed_slots.insert(slot, (span.start_line, span.end_line));
+                        warnings.push(format!(
+                            "'{}': package '{}' has no selected members — emitting the \
+                             complete original package statement untrimmed",
+                            members[slot].key, pkg
+                        ));
+                    }
+                    None => {
+                        warnings.push(format!(
+                            "'{}': no package statement for '{}' at line {} in '{}'",
+                            members[slot].key, pkg, line, file_display
+                        ));
+                    }
+                }
+                continue;
+            }
             // A spec statement keeps declarations referenced by the selected
             // members' bodies — signatures alone cannot see those references.
             let is_spec_stmt = stmts
@@ -1845,7 +1907,7 @@ pub fn run_extract(
                 end_line: span.end_line,
             });
         }
-        for (slot, (sl, el)) in &pkg_slot_span {
+        for (slot, (sl, el)) in pkg_slot_span.iter().chain(untrimmed_slots.iter()) {
             ranges.push(RangeReport {
                 node: members[*slot].key.clone(),
                 start_line: *sl,
@@ -1862,16 +1924,20 @@ pub fn run_extract(
 
         for (slot, member) in members.iter().enumerate() {
             let extracted = extracted_slots.contains(&slot) || pkg_slot_span.contains_key(&slot);
+            let status = if untrimmed_slots.contains_key(&slot) {
+                STATUS_UNTRIMMED_PACKAGE
+            } else if extracted {
+                STATUS_EXTRACTED
+            } else {
+                STATUS_MISSING_STATEMENT
+            };
             closure_nodes.push(ClosureNodeReport {
                 key: member.key.clone(),
                 type_tag: crate::graph::node_type_tag(&graph[member.idx]).to_string(),
-                status: if extracted {
-                    STATUS_EXTRACTED
-                } else {
-                    STATUS_MISSING_STATEMENT
-                },
+                status,
                 source: Some(file_display.clone()),
-                output: extracted.then(|| out_display.clone()),
+                output: (extracted || untrimmed_slots.contains_key(&slot))
+                    .then(|| out_display.clone()),
             });
         }
     }
@@ -3209,12 +3275,19 @@ END pkg_t;
         );
     }
 
-    /// A package node with no members in the closure still emits a minimal
-    /// deployable wrapper — never broken SQL.
+    /// A bare package node with NO selected members must NOT silently
+    /// produce an empty `CREATE PACKAGE … END;` wrapper counted as
+    /// extracted (review on #194 round 2): it emits the COMPLETE original
+    /// package statement, reports `untrimmed_package`, and warns.
     #[test]
-    fn should_emit_minimal_package_wrapper_for_bare_package_node() {
+    fn should_emit_full_statement_for_bare_package_node() {
         let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_m AS
     PROCEDURE p1 IS
+    BEGIN
+        NULL;
+    END;
+
+    PROCEDURE p2 IS
     BEGIN
         NULL;
     END;
@@ -3225,7 +3298,7 @@ END pkg_m;
         let root = dir.path().to_path_buf();
 
         // depth 0: only the package node itself, no members.
-        run_extract(
+        let outcome = run_extract(
             &graph,
             &root,
             &[pkg],
@@ -3242,11 +3315,30 @@ END pkg_m;
         assert!(
             written.contains("CREATE OR REPLACE PACKAGE BODY pkg_m AS")
                 && written.contains("END pkg_m;"),
-            "minimal deployable wrapper: {written:?}"
+            "complete original statement: {written:?}"
         );
         assert!(
-            !written.contains("PROCEDURE p1"),
-            "no members selected → none emitted: {written:?}"
+            written.contains("PROCEDURE p1") && written.contains("PROCEDURE p2"),
+            "bare package node emits ALL members verbatim, not an empty wrapper: {written:?}"
+        );
+        let node_report = outcome
+            .report
+            .closure_nodes
+            .iter()
+            .find(|n| n.key.contains("pkg_m"))
+            .expect("package node in report");
+        assert_eq!(
+            node_report.status, STATUS_UNTRIMMED_PACKAGE,
+            "bare package node must not count as extracted: {node_report:?}"
+        );
+        assert!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("untrimmed")),
+            "untrimmed emission must be warned: {:?}",
+            outcome.report.warnings
         );
     }
 
